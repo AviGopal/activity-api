@@ -1,0 +1,15 @@
+node_modules
+dist
+*.log
+.env
+.env.*
+*.md
+!README.md
+.git
+.gitignore
+test
+tests
+*.test.ts
+*.spec.ts
+coverage
+.DS_Store

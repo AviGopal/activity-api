@@ -1,0 +1,112 @@
+# Default values for metabob-activity-api
+replicaCount: 2
+
+image:
+  repository: metabob-activity-api
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Service configuration
+service:
+  type: ClusterIP
+  port: 8080
+  targetPort: 8080
+
+# Configuration
+config:
+  # Server
+  port: 8080
+  host: "0.0.0.0"
+  
+  # SurrealDB connection
+  surrealdb:
+    url: "http://surrealdb.metabob.svc.cluster.local:8000"
+    namespace: "metabob"
+    database: "learning_loop"
+    username: "root"
+    password: "changeme"  # Override in production
+  
+  # Redis connection
+  redis:
+    url: "redis://redis-master.metabob.svc.cluster.local:6379"
+    sessionTtl: 86400     # 24 hours
+    templateTtl: 3600     # 1 hour
+    metricsTtl: 300       # 5 minutes
+  
+  # Security
+  auth:
+    requireAuth: false    # Set to true in production
+  
+  # Logging
+  logLevel: "info"        # debug, info, warn, error
+  logFormat: "json"       # json or text
+  
+  # CORS
+  corsOrigins: "*"        # Comma-separated list
+
+# Resource limits
+resources:
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+  requests:
+    cpu: 250m
+    memory: 512Mi
+
+# Autoscaling
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 80
+
+# Pod configuration
+podAnnotations: {}
+podSecurityContext: {}
+securityContext: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Liveness and readiness probes
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# Ingress configuration
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: activity-api.metabob.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# Development configuration
+dev:
+  enabled: false
+  hotReload: false
+  volumeMounts: []

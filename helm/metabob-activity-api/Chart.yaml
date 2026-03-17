@@ -1,0 +1,14 @@
+apiVersion: v2
+name: metabob-activity-api
+description: TypeScript Activity System API with Thompson Sampling learning loop
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - activity-system
+  - learning-loop
+  - thompson-sampling
+  - metabob
+maintainers:
+  - name: Metabob Team
+    email: dev@metabob.com
