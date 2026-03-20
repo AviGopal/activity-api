@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "metabob-activity-api.fullname" . }}
+  labels:
+    {{- include "metabob-activity-api.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "metabob-activity-api.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "metabob-activity-api.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+      - name: {{ .Chart.Name }}
+        securityContext:
+          {{- toYaml .Values.securityContext | nindent 12 }}
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        ports:
+        - name: http
+          containerPort: {{ .Values.config.port }}
+          protocol: TCP
+        env:
+        - name: PORT
+          value: {{ .Values.config.port | quote }}
+        - name: HOST
+          value: {{ .Values.config.host | quote }}
+        - name: SURREALDB_URL
+          value: {{ .Values.config.surrealdb.url | quote }}
+        - name: SURREALDB_NAMESPACE
+          value: {{ .Values.config.surrealdb.namespace | quote }}
+        - name: SURREALDB_DATABASE
+          value: {{ .Values.config.surrealdb.database | quote }}
+        - name: SURREALDB_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "metabob-activity-api.fullname" . }}
+              key: surrealdb-username
+        - name: SURREALDB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "metabob-activity-api.fullname" . }}
+              key: surrealdb-password
+        - name: REDIS_URL
+          value: {{ .Values.config.redis.url | quote }}
+        - name: REDIS_SESSION_TTL
+          value: {{ .Values.config.redis.sessionTtl | quote }}
+        - name: REDIS_TEMPLATE_TTL
+          value: {{ .Values.config.redis.templateTtl | quote }}
+        - name: REDIS_METRICS_TTL
+          value: {{ .Values.config.redis.metricsTtl | quote }}
+        - name: REQUIRE_AUTH
+          value: {{ .Values.config.auth.requireAuth | quote }}
+        - name: LOG_LEVEL
+          value: {{ .Values.config.logLevel | quote }}
+        - name: LOG_FORMAT
+          value: {{ .Values.config.logFormat | quote }}
+        - name: CORS_ORIGINS
+          value: {{ .Values.config.corsOrigins | quote }}
+        livenessProbe:
+          {{- toYaml .Values.livenessProbe | nindent 12 }}
+        readinessProbe:
+          {{- toYaml .Values.readinessProbe | nindent 12 }}
+        resources:
+          {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

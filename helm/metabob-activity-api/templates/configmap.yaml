@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "metabob-activity-api.fullname" . }}
+  labels:
+    {{- include "metabob-activity-api.labels" . | nindent 4 }}
+data:
+  config.json: |
+    {
+      "port": {{ .Values.config.port }},
+      "host": "{{ .Values.config.host }}",
+      "surrealdb": {
+        "url": "{{ .Values.config.surrealdb.url }}",
+        "namespace": "{{ .Values.config.surrealdb.namespace }}",
+        "database": "{{ .Values.config.surrealdb.database }}"
+      },
+      "redis": {
+        "url": "{{ .Values.config.redis.url }}",
+        "ttl": {
+          "session": {{ .Values.config.redis.sessionTtl }},
+          "template": {{ .Values.config.redis.templateTtl }},
+          "metrics": {{ .Values.config.redis.metricsTtl }}
+        }
+      },
+      "auth": {
+        "requireAuth": {{ .Values.config.auth.requireAuth }}
+      },
+      "logLevel": "{{ .Values.config.logLevel }}",
+      "logFormat": "{{ .Values.config.logFormat }}",
+      "cors": {
+        "origins": "{{ .Values.config.corsOrigins }}"
+      }
+    }

@@ -52,6 +52,23 @@ function parseEnvBool(key: string, defaultValue: boolean): boolean {
   return value.toLowerCase() === 'true' || value === '1';
 }
 
+/**
+ * Validates SurrealDB namespace format and existence
+ * Fails fast on invalid configuration to prevent silent query failures
+ */
+function validateNamespace(ns: string | undefined): string {
+  if (!ns) {
+    throw new Error('SURREALDB_NAMESPACE environment variable is required. Set it to "activity-system" for Activity API deployment.');
+  }
+  
+  // Validate namespace format (alphanumeric, underscore, hyphen)
+  if (!/^[a-z0-9_-]+$/i.test(ns)) {
+    throw new Error(`Invalid namespace format: "${ns}". Must contain only alphanumeric characters, underscores, and hyphens.`);
+  }
+  
+  return ns;
+}
+
 export function loadConfig(): Config {
   return {
     port: parseEnvInt('PORT', 8080),
@@ -59,7 +76,7 @@ export function loadConfig(): Config {
     
     surrealdb: {
       url: process.env.SURREALDB_URL || 'http://localhost:8000',
-      namespace: process.env.SURREALDB_NAMESPACE || 'metabob',
+      namespace: validateNamespace(process.env.SURREALDB_NAMESPACE),
       database: process.env.SURREALDB_DATABASE || 'learning_loop',
       username: process.env.SURREALDB_USERNAME || 'root',
       password: process.env.SURREALDB_PASSWORD || 'changeme',

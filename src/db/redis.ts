@@ -151,6 +151,90 @@ export class RedisClient {
     }
   }
 
+  /**
+   * Acquire distributed lock using Redis SETNX
+   * Prevents cache stampede by ensuring only one process refreshes cache at a time
+   * 
+   * @param lockKey - Unique lock key (e.g., "lock:templates:refresh")
+   * @param ttlSeconds - Lock TTL to prevent deadlocks (default: 30s)
+   * @returns true if lock acquired, false if already locked
+   */
+  async acquireLock(lockKey: string, ttlSeconds: number = 30): Promise<boolean> {
+    const client = this.getClient();
+    try {
+      // SET NX EX: Set if Not eXists, with EXpiration
+      const result = await client.set(lockKey, '1', 'EX', ttlSeconds, 'NX');
+      const acquired = result === 'OK';
+      logger.debug('Redis LOCK acquire', { lockKey, ttlSeconds, acquired });
+      return acquired;
+    } catch (error) {
+      logger.error('Redis LOCK acquire failed', { lockKey, error });
+      throw error;
+    }
+  }
+
+  /**
+   * Release distributed lock
+   * 
+   * @param lockKey - Lock key to release
+   */
+  async releaseLock(lockKey: string): Promise<void> {
+    const client = this.getClient();
+    try {
+      await client.del(lockKey);
+      logger.debug('Redis LOCK release', { lockKey });
+    } catch (error) {
+      logger.error('Redis LOCK release failed', { lockKey, error });
+      throw error;
+    }
+  }
+
+  /**
+   * Execute function with distributed lock (cache stampede prevention)
+   * If lock is already held, waits and returns cached value
+   * 
+   * @param lockKey - Lock key
+   * @param cacheKey - Cache key to check after waiting
+   * @param fn - Function to execute if lock acquired
+   * @param lockTTL - Lock TTL in seconds (default: 30s)
+   * @returns Result from fn() or cached value
+   */
+  async withLock<T>(
+    lockKey: string,
+    cacheKey: string,
+    fn: () => Promise<T>,
+    lockTTL: number = 30
+  ): Promise<T> {
+    const lockAcquired = await this.acquireLock(lockKey, lockTTL);
+
+    if (lockAcquired) {
+      try {
+        // Execute function and cache result
+        logger.debug('Lock acquired, executing function', { lockKey });
+        const result = await fn();
+        return result;
+      } finally {
+        // Always release lock, even if fn() throws
+        await this.releaseLock(lockKey);
+      }
+    } else {
+      // Lock held by another process - wait briefly and check cache
+      logger.debug('Lock held by another process, waiting for cache refresh', { lockKey });
+      await new Promise(resolve => setTimeout(resolve, 100)); // Wait 100ms
+
+      // Check if cache was populated by lock holder
+      const cached = await this.get(cacheKey);
+      if (cached) {
+        logger.debug('Cache refreshed by lock holder', { cacheKey });
+        return JSON.parse(cached) as T;
+      }
+
+      // Cache still empty - fall through to query without lock
+      logger.warn('Cache refresh failed, falling through to query', { cacheKey });
+      return await fn();
+    }
+  }
+
   async close(): Promise<void> {
     if (this.client) {
       await this.client.quit();

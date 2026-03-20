@@ -15,6 +15,8 @@ import { authMiddleware } from './middleware/auth';
 import sessionRoutes from './routes/session';
 import activitiesRoutes from './routes/activities';
 import impulsesRoutes from './routes/impulses';
+import { broadcaster } from './websocket/broadcaster';
+import type { ServerWebSocket } from 'bun';
 
 const app = new Hono();
 
@@ -41,13 +43,62 @@ app.use('/v2/*', authMiddleware);
 // ============================================================================
 
 // Health check endpoint (no auth required)
-app.get('/health', (c) => {
-  return c.json({ 
-    status: 'ok', 
+// Deep health check: verifies Redis and SurrealDB connectivity
+app.get('/health', async (c) => {
+  const healthStatus: any = {
     service: 'metabob-activity-api',
     version: '1.0.0',
-    timestamp: new Date().toISOString()
-  });
+    timestamp: new Date().toISOString(),
+    checks: {
+      redis: { status: 'unknown', latency_ms: 0 },
+      surrealdb: { status: 'unknown', latency_ms: 0 }
+    }
+  };
+
+  let allHealthy = true;
+
+  // Check Redis connectivity
+  try {
+    const redisStart = Date.now();
+    const { RedisClient } = await import('./db/redis');
+    const redis = RedisClient.getInstance();
+    await redis.getClient().ping();
+    healthStatus.checks.redis = {
+      status: 'healthy',
+      latency_ms: Date.now() - redisStart
+    };
+  } catch (error: any) {
+    logger.error('Redis health check failed', { error: error.message });
+    healthStatus.checks.redis = {
+      status: 'unhealthy',
+      error: error.message
+    };
+    allHealthy = false;
+  }
+
+  // Check SurrealDB connectivity
+  try {
+    const surrealStart = Date.now();
+    const { surrealDB } = await import('./db/surreal');
+    await surrealDB.query('SELECT * FROM variant_performance_metrics LIMIT 1');
+    healthStatus.checks.surrealdb = {
+      status: 'healthy',
+      latency_ms: Date.now() - surrealStart
+    };
+  } catch (error: any) {
+    logger.error('SurrealDB health check failed', { error: error.message });
+    healthStatus.checks.surrealdb = {
+      status: 'unhealthy',
+      error: error.message
+    };
+    allHealthy = false;
+  }
+
+  healthStatus.status = allHealthy ? 'healthy' : 'unhealthy';
+
+  // Return 503 Service Unavailable if any dependency is unhealthy
+  // This signals Kubernetes to remove pod from load balancer
+  return c.json(healthStatus, allHealthy ? 200 : 503);
 });
 
 // Session routes (POST /v2/session, GET /v2/session)
@@ -102,17 +153,88 @@ logger.info('Starting Metabob Activity API', {
   surrealdb: config.surrealdb.url
 });
 
-export default {
-  port,
-  fetch: app.fetch,
-};
-
-// CLI execution
-if (import.meta.main) {
-  const server = Bun.serve({
-    port,
-    fetch: app.fetch,
-  });
-
-  logger.info(`Server running at http://localhost:${server.port}`);
+// WebSocket data type
+interface WebSocketData {
+  sessionId?: string;
+  orgId?: string;
+  authenticated: boolean;
 }
+
+// Start server with WebSocket support
+const server = Bun.serve<WebSocketData>({
+  port,
+  fetch(req, server) {
+    // Handle WebSocket upgrade for /ws endpoint
+    const url = new URL(req.url);
+    if (url.pathname === '/ws') {
+      const success = server.upgrade(req, {
+        data: { authenticated: false }
+      });
+      if (success) {
+        return undefined; // Upgrade successful, handled by websocket handlers
+      }
+      return new Response('WebSocket upgrade failed', { status: 500 });
+    }
+    
+    // Regular HTTP requests
+    return app.fetch(req, server);
+  },
+  websocket: {
+    open(ws) {
+      broadcaster.addClient(ws as any);
+      logger.info('[WebSocket] Client connected, awaiting authentication');
+    },
+    
+    message(ws, message) {
+      try {
+        const data = JSON.parse(message.toString());
+        
+        // Handle authentication
+        if (data.type === 'authenticate' && data.token) {
+          // TODO: Validate token against session store
+          // For now, mark as authenticated (will implement proper auth in next iteration)
+          ws.data.authenticated = true;
+          ws.data.sessionId = data.sessionId || 'default';
+          ws.data.orgId = data.orgId || 'default';
+          
+          logger.info('[WebSocket] Client authenticated', {
+            sessionId: ws.data.sessionId,
+            orgId: ws.data.orgId,
+          });
+          
+          // Send auth confirmation
+          ws.send(JSON.stringify({
+            type: 'authenticated',
+            timestamp: new Date().toISOString(),
+          }));
+        }
+        
+        // Handle ping/pong for keepalive
+        if (data.type === 'ping') {
+          ws.send(JSON.stringify({
+            type: 'pong',
+            timestamp: new Date().toISOString(),
+          }));
+        }
+      } catch (error: any) {
+        logger.error('[WebSocket] Failed to parse message', {
+          error: error.message,
+        });
+      }
+    },
+    
+    close(ws) {
+      broadcaster.removeClient(ws as any);
+    },
+    
+    drain(ws) {
+      // Handle backpressure (optional, for high-volume scenarios)
+      logger.debug('[WebSocket] Drain event', {
+        bufferedAmount: ws.getBufferedAmount?.() || 0,
+      });
+    },
+  },
+});
+
+logger.info(`Server running at http://localhost:${server.port}`);
+logger.info(`WebSocket endpoint available at ws://localhost:${server.port}/ws`);

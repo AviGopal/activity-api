@@ -52,7 +52,26 @@ export async function authMiddleware(c: Context, next: Next) {
     }
 
     // Parse and validate session data
-    const sessionData = SessionDataSchema.parse(JSON.parse(sessionDataRaw));
+    let sessionData: SessionData;
+    try {
+      sessionData = SessionDataSchema.parse(JSON.parse(sessionDataRaw));
+    } catch (parseError: any) {
+      // Handle Zod validation errors gracefully
+      if (parseError.name === 'ZodError') {
+        logger.warn('Invalid session schema - corrupted session data', {
+          sessionKey,
+          errors: parseError.errors,
+        });
+        return c.json({ error: 'Invalid session' }, 401);
+      }
+      
+      // Handle JSON parse errors
+      logger.warn('Failed to parse session JSON', {
+        sessionKey,
+        error: parseError.message,
+      });
+      return c.json({ error: 'Invalid session' }, 401);
+    }
     
     // Extend session TTL (Python does this on every access)
     const sessionTTL = parseInt(process.env.SESSION_LENGTH || '86400', 10);

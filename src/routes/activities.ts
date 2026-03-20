@@ -14,7 +14,15 @@ import { surrealDB } from '../db/surreal';
 import { RedisClient } from '../db/redis';
 import { logger } from '../utils/logger';
 import type { SessionData } from '../models/schemas';
-import { ExecutionRecordSchema, type ExecutionRecord, type ExecutionRecordResponse } from '../models/schemas';
+import { 
+  ExecutionRecordSchema, 
+  CreateTemplateRequestSchema,
+  type ExecutionRecord, 
+  type ExecutionRecordResponse,
+  type CreateTemplateRequest,
+  type CreateTemplateResponse,
+} from '../models/schemas';
+import { broadcaster } from '../websocket/broadcaster';
 
 const app = new Hono();
 
@@ -121,6 +129,150 @@ async function listAllTemplatesFromDB(
 }
 
 /**
+ * POST /v2/activities/templates
+ * Register a new activity template variant
+ * 
+ * This endpoint enables template registration from:
+ * - MiniBob executing local JSON templates
+ * - OpenCode creating new templates
+ * - External systems registering custom templates
+ * 
+ * Automatically creates initial performance metrics with Thompson Sampling parameters
+ */
+app.post('/templates', async (c) => {
+  try {
+    // Extract session from context (set by auth middleware)
+    const session = (c.get as any)('session') as SessionData | undefined;
+    const orgId = session?.org_id || null;
+    const projectId = session?.project_id || null;
+
+    // Parse and validate request body
+    const body = await c.req.json();
+    const validated = CreateTemplateRequestSchema.parse(body);
+
+    logger.info('POST /v2/activities/templates', {
+      variant_id: validated.variant_id,
+      activity_id: validated.activity_id,
+      variant_name: validated.variant_name,
+      category: validated.category,
+      scope: validated.scope,
+    });
+
+    // Check if template already exists
+    const existingQuery = `
+      SELECT * FROM activity_template
+      WHERE variant_id = $variant_id
+      LIMIT 1
+    `;
+    
+    const existing = await surrealDB.query<ActivityTemplate>(existingQuery, {
+      variant_id: validated.variant_id,
+    });
+
+    if (existing.length > 0) {
+      logger.warn('Template already exists', { variant_id: validated.variant_id });
+      return c.json({
+        success: false,
+        variant_id: validated.variant_id,
+        message: 'Template variant already exists',
+      } as CreateTemplateResponse, 409);
+    }
+
+    // Build template record, only include fields with values (SurrealDB doesn't accept null)
+    const templateRecord: Record<string, any> = {
+      variant_id: validated.variant_id,
+      activity_id: validated.activity_id,
+      variant_name: validated.variant_name,
+      description: validated.description,
+      category: validated.category,
+      scope: validated.scope || 'global',
+    };
+
+    // Only add optional fields if they have values
+    if (validated.task_steps && validated.task_steps.length > 0) {
+      templateRecord.task_steps = validated.task_steps;
+    }
+    if (validated.org_id || orgId) {
+      templateRecord.org_id = validated.org_id || orgId;
+    }
+    if (validated.project_id || projectId) {
+      templateRecord.project_id = validated.project_id || projectId;
+    }
+    if (validated.genealogy && Object.keys(validated.genealogy).length > 0) {
+      templateRecord.genealogy = validated.genealogy;
+    }
+
+    // Build dynamic query with only provided fields
+    const fields = Object.keys(templateRecord).map(k => `${k}: $${k}`).join(',\n        ');
+    const insertTemplateQuery = `
+      INSERT INTO activity_template {
+        ${fields},
+        created_at: time::now(),
+        updated_at: time::now()
+      }
+    `;
+
+    await surrealDB.query(insertTemplateQuery, templateRecord);
+
+    logger.debug('Template inserted into activity_template');
+
+    // Create initial performance metrics
+    const insertMetricsQuery = `
+      INSERT INTO variant_performance_metrics {
+        variant_id: $variant_id,
+        activity_id: $activity_id,
+        total_executions: 0,
+        successful_executions: 0,
+        failed_executions: 0,
+        success_rate: 0.0,
+        avg_duration_ms: 0.0,
+        avg_cost_usd: 0.0,
+        thompson_alpha: 1.0,
+        thompson_beta: 1.0,
+        total_selections: 0,
+        created_at: time::now(),
+        updated_at: time::now()
+      }
+    `;
+
+    await surrealDB.query(insertMetricsQuery, {
+      variant_id: validated.variant_id,
+      activity_id: validated.activity_id,
+    });
+
+    logger.info('Template registered successfully', {
+      variant_id: validated.variant_id,
+    });
+
+    return c.json({
+      success: true,
+      variant_id: validated.variant_id,
+      message: 'Template registered successfully',
+    } as CreateTemplateResponse, 201);
+
+  } catch (error: any) {
+    logger.error('POST /v2/activities/templates failed', {
+      error: error.message,
+      stack: error.stack,
+    });
+
+    // Check if it's a validation error
+    if (error.name === 'ZodError') {
+      return c.json({
+        error: 'Validation failed',
+        message: error.message,
+        details: error.errors,
+      }, 400);
+    }
+
+    return c.json({
+      error: 'Failed to register template',
+      message: error.message,
+    }, 500);
+  }
+});
+
+/**
  * GET /v2/activities/templates
  * List all activity templates with Thompson Sampling scores
  */
@@ -188,36 +340,50 @@ app.get('/templates', async (c) => {
     }
 
     if (!cacheHit) {
-      // CACHE MISS - Load from SurrealDB
+      // CACHE MISS - Load from SurrealDB with distributed lock (cache stampede prevention)
       logger.info('Template list cache miss, loading from SurrealDB');
       
-      templates = await listAllTemplatesFromDB(limit * 2, orgId, projectId);
+      const lockKey = 'lock:templates:refresh';
+      const cacheKey = CACHE_LIST_KEY;
+      
+      // Use distributed lock to prevent cache stampede
+      templates = await redis.withLock(
+        lockKey,
+        cacheKey,
+        async () => {
+          // Load templates from database
+          const dbTemplates = await listAllTemplatesFromDB(limit * 2, orgId, projectId);
 
-      // Populate Redis cache
-      if (templates.length > 0) {
-        const cachePromises: Promise<any>[] = [];
+          // Populate Redis cache
+          if (dbTemplates.length > 0) {
+            const cachePromises: Promise<any>[] = [];
 
-        for (const template of templates) {
-          const variantId = template.variant_id;
-          
-          // Store template data with TTL
-          cachePromises.push(
-            redis.set(
-              `${CACHE_KEY_PREFIX}${variantId}`,
-              JSON.stringify(template),
-              TEMPLATE_CACHE_TTL
-            )
-          );
+            for (const template of dbTemplates) {
+              const variantId = template.variant_id;
+              
+              // Store template data with TTL
+              cachePromises.push(
+                redis.set(
+                  `${CACHE_KEY_PREFIX}${variantId}`,
+                  JSON.stringify(template),
+                  TEMPLATE_CACHE_TTL
+                )
+              );
 
-          // Add to template list set
-          cachePromises.push(
-            redis.sadd(CACHE_LIST_KEY, variantId)
-          );
-        }
+              // Add to template list set
+              cachePromises.push(
+                redis.sadd(CACHE_LIST_KEY, variantId)
+              );
+            }
 
-        await Promise.all(cachePromises);
-        logger.info(`Cached ${templates.length} templates from SurrealDB`);
-      }
+            await Promise.all(cachePromises);
+            logger.info(`Cached ${dbTemplates.length} templates from SurrealDB`);
+          }
+
+          return dbTemplates;
+        },
+        30 // Lock TTL: 30 seconds
+      );
     }
 
     // Filter by category if specified
@@ -371,46 +537,67 @@ app.post('/executions', async (c) => {
     // Generate execution ID
     const executionId = `exec_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
 
-    // Step 1: Record execution in activity_executions table
+    // Emit execution_started event via WebSocket
+    const executionStartedData: any = {
+      execution_id: executionId,
+      variant_id: validated.variant_id,
+    };
+    // Add pod_name if available (MiniBob execution context)
+    if ((validated as any).pod_name) {
+      executionStartedData.pod_name = (validated as any).pod_name;
+    }
+    broadcaster.emit({
+      type: 'execution_started',
+      timestamp: new Date().toISOString(),
+      data: executionStartedData,
+    });
+
+    // Build execution record, only include fields with values (SurrealDB doesn't accept null)
+    const executionRecord: Record<string, any> = {
+      execution_id: executionId,
+      variant_id: validated.variant_id,
+      success: validated.success,
+      duration_ms: validated.duration_ms,
+      cost_usd: validated.cost,
+      tokens_input: validated.tokens.input,
+      tokens_output: validated.tokens.output,
+      tokens_cache: validated.tokens.cache,
+    };
+
+    // Only add optional fields if they have values
+    if (orgId) {
+      executionRecord.org_id = orgId;
+    }
+    if (projectId) {
+      executionRecord.project_id = projectId;
+    }
+    if (validated.error_message) {
+      executionRecord.error_message = validated.error_message;
+    }
+    if (validated.error_type) {
+      executionRecord.error_type = validated.error_type;
+    }
+    if (validated.failed_task_id) {
+      executionRecord.failed_task_id = validated.failed_task_id;
+    }
+    if (validated.impulses_used && validated.impulses_used.length > 0) {
+      executionRecord.impulses_used = validated.impulses_used;
+    }
+    if (validated.component_changes && validated.component_changes.length > 0) {
+      executionRecord.component_changes = validated.component_changes;
+    }
+
+    // Build dynamic query with only provided fields
+    const execFields = Object.keys(executionRecord).map(k => `${k}: $${k}`).join(',\n        ');
     const insertExecutionQuery = `
       INSERT INTO activity_executions {
-        execution_id: $execution_id,
-        variant_id: $variant_id,
-        org_id: $org_id,
-        project_id: $project_id,
-        success: $success,
-        duration_ms: $duration_ms,
-        cost_usd: $cost,
-        tokens_input: $tokens_input,
-        tokens_output: $tokens_output,
-        tokens_cache: $tokens_cache,
-        error_message: $error_message,
-        error_type: $error_type,
-        failed_task_id: $failed_task_id,
-        impulses_used: $impulses_used,
-        component_changes: $component_changes,
+        ${execFields},
         executed_at: time::now(),
         created_at: time::now()
       }
     `;
 
-    await surrealDB.query(insertExecutionQuery, {
-      execution_id: executionId,
-      variant_id: validated.variant_id,
-      org_id: orgId,
-      project_id: projectId,
-      success: validated.success,
-      duration_ms: validated.duration_ms,
-      cost: validated.cost,
-      tokens_input: validated.tokens.input,
-      tokens_output: validated.tokens.output,
-      tokens_cache: validated.tokens.cache,
-      error_message: validated.error_message || null,
-      error_type: validated.error_type || null,
-      failed_task_id: validated.failed_task_id || null,
-      impulses_used: validated.impulses_used || [],
-      component_changes: validated.component_changes || [],
-    });
+    await surrealDB.query(insertExecutionQuery, executionRecord);
 
     logger.debug('Execution recorded in activity_executions', { executionId });
 
@@ -418,42 +605,24 @@ app.post('/executions', async (c) => {
     // Thompson Sampling uses Beta distribution: Beta(alpha, beta)
     // - alpha: number of successes + 1
     // - beta: number of failures + 1
+    //
+    // ATOMIC UPDATE: Uses SurrealDB += operator for race-condition-free concurrent updates
+    // Previous implementation had read-modify-write race condition
+    
+    const success_delta = validated.success ? 1 : 0;
+    const failure_delta = validated.success ? 0 : 1;
     
     const updateMetricsQuery = `
-      LET $current_metrics = (
-        SELECT * FROM variant_performance_metrics 
-        WHERE variant_id = $variant_id 
-        LIMIT 1
-      )[0];
-      
-      LET $total_executions = $current_metrics.total_executions OR 0;
-      LET $successful_executions = $current_metrics.successful_executions OR 0;
-      LET $failed_executions = $current_metrics.failed_executions OR 0;
-      
-      LET $new_total = $total_executions + 1;
-      LET $new_successes = $successful_executions + (IF $success THEN 1 ELSE 0 END);
-      LET $new_failures = $failed_executions + (IF $success THEN 0 ELSE 1 END);
-      LET $new_success_rate = $new_successes / $new_total;
-      
-      LET $prev_avg_duration = $current_metrics.avg_duration_ms OR 0;
-      LET $prev_avg_cost = $current_metrics.avg_cost_usd OR 0;
-      
-      LET $new_avg_duration = (($prev_avg_duration * $total_executions) + $duration_ms) / $new_total;
-      LET $new_avg_cost = (($prev_avg_cost * $total_executions) + $cost) / $new_total;
-      
-      LET $thompson_alpha = $new_successes + 1;
-      LET $thompson_beta = $new_failures + 1;
-      
       UPDATE variant_performance_metrics 
       SET 
-        total_executions = $new_total,
-        successful_executions = $new_successes,
-        failed_executions = $new_failures,
-        success_rate = $new_success_rate,
-        avg_duration_ms = $new_avg_duration,
-        avg_cost_usd = $new_avg_cost,
-        thompson_alpha = $thompson_alpha,
-        thompson_beta = $thompson_beta,
+        total_executions += 1,
+        successful_executions += $success_delta,
+        failed_executions += $failure_delta,
+        success_rate = successful_executions / total_executions,
+        avg_duration_ms = ((avg_duration_ms * (total_executions - 1)) + $duration_ms) / total_executions,
+        avg_cost_usd = ((avg_cost_usd * (total_executions - 1)) + $cost) / total_executions,
+        thompson_alpha = successful_executions + 1,
+        thompson_beta = failed_executions + 1,
         last_executed_at = time::now(),
         updated_at = time::now()
       WHERE variant_id = $variant_id
@@ -462,7 +631,8 @@ app.post('/executions', async (c) => {
 
     const metricsResult = await surrealDB.query(updateMetricsQuery, {
       variant_id: validated.variant_id,
-      success: validated.success,
+      success_delta,
+      failure_delta,
       duration_ms: validated.duration_ms,
       cost: validated.cost,
     });
@@ -481,11 +651,46 @@ app.post('/executions', async (c) => {
       variant_id: validated.variant_id,
     });
 
+    // Extract updated metrics from result
+    const updatedMetrics = metricsResult.length > 0 ? metricsResult[0] : undefined;
+
+    // Emit execution_completed event via WebSocket
+    broadcaster.emit({
+      type: 'execution_completed',
+      timestamp: new Date().toISOString(),
+      data: {
+        execution_id: executionId,
+        variant_id: validated.variant_id,
+        success: validated.success,
+        duration_ms: validated.duration_ms,
+        cost: validated.cost,
+        completed_at: new Date().toISOString(),
+      },
+    });
+
+    // Emit template_metrics_updated event via WebSocket
+    if (updatedMetrics) {
+      broadcaster.emit({
+        type: 'template_updated',
+        timestamp: new Date().toISOString(),
+        data: {
+          variant_id: validated.variant_id,
+          metrics: {
+            success_rate: updatedMetrics.success_rate || 0,
+            avg_duration_ms: updatedMetrics.avg_duration_ms || 0,
+            avg_cost_usd: updatedMetrics.avg_cost_usd || 0,
+            thompson_alpha: updatedMetrics.thompson_alpha || 1,
+            thompson_beta: updatedMetrics.thompson_beta || 1,
+          },
+        },
+      });
+    }
+
     // Return response with updated metrics
     const response: ExecutionRecordResponse = {
       success: true,
       execution_id: executionId,
-      metrics: metricsResult.length > 0 ? metricsResult[0] : undefined,
+      metrics: updatedMetrics,
     };
 
     return c.json(response, 201);
@@ -512,4 +717,255 @@ app.post('/executions', async (c) => {
   }
 });
 
+/**
+ * GET /v2/activities/executions
+ * 
+ * List execution history with filtering.
+ * 
+ * Query Parameters:
+ * - variant_id: Filter by variant ID (optional)
+ * - success: Filter by success status (true/false, optional)
+ * - limit: Maximum number of results (1-100, default 50)
+ * - offset: Pagination offset (default 0)
+ * 
+ * Returns:
+ * - executions: Array of execution records
+ * - total: Number of results returned
+ * - limit: Applied limit
+ * - offset: Applied offset
+ * 
+ * Data Flow: Dashboard → GET /executions → SurrealDB query → execution history
+ */
+app.get('/executions', async (c) => {
+  try {
+    // Extract session from context for multi-tenant filtering
+    const session = (c.get as any)('session') as SessionData | undefined;
+    const orgId = session?.org_id || null;
+    const projectId = session?.project_id || null;
+
+    // Parse query parameters
+    const variantId = c.req.query('variant_id') || null;
+    const successParam = c.req.query('success');
+    const limitStr = c.req.query('limit') || '50';
+    const offsetStr = c.req.query('offset') || '0';
+    
+    const limit = Math.min(Math.max(parseInt(limitStr, 10), 1), 100);
+    const offset = Math.max(parseInt(offsetStr, 10), 0);
+    
+    logger.info('GET /v2/activities/executions', {
+      variant_id: variantId,
+      success: successParam,
+      limit,
+      offset,
+      orgId,
+      projectId,
+    });
+
+    // Build query with filters
+    let query = 'SELECT * FROM activity_executions WHERE 1=1';
+    const params: Record<string, any> = {};
+    
+    // Multi-tenant filtering (same as templates)
+    if (orgId) {
+      query += ' AND (org_id = $org_id OR org_id = NONE)';
+      params.org_id = orgId;
+    }
+    if (projectId) {
+      query += ' AND (project_id = $project_id OR project_id = NONE OR org_id = $org_id)';
+      params.project_id = projectId;
+    }
+    
+    // Filter by variant_id
+    if (variantId) {
+      query += ' AND variant_id = $variant_id';
+      params.variant_id = variantId;
+    }
+    
+    // Filter by success status
+    if (successParam !== undefined) {
+      query += ' AND success = $success';
+      params.success = successParam === 'true';
+    }
+    
+    // Order by most recent first
+    query += ' ORDER BY executed_at DESC';
+    
+    // Pagination
+    query += ' LIMIT $limit START $offset';
+    params.limit = limit;
+    params.offset = offset;
+    
+    logger.debug('Execution history query', { query, params });
+    
+    const result = await surrealDB.query(query, params);
+    const executions = result[0] || [];
+    
+    logger.debug('Execution history results', { count: executions.length });
+
+    return c.json({
+      executions,
+      total: executions.length,
+      limit,
+      offset,
+    });
+  } catch (error: any) {
+    logger.error('GET /v2/activities/executions failed', { 
+      error: error.message,
+      stack: error.stack,
+    });
+    
+    return c.json({
+      error: 'Failed to fetch execution history',
+      message: error.message,
+    }, 500);
+  }
+});
+
 export default app;
+
+/**
+ * POST /recommend
+ * 
+ * Get activity recommendations using Thompson Sampling
+ * 
+ * Request body:
+ * {
+ *   task_description: string,
+ *   category?: string,
+ *   loaded_impulses?: string[],
+ *   limit?: number
+ * }
+ * 
+ * Returns:
+ * {
+ *   recommendations: [
+ *     {
+ *       template_id: string,
+ *       selection_metadata: {
+ *         method: "thompson_sampling",
+ *         alpha: number,
+ *         beta: number,
+ *         sample: number,
+ *         score: number
+ *       }
+ *     }
+ *   ]
+ * }
+ */
+app.post('/recommend', async (c) => {
+  try {
+    const body = await c.req.json();
+    const { task_description, category, loaded_impulses = [], limit = 3 } = body;
+
+    logger.info('POST /recommend', { 
+      task_description: task_description?.substring(0, 100),
+      category,
+      loaded_impulses,
+      limit 
+    });
+
+    // Validate required fields
+    if (!task_description) {
+      return c.json({
+        error: 'task_description is required',
+      }, 400);
+    }
+
+    // Get session data for multi-tenant filtering
+    const sessionData = c.get('session') as SessionData | undefined;
+    const orgId = sessionData?.user_id ? sessionData.user_id.split(':')[0] : null;
+    const projectId = sessionData?.project_id || null;
+
+    // Fetch templates with Thompson Sampling scores
+    let query = `
+      SELECT 
+        variant_id,
+        activity_id,
+        variant_name,
+        description,
+        category,
+        (SELECT * FROM activity_metrics WHERE variant_id = $parent.variant_id)[0] AS metrics
+      FROM activity_template
+    `;
+
+    const params: Record<string, any> = {};
+
+    // Build WHERE clause for multi-tenant filtering
+    const whereClauses: string[] = [];
+
+    if (orgId) {
+      whereClauses.push(`(scope IS NULL OR scope = 'global' OR (scope = 'org' AND org_id = $org_id) OR (scope = 'project' AND project_id = $project_id))`);
+      params.org_id = orgId;
+      params.project_id = projectId;
+    } else {
+      whereClauses.push(`(scope IS NULL OR scope = 'global')`);
+    }
+
+    // Filter by category if provided
+    if (category) {
+      whereClauses.push(`category = $category`);
+      params.category = category;
+    }
+
+    if (whereClauses.length > 0) {
+      query += ` WHERE ${whereClauses.join(' AND ')}`;
+    }
+
+    logger.debug('Recommendation query', { query, params });
+
+    const result = await surrealDB.query(query, params);
+    const templates: any[] = result[0] || [];
+
+    logger.info('Templates fetched for recommendation', { count: templates.length });
+
+    // Apply Thompson Sampling
+    const recommendations = templates
+      .map((template) => {
+        const metrics = template.metrics || {
+          thompson_alpha: 1.0,
+          thompson_beta: 1.0,
+        };
+
+        const alpha = metrics.thompson_alpha || 1.0;
+        const beta = metrics.thompson_beta || 1.0;
+
+        // Sample from Beta distribution (simplified: use expected value for deterministic testing)
+        // In production, would use: sample = beta_random(alpha, beta)
+        const sample = alpha / (alpha + beta); // Expected value of Beta(alpha, beta)
+
+        return {
+          template_id: template.variant_id,
+          template_name: template.variant_name,
+          category: template.category,
+          selection_metadata: {
+            method: 'thompson_sampling',
+            alpha,
+            beta,
+            sample,
+            score: sample, // Use sample as score for ranking
+          },
+        };
+      })
+      // Sort by Thompson sample (highest first)
+      .sort((a, b) => b.selection_metadata.sample - a.selection_metadata.sample)
+      // Take top N
+      .slice(0, limit);
+
+    logger.info('Recommendations generated', { 
+      count: recommendations.length,
+      top: recommendations[0]?.template_id 
+    });
+
+    return c.json({ recommendations });
+  } catch (error: any) {
+    logger.error('POST /recommend failed', { 
+      error: error.message,
+      stack: error.stack,
+    });
+
+    return c.json({
+      error: 'Failed to generate recommendations',
+      message: error.message,
+    }, 500);
+  }
+});

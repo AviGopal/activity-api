@@ -85,6 +85,26 @@ export const TemplateListResponseSchema = z.object({
   total: z.number(),
 });
 
+// Template Registration/Creation schemas
+export const CreateTemplateRequestSchema = z.object({
+  variant_id: z.string(),
+  activity_id: z.string(),
+  variant_name: z.string(),
+  description: z.string(),
+  category: z.enum(['feature', 'bugfix', 'refactor', 'tool', 'infrastructure']),
+  task_steps: z.array(TemplateTaskSchema),
+  scope: z.enum(['global', 'org', 'project']).default('global'),
+  org_id: z.string().nullable().optional(),
+  project_id: z.string().nullable().optional(),
+  genealogy: z.record(z.any()).optional(),
+});
+
+export const CreateTemplateResponseSchema = z.object({
+  success: z.boolean(),
+  variant_id: z.string(),
+  message: z.string().optional(),
+});
+
 // Execution schemas
 export const ExecutionTokensSchema = z.object({
   input: z.number(),
@@ -119,6 +139,8 @@ export type TemplateTask = z.infer<typeof TemplateTaskSchema>;
 export type TemplateMetrics = z.infer<typeof TemplateMetricsSchema>;
 export type ActivityTemplate = z.infer<typeof ActivityTemplateSchema>;
 export type TemplateListResponse = z.infer<typeof TemplateListResponseSchema>;
+export type CreateTemplateRequest = z.infer<typeof CreateTemplateRequestSchema>;
+export type CreateTemplateResponse = z.infer<typeof CreateTemplateResponseSchema>;
 export type ExecutionTokens = z.infer<typeof ExecutionTokensSchema>;
 export type ExecutionRecord = z.infer<typeof ExecutionRecordSchema>;
 export type ExecutionRecordResponse = z.infer<typeof ExecutionRecordResponseSchema>;
