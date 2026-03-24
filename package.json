@@ -1,6 +1,6 @@
 {
   "name": "metabob-activity-api",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Lightweight TypeScript server for Metabob activity system - replaces Python RPC API v2 endpoints",
   "main": "src/index.ts",
   "type": "module",
@@ -8,6 +8,7 @@
     "dev": "bun run --watch src/index.ts",
     "start": "bun run src/index.ts",
     "build": "bun build src/index.ts --outdir dist --target bun",
+    "init-db": "bun run scripts/init-database.ts",
     "test": "bun test",
     "lint": "eslint src --ext .ts",
     "format": "prettier --write 'src/**/*.ts'"
@@ -30,5 +31,9 @@
   },
   "engines": {
     "bun": ">=1.0.0"
+  },
+  "private": true,
+  "peerDependencies": {
+    "typescript": "^5"
   }
 }
