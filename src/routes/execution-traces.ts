@@ -44,6 +44,9 @@ interface ExecutionTrace {
       tool: string;
       duration_ms: number;
       success: boolean;
+      arguments?: Record<string, unknown>;  // Tool parameters for debugging
+      error?: string;  // Error message if tool failed
+      output?: string;  // Tool output if successful
     }>;
   }>;
   state_snapshot?: {
@@ -335,6 +338,10 @@ app.post('/', async (c) => {
               tool: tc.name || tc.tool,  // MiniBob uses 'name', dashboard expects 'tool'
               duration_ms: tc.duration_ms || 0,
               success: tc.result?.success ?? tc.success ?? false,
+              // Include debugging information
+              arguments: tc.arguments,  // Tool parameters for debugging
+              error: tc.result?.error,  // Error message if tool failed
+              output: tc.result?.output,  // Tool output if successful
             })) || [],
           }))
         : [],
