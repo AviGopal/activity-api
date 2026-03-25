@@ -6,9 +6,10 @@
  */
 
 import { Hono } from 'hono';
-import { surrealDB } from '../db/surreal';
+import { surrealDB, queryWithAuth } from '../db/surreal';
 import { logger } from '../utils/logger';
 import type { SessionData } from '../models/schemas';
+import { getJwtAuthFromContext, hasJwtAuth } from '../middleware/jwtAuth';
 
 const app = new Hono();
 
@@ -44,9 +45,6 @@ interface ExecutionTrace {
       tool: string;
       duration_ms: number;
       success: boolean;
-      arguments?: Record<string, unknown>;  // Tool parameters for debugging
-      error?: string;  // Error message if tool failed
-      output?: string;  // Tool output if successful
     }>;
   }>;
   state_snapshot?: {
@@ -98,8 +96,12 @@ interface ListExecutionTracesResponse {
  */
 app.get('/', async (c) => {
   try {
+    // Check for JWT auth first (MiniBob instances)
+    const jwtAuth = getJwtAuthFromContext(c);
+    const useJwtAuth = hasJwtAuth(c);
+
     // Session may be undefined for internal/unauthenticated calls
-    const session = (c.get('session') as SessionData | undefined) || {
+    const session = ((c.get as any)('session') as SessionData | undefined) || {
       session_id: 'internal', org_id: null, project_id: null, api_key: null, latest_job_id: null
     };
 
@@ -123,15 +125,17 @@ app.get('/', async (c) => {
       offset,
     };
 
-    // Multi-tenant filtering
-    if (session.org_id) {
-      whereConditions.push('(org_id = $org_id OR org_id = NULL)');
-      params.org_id = session.org_id;
-    }
+    // Multi-tenant filtering (skip when using JWT - RBAC handles it via PERMISSIONS)
+    if (!useJwtAuth) {
+      if (session.org_id) {
+        whereConditions.push('(org_id = $org_id OR org_id = NULL)');
+        params.org_id = session.org_id;
+      }
 
-    if (session.project_id) {
-      whereConditions.push('(project_id = $project_id OR project_id = NULL)');
-      params.project_id = session.project_id;
+      if (session.project_id) {
+        whereConditions.push('(project_id = $project_id OR project_id = NULL)');
+        params.project_id = session.project_id;
+      }
     }
 
     // Filter by variant_id
@@ -181,25 +185,41 @@ app.get('/', async (c) => {
       whereClause,
       params,
       query,
+      authMethod: useJwtAuth ? 'jwt' : 'session',
     });
 
-    const executions = await surrealDB.query<ExecutionTrace>(query, params);
+    // Execute query with appropriate auth method
+    let executions: ExecutionTrace[];
+    let countResult: { total: number }[];
+
+    if (useJwtAuth && jwtAuth?.jwtToken) {
+      // JWT AUTH PATH: Use RBAC-enforced query
+      executions = await queryWithAuth<ExecutionTrace>(jwtAuth.jwtToken, query, params);
+      const countQuery = `
+        SELECT count() as total FROM activity_execution_traces
+        ${whereClause}
+        GROUP ALL
+      `;
+      countResult = await queryWithAuth<{ total: number }>(jwtAuth.jwtToken, countQuery, params);
+    } else {
+      // LEGACY PATH: Direct query with application-level filtering
+      executions = await surrealDB.query<ExecutionTrace>(query, params);
+      const countQuery = `
+        SELECT count() as total FROM activity_execution_traces
+        ${whereClause}
+        GROUP ALL
+      `;
+      countResult = await surrealDB.query<{ total: number }>(countQuery, params);
+    }
 
     logger.info('Raw executions result from SurrealDB', {
       executionsType: typeof executions,
       executionsIsArray: Array.isArray(executions),
       executionsLength: executions?.length || 0,
       firstExecution: executions?.[0] || null,
+      rbacEnforced: useJwtAuth,
     });
 
-    // Count total matching records (for pagination)
-    const countQuery = `
-      SELECT count() as total FROM activity_execution_traces
-      ${whereClause}
-      GROUP ALL
-    `;
-
-    const countResult = await surrealDB.query<{ total: number }>(countQuery, params);
     const total = countResult?.[0]?.total || 0;
 
     logger.info('Execution traces fetched', {
@@ -289,8 +309,16 @@ app.get('/:executionId', async (c) => {
  */
 app.post('/', async (c) => {
   try {
+    // Check for JWT auth first (MiniBob instances)
+    const jwtAuth = getJwtAuthFromContext(c);
+
     // Session may be undefined for internal/unauthenticated calls
-    const session = (c.get('session') as SessionData | undefined) || { session_id: 'internal', org_id: null, project_id: null, api_key: null, latest_job_id: null };
+    const session = ((c.get as any)('session') as SessionData | undefined) || { session_id: 'internal', org_id: null, project_id: null, api_key: null, latest_job_id: null };
+
+    // Use JWT auth claims if available, otherwise fall back to session
+    const orgId = jwtAuth?.orgId || session.org_id || null;
+    const projectId = jwtAuth?.projectId || session.project_id || null;
+
     const body = await c.req.json();
 
     // Validate required fields
@@ -311,40 +339,29 @@ app.post('/', async (c) => {
       activity_id: body.activity_id || body.template_id, // Default to template_id
       success: body.status === 'completed' || body.success === true,
       duration_ms: body.duration_ms || 0,
-      cost: body.cost_usd || body.cost || 0,
-      tokens: {
-        input: body.tokens?.input || 0,
-        output: body.tokens?.output || 0,
-        cache: body.tokens?.cache || 0,
-      },
-      // Optional fields - omit (undefined) if not provided to avoid NULL vs NONE issues
-      // SurrealDB schema expects NONE (omitted) or value, not JSON NULL
-      ...(body.error_message && { error_message: body.error_message }),
-      ...(body.error_type && { error_type: body.error_type }),
-      ...(body.failed_task_id && { failed_task_id: body.failed_task_id }),
-      // Array fields use empty array instead of null
-      impulses_used: body.impulses_used && body.impulses_used.length > 0 ? body.impulses_used : [],
-      component_changes: body.component_changes && body.component_changes.length > 0 ? body.component_changes : [],
+      cost_usd: body.cost_usd || body.cost || 0,
+      // Token counts (separate fields, not nested object)
+      tokens_input: body.tokens?.input || body.total_tokens || 0,
+      tokens_output: body.tokens?.output || 0,
+      tokens_cache: body.tokens?.cache || 0,
+      // Optional string fields - only include if set (avoid NULL vs NONE issues in SurrealDB)
+      ...(body.error_message ? { error_message: body.error_message } : {}),
+      ...(body.error_type ? { error_type: body.error_type } : {}),
+      ...(body.failed_task_id ? { failed_task_id: body.failed_task_id } : {}),
+      // Only include arrays if they have content (avoid NULL vs NONE issues in SurrealDB)
+      ...(body.impulses_used && body.impulses_used.length > 0 ? { impulses_used: body.impulses_used } : {}),
+      ...(body.component_changes && body.component_changes.length > 0 ? { component_changes: body.component_changes } : {}),
 
       // Extract task details from execution_trace if available
       tasks: body.execution_trace?.tasks && body.execution_trace.tasks.length > 0
         ? body.execution_trace.tasks.map((task: any) => ({
-            task_id: task.taskId || task.task_id || task.id,
+            task_id: task.taskId || task.task_id,
             description: task.description,
             status: task.status,
             duration_ms: task.duration || task.duration_ms,
-            // Transform tool calls to dashboard format
-            tool_calls: task.toolCalls?.map((tc: any) => ({
-              tool: tc.name || tc.tool,  // MiniBob uses 'name', dashboard expects 'tool'
-              duration_ms: tc.duration_ms || 0,
-              success: tc.result?.success ?? tc.success ?? false,
-              // Include debugging information
-              arguments: tc.arguments,  // Tool parameters for debugging
-              error: tc.result?.error,  // Error message if tool failed
-              output: tc.result?.output,  // Tool output if successful
-            })) || [],
+            tool_calls: task.toolCalls || null,
           }))
-        : [],
+        : null,
 
       // Extract state snapshot from execution_trace
       state_snapshot: body.execution_trace
@@ -355,24 +372,55 @@ app.post('/', async (c) => {
           }
         : null,
 
-      // Multi-tenancy - omit if not provided
-      ...(session.org_id && { org_id: session.org_id }),
-      ...(session.project_id && { project_id: session.project_id }),
+      // Multi-tenancy (prefer JWT claims over session)
+      org_id: orgId,
+      project_id: projectId,
 
       // Timestamps (SurrealDB datetime type)
       executed_at: new Date(),
       created_at: new Date(),
     };
 
-    // Build INSERT query dynamically to only include fields that are present
-    // This avoids NULL vs NONE issues with optional string fields
-    const fields = Object.keys(trace)
-      .map(key => `${key}: $${key}`)
-      .join(',\n        ');
+    // Insert into database
+    // Build query dynamically to avoid NULL vs NONE issues for optional fields
+    const optionalFields: string[] = [];
+    // Optional string fields
+    if (trace.error_message) optionalFields.push('error_message: $error_message');
+    if (trace.error_type) optionalFields.push('error_type: $error_type');
+    if (trace.failed_task_id) optionalFields.push('failed_task_id: $failed_task_id');
+    // Optional array/object fields
+    if (trace.impulses_used) optionalFields.push('impulses_used: $impulses_used');
+    if (trace.component_changes) optionalFields.push('component_changes: $component_changes');
+    if (trace.tasks) optionalFields.push('tasks: $tasks');
+    if (trace.state_snapshot) optionalFields.push('state_snapshot: $state_snapshot');
+
+    const optionalFieldsStr = optionalFields.length > 0 ? `,\n        ${optionalFields.join(',\n        ')}` : '';
+
+    // Build org_id/project_id record link expressions
+    // SurrealDB expects record links (organizations:xxx) not plain strings
+    // Use type::record() to construct record links from string IDs
+    const orgIdExpr = trace.org_id
+      ? `type::record('organizations', $org_id)`
+      : 'NONE';
+    const projectIdExpr = trace.project_id
+      ? `type::record('projects', $project_id)`
+      : 'NONE';
 
     const query = `
       INSERT INTO activity_execution_traces {
-        ${fields}
+        execution_id: $execution_id,
+        variant_id: $variant_id,
+        activity_id: $activity_id,
+        success: $success,
+        duration_ms: $duration_ms,
+        cost_usd: $cost_usd,
+        tokens_input: $tokens_input,
+        tokens_output: $tokens_output,
+        tokens_cache: $tokens_cache,
+        org_id: ${orgIdExpr},
+        project_id: ${projectIdExpr},
+        executed_at: $executed_at,
+        created_at: $created_at${optionalFieldsStr}
       }
     `;
 

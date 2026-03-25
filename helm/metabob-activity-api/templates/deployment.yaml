@@ -27,6 +27,32 @@ spec:
       {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if .Values.initDatabase.enabled }}
+      initContainers:
+      - name: init-database
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command: ["bun", "run", "init-db"]
+        env:
+        - name: SURREALDB_URL
+          value: {{ .Values.config.surrealdb.url | quote }}
+        - name: SURREALDB_NAMESPACE
+          value: {{ .Values.config.surrealdb.namespace | quote }}
+        - name: SURREALDB_DATABASE
+          value: {{ .Values.config.surrealdb.database | quote }}
+        - name: SURREALDB_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "metabob-activity-api.fullname" . }}
+              key: surrealdb-username
+        - name: SURREALDB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "metabob-activity-api.fullname" . }}
+              key: surrealdb-password
+        resources:
+          {{- toYaml .Values.initDatabase.resources | nindent 12 }}
+      {{- end }}
       containers:
       - name: {{ .Chart.Name }}
         securityContext:

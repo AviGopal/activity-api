@@ -78,16 +78,31 @@ class SurrealDBClient {
     }
 
     try {
-      logger.debug('Executing SurrealDB query', { 
-        sql, 
+      logger.info('Executing SurrealDB query', {
+        sql,
         params,
+        paramsStringified: JSON.stringify(params),
         namespace: config.surrealdb.namespace,
-        database: config.surrealdb.database 
+        database: config.surrealdb.database
       });
       const result = await this.db.query(sql, params);
-      
+
+      logger.info('Raw SurrealDB query result', {
+        resultType: typeof result,
+        resultIsArray: Array.isArray(result),
+        resultLength: Array.isArray(result) ? result.length : 'N/A',
+        firstElement: Array.isArray(result) && result.length > 0 ? result[0] : null,
+      });
+
       // SurrealDB returns array of result sets, we typically want the first one
       const firstResult = Array.isArray(result) && result.length > 0 ? result[0] : [];
+
+      logger.info('Extracted first result', {
+        firstResultType: typeof firstResult,
+        firstResultIsArray: Array.isArray(firstResult),
+        firstResultLength: Array.isArray(firstResult) ? firstResult.length : 'N/A',
+      });
+
       return firstResult as T[];
     } catch (error) {
       const err = error as Error;
@@ -113,7 +128,76 @@ class SurrealDBClient {
       logger.info('Closed SurrealDB connection');
     }
   }
+
+  /**
+   * Get the underlying Surreal instance for direct access to auth methods
+   * @returns The connected Surreal instance
+   */
+  async getInstance(): Promise<Surreal> {
+    await this.connect();
+    if (!this.db) {
+      throw new Error('SurrealDB not connected');
+    }
+    return this.db;
+  }
 }
 
 // Singleton instance
 export const surrealDB = new SurrealDBClient();
+
+/**
+ * Create a request-scoped SurrealDB client authenticated with a JWT token.
+ * This enables database-level RBAC via $auth.org_id, $auth.project_id.
+ *
+ * Use this for user-scoped operations where PERMISSIONS should be enforced.
+ * Use surrealDB (root) for system operations (migrations, health checks).
+ *
+ * @param jwtToken - JWT token from MiniBob signin or user auth
+ * @returns Authenticated Surreal instance with $auth populated
+ */
+export async function createAuthenticatedClient(jwtToken: string): Promise<Surreal> {
+  const db = new Surreal();
+
+  await db.connect(config.surrealdb.url);
+  await db.use({
+    namespace: config.surrealdb.namespace,
+    database: config.surrealdb.database,
+  });
+
+  // Authenticate with JWT - this populates $auth for PERMISSIONS
+  await db.authenticate(jwtToken);
+
+  return db;
+}
+
+/**
+ * Execute a query with user-scoped authentication.
+ * Uses the JWT token to enforce RBAC permissions at the database level.
+ *
+ * @param jwtToken - JWT token from request header
+ * @param sql - SurrealQL query
+ * @param params - Query parameters
+ * @returns Query results (filtered by PERMISSIONS automatically)
+ */
+export async function queryWithAuth<T = any>(
+  jwtToken: string,
+  sql: string,
+  params?: Record<string, any>
+): Promise<T[]> {
+  const db = await createAuthenticatedClient(jwtToken);
+
+  try {
+    logger.info('Executing authenticated query', {
+      sql,
+      params,
+      namespace: config.surrealdb.namespace,
+      database: config.surrealdb.database,
+    });
+
+    const result = await db.query(sql, params);
+    const firstResult = Array.isArray(result) && result.length > 0 ? result[0] : [];
+    return firstResult as T[];
+  } finally {
+    await db.close();
+  }
+}

@@ -1,0 +1,268 @@
+name: CI with Webhook Integration
+
+on:
+  push:
+    branches:
+      - feature/*
+      - bugfix/*
+      - refactor/*
+      - tool/*
+      - infrastructure/*
+    # Exclude main/master branches (they use different deployment workflows)
+    branches-ignore:
+      - main
+      - master
+      - production
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      execution_id:
+        description: 'Execution ID to associate with this CI run'
+        required: true
+        type: string
+      template_id:
+        description: 'Template ID that generated the changes'
+        required: false
+        type: string
+
+env:
+  # Set from repository secrets
+  ACTIVITY_API_URL: ${{ secrets.ACTIVITY_API_URL || 'http://api.minibob.local' }}
+  ACTIVITY_API_KEY: ${{ secrets.ACTIVITY_API_KEY || '' }}
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Full history for better analysis
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        id: install
+        run: |
+          echo "install_start=$(date +%s%3N)" >> $GITHUB_OUTPUT
+          bun install --frozen-lockfile
+          echo "install_end=$(date +%s%3N)" >> $GITHUB_OUTPUT
+
+      - name: Build
+        id: build
+        continue-on-error: true
+        run: |
+          echo "build_start=$(date +%s%3N)" >> $GITHUB_OUTPUT
+          bun run build || echo "build_failed=true" >> $GITHUB_OUTPUT
+          echo "build_end=$(date +%s%3N)" >> $GITHUB_OUTPUT
+
+      - name: Typecheck
+        id: typecheck
+        continue-on-error: true
+        run: |
+          echo "typecheck_start=$(date +%s%3N)" >> $GITHUB_OUTPUT
+          bun run typecheck 2>&1 | tee typecheck.log || echo "typecheck_failed=true" >> $GITHUB_OUTPUT
+          echo "typecheck_end=$(date +%s%3N)" >> $GITHUB_OUTPUT
+
+      - name: Run tests
+        id: test
+        continue-on-error: true
+        run: |
+          echo "test_start=$(date +%s%3N)" >> $GITHUB_OUTPUT
+          bun test --coverage 2>&1 | tee test.log || echo "test_failed=true" >> $GITHUB_OUTPUT
+          echo "test_end=$(date +%s%3N)" >> $GITHUB_OUTPUT
+
+          # Extract test results from log (example parser, adjust based on actual output)
+          TESTS_PASSED=$(grep -oP "(?<=✓ )\d+" test.log | awk '{s+=$1} END {print s}' || echo 0)
+          TESTS_FAILED=$(grep -oP "(?<=✗ )\d+" test.log | awk '{s+=$1} END {print s}' || echo 0)
+          echo "tests_passed=${TESTS_PASSED}" >> $GITHUB_OUTPUT
+          echo "tests_failed=${TESTS_FAILED}" >> $GITHUB_OUTPUT
+
+      - name: Lint
+        id: lint
+        continue-on-error: true
+        run: |
+          echo "lint_start=$(date +%s%3N)" >> $GITHUB_OUTPUT
+          bun run lint --format=compact 2>&1 | tee lint.log || echo "lint_failed=true" >> $GITHUB_OUTPUT
+          echo "lint_end=$(date +%s%3N)" >> $GITHUB_OUTPUT
+
+          # Extract lint results (example parser)
+          LINT_ERRORS=$(grep -c "error" lint.log || echo 0)
+          LINT_WARNINGS=$(grep -c "warning" lint.log || echo 0)
+          echo "lint_errors=${LINT_ERRORS}" >> $GITHUB_OUTPUT
+          echo "lint_warnings=${LINT_WARNINGS}" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image (on success)
+        id: docker
+        if: steps.build.outcome == 'success' && steps.typecheck.outcome == 'success' && steps.test.outcome == 'success'
+        run: |
+          echo "docker_start=$(date +%s%3N)" >> $GITHUB_OUTPUT
+
+          # Tag with commit SHA
+          IMAGE_TAG="metabob-activity-api:${{ github.sha }}"
+          docker build -t ${IMAGE_TAG} .
+
+          # Save image as artifact
+          docker save ${IMAGE_TAG} | gzip > docker-image.tar.gz
+
+          echo "docker_end=$(date +%s%3N)" >> $GITHUB_OUTPUT
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+          # Get image size
+          IMAGE_SIZE=$(stat -c%s docker-image.tar.gz)
+          echo "image_size=${IMAGE_SIZE}" >> $GITHUB_OUTPUT
+
+      - name: Upload Docker image artifact
+        if: steps.docker.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-${{ github.sha }}
+          path: docker-image.tar.gz
+          retention-days: 7
+          compression-level: 0 # Already gzipped
+
+      - name: Upload test coverage
+        if: steps.test.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-${{ github.sha }}
+          path: coverage/
+          retention-days: 14
+
+      - name: Determine overall success
+        id: overall
+        run: |
+          WORKFLOW_START="${{ steps.install.outputs.install_start }}"
+          WORKFLOW_END="$(date +%s%3N)"
+          WORKFLOW_DURATION=$((WORKFLOW_END - WORKFLOW_START))
+
+          echo "workflow_duration=${WORKFLOW_DURATION}" >> $GITHUB_OUTPUT
+
+          # Check if all critical stages passed
+          if [ "${{ steps.build.outcome }}" == "success" ] && \
+             [ "${{ steps.typecheck.outcome }}" == "success" ] && \
+             [ "${{ steps.test.outcome }}" == "success" ]; then
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send webhook to Activity API
+        if: always()
+        env:
+          EXECUTION_ID: ${{ github.event.inputs.execution_id || github.event.head_commit.message }}
+        run: |
+          # Extract execution ID from commit message if not provided
+          # Commit message format: "feat: implement X [execution:exec-abc123]"
+          if [ -z "$EXECUTION_ID" ] || [ "$EXECUTION_ID" == "null" ]; then
+            EXECUTION_ID=$(git log -1 --pretty=%B | grep -oP '(?<=\[execution:)[^\]]+' || echo "manual-${{ github.run_id }}")
+          fi
+
+          # Calculate stage durations
+          BUILD_DURATION=$((
+            ${{ steps.build.outputs.build_end || 0 }} -
+            ${{ steps.build.outputs.build_start || 0 }}
+          ))
+
+          TYPECHECK_DURATION=$((
+            ${{ steps.typecheck.outputs.typecheck_end || 0 }} -
+            ${{ steps.typecheck.outputs.typecheck_start || 0 }}
+          ))
+
+          TEST_DURATION=$((
+            ${{ steps.test.outputs.test_end || 0 }} -
+            ${{ steps.test.outputs.test_start || 0 }}
+          ))
+
+          LINT_DURATION=$((
+            ${{ steps.lint.outputs.lint_end || 0 }} -
+            ${{ steps.lint.outputs.lint_start || 0 }}
+          ))
+
+          # Build webhook payload
+          PAYLOAD=$(cat <<EOF
+          {
+            "execution_id": "${EXECUTION_ID}",
+            "template_id": "${{ github.event.inputs.template_id || '' }}",
+            "branch": "${{ github.ref_name }}",
+            "commit": "${{ github.sha }}",
+            "success": ${{ steps.overall.outputs.success }},
+            "duration_ms": ${{ steps.overall.outputs.workflow_duration }},
+            "ci_provider": "github_actions",
+            "workflow_name": "${{ github.workflow }}",
+            "run_id": "${{ github.run_id }}",
+            "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "stages": {
+              "build": {
+                "success": ${{ steps.build.outcome == 'success' }},
+                "duration_ms": ${BUILD_DURATION},
+                "error": "${{ steps.build.outputs.build_failed && 'Build failed' || '' }}"
+              },
+              "typecheck": {
+                "success": ${{ steps.typecheck.outcome == 'success' }},
+                "duration_ms": ${TYPECHECK_DURATION},
+                "error": "${{ steps.typecheck.outputs.typecheck_failed && 'Typecheck failed' || '' }}"
+              },
+              "test": {
+                "success": ${{ steps.test.outcome == 'success' }},
+                "duration_ms": ${TEST_DURATION},
+                "tests_passed": ${{ steps.test.outputs.tests_passed || 0 }},
+                "tests_failed": ${{ steps.test.outputs.tests_failed || 0 }},
+                "error": "${{ steps.test.outputs.test_failed && 'Tests failed' || '' }}"
+              },
+              "lint": {
+                "success": ${{ steps.lint.outcome == 'success' }},
+                "duration_ms": ${LINT_DURATION},
+                "errors": ${{ steps.lint.outputs.lint_errors || 0 }},
+                "warnings": ${{ steps.lint.outputs.lint_warnings || 0 }},
+                "error": "${{ steps.lint.outputs.lint_failed && 'Lint failed' || '' }}"
+              }
+            },
+            "artifacts": [
+              {
+                "name": "docker-image-${{ github.sha }}",
+                "type": "docker_image",
+                "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                "size_bytes": ${{ steps.docker.outputs.image_size || 0 }},
+                "metadata": {
+                  "image_tag": "${{ steps.docker.outputs.image_tag || '' }}"
+                }
+              }
+            ],
+            "metadata": {
+              "repository": "${{ github.repository }}",
+              "actor": "${{ github.actor }}",
+              "event": "${{ github.event_name }}",
+              "ref": "${{ github.ref }}"
+            }
+          }
+          EOF
+          )
+
+          # Send webhook (with auth if available)
+          if [ -n "$ACTIVITY_API_KEY" ]; then
+            curl -X POST "${ACTIVITY_API_URL}/v2/activities/ci-result" \
+              -H "Content-Type: application/json" \
+              -H "X-Internal-Api-Key: ${ACTIVITY_API_KEY}" \
+              -d "${PAYLOAD}" \
+              --fail-with-body \
+              --retry 3 \
+              --retry-delay 5 \
+              || echo "WARNING: Webhook failed but continuing workflow"
+          else
+            echo "ACTIVITY_API_KEY not set, skipping webhook"
+            echo "Payload would have been:"
+            echo "${PAYLOAD}" | jq .
+          fi
+
+      - name: Fail workflow on CI failure
+        if: steps.overall.outputs.success == 'false'
+        run: |
+          echo "CI checks failed. See logs above for details."
+          exit 1
