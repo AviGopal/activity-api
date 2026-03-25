@@ -37,6 +37,11 @@ export interface JwtAuthContext {
  */
 export async function jwtAuthMiddleware(c: Context, next: Next) {
   const authHeader = c.req.header('Authorization');
+  logger.info('JWT middleware called', {
+    path: c.req.path,
+    hasAuthHeader: !!authHeader,
+    authHeaderPrefix: authHeader ? authHeader.substring(0, 30) + '...' : 'none'
+  });
 
   if (!authHeader) {
     c.set('jwtAuth', null);
@@ -74,6 +79,7 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
   }
 
   try {
+    logger.info('JWT auth: attempting to validate token', { tokenLength: token.length });
     // Validate token by attempting to authenticate with SurrealDB
     const db = await createAuthenticatedClient(token);
 

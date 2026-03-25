@@ -46,13 +46,22 @@ app.use('/*', honoLogger());
 // Authentication middleware (applies to all routes except /health and /v2/auth)
 // JWT auth runs first, then falls back to Redis session auth
 app.use('/v2/*', async (c, next) => {
+  logger.info('Auth middleware triggered', { path: c.req.path });
   // Skip auth middleware for authentication endpoints
   if (c.req.path.startsWith('/v2/auth/')) {
     await next();
     return;
   }
+  logger.info('Calling JWT auth middleware', { path: c.req.path });
   // Try JWT auth first (for MiniBob instances)
   await jwtAuthMiddleware(c, async () => {
+    // If JWT auth succeeded, skip session auth (JWT takes precedence)
+    const jwtAuth = c.get('jwtAuth');
+    if (jwtAuth) {
+      logger.debug('JWT auth succeeded, skipping session auth');
+      await next();
+      return;
+    }
     // Then try Redis session auth (for dashboard/web clients)
     await authMiddleware(c, next);
   });

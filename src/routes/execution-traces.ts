@@ -10,6 +10,7 @@ import { surrealDB, queryWithAuth } from '../db/surreal';
 import { logger } from '../utils/logger';
 import type { SessionData } from '../models/schemas';
 import { getJwtAuthFromContext, hasJwtAuth } from '../middleware/jwtAuth';
+import { config } from '../config';
 
 const app = new Hono();
 
@@ -78,6 +79,74 @@ interface ListExecutionTracesResponse {
   total: number;
   limit: number;
   offset: number;
+}
+
+/**
+ * Forward co-change event to analysis-api learning service (async/non-blocking)
+ * This updates co-change patterns based on files modified in execution traces.
+ *
+ * M4.2: Wire Activity API to Learning
+ */
+async function forwardToLearning(
+  sessionId: string,
+  changedFiles: string[],
+  projectId: string | null
+): Promise<void> {
+  // Only forward if we have at least 2 files changed (co-change requires pairs)
+  if (changedFiles.length < 2) {
+    logger.debug('Skipping learning forward - less than 2 files changed', {
+      session_id: sessionId,
+      files_count: changedFiles.length,
+    });
+    return;
+  }
+
+  const analysisApiUrl = config.analysisApi.url;
+  const endpoint = `${analysisApiUrl}/v2/analysis/learning/cochange`;
+
+  try {
+    // Fire and forget - don't await the response
+    fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Session-ID': sessionId,
+      },
+      body: JSON.stringify({
+        session_id: sessionId,
+        changed_files: changedFiles,
+        project_id: projectId || 'default',
+      }),
+      // Short timeout since this is non-blocking
+      signal: AbortSignal.timeout(config.analysisApi.timeout),
+    }).then(async (response) => {
+      if (response.ok) {
+        logger.info('[learning] Co-change event forwarded successfully', {
+          session_id: sessionId,
+          files_count: changedFiles.length,
+        });
+      } else {
+        const errorText = await response.text();
+        logger.warn('[learning] Co-change forward failed', {
+          session_id: sessionId,
+          status: response.status,
+          error: errorText,
+        });
+      }
+    }).catch((error) => {
+      // Log but don't fail - learning is non-critical
+      logger.warn('[learning] Co-change forward error (non-blocking)', {
+        session_id: sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  } catch (error) {
+    // Catch synchronous errors (shouldn't happen with fetch)
+    logger.warn('[learning] Co-change forward setup error', {
+      session_id: sessionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 /**
@@ -446,6 +515,40 @@ app.post('/', async (c) => {
       task_count: body.execution_trace?.tasks?.length || 0,
       db_result: result[0],
     });
+
+    // M4.2: Forward to learning service (async/non-blocking)
+    // Extract modified files from execution trace
+    const filesModified: string[] = [];
+
+    // From state_snapshot output_state
+    if (trace.state_snapshot?.output_state?.filesModified) {
+      filesModified.push(...trace.state_snapshot.output_state.filesModified);
+    }
+    if (trace.state_snapshot?.output_state?.filesCreated) {
+      filesModified.push(...trace.state_snapshot.output_state.filesCreated);
+    }
+
+    // From execution_trace.filesModified (MiniBob format)
+    if (body.execution_trace?.filesModified) {
+      filesModified.push(...body.execution_trace.filesModified);
+    }
+
+    // From component_changes (if available)
+    if (trace.component_changes) {
+      const componentFiles = trace.component_changes
+        .filter((cc: any) => cc.change_type !== 'deleted')
+        .map((cc: any) => cc.file_path);
+      filesModified.push(...componentFiles);
+    }
+
+    // Deduplicate
+    const uniqueFiles = [...new Set(filesModified)];
+
+    // Forward to learning (non-blocking, don't await)
+    if (uniqueFiles.length >= 2) {
+      const sessionId = c.req.header('X-Session-ID') || session.session_id || 'unknown';
+      forwardToLearning(sessionId, uniqueFiles, projectId);
+    }
 
     return c.json({
       success: true,

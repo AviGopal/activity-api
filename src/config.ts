@@ -6,7 +6,7 @@
 export interface Config {
   port: number;
   host: string;
-  
+
   // Database
   surrealdb: {
     url: string;
@@ -15,7 +15,7 @@ export interface Config {
     username: string;
     password: string;
   };
-  
+
   // Redis
   redis: {
     url: string;
@@ -25,16 +25,24 @@ export interface Config {
       metrics: number;      // Metrics cache TTL
     };
   };
-  
+
+  // Analysis API (M3 - Impulse Bridge)
+  analysisApi: {
+    url: string;
+    timeout: number;       // Request timeout in ms
+    retryAttempts: number; // Number of retry attempts
+    retryDelay: number;    // Delay between retries in ms
+  };
+
   // Security
   auth: {
     requireAuth: boolean;  // Set to false for development
   };
-  
+
   // Logging
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   logFormat: 'json' | 'text';
-  
+
   // CORS
   cors: {
     origins: string[];
@@ -90,7 +98,14 @@ export function loadConfig(): Config {
         metrics: parseEnvInt('REDIS_METRICS_TTL', 300),    // 5 minutes
       },
     },
-    
+
+    analysisApi: {
+      url: process.env.ANALYSIS_API_URL || 'http://metabob-analysis-api:8080',
+      timeout: parseEnvInt('ANALYSIS_API_TIMEOUT', 30000),
+      retryAttempts: parseEnvInt('ANALYSIS_API_RETRY_ATTEMPTS', 3),
+      retryDelay: parseEnvInt('ANALYSIS_API_RETRY_DELAY', 1000),
+    },
+
     auth: {
       requireAuth: parseEnvBool('REQUIRE_AUTH', false),
     },

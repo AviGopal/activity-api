@@ -30,6 +30,7 @@ import {
   formatImpactAsMarkdown,
   formatSearchResultsAsMarkdown,
 } from '../services/impulse-formatters';
+import { getJwtAuthFromContext, type JwtAuthContext } from '../middleware/jwtAuth';
 
 const router = new Hono();
 
@@ -130,6 +131,7 @@ async function proxyToAnalysisApi<T>(
 router.post('/', async (c) => {
   try {
     const session = (c.get as any)('session') as SessionData | null;
+    const jwtAuth = getJwtAuthFromContext(c);
 
     // Allow internal service calls with X-Internal-Api-Key header
     const internalApiKey = c.req.header('X-Internal-Api-Key');
@@ -137,21 +139,27 @@ router.post('/', async (c) => {
     // Debug: log all headers
     logger.debug('POST /v2/impulses headers', {
       hasSession: !!session,
+      hasJwtAuth: !!jwtAuth,
       hasInternalKey: !!internalApiKey,
       internalKeyPrefix: internalApiKey ? internalApiKey.substring(0, 10) + '...' : 'none',
       authorization: c.req.header('Authorization') ? 'present' : 'missing',
     });
 
-    // Get api_key from session or internal header
+    // Get api_key from session, JWT auth, or internal header
     let api_key: string;
+
     if (session?.api_key) {
       api_key = session.api_key;
+    } else if (jwtAuth) {
+      // JWT auth from MiniBob instances - use instance info
+      api_key = `minibob:${jwtAuth.instanceId || jwtAuth.orgId}`;
+      logger.debug('Using JWT auth', { orgId: jwtAuth.orgId, projectId: jwtAuth.projectId });
     } else if (internalApiKey) {
       api_key = internalApiKey;
       logger.debug('Using internal service api_key', { api_key: api_key.substring(0, 8) + '...' });
     } else {
-      logger.warn('POST /v2/impulses: no auth', { hasSession: !!session, hasInternalKey: !!internalApiKey });
-      return c.json({ error: 'Unauthorized - valid session or X-Internal-Api-Key required' }, 401);
+      logger.warn('POST /v2/impulses: no auth', { hasSession: !!session, hasJwtAuth: !!jwtAuth, hasInternalKey: !!internalApiKey });
+      return c.json({ error: 'Unauthorized - valid session, JWT token, or X-Internal-Api-Key required' }, 401);
     }
 
     // Parse request body
@@ -274,15 +282,18 @@ router.post('/', async (c) => {
 router.get('/:impulseId', async (c) => {
   try {
     const session = (c.get as any)('session') as SessionData | null;
+    const jwtAuth = getJwtAuthFromContext(c);
     const internalApiKey = c.req.header('X-Internal-Api-Key');
 
     let api_key: string;
     if (session?.api_key) {
       api_key = session.api_key;
+    } else if (jwtAuth) {
+      api_key = `minibob:${jwtAuth.instanceId || jwtAuth.orgId}`;
     } else if (internalApiKey) {
       api_key = internalApiKey;
     } else {
-      return c.json({ error: 'Unauthorized - valid session or X-Internal-Api-Key required' }, 401);
+      return c.json({ error: 'Unauthorized - valid session, JWT token, or X-Internal-Api-Key required' }, 401);
     }
 
     const impulse_id = c.req.param('impulseId');
@@ -370,15 +381,18 @@ router.get('/:impulseId', async (c) => {
 router.get('/', async (c) => {
   try {
     const session = (c.get as any)('session') as SessionData | null;
+    const jwtAuth = getJwtAuthFromContext(c);
     const internalApiKey = c.req.header('X-Internal-Api-Key');
 
     let api_key: string;
     if (session?.api_key) {
       api_key = session.api_key;
+    } else if (jwtAuth) {
+      api_key = `minibob:${jwtAuth.instanceId || jwtAuth.orgId}`;
     } else if (internalApiKey) {
       api_key = internalApiKey;
     } else {
-      return c.json({ error: 'Unauthorized - valid session or X-Internal-Api-Key required' }, 401);
+      return c.json({ error: 'Unauthorized - valid session, JWT token, or X-Internal-Api-Key required' }, 401);
     }
 
     const project_id = c.req.query('project_id');
@@ -752,6 +766,139 @@ router.post('/resolve', async (c) => {
           content = `# Template Comparison\n\nNo executions found for activity: ${pointer.activityId}`;
         } else {
           content = formatTemplateComparisonAsMarkdown(result, pointer.activityId);
+        }
+        break;
+      }
+
+      // =============================================================================
+      // ANALYSIS API POINTER TYPES (M3 - Impulse Bridge)
+      // These proxy to metabob-analysis-api for CPG and analysis data
+      // =============================================================================
+
+      case 'analysisResult': {
+        // Load a single analysis problem/issue
+        if (!pointer.resultId) {
+          return c.json({
+            success: false,
+            error: 'resultId required for analysisResult pointer',
+          } as ImpulseResolveResponse, 400);
+        }
+
+        const sessionId = c.req.header('X-Session-ID');
+        const analysisResult = await proxyToAnalysisApi<{ problem: any }>(
+          `/v2/analysis/problems/${pointer.resultId}`,
+          { method: 'GET', sessionId: sessionId || undefined }
+        );
+
+        if (!analysisResult || !analysisResult.problem) {
+          content = `# Analysis Result\n\nProblem not found: ${pointer.resultId}\n\n*The analysis API may be unavailable or the problem does not exist.*`;
+        } else {
+          content = formatAnalysisResultAsMarkdown(
+            analysisResult.problem,
+            pointer.format || 'full'
+          );
+        }
+        break;
+      }
+
+      case 'cochangeSuggestions': {
+        // Get co-change suggestions for components
+        if (!pointer.componentIds || pointer.componentIds.length === 0) {
+          return c.json({
+            success: false,
+            error: 'componentIds required for cochangeSuggestions pointer',
+          } as ImpulseResolveResponse, 400);
+        }
+
+        const sessionId = c.req.header('X-Session-ID');
+
+        // Extract file paths from component IDs
+        const changedFiles = [...new Set(
+          pointer.componentIds.map(id => id.split('::')[0])
+        )];
+
+        const cochangeResult = await proxyToAnalysisApi<{ suggestions: any[] }>(
+          '/v2/analysis/cochange/suggest',
+          {
+            method: 'POST',
+            sessionId: sessionId || undefined,
+            body: {
+              changed_files: changedFiles,
+              limit: pointer.limit || 5,
+              confidence_threshold: 0.3,
+            },
+          }
+        );
+
+        if (!cochangeResult || !cochangeResult.suggestions) {
+          content = `# Co-Change Suggestions\n\nUnable to get co-change suggestions.\n\n*The analysis API may be unavailable or the codebase is not indexed.*`;
+        } else {
+          content = formatCochangeAsMarkdown(cochangeResult.suggestions);
+        }
+        break;
+      }
+
+      case 'impactAnalysis': {
+        // Get impact analysis for changed files
+        if (!pointer.changedFiles || pointer.changedFiles.length === 0) {
+          return c.json({
+            success: false,
+            error: 'changedFiles required for impactAnalysis pointer',
+          } as ImpulseResolveResponse, 400);
+        }
+
+        const sessionId = c.req.header('X-Session-ID');
+        const impactResult = await proxyToAnalysisApi<any>(
+          '/v2/analysis/impact',
+          {
+            method: 'POST',
+            sessionId: sessionId || undefined,
+            body: {
+              changed_files: pointer.changedFiles,
+              max_depth: pointer.maxDepth || 2,
+              include_tests: true,
+            },
+          }
+        );
+
+        if (!impactResult) {
+          content = `# Impact Analysis\n\nUnable to perform impact analysis.\n\n*The analysis API may be unavailable or the codebase is not indexed.*`;
+        } else {
+          content = formatImpactAsMarkdown(impactResult);
+        }
+        break;
+      }
+
+      case 'codebaseSearch': {
+        // Search the indexed codebase
+        if (!pointer.query) {
+          return c.json({
+            success: false,
+            error: 'query required for codebaseSearch pointer',
+          } as ImpulseResolveResponse, 400);
+        }
+
+        const sessionId = c.req.header('X-Session-ID');
+        const searchResult = await proxyToAnalysisApi<{ results: any[] }>(
+          '/v2/analysis/search',
+          {
+            method: 'POST',
+            sessionId: sessionId || undefined,
+            body: {
+              query: pointer.query,
+              limit: pointer.limit || 10,
+              filters: {
+                severity: pointer.severity,
+                category: pointer.category,
+              },
+            },
+          }
+        );
+
+        if (!searchResult || !searchResult.results) {
+          content = `# Codebase Search: "${pointer.query}"\n\nUnable to search codebase.\n\n*The analysis API may be unavailable or the codebase is not indexed.*`;
+        } else {
+          content = formatSearchResultsAsMarkdown(searchResult.results, pointer.query);
         }
         break;
       }
