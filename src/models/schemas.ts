@@ -153,7 +153,8 @@ export type ExecutionRecordResponse = z.infer<typeof ExecutionRecordResponseSche
 export const ImpulsePointerSchema = z.object({
   type: z.string(), // file, memo, component, activityOutput, etc.
   content: z.string().optional(), // memo content
-  file_path: z.string().optional(), // file pointer
+  file_path: z.string().optional(), // file pointer (backend field name)
+  path: z.string().optional(), // file pointer (MiniBob field name - accepts both)
   component_id: z.string().optional(), // component pointer
   source: z.string().optional(), // source identifier
 });
@@ -163,7 +164,8 @@ export const ImpulseDataSchema = z.object({
   type: z.string(),
   pointer: ImpulsePointerSchema,
   budget: z.number(),
-  priority: z.number().optional(),
+  // Accept both string ("high", "medium", "low") and number (1, 2, 3, 4)
+  priority: z.union([z.number(), z.string()]).optional(),
   scope: z.string().optional(),
   metadata: z.record(z.any()).optional(),
 });
@@ -616,6 +618,15 @@ export const ImpulseResolveRequestSchema = z.object({
     filter: z.enum(['failed', 'successful', 'all']).optional(),
     limit: z.number().int().positive().optional(),
     since: z.string().optional(), // ISO date string
+    // Analysis-specific pointer types (M3 - Impulse Bridge)
+    resultId: z.string().optional(), // For analysisResult pointer
+    componentIds: z.array(z.string()).optional(), // For cochangeSuggestions pointer
+    changedFiles: z.array(z.string()).optional(), // For impactAnalysis pointer
+    query: z.string().optional(), // For codebaseSearch pointer
+    maxDepth: z.number().int().positive().optional(), // For impactAnalysis
+    format: z.enum(['full', 'summary']).optional(), // For analysisResult
+    severity: z.array(z.string()).optional(), // For codebaseSearch filters
+    category: z.array(z.string()).optional(), // For codebaseSearch filters
   }),
 });
 

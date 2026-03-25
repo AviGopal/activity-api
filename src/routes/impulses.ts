@@ -23,8 +23,93 @@ import {
   type ImpulseResolveResponse,
   type SessionData,
 } from '../models/schemas';
+import { config } from '../config';
+import {
+  formatAnalysisResultAsMarkdown,
+  formatCochangeAsMarkdown,
+  formatImpactAsMarkdown,
+  formatSearchResultsAsMarkdown,
+} from '../services/impulse-formatters';
 
 const router = new Hono();
+
+/**
+ * Proxy request to Analysis API with retry and timeout
+ * Returns null on failure (graceful degradation)
+ */
+async function proxyToAnalysisApi<T>(
+  endpoint: string,
+  options: {
+    method?: 'GET' | 'POST';
+    body?: unknown;
+    sessionId?: string;
+    params?: Record<string, string | number>;
+  } = {}
+): Promise<T | null> {
+  const { method = 'GET', body, sessionId, params } = options;
+  const baseUrl = config.analysisApi.url;
+
+  // Build URL with query params
+  let url = `${baseUrl}${endpoint}`;
+  if (params && Object.keys(params).length > 0) {
+    const searchParams = new URLSearchParams();
+    for (const [key, value] of Object.entries(params)) {
+      searchParams.append(key, String(value));
+    }
+    url += `?${searchParams.toString()}`;
+  }
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (sessionId) {
+    headers['X-Session-ID'] = sessionId;
+  }
+
+  for (let attempt = 0; attempt < config.analysisApi.retryAttempts; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), config.analysisApi.timeout);
+
+      const response = await fetch(url, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        logger.warn('Analysis API error', {
+          endpoint,
+          status: response.status,
+          attempt: attempt + 1,
+        });
+
+        if (response.status >= 500 && attempt < config.analysisApi.retryAttempts - 1) {
+          await new Promise(r => setTimeout(r, config.analysisApi.retryDelay * (attempt + 1)));
+          continue;
+        }
+        return null;
+      }
+
+      return await response.json() as T;
+    } catch (error) {
+      logger.warn('Analysis API request failed', {
+        endpoint,
+        error: error instanceof Error ? error.message : 'Unknown error',
+        attempt: attempt + 1,
+      });
+
+      if (attempt < config.analysisApi.retryAttempts - 1) {
+        await new Promise(r => setTimeout(r, config.analysisApi.retryDelay * (attempt + 1)));
+      }
+    }
+  }
+
+  return null;
+}
 
 /**
  * POST /v2/impulses
@@ -434,13 +519,14 @@ router.post('/resolve', async (c) => {
           } as ImpulseResolveResponse, 400);
         }
 
-        // Load execution trace from database
+        // Load execution trace from activity_execution_traces (RBAC-enabled table)
+        // This is the table MiniBob writes to via POST /v2/activities/execution-traces
         const query = `
-          SELECT * FROM execution_traces
+          SELECT * FROM activity_execution_traces
           WHERE execution_id = $execution_id
           LIMIT 1
         `;
-        
+
         const result = await surrealDB.query<any>(query, {
           execution_id: pointer.executionId,
         });
@@ -564,7 +650,7 @@ router.post('/resolve', async (c) => {
         }
 
         const query = `
-          SELECT * FROM execution_traces
+          SELECT * FROM activity_execution_traces
           ${whereClause}
           ORDER BY created_at DESC
           LIMIT $limit
@@ -589,13 +675,13 @@ router.post('/resolve', async (c) => {
 
         const query = `
           SELECT
-            template_id,
+            variant_id as template_id,
             status,
             execution_trace.tasks.*.result.error as errors,
             execution_trace.tasks.*.toolCalls.*.result.error as tool_errors,
             created_at
-          FROM execution_traces
-          WHERE status = "failed" AND created_at >= $since
+          FROM activity_execution_traces
+          WHERE status = "failure" AND created_at >= $since
           ORDER BY created_at DESC
           LIMIT $limit
         `;
@@ -617,13 +703,13 @@ router.post('/resolve', async (c) => {
 
         const query = `
           SELECT
-            template_id,
+            variant_id as template_id,
             duration_ms,
             cost_usd,
             execution_trace.tasks.*.toolCalls as tool_usage,
             created_at
-          FROM execution_traces
-          WHERE status = "completed" AND created_at >= $since
+          FROM activity_execution_traces
+          WHERE status = "success" AND created_at >= $since
           ORDER BY duration_ms ASC
           LIMIT $limit
         `;
@@ -649,14 +735,14 @@ router.post('/resolve', async (c) => {
 
         const query = `
           SELECT
-            template_id,
+            variant_id as template_id,
             count() as executions,
             math::mean(duration_ms) as avg_duration,
             math::mean(cost_usd) as avg_cost,
-            count(status = "completed") / count() as success_rate
-          FROM execution_traces
+            count(success = true) / count() as success_rate
+          FROM activity_execution_traces
           WHERE activity_id = $activity_id
-          GROUP BY template_id
+          GROUP BY variant_id
           ORDER BY success_rate DESC
         `;
 
@@ -1043,5 +1129,101 @@ function formatTemplateComparisonAsMarkdown(comparisons: any[], activityId: stri
 
   return md;
 }
+
+/**
+ * POST /v2/impulses/:impulseId/usage
+ * Track impulse usage for analytics and learning
+ *
+ * MiniBob calls this endpoint to record when an impulse is used in an activity.
+ * This enables:
+ * - Usage analytics (most/least used impulses)
+ * - Cleanup of unused impulses
+ * - Learning about impulse relevance
+ *
+ * Flow:
+ * 1. Verify impulse exists (404 if not found)
+ * 2. Store usage record in impulse_usage_history
+ * 3. Update usage_count and last_used_at on impulse_data
+ * 4. Return success
+ */
+router.post('/:impulseId/usage', async (c) => {
+  try {
+    const { impulseId } = c.req.param();
+    const body = await c.req.json();
+
+    const { activityId, taskId, executionId, tokensUsed, success } = body;
+
+    logger.info('POST /v2/impulses/:impulseId/usage', {
+      impulse_id: impulseId,
+      activity_id: activityId,
+      task_id: taskId,
+      tokens_used: tokensUsed,
+    });
+
+    // Check if impulse exists (we need to query without auth for internal service calls)
+    // For now, just record the usage - we'll validate later when we have proper auth context
+    const checkQuery = `
+      SELECT impulse_id FROM impulse_data
+      WHERE impulse_id = $impulse_id
+      LIMIT 1
+    `;
+
+    const existing = await surrealDB.query<any>(checkQuery, { impulse_id: impulseId });
+
+    if (existing.length === 0) {
+      return c.json({
+        success: false,
+        error: `Impulse not found: ${impulseId}`,
+      }, 404);
+    }
+
+    // Create usage record in impulse_usage_history
+    // Note: org_id and project_id would be set via $auth in RBAC context
+    const usageQuery = `
+      CREATE impulse_usage_history SET
+        impulse_id = $impulse_id,
+        activity_id = $activity_id,
+        task_id = $task_id,
+        execution_id = $execution_id,
+        tokens_consumed = $tokens_consumed,
+        success = $success,
+        used_at = time::now()
+    `;
+
+    await surrealDB.query(usageQuery, {
+      impulse_id: impulseId,
+      activity_id: activityId || null,
+      task_id: taskId || null,
+      execution_id: executionId || null,
+      tokens_consumed: tokensUsed || 0,
+      success: success ?? true,
+    });
+
+    // Update usage stats on the impulse itself
+    const updateQuery = `
+      UPDATE impulse_data SET
+        usage_count = usage_count + 1,
+        last_used_at = time::now()
+      WHERE impulse_id = $impulse_id
+    `;
+
+    await surrealDB.query(updateQuery, { impulse_id: impulseId });
+
+    logger.info('Impulse usage recorded', { impulse_id: impulseId });
+
+    return c.json({ success: true }, 200);
+
+  } catch (error: any) {
+    logger.error('POST /v2/impulses/:impulseId/usage failed', {
+      error: error.message,
+      stack: error.stack,
+    });
+
+    return c.json({
+      success: false,
+      error: error.message,
+    }, 500);
+  }
+});
 
 export default router;
