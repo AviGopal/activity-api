@@ -53,9 +53,10 @@ DEFINE FIELD IF NOT EXISTS project_id ON activity_execution_traces TYPE option<r
   VALUE $value OR $auth.project_id
   COMMENT "Project ID (optional, inherited from auth context)";
 
-DEFINE FIELD IF NOT EXISTS created_by ON activity_execution_traces TYPE option<record<users>>
+-- created_by can be either a user (dashboard) or a minibob_instance (autonomous vessel)
+DEFINE FIELD IF NOT EXISTS created_by ON activity_execution_traces TYPE option<record<users> | record<minibob_instance>>
   VALUE $value OR $auth.id
-  COMMENT "User or instance who created this execution";
+  COMMENT "User or MiniBob instance who created this execution";
 
 -- Execution results
 DEFINE FIELD IF NOT EXISTS success ON activity_execution_traces TYPE bool

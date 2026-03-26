@@ -47,9 +47,10 @@ DEFINE FIELD IF NOT EXISTS project_id ON impulse_data TYPE option<record<project
   VALUE $value OR $auth.project_id
   COMMENT "Project ID for project-scoped impulses";
 
-DEFINE FIELD IF NOT EXISTS created_by ON impulse_data TYPE option<record<users>>
+-- created_by can be either a user (dashboard) or a minibob_instance (autonomous vessel)
+DEFINE FIELD IF NOT EXISTS created_by ON impulse_data TYPE option<record<users> | record<minibob_instance>>
   VALUE $value OR $auth.id
-  COMMENT "User or instance who created this impulse";
+  COMMENT "User or MiniBob instance who created this impulse";
 
 -- Legacy field for backward compatibility (DEPRECATED)
 DEFINE FIELD IF NOT EXISTS api_key ON impulse_data TYPE option<string>

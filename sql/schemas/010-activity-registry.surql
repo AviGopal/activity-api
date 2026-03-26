@@ -84,6 +84,13 @@ DEFINE FIELD IF NOT EXISTS typical_inputs ON activity_registry TYPE option<objec
 DEFINE FIELD IF NOT EXISTS typical_outputs ON activity_registry TYPE option<object>
   COMMENT "Typical output shape (learned from executions)";
 
+-- Schema-based activity matching (self-development loop)
+DEFINE FIELD IF NOT EXISTS input_schema ON activity_registry TYPE option<object>
+  COMMENT "Input schema: { required: ImpulseShape[], optional?: ImpulseShape[] }";
+
+DEFINE FIELD IF NOT EXISTS output_schema ON activity_registry TYPE option<object>
+  COMMENT "Output schema: { produces: ImpulseShape[] }";
+
 -- Thompson Sampling (shared across all activity formats)
 DEFINE FIELD IF NOT EXISTS executions ON activity_registry TYPE int
   VALUE $value OR 0
@@ -134,9 +141,10 @@ DEFINE FIELD IF NOT EXISTS project_id ON activity_registry TYPE option<record<pr
 DEFINE FIELD IF NOT EXISTS vessel_id ON activity_registry TYPE option<string>
   COMMENT "Vessel ID (for vessel-function activities)";
 
-DEFINE FIELD IF NOT EXISTS created_by ON activity_registry TYPE option<record<users>>
+-- created_by can be either a user (dashboard) or a minibob_instance (autonomous vessel)
+DEFINE FIELD IF NOT EXISTS created_by ON activity_registry TYPE option<record<users> | record<minibob_instance>>
   VALUE $value OR $auth.id
-  COMMENT "User who created this activity";
+  COMMENT "User or MiniBob instance who created this activity";
 
 -- Metadata
 DEFINE FIELD IF NOT EXISTS genealogy ON activity_registry TYPE option<object>
@@ -202,13 +210,12 @@ DEFINE FIELD IF NOT EXISTS activity_id ON variant_performance_metrics TYPE strin
   ASSERT $value != NONE
   COMMENT "Base activity identifier";
 
-DEFINE FIELD IF NOT EXISTS org_id ON variant_performance_metrics TYPE record<organizations>
-  ASSERT $value != NONE
+DEFINE FIELD IF NOT EXISTS org_id ON variant_performance_metrics TYPE option<string>
   VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (required for RBAC)";
+  COMMENT "Organization ID (string identifier)";
 
-DEFINE FIELD IF NOT EXISTS project_id ON variant_performance_metrics TYPE option<record<projects>>
-  COMMENT "Project ID (optional)";
+DEFINE FIELD IF NOT EXISTS project_id ON variant_performance_metrics TYPE option<string>
+  COMMENT "Project ID (string identifier, optional)";
 
 DEFINE FIELD IF NOT EXISTS total_executions ON variant_performance_metrics TYPE int
   VALUE $value OR 0

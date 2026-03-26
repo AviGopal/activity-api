@@ -10,9 +10,32 @@
  */
 
 import { Hono } from 'hono';
+import beta from '@stdlib/random-base-beta';
 import { surrealDB, queryWithAuth } from '../db/surreal';
 import { RedisClient } from '../db/redis';
 import { logger } from '../utils/logger';
+
+/**
+ * Thompson Sampling Beta distribution sampler.
+ *
+ * Uses @stdlib/random-base-beta to sample from Beta(alpha, beta) distribution.
+ * When THOMPSON_SAMPLING_SEED env var is set, uses seeded RNG for reproducible tests.
+ *
+ * @param alpha - Success count + 1 (prior)
+ * @param betaParam - Failure count + 1 (prior)
+ * @returns Sample from Beta(alpha, beta) distribution, value between 0 and 1
+ */
+const betaSample: (alpha: number, betaParam: number) => number = (() => {
+  const seed = process.env.THOMPSON_SAMPLING_SEED;
+  if (seed) {
+    const seedNum = parseInt(seed, 10);
+    if (!isNaN(seedNum)) {
+      logger.info('Thompson Sampling initialized with seed', { seed: seedNum });
+      return beta.factory({ seed: seedNum });
+    }
+  }
+  return beta;
+})();
 import type { SessionData } from '../models/schemas';
 import { getJwtAuthFromContext, hasJwtAuth, type JwtAuthContext } from '../middleware/jwtAuth';
 import { generateActivity } from '../services/activity-generator';
@@ -60,7 +83,6 @@ interface ActivityTemplate {
   category: string;
   task_steps?: any[];
   scope: string | null;
-  public?: boolean;
   org_id: string | null;
   project_id: string | null;
   genealogy?: Record<string, any>;
@@ -82,6 +104,42 @@ interface ActivityTemplate {
     created_at: string;
     updated_at: string;
   };
+}
+
+/**
+ * Filter templates by input schema compatibility
+ * A template matches if ALL required shapes in its inputSchema are present in providedShapes
+ * Templates without inputSchema match anything (backwards compatible)
+ */
+function filterByInputSchema(
+  templates: any[],
+  providedShapes: string[]
+): any[] {
+  if (!providedShapes || providedShapes.length === 0) {
+    return templates;
+  }
+
+  const providedSet = new Set(providedShapes);
+
+  return templates.filter(template => {
+    const inputSchema = template.input_schema;
+
+    // Templates without inputSchema match anything (backwards compatible)
+    if (!inputSchema || !inputSchema.required || !Array.isArray(inputSchema.required)) {
+      return true;
+    }
+
+    // Check if all required shapes are provided
+    const requiredShapes = inputSchema.required.map((s: any) =>
+      typeof s === 'string' ? s : s.shape
+    ).filter(Boolean);
+
+    const allRequiredPresent = requiredShapes.every((shape: string) =>
+      providedSet.has(shape)
+    );
+
+    return allRequiredPresent;
+  });
 }
 
 /**
@@ -329,7 +387,6 @@ app.post('/templates', async (c) => {
       description: validated.description,
       category: validated.category,
       scope: validated.scope || 'global',
-      public: validated.public || false,
     };
 
     // Only add optional fields if they have values
@@ -361,8 +418,8 @@ app.post('/templates', async (c) => {
     logger.debug('Template inserted into activity_template');
 
     // Create initial performance metrics
-    // org_id is required by schema - use session org or default to metabob_internal for global templates
-    const metricsOrgId = validated.org_id || orgId || 'organizations:metabob_internal';
+    // org_id is optional - use session org or request value if provided
+    const metricsOrgId = validated.org_id || orgId || 'metabob_internal';
     const metricsProjectId = validated.project_id || projectId;
 
     // Build metrics query with conditional project_id
@@ -1491,13 +1548,20 @@ export default app;
 app.post('/recommend', async (c) => {
   try {
     const body = await c.req.json();
-    const { task_description, category, loaded_impulses = [], limit = 3 } = body;
+    const {
+      task_description,
+      category,
+      loaded_impulses = [],
+      impulse_shapes = [],  // NEW: Array of impulse shapes for schema filtering
+      limit = 3
+    } = body;
 
-    logger.info('POST /recommend', { 
+    logger.info('POST /recommend', {
       task_description: task_description?.substring(0, 100),
       category,
       loaded_impulses,
-      limit 
+      impulse_shapes,
+      limit
     });
 
     // Validate required fields
@@ -1513,12 +1577,15 @@ app.post('/recommend', async (c) => {
     const projectId = sessionData?.project_id || null;
 
     // Fetch templates for Thompson Sampling recommendations
+    // Include input_schema for schema-based filtering
     let query = `
-      SELECT 
+      SELECT
         variant_id,
         activity_id,
         variant_name,
-        category
+        category,
+        input_schema,
+        output_schema
       FROM activity_template
     `;
 
@@ -1552,28 +1619,43 @@ app.post('/recommend', async (c) => {
 
     logger.info('Templates fetched for recommendation', { count: templates.length });
 
+    // Apply schema-based filtering if impulse_shapes provided
+    if (impulse_shapes && impulse_shapes.length > 0) {
+      const beforeCount = templates.length;
+      templates = filterByInputSchema(templates, impulse_shapes);
+      logger.info('Schema filtering applied', {
+        before: beforeCount,
+        after: templates.length,
+        providedShapes: impulse_shapes,
+        reduction: `${Math.round((1 - templates.length / beforeCount) * 100)}%`
+      });
+    }
+
     // Enrich templates with metrics (thompson_alpha, thompson_beta)
     templates = await enrichTemplatesWithMetrics(templates);
 
     // Apply Thompson Sampling
     const recommendations = templates
       .map((template) => {
-        // Get alpha/beta from enriched metrics
+        // Get alpha/beta from enriched metrics (defaults: Beta(1,1) = uniform prior)
         const alpha = template.metrics?.thompson_alpha || 1.0;
-        const beta = template.metrics?.thompson_beta || 1.0;
+        const betaVal = template.metrics?.thompson_beta || 1.0;
 
-        // Sample from Beta distribution (simplified: use expected value for deterministic testing)
-        // In production, would use: sample = beta_random(alpha, beta)
-        const sample = alpha / (alpha + beta); // Expected value of Beta(alpha, beta)
+        // Sample from Beta(alpha, beta) distribution for Thompson Sampling
+        // This enables exploration (high variance for uncertain templates) and
+        // exploitation (high mean for proven templates) tradeoff
+        const sample = betaSample(alpha, betaVal);
 
         return {
           template_id: template.variant_id,
           template_name: template.variant_name,
           category: template.category,
+          input_schema: template.input_schema || null,
+          output_schema: template.output_schema || null,
           selection_metadata: {
             method: 'thompson_sampling',
             alpha,
-            beta,
+            beta: betaVal,
             sample,
             score: sample, // Use sample as score for ranking
           },
