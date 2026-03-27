@@ -109,8 +109,30 @@ DEFINE FIELD IF NOT EXISTS component_changes ON activity_execution_traces TYPE o
 DEFINE FIELD IF NOT EXISTS execution_trace ON activity_execution_traces TYPE option<object>
   COMMENT "Full execution trace data (task-by-task details)";
 
+DEFINE FIELD IF NOT EXISTS state_snapshot ON activity_execution_traces TYPE option<object> FLEXIBLE
+  COMMENT "State snapshot with any nested structure (input_state, output_state, stateTransition)";
+
+DEFINE FIELD IF NOT EXISTS tasks ON activity_execution_traces TYPE option<array<object>> FLEXIBLE
+  COMMENT "Array of task execution details with any nested structure";
+
 DEFINE FIELD IF NOT EXISTS parent_execution_id ON activity_execution_traces TYPE option<string>
   COMMENT "Parent execution ID (for composition tracking)";
+
+-- Edge Learning Fields (from improvisation traces)
+DEFINE FIELD IF NOT EXISTS improvisation ON activity_execution_traces TYPE option<bool>
+  COMMENT "Whether this was an LLM improvisation (no template matched)";
+
+DEFINE FIELD IF NOT EXISTS input_impulse_shapes ON activity_execution_traces TYPE option<array<string>>
+  COMMENT "Shapes of input impulses (goal, task, previous_result, error_context, etc.)";
+
+DEFINE FIELD IF NOT EXISTS output_impulse_shapes ON activity_execution_traces TYPE option<array<string>>
+  COMMENT "Shapes of output impulses produced (documentation, source_code, command_result, etc.)";
+
+DEFINE FIELD IF NOT EXISTS output_impulses ON activity_execution_traces TYPE option<array<object>> FLEXIBLE
+  COMMENT "Full output impulse data [{shape, pointer}] for ribosome extraction";
+
+DEFINE FIELD IF NOT EXISTS metadata ON activity_execution_traces TYPE option<object> FLEXIBLE
+  COMMENT "Extensible metadata for edge learning (inputShapes, outputShapes, producedImpulses, etc.)";
 
 -- Timestamps
 DEFINE FIELD IF NOT EXISTS executed_at ON activity_execution_traces TYPE datetime
