@@ -14,6 +14,17 @@ import beta from '@stdlib/random-base-beta';
 import { surrealDB, queryWithAuth } from '../db/surreal';
 import { RedisClient } from '../db/redis';
 import { logger } from '../utils/logger';
+import {
+  insertActivity,
+  insertExecution,
+  getActivityScores,
+  queryActivitiesByShapes,
+  transformToLegacyTemplate,
+  isDualWriteEnabled,
+  type ParadigmActivity,
+  type ParadigmExecution,
+  type ActivityScore,
+} from '../db/paradigm';
 
 /**
  * Thompson Sampling Beta distribution sampler.
@@ -342,10 +353,21 @@ async function listAllTemplatesFromDB(
  */
 app.post('/templates', async (c) => {
   try {
+    // Check for JWT auth first (MiniBob instances)
+    const jwtAuth = getJwtAuthFromContext(c);
+
+    logger.info('POST /templates - JWT auth context', {
+      hasJwtAuth: !!jwtAuth,
+      jwtAuthOrgId: jwtAuth?.orgId,
+      hasJwtToken: !!jwtAuth?.jwtToken,
+    });
+
     // Extract session from context (set by auth middleware)
     const session = (c.get as any)('session') as SessionData | undefined;
-    const orgId = session?.org_id || null;
-    const projectId = session?.project_id || null;
+
+    // Use JWT auth claims if available, otherwise fall back to session
+    const orgId = jwtAuth?.orgId || session?.org_id || null;
+    const projectId = jwtAuth?.projectId || session?.project_id || null;
 
     // Parse and validate request body
     const body = await c.req.json();
@@ -416,6 +438,42 @@ app.post('/templates', async (c) => {
     await surrealDB.query(insertTemplateQuery, templateRecord);
 
     logger.debug('Template inserted into activity_template');
+
+    // DUAL-WRITE: Also insert into new paradigm activity table (schema-paradigm-alignment)
+    // This enables gradual migration to the 4-table schema
+    // P4.1: Feature flag controlled
+    if (isDualWriteEnabled()) {
+      try {
+        const paradigmActivity: Partial<ParadigmActivity> = {
+        id: validated.variant_id,
+        name: validated.variant_name,
+        description: validated.description,
+        input_shapes: [], // Legacy templates don't have shapes yet
+        output_shapes: [],
+        execution_type: 'template',
+        category: validated.category,
+        tasks: validated.task_steps,
+        scope: validated.scope || 'org',
+        public: validated.scope === 'global',
+        org_id: validated.org_id || orgId || undefined,
+        project_id: validated.project_id || projectId || undefined,
+      };
+
+      const paradigmResult = await insertActivity(paradigmActivity, jwtAuth?.jwtToken);
+      if (paradigmResult) {
+        logger.info('[paradigm] Template also written to activity table', {
+          id: validated.variant_id,
+          path: 'dual-write',
+        });
+      }
+      } catch (paradigmError) {
+        // Don't fail the request if paradigm write fails - legacy write succeeded
+        logger.warn('[paradigm] Dual-write to activity table failed (non-blocking)', {
+          variant_id: validated.variant_id,
+          error: paradigmError instanceof Error ? paradigmError.message : String(paradigmError),
+        });
+      }
+    } // end isDualWriteEnabled()
 
     // Create initial performance metrics
     // org_id is optional - use session org or request value if provided
@@ -786,10 +844,15 @@ app.get('/templates/:variantId', async (c) => {
  */
 app.post('/executions', async (c) => {
   try {
+    // Check for JWT auth first (MiniBob instances)
+    const jwtAuth = getJwtAuthFromContext(c);
+
     // Extract session from context (set by auth middleware)
     const session = (c.get as any)('session') as SessionData | undefined;
-    const orgId = session?.org_id || null;
-    const projectId = session?.project_id || null;
+
+    // Use JWT auth claims if available, otherwise fall back to session
+    const orgId = jwtAuth?.orgId || session?.org_id || null;
+    const projectId = jwtAuth?.projectId || session?.project_id || null;
 
     // Parse and validate request body
     const body = await c.req.json();
@@ -857,6 +920,23 @@ app.post('/executions', async (c) => {
       executionRecord.component_changes = validated.component_changes;
     }
 
+    // Edge learning fields (from improvisation traces)
+    if (validated.improvisation) {
+      executionRecord.improvisation = validated.improvisation;
+    }
+    if (validated.input_impulse_shapes && validated.input_impulse_shapes.length > 0) {
+      executionRecord.input_impulse_shapes = validated.input_impulse_shapes;
+    }
+    if (validated.output_impulse_shapes && validated.output_impulse_shapes.length > 0) {
+      executionRecord.output_impulse_shapes = validated.output_impulse_shapes;
+    }
+    if (validated.output_impulses && validated.output_impulses.length > 0) {
+      executionRecord.output_impulses = validated.output_impulses;
+    }
+    if (validated.metadata) {
+      executionRecord.metadata = validated.metadata;
+    }
+
     // Build dynamic query with only provided fields
     const execFields = Object.keys(executionRecord).map(k => `${k}: $${k}`).join(',\n        ');
     const insertExecutionQuery = `
@@ -870,6 +950,53 @@ app.post('/executions', async (c) => {
     await surrealDB.query(insertExecutionQuery, executionRecord);
 
     logger.debug('Execution recorded in activity_executions', { executionId });
+
+    // DUAL-WRITE: Also insert into new paradigm execution table (schema-paradigm-alignment)
+    // v_activity_score view computes Thompson Sampling from execution table automatically
+    // P4.1: Feature flag controlled
+    if (isDualWriteEnabled()) {
+      try {
+        const paradigmExecution: Partial<ParadigmExecution> = {
+        id: executionId,
+        activity_id: validated.variant_id,
+        input_impulses: validated.impulses_used || [],
+        // Use output_impulses from improvisation traces if available
+        output_impulses: validated.output_impulses?.map((imp: any) => imp.shape) || [],
+        success: validated.success,
+        error: validated.error_message ? {
+          message: validated.error_message,
+          type: validated.error_type,
+          task_id: validated.failed_task_id,
+        } : undefined,
+        duration_ms: validated.duration_ms,
+        cost_usd: validated.cost,
+        tokens_in: validated.tokens.input,
+        tokens_out: validated.tokens.output,
+        org_id: orgId || undefined,
+        project_id: projectId || undefined,
+        // Edge learning fields
+        ...(validated.improvisation && { improvisation: validated.improvisation }),
+        ...(validated.input_impulse_shapes && { input_impulse_shapes: validated.input_impulse_shapes }),
+        ...(validated.output_impulse_shapes && { output_impulse_shapes: validated.output_impulse_shapes }),
+        ...(validated.metadata && { metadata: validated.metadata }),
+      };
+
+      const paradigmResult = await insertExecution(paradigmExecution, jwtAuth?.jwtToken);
+      if (paradigmResult) {
+        logger.info('[paradigm] Execution also written to execution table', {
+          id: executionId,
+          activity_id: validated.variant_id,
+          path: 'dual-write',
+        });
+      }
+      } catch (paradigmError) {
+        // Don't fail the request if paradigm write fails - legacy write succeeded
+        logger.warn('[paradigm] Dual-write to execution table failed (non-blocking)', {
+          execution_id: executionId,
+          error: paradigmError instanceof Error ? paradigmError.message : String(paradigmError),
+        });
+      }
+    } // end isDualWriteEnabled()
 
     // Step 2: Update Thompson Sampling metrics in variant_performance_metrics
     // Thompson Sampling uses Beta distribution: Beta(alpha, beta)
@@ -1573,73 +1700,119 @@ app.post('/recommend', async (c) => {
 
     // Get session data for multi-tenant filtering
     const sessionData = (c.get as any)('session') as SessionData | undefined;
-    const orgId = sessionData?.org_id || null;
-    const projectId = sessionData?.project_id || null;
+    const jwtAuth = getJwtAuthFromContext(c);
+    const orgId = jwtAuth?.orgId || sessionData?.org_id || null;
+    const projectId = jwtAuth?.projectId || sessionData?.project_id || null;
 
-    // Fetch templates for Thompson Sampling recommendations
-    // Include input_schema for schema-based filtering
-    let query = `
-      SELECT
-        variant_id,
-        activity_id,
-        variant_name,
-        category,
-        input_schema,
-        output_schema
-      FROM activity_template
-    `;
+    // PARADIGM PATH: Try new schema with shape-based matching first
+    // Falls back to legacy activity_template if new schema fails or returns empty
+    let templates: any[] = [];
+    let queryPath: 'new' | 'legacy' = 'legacy';
 
-    const params: Record<string, any> = {};
-
-    // Build WHERE clause for multi-tenant filtering
-    const whereClauses: string[] = [];
-
-    if (orgId) {
-      whereClauses.push(`(scope IS NULL OR scope = 'global' OR (scope = 'org' AND org_id = $org_id) OR (scope = 'project' AND project_id = $project_id))`);
-      params.org_id = orgId;
-      params.project_id = projectId;
-    } else {
-      whereClauses.push(`(scope IS NULL OR scope = 'global')`);
-    }
-
-    // Filter by category if provided
-    if (category) {
-      whereClauses.push(`category = $category`);
-      params.category = category;
-    }
-
-    if (whereClauses.length > 0) {
-      query += ` WHERE ${whereClauses.join(' AND ')}`;
-    }
-
-    logger.debug('Recommendation query', { query, params });
-
-    const result = await surrealDB.query(query, params);
-    let templates: any[] = result || [];
-
-    logger.info('Templates fetched for recommendation', { count: templates.length });
-
-    // Apply schema-based filtering if impulse_shapes provided
     if (impulse_shapes && impulse_shapes.length > 0) {
-      const beforeCount = templates.length;
-      templates = filterByInputSchema(templates, impulse_shapes);
-      logger.info('Schema filtering applied', {
-        before: beforeCount,
-        after: templates.length,
-        providedShapes: impulse_shapes,
-        reduction: `${Math.round((1 - templates.length / beforeCount) * 100)}%`
-      });
+      // Use shape-based matching with new activity table
+      const paradigmResult = await queryActivitiesByShapes(
+        impulse_shapes,
+        orgId,
+        category,
+        limit * 3, // Fetch more to account for filtering
+        jwtAuth?.jwtToken
+      );
+
+      if (paradigmResult.data.length > 0) {
+        templates = paradigmResult.data;
+        queryPath = paradigmResult.path;
+        logger.info('[paradigm] Activities fetched with shape matching', {
+          count: templates.length,
+          path: queryPath,
+          impulse_shapes,
+        });
+      }
     }
 
-    // Enrich templates with metrics (thompson_alpha, thompson_beta)
-    templates = await enrichTemplatesWithMetrics(templates);
+    // Fall back to legacy query if paradigm path returned no results
+    if (templates.length === 0) {
+      let query = `
+        SELECT
+          variant_id,
+          activity_id,
+          variant_name,
+          category,
+          input_schema,
+          output_schema
+        FROM activity_template
+      `;
+
+      const params: Record<string, any> = {};
+
+      // Build WHERE clause for multi-tenant filtering
+      const whereClauses: string[] = [];
+
+      if (orgId) {
+        whereClauses.push(`(scope IS NULL OR scope = 'global' OR (scope = 'org' AND org_id = $org_id) OR (scope = 'project' AND project_id = $project_id))`);
+        params.org_id = orgId;
+        params.project_id = projectId;
+      } else {
+        whereClauses.push(`(scope IS NULL OR scope = 'global')`);
+      }
+
+      // Filter by category if provided
+      if (category) {
+        whereClauses.push(`category = $category`);
+        params.category = category;
+      }
+
+      if (whereClauses.length > 0) {
+        query += ` WHERE ${whereClauses.join(' AND ')}`;
+      }
+
+      logger.debug('Recommendation query (legacy)', { query, params });
+
+      const result = await surrealDB.query(query, params);
+      templates = result || [];
+      queryPath = 'legacy';
+
+      logger.info('Templates fetched for recommendation', { count: templates.length, path: queryPath });
+
+      // Apply schema-based filtering if impulse_shapes provided (legacy fallback)
+      if (impulse_shapes && impulse_shapes.length > 0) {
+        const beforeCount = templates.length;
+        templates = filterByInputSchema(templates, impulse_shapes);
+        logger.info('Schema filtering applied (legacy)', {
+          before: beforeCount,
+          after: templates.length,
+          providedShapes: impulse_shapes,
+          reduction: `${Math.round((1 - templates.length / beforeCount) * 100)}%`
+        });
+      }
+    }
+
+    // Get Thompson Sampling scores from v_activity_score (or fallback to variant_performance_metrics)
+    const activityIds = templates.map((t: any) => t.id || t.variant_id);
+    let scoresMap = new Map<string, ActivityScore>();
+
+    if (activityIds.length > 0 && orgId) {
+      const scoresResult = await getActivityScores(orgId, activityIds, jwtAuth?.jwtToken);
+      for (const score of scoresResult.data) {
+        scoresMap.set(score.activity_id, score);
+      }
+      logger.debug('[paradigm] Activity scores fetched', {
+        count: scoresResult.data.length,
+        path: scoresResult.path,
+      });
+    } else {
+      // Fallback: Use enrichTemplatesWithMetrics for legacy path
+      templates = await enrichTemplatesWithMetrics(templates);
+    }
 
     // Apply Thompson Sampling
     const recommendations = templates
-      .map((template) => {
-        // Get alpha/beta from enriched metrics (defaults: Beta(1,1) = uniform prior)
-        const alpha = template.metrics?.thompson_alpha || 1.0;
-        const betaVal = template.metrics?.thompson_beta || 1.0;
+      .map((template: any) => {
+        // Try to get alpha/beta from v_activity_score first
+        const activityId = template.id || template.variant_id;
+        const scores = scoresMap.get(activityId);
+        const alpha = scores?.alpha || template.metrics?.thompson_alpha || 1.0;
+        const betaVal = scores?.beta || template.metrics?.thompson_beta || 1.0;
 
         // Sample from Beta(alpha, beta) distribution for Thompson Sampling
         // This enables exploration (high variance for uncertain templates) and
@@ -1647,9 +1820,11 @@ app.post('/recommend', async (c) => {
         const sample = betaSample(alpha, betaVal);
 
         return {
-          template_id: template.variant_id,
-          template_name: template.variant_name,
+          template_id: activityId,
+          template_name: template.name || template.variant_name,
           category: template.category,
+          input_shapes: template.input_shapes || [],
+          output_shapes: template.output_shapes || [],
           input_schema: template.input_schema || null,
           output_schema: template.output_schema || null,
           selection_metadata: {
@@ -1658,11 +1833,12 @@ app.post('/recommend', async (c) => {
             beta: betaVal,
             sample,
             score: sample, // Use sample as score for ranking
+            query_path: queryPath, // For monitoring
           },
         };
       })
       // Sort by Thompson sample (highest first)
-      .sort((a, b) => b.selection_metadata.sample - a.selection_metadata.sample)
+      .sort((a: any, b: any) => b.selection_metadata.sample - a.selection_metadata.sample)
       // Take top N
       .slice(0, limit);
 
