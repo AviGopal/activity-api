@@ -11,6 +11,7 @@ import { logger } from '../utils/logger';
 import type { SessionData } from '../models/schemas';
 import { getJwtAuthFromContext, hasJwtAuth } from '../middleware/jwtAuth';
 import { config } from '../config';
+import { insertExecution, isDualWriteEnabled, type ParadigmExecution } from '../db/paradigm';
 
 const app = new Hono();
 
@@ -72,6 +73,12 @@ interface ExecutionTrace {
   project_id: string | null;
   executed_at: string;
   created_at: string;
+  // Edge learning fields
+  improvisation?: boolean;
+  input_impulse_shapes?: string[];
+  output_impulse_shapes?: string[];
+  output_impulses?: Array<{ shape: string; pointer: Record<string, unknown> }>;
+  metadata?: Record<string, unknown>;
 }
 
 interface ListExecutionTracesResponse {
@@ -448,6 +455,16 @@ app.post('/', async (c) => {
       // Timestamps (SurrealDB datetime type)
       executed_at: new Date(),
       created_at: new Date(),
+
+      // Edge learning fields (from improvisation traces)
+      ...(body.improvisation ? { improvisation: body.improvisation } : {}),
+      ...(body.input_impulse_shapes && body.input_impulse_shapes.length > 0
+        ? { input_impulse_shapes: body.input_impulse_shapes } : {}),
+      ...(body.output_impulse_shapes && body.output_impulse_shapes.length > 0
+        ? { output_impulse_shapes: body.output_impulse_shapes } : {}),
+      ...(body.output_impulses && body.output_impulses.length > 0
+        ? { output_impulses: body.output_impulses } : {}),
+      ...(body.metadata ? { metadata: body.metadata } : {}),
     };
 
     // Insert into database
@@ -462,6 +479,12 @@ app.post('/', async (c) => {
     if (trace.component_changes) optionalFields.push('component_changes: $component_changes');
     if (trace.tasks) optionalFields.push('tasks: $tasks');
     if (trace.state_snapshot) optionalFields.push('state_snapshot: $state_snapshot');
+    // Edge learning fields
+    if (trace.improvisation) optionalFields.push('improvisation: $improvisation');
+    if (trace.input_impulse_shapes) optionalFields.push('input_impulse_shapes: $input_impulse_shapes');
+    if (trace.output_impulse_shapes) optionalFields.push('output_impulse_shapes: $output_impulse_shapes');
+    if (trace.output_impulses) optionalFields.push('output_impulses: $output_impulses');
+    if (trace.metadata) optionalFields.push('metadata: $metadata');
 
     const optionalFieldsStr = optionalFields.length > 0 ? `,\n        ${optionalFields.join(',\n        ')}` : '';
 
@@ -515,6 +538,62 @@ app.post('/', async (c) => {
       task_count: body.execution_trace?.tasks?.length || 0,
       db_result: result[0],
     });
+
+    // DUAL-WRITE: Also insert into new paradigm execution table (schema-paradigm-alignment)
+    // v_activity_score view computes Thompson Sampling from execution table automatically
+    // P4.1: Feature flag controlled
+    if (isDualWriteEnabled()) {
+      try {
+        // Use new fields from MiniBob (P3.1) or fallback to legacy extraction
+      const inputImpulses = body.input_impulses || trace.impulses_used || [];
+      // Paradigm table expects array<string> for output_impulses (impulse IDs)
+      // Convert full impulse objects to shape strings for compatibility
+      const rawOutputImpulses = body.output_impulses || body.execution_trace?.impulsesCreated || [];
+      const outputImpulses: string[] = rawOutputImpulses.map((imp: any) =>
+        typeof imp === 'string' ? imp : (imp?.shape || 'unknown')
+      );
+
+      const paradigmExecution: Partial<ParadigmExecution> = {
+        id: trace.execution_id,
+        activity_id: trace.variant_id,
+        input_impulses: inputImpulses,
+        output_impulses: outputImpulses,
+        success: trace.success,
+        error: trace.error_message ? {
+          message: trace.error_message,
+          type: trace.error_type,
+          task_id: trace.failed_task_id,
+        } : undefined,
+        duration_ms: trace.duration_ms,
+        cost_usd: trace.cost_usd,
+        tokens_in: trace.tokens_input,
+        tokens_out: trace.tokens_output,
+        parent_execution_id: body.parent_execution_id,
+        trace: {
+          tasks: trace.tasks,
+          state_snapshot: trace.state_snapshot,
+        },
+        org_id: typeof trace.org_id === 'string' ? trace.org_id : undefined,
+        project_id: typeof trace.project_id === 'string' ? trace.project_id : undefined,
+        vessel_id: body.vessel_id || body.pod_name,
+      };
+
+      const paradigmResult = await insertExecution(paradigmExecution, jwtAuth?.jwtToken);
+      if (paradigmResult) {
+        logger.info('[paradigm] Execution trace also written to execution table', {
+          id: trace.execution_id,
+          activity_id: trace.variant_id,
+          path: 'dual-write',
+        });
+      }
+      } catch (paradigmError) {
+        // Don't fail the request if paradigm write fails - legacy write succeeded
+        logger.warn('[paradigm] Dual-write to execution table failed (non-blocking)', {
+          execution_id: trace.execution_id,
+          error: paradigmError instanceof Error ? paradigmError.message : String(paradigmError),
+        });
+      }
+    } // end isDualWriteEnabled()
 
     // M4.2: Forward to learning service (async/non-blocking)
     // Extract modified files from execution trace

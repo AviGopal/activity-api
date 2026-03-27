@@ -131,6 +131,10 @@ DEFINE FIELD IF NOT EXISTS output_impulse_shapes ON activity_execution_traces TY
 DEFINE FIELD IF NOT EXISTS output_impulses ON activity_execution_traces TYPE option<array<object>> FLEXIBLE
   COMMENT "Full output impulse data [{shape, pointer}] for ribosome extraction";
 
+-- Nested field definitions for output_impulses array elements (FLEXIBLE required for arbitrary nested structure)
+DEFINE FIELD IF NOT EXISTS output_impulses.* ON activity_execution_traces TYPE object FLEXIBLE
+  COMMENT "Individual output impulse with shape and pointer (allows arbitrary nested fields)";
+
 DEFINE FIELD IF NOT EXISTS metadata ON activity_execution_traces TYPE option<object> FLEXIBLE
   COMMENT "Extensible metadata for edge learning (inputShapes, outputShapes, producedImpulses, etc.)";
 
