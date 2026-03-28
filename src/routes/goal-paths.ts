@@ -342,7 +342,7 @@ app.get('/', async (c) => {
       GROUP ALL
     `;
     
-    const countResult = await surrealDB.query<{ total: number }[]>(countQuery, params);
+    const countResult = await surrealDB.query<{ total: number }>(countQuery, params);
     const total = countResult && countResult.length > 0 ? countResult[0].total : 0;
     
     const response = PathsResponseSchema.parse({
@@ -520,15 +520,15 @@ app.get('/stats', async (c) => {
         SELECT goal_hash FROM goal_execution_paths GROUP BY goal_hash
       ) GROUP ALL
     `;
-    const goalsResult = await surrealDB.query<{ total: number }[]>(goalsQuery);
+    const goalsResult = await surrealDB.query<{ total: number }>(goalsQuery);
     const totalGoals = goalsResult && goalsResult.length > 0 ? goalsResult[0].total : 0;
-    
+
     // Total paths
     const pathsQuery = `
       SELECT count() AS total FROM goal_execution_paths
       GROUP ALL
     `;
-    const pathsResult = await surrealDB.query<{ total: number }[]>(pathsQuery);
+    const pathsResult = await surrealDB.query<{ total: number }>(pathsQuery);
     const totalPaths = pathsResult && pathsResult.length > 0 ? pathsResult[0].total : 0;
     
     // Avg paths per goal

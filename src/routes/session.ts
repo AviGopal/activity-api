@@ -1,15 +1,22 @@
 import { Hono } from 'hono';
 import { v4 as uuidv4 } from 'uuid';
 import { RedisClient } from '../db/redis';
-import { 
-  SessionPostRequestSchema, 
+import {
+  SessionPostRequestSchema,
   SessionDataSchema,
   type SessionPostRequest,
-  type SessionData 
+  type SessionData
 } from '../models/schemas';
 import { logger } from '../utils/logger';
 
-const router = new Hono();
+// Define app environment type with session context variable
+type SessionEnv = {
+  Variables: {
+    session: SessionData | null;
+  };
+};
+
+const router = new Hono<SessionEnv>();
 
 /**
  * POST /v2/session

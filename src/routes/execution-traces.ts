@@ -189,6 +189,7 @@ app.get('/', async (c) => {
     const offsetParam = parseInt(c.req.query('offset') || '0', 10);
     const startDate = c.req.query('start_date');
     const endDate = c.req.query('end_date');
+    const includeSelection = c.req.query('include_selection') === 'true';
 
     // Validate and cap limit
     const limit = Math.min(Math.max(limitParam, 1), 500);
@@ -303,10 +304,129 @@ app.get('/', async (c) => {
       total,
       limit,
       offset,
+      includeSelection,
     });
 
+    // If include_selection is true, fetch selection data for each trace
+    let executionsWithSelection = executions || [];
+    if (includeSelection && executionsWithSelection.length > 0) {
+      // Collect correlation_ids from traces that have them
+      const correlationIds = executionsWithSelection
+        .filter((e: any) => e.correlation_id)
+        .map((e: any) => e.correlation_id);
+
+      // Collect activity_ids for traces without correlation_id
+      const activityIds = executionsWithSelection
+        .filter((e: any) => !e.correlation_id)
+        .map((e: any) => e.activity_id || e.variant_id);
+
+      // Batch fetch selection data
+      let selectionByCorrelation = new Map<string, any>();
+      let selectionByActivity = new Map<string, any>();
+
+      try {
+        // Fetch by correlation_id (exact match)
+        if (correlationIds.length > 0) {
+          const correlationQuery = `
+            SELECT
+              correlation_id,
+              thompson_sample,
+              alpha,
+              beta,
+              selection_method,
+              candidates_count,
+              selected_at
+            FROM thompson_selection_log
+            WHERE correlation_id IN $correlation_ids
+          `;
+          const correlationResults = await surrealDB.query<any>(correlationQuery, {
+            correlation_ids: correlationIds,
+          });
+          for (const sel of correlationResults || []) {
+            selectionByCorrelation.set(sel.correlation_id, sel);
+          }
+        }
+
+        // Fetch most recent by activity_id (fallback for traces without correlation_id)
+        if (activityIds.length > 0) {
+          const activityQuery = `
+            SELECT
+              activity_id,
+              thompson_sample,
+              alpha,
+              beta,
+              selection_method,
+              candidates_count,
+              selected_at,
+              correlation_id
+            FROM thompson_selection_log
+            WHERE activity_id IN $activity_ids
+            ORDER BY selected_at DESC
+          `;
+          const activityResults = await surrealDB.query<any>(activityQuery, {
+            activity_ids: [...new Set(activityIds)], // Dedupe
+          });
+          // Take most recent per activity
+          for (const sel of activityResults || []) {
+            if (!selectionByActivity.has(sel.activity_id)) {
+              selectionByActivity.set(sel.activity_id, sel);
+            }
+          }
+        }
+
+        // Attach selection_attribution to each trace
+        executionsWithSelection = executionsWithSelection.map((trace: any) => {
+          let selectionData = null;
+          let matchType: 'exact' | 'activity_fallback' | null = null;
+
+          if (trace.correlation_id && selectionByCorrelation.has(trace.correlation_id)) {
+            const sel = selectionByCorrelation.get(trace.correlation_id);
+            selectionData = {
+              selection_probability: sel.thompson_sample,
+              selection_method: sel.selection_method,
+              alpha_at_selection: sel.alpha,
+              beta_at_selection: sel.beta,
+              candidates_count: sel.candidates_count,
+              selected_at: sel.selected_at,
+              match_type: 'exact' as const,
+            };
+          } else {
+            const activityKey = trace.activity_id || trace.variant_id;
+            if (selectionByActivity.has(activityKey)) {
+              const sel = selectionByActivity.get(activityKey);
+              selectionData = {
+                selection_probability: sel.thompson_sample,
+                selection_method: sel.selection_method,
+                alpha_at_selection: sel.alpha,
+                beta_at_selection: sel.beta,
+                candidates_count: sel.candidates_count,
+                selected_at: sel.selected_at,
+                match_type: 'activity_fallback' as const,
+              };
+            }
+          }
+
+          return {
+            ...trace,
+            selection_attribution: selectionData,
+          };
+        });
+
+        logger.info('Selection attribution added to traces', {
+          byCorrelation: selectionByCorrelation.size,
+          byActivity: selectionByActivity.size,
+          totalTraces: executionsWithSelection.length,
+        });
+      } catch (selectionError) {
+        logger.warn('Failed to fetch selection data for list', {
+          error: selectionError instanceof Error ? selectionError.message : String(selectionError),
+        });
+        // Continue without selection data
+      }
+    }
+
     const response: ListExecutionTracesResponse = {
-      executions: executions || [],
+      executions: executionsWithSelection,
       total,
       limit,
       offset,
@@ -331,18 +451,20 @@ app.get('/', async (c) => {
  * GET /v2/activities/execution-traces/:executionId
  *
  * Get detailed information about a specific execution trace
+ * Enhanced with Thompson Sampling selection data for explainability (M4.2)
  */
 app.get('/:executionId', async (c) => {
   try {
     const executionId = c.req.param('executionId');
 
-    const query = `
+    // Fetch execution trace
+    const traceQuery = `
       SELECT * FROM activity_execution_traces
       WHERE execution_id = $execution_id
       LIMIT 1
     `;
 
-    const result = await surrealDB.query<ExecutionTrace>(query, {
+    const result = await surrealDB.query<ExecutionTrace>(traceQuery, {
       execution_id: executionId,
     });
 
@@ -355,7 +477,6 @@ app.get('/:executionId', async (c) => {
     if (!result || result.length === 0) {
       logger.warn('Execution trace not found in database', {
         executionId,
-        query,
         params: { execution_id: executionId },
       });
       return c.json({
@@ -364,7 +485,90 @@ app.get('/:executionId', async (c) => {
       }, 404);
     }
 
-    return c.json(result[0]);
+    const trace = result[0];
+
+    // M4.2: Fetch Thompson Sampling selection data for explainability
+    // Priority: 1) correlation_id (exact match), 2) activity_id (approximate/most recent)
+    let selectionData = null;
+    try {
+      let selectionResult: {
+        thompson_sample: number;
+        alpha: number;
+        beta: number;
+        selection_method: string;
+        candidates_count: number | null;
+        selected_at: string;
+        correlation_id?: string;
+      }[] = [];
+
+      // First try exact match by correlation_id if the trace has one
+      if ((trace as any).correlation_id) {
+        const correlationQuery = `
+          SELECT
+            thompson_sample,
+            alpha,
+            beta,
+            selection_method,
+            candidates_count,
+            selected_at,
+            correlation_id
+          FROM thompson_selection_log
+          WHERE correlation_id = $correlation_id
+          LIMIT 1
+        `;
+        selectionResult = await surrealDB.query(correlationQuery, {
+          correlation_id: (trace as any).correlation_id,
+        });
+      }
+
+      // Fall back to activity_id match (most recent selection for this activity)
+      if (!selectionResult || selectionResult.length === 0) {
+        const activityQuery = `
+          SELECT
+            thompson_sample,
+            alpha,
+            beta,
+            selection_method,
+            candidates_count,
+            selected_at,
+            correlation_id
+          FROM thompson_selection_log
+          WHERE activity_id = $activity_id
+          ORDER BY selected_at DESC
+          LIMIT 1
+        `;
+        selectionResult = await surrealDB.query(activityQuery, {
+          activity_id: trace.activity_id || trace.variant_id,
+        });
+      }
+
+      if (selectionResult && selectionResult.length > 0) {
+        const sel = selectionResult[0];
+        selectionData = {
+          selection_probability: sel.thompson_sample,
+          selection_method: sel.selection_method,
+          alpha_at_selection: sel.alpha,
+          beta_at_selection: sel.beta,
+          candidates_count: sel.candidates_count,
+          selected_at: sel.selected_at,
+          // Include match type for debugging
+          match_type: (trace as any).correlation_id && sel.correlation_id === (trace as any).correlation_id
+            ? 'exact' : 'activity_fallback',
+        };
+      }
+    } catch (selectionError) {
+      // Don't fail the request if selection data fetch fails
+      logger.warn('Failed to fetch selection data', {
+        executionId,
+        error: selectionError instanceof Error ? selectionError.message : String(selectionError),
+      });
+    }
+
+    // Return trace with optional selection data
+    return c.json({
+      ...trace,
+      selection_attribution: selectionData,
+    });
 
   } catch (error) {
     logger.error('Failed to get execution trace', {
@@ -373,6 +577,113 @@ app.get('/:executionId', async (c) => {
 
     return c.json({
       error: 'Failed to get execution trace',
+      message: error instanceof Error ? error.message : 'Unknown error',
+    }, 500);
+  }
+});
+
+/**
+ * GET /v2/activities/execution-traces/selection-events
+ *
+ * List Thompson Sampling selection events for explainability dashboard (M4.1)
+ *
+ * Query params:
+ * - activity_id: Filter by activity ID
+ * - limit: Max records to return (default: 50, max: 500)
+ * - offset: Pagination offset (default: 0)
+ * - start_date: Filter selections after this ISO timestamp
+ * - end_date: Filter selections before this ISO timestamp
+ */
+app.get('/selection-events', async (c) => {
+  try {
+    const jwtAuth = getJwtAuthFromContext(c);
+    const useJwtAuth = hasJwtAuth(c);
+
+    // Parse query params
+    const activityId = c.req.query('activity_id');
+    const limitParam = parseInt(c.req.query('limit') || '50', 10);
+    const offsetParam = parseInt(c.req.query('offset') || '0', 10);
+    const startDate = c.req.query('start_date');
+    const endDate = c.req.query('end_date');
+
+    const limit = Math.min(Math.max(limitParam, 1), 500);
+    const offset = Math.max(offsetParam, 0);
+
+    // Build query
+    const whereConditions: string[] = [];
+    const params: Record<string, any> = { limit, offset };
+
+    if (activityId) {
+      whereConditions.push('activity_id = $activity_id');
+      params.activity_id = activityId;
+    }
+
+    if (startDate) {
+      whereConditions.push('selected_at >= $start_date');
+      params.start_date = startDate;
+    }
+
+    if (endDate) {
+      whereConditions.push('selected_at <= $end_date');
+      params.end_date = endDate;
+    }
+
+    const whereClause = whereConditions.length > 0
+      ? `WHERE ${whereConditions.join(' AND ')}`
+      : '';
+
+    const query = `
+      SELECT * FROM thompson_selection_log
+      ${whereClause}
+      ORDER BY selected_at DESC
+      LIMIT $limit
+      START $offset
+    `;
+
+    logger.info('Fetching selection events', { whereClause, params });
+
+    let events: any[];
+    let countResult: { total: number }[];
+
+    if (useJwtAuth && jwtAuth?.jwtToken) {
+      events = await queryWithAuth(jwtAuth.jwtToken, query, params);
+      const countQuery = `
+        SELECT count() as total FROM thompson_selection_log
+        ${whereClause}
+        GROUP ALL
+      `;
+      countResult = await queryWithAuth(jwtAuth.jwtToken, countQuery, params);
+    } else {
+      events = await surrealDB.query(query, params);
+      const countQuery = `
+        SELECT count() as total FROM thompson_selection_log
+        ${whereClause}
+        GROUP ALL
+      `;
+      countResult = await surrealDB.query(countQuery, params);
+    }
+
+    const total = countResult?.[0]?.total || 0;
+
+    logger.info('Selection events fetched', {
+      count: events?.length || 0,
+      total,
+    });
+
+    return c.json({
+      events: events || [],
+      total,
+      limit,
+      offset,
+    });
+
+  } catch (error) {
+    logger.error('Failed to list selection events', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+
+    return c.json({
+      error: 'Failed to list selection events',
       message: error instanceof Error ? error.message : 'Unknown error',
     }, 500);
   }
@@ -465,6 +776,9 @@ app.post('/', async (c) => {
       ...(body.output_impulses && body.output_impulses.length > 0
         ? { output_impulses: body.output_impulses } : {}),
       ...(body.metadata ? { metadata: body.metadata } : {}),
+
+      // Selection-to-execution correlation (from /recommend endpoint)
+      ...(body.correlation_id ? { correlation_id: body.correlation_id } : {}),
     };
 
     // Insert into database
@@ -485,6 +799,8 @@ app.post('/', async (c) => {
     if (trace.output_impulse_shapes) optionalFields.push('output_impulse_shapes: $output_impulse_shapes');
     if (trace.output_impulses) optionalFields.push('output_impulses: $output_impulses');
     if (trace.metadata) optionalFields.push('metadata: $metadata');
+    // Selection-to-execution correlation
+    if ((trace as any).correlation_id) optionalFields.push('correlation_id: $correlation_id');
 
     const optionalFieldsStr = optionalFields.length > 0 ? `,\n        ${optionalFields.join(',\n        ')}` : '';
 

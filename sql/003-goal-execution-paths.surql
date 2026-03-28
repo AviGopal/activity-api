@@ -24,8 +24,8 @@ DEFINE FIELD goal_text ON goal_execution_paths TYPE string
   COMMENT "Original goal text as provided by user";
 
 DEFINE FIELD goal_category ON goal_execution_paths TYPE string
-  ASSERT $value IN ['feature', 'bugfix', 'refactor', 'tool', 'infrastructure']
-  COMMENT "Goal category for filtering";
+  ASSERT $value IN ['feature', 'bugfix', 'refactor', 'tool', 'infrastructure', 'meta']
+  COMMENT "Goal category for filtering (meta = self-referential goals)";
 
 -- Path definition
 DEFINE FIELD path_activities ON goal_execution_paths TYPE array<string>

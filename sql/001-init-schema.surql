@@ -16,7 +16,32 @@
 -- Stores activity template variants with their task definitions
 -- =============================================================================
 
-DEFINE TABLE activity_template SCHEMAFULL;
+-- Note: org_id is stored as string (legacy format) but $auth.org_id from JWT
+-- is a record reference like "organizations:metabob_internal". We handle both
+-- by comparing against both formats in PERMISSIONS.
+DEFINE TABLE activity_template SCHEMAFULL
+  PERMISSIONS
+    -- SELECT: Users can see global templates or templates in their org
+    -- Handle both string org_id and record $auth.org_id formats
+    FOR select WHERE
+      scope = 'global'
+      OR org_id IS NONE
+      OR org_id = $auth.org_id
+      OR org_id = string::replace(type::string($auth.org_id), 'organizations:', '')
+
+    -- CREATE: Authenticated users can create templates
+    FOR create WHERE $auth != NONE
+
+    -- UPDATE: Users can update templates in their org
+    FOR update WHERE
+      org_id IS NONE
+      OR org_id = $auth.org_id
+      OR org_id = string::replace(type::string($auth.org_id), 'organizations:', '')
+
+    -- DELETE: Users can delete templates in their org
+    FOR delete WHERE
+      org_id IS NONE
+      OR org_id = $auth.org_id;
 
 DEFINE FIELD variant_id ON activity_template TYPE string
   ASSERT $value != NONE
@@ -34,9 +59,19 @@ DEFINE FIELD description ON activity_template TYPE string
   ASSERT $value != NONE
   COMMENT "Template description";
 
-DEFINE FIELD category ON activity_template TYPE string
-  ASSERT $value IN ['feature', 'bugfix', 'refactor', 'tool', 'infrastructure']
-  COMMENT "Template category";
+-- DEPRECATED: Use tags field instead. Kept for backward compatibility.
+DEFINE FIELD category ON activity_template TYPE option<string>
+  COMMENT "DEPRECATED: Use tags field for hierarchical classification.";
+
+-- Hierarchical tags using dot-notation (e.g., feature.vessel.state.communication)
+DEFINE FIELD tags ON activity_template TYPE array<string>
+  DEFAULT []
+  COMMENT "Hierarchical tags using dot-notation (e.g., feature.vessel.state, utility.code.trace)";
+
+-- Computed tag prefixes for efficient prefix queries
+DEFINE FIELD tag_prefixes ON activity_template TYPE array<string>
+  DEFAULT []
+  COMMENT "Auto-computed tag prefixes for hierarchical queries";
 
 DEFINE FIELD task_steps ON activity_template TYPE option<array<object>> FLEXIBLE
   COMMENT "Array of task definitions (flexible structure - no nested validation)";
@@ -78,7 +113,30 @@ DEFINE INDEX idx_activity_template_category
 -- Stores aggregated performance metrics and Thompson Sampling parameters
 -- =============================================================================
 
-DEFINE TABLE variant_performance_metrics SCHEMAFULL;
+-- Note: org_id is stored as string (legacy format) but $auth.org_id from JWT
+-- is a record reference. Handle both formats in PERMISSIONS.
+DEFINE TABLE variant_performance_metrics SCHEMAFULL
+  PERMISSIONS
+    -- SELECT: Users can see metrics for global templates or their org's templates
+    -- Handle both string org_id and record $auth.org_id formats
+    FOR select WHERE
+      org_id IS NONE
+      OR org_id = $auth.org_id
+      OR org_id = string::replace(type::string($auth.org_id), 'organizations:', '')
+
+    -- CREATE: Authenticated users can create metrics
+    FOR create WHERE $auth != NONE
+
+    -- UPDATE: Users can update metrics for their org
+    FOR update WHERE
+      org_id IS NONE
+      OR org_id = $auth.org_id
+      OR org_id = string::replace(type::string($auth.org_id), 'organizations:', '')
+
+    -- DELETE: Users can delete metrics for their org
+    FOR delete WHERE
+      org_id IS NONE
+      OR org_id = $auth.org_id;
 
 DEFINE FIELD variant_id ON variant_performance_metrics TYPE string
   ASSERT $value != NONE

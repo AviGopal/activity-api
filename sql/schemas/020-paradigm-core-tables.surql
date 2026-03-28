@@ -301,6 +301,9 @@ DEFINE INDEX IF NOT EXISTS idx_execution_org_activity ON execution FIELDS org_id
 DEFINE INDEX IF NOT EXISTS idx_execution_vessel ON execution FIELDS vessel_id;
 DEFINE INDEX IF NOT EXISTS idx_execution_executed_at ON execution FIELDS executed_at;
 
+-- Composite index for dashboard success rate time-series queries
+DEFINE INDEX IF NOT EXISTS idx_execution_org_success_time ON execution FIELDS org_id, success, executed_at;
+
 -- ============================================================================
 -- Table 4: vessel
 -- ============================================================================

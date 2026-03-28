@@ -229,7 +229,7 @@ connections.post('/acquire', async (c) => {
 
     // Find API key by hash comparison
     // First, get all active API keys and verify hash
-    const apiKeys = await surrealDB.query<ApiKey[]>(
+    const apiKeys = await surrealDB.query<ApiKey>(
       `SELECT * FROM api_keys WHERE is_active = true AND status = 'active'`
     );
 
@@ -268,7 +268,7 @@ connections.post('/acquire', async (c) => {
       const activeCount = await getSlotCount(matchedKey.id);
 
       // Get oldest connection info
-      const activeConnections = await surrealDB.query<Connection[]>(
+      const activeConnections = await surrealDB.query<Connection>(
         `SELECT * FROM connection
          WHERE api_key_id = $apiKeyId AND status IN ['active', 'grace']
          ORDER BY connected_at ASC LIMIT 1`,
@@ -319,7 +319,7 @@ connections.post('/acquire', async (c) => {
 
     // Create connection record in SurrealDB
     const now = new Date().toISOString();
-    const connectionRecord = await surrealDB.query<Connection[]>(
+    const connectionRecord = await surrealDB.query<Connection>(
       `CREATE $connectionId CONTENT {
         api_key_id: $apiKeyId,
         org_id: $orgId,
@@ -416,20 +416,20 @@ connections.post('/heartbeat', async (c) => {
     }
 
     // Verify connection exists and belongs to this org
-    const connections = await queryWithAuth<Connection>(
-      jwtAuth.jwtToken,
+    const connectionsResult = await queryWithAuth<Connection>(
+      jwtAuth!.jwtToken,
       `SELECT * FROM $connectionId WHERE status IN ['active', 'grace']`,
       { connectionId }
     );
 
-    if (connections.length === 0) {
+    if (connectionsResult.length === 0) {
       return c.json({
         error: 'connection_not_found',
         message: 'Connection not found or already disconnected'
       }, 404);
     }
 
-    const connection = connections[0];
+    const connection = connectionsResult[0];
 
     // Update heartbeat and execution state
     const now = new Date().toISOString();
@@ -451,7 +451,7 @@ connections.post('/heartbeat', async (c) => {
     }
 
     await queryWithAuth(
-      jwtAuth.jwtToken,
+      jwtAuth!.jwtToken,
       `UPDATE $connectionId MERGE $updateFields`,
       { connectionId, updateFields }
     );
@@ -515,19 +515,19 @@ connections.post('/reconnect', async (c) => {
     }
 
     // Find connection by session token
-    const connections = await surrealDB.query<Connection[]>(
+    const connectionsResult = await surrealDB.query<Connection>(
       `SELECT * FROM connection WHERE session_token = $sessionToken LIMIT 1`,
       { sessionToken: session_token }
     );
 
-    if (connections.length === 0) {
+    if (connectionsResult.length === 0) {
       return c.json({
         error: 'session_not_found',
         message: 'Session not found'
       }, 404);
     }
 
-    const connection = connections[0];
+    const connection = connectionsResult[0];
 
     // Check if already disconnected (past grace period)
     if (connection.status === 'disconnected') {
@@ -564,12 +564,12 @@ connections.post('/reconnect', async (c) => {
 
     // We need the original API key to regenerate JWT
     // For now, get it from the api_keys table via the api_key_id
-    const apiKeys = await surrealDB.query<ApiKey[]>(
+    const apiKeysResult = await surrealDB.query<ApiKey>(
       `SELECT * FROM $apiKeyId`,
       { apiKeyId: connection.api_key_id }
     );
 
-    if (apiKeys.length === 0) {
+    if (apiKeysResult.length === 0) {
       await db.close();
       return c.json({
         error: 'api_key_not_found',
@@ -667,25 +667,25 @@ connections.post('/release', async (c) => {
     }
 
     // Verify connection exists and belongs to this org
-    const connections = await queryWithAuth<Connection>(
-      jwtAuth.jwtToken,
+    const releaseConnectionsResult = await queryWithAuth<Connection>(
+      jwtAuth!.jwtToken,
       `SELECT * FROM $connectionId`,
       { connectionId }
     );
 
-    if (connections.length === 0) {
+    if (releaseConnectionsResult.length === 0) {
       return c.json({
         error: 'connection_not_found',
         message: 'Connection not found'
       }, 404);
     }
 
-    const connection = connections[0];
+    const connection = releaseConnectionsResult[0];
 
     // Mark as disconnected
     const now = new Date().toISOString();
     await queryWithAuth(
-      jwtAuth.jwtToken,
+      jwtAuth!.jwtToken,
       `UPDATE $connectionId SET
         status = 'disconnected',
         disconnected_at = $now,
@@ -735,7 +735,7 @@ connections.get('/count', async (c) => {
     const redisCount = await getSlotCount(apiKeyId);
 
     // Also get from SurrealDB for accuracy (in case Redis is stale)
-    const dbConnections = await surrealDB.query<{ count: number }[]>(
+    const dbConnections = await surrealDB.query<{ count: number }>(
       `SELECT count() as count FROM connection
        WHERE api_key_id = $apiKeyId AND status IN ['active', 'grace']
        GROUP ALL`,
@@ -745,7 +745,7 @@ connections.get('/count', async (c) => {
     const dbCount = dbConnections[0]?.count || 0;
 
     // Get max_connections from the API key
-    const apiKeyInfo = await surrealDB.query<ApiKey[]>(
+    const apiKeyInfo = await surrealDB.query<ApiKey>(
       `SELECT max_connections, tier FROM $apiKeyId`,
       { apiKeyId }
     );
@@ -795,7 +795,7 @@ connections.get('/status', async (c) => {
 
     // Get all connections for this org
     const orgConnections = await queryWithAuth<Connection>(
-      jwtAuth.jwtToken,
+      jwtAuth!.jwtToken,
       `SELECT * FROM connection WHERE status IN ['active', 'grace'] ORDER BY connected_at DESC`
     );
 

@@ -166,7 +166,7 @@ app.post('/pattern', async (c) => {
     const patternId = `pattern:${body.required_impulse_type}:${body.satisfying_activity_id}`;
 
     // Check if pattern exists
-    const existing = await surrealDB.query<PrerequisitePattern[]>(
+    const existing = await surrealDB.query<PrerequisitePattern>(
       `SELECT * FROM prerequisite_patterns WHERE required_impulse_type = $type AND satisfying_activity_id = $activity`,
       { type: body.required_impulse_type, activity: body.satisfying_activity_id }
     );
@@ -179,7 +179,7 @@ app.post('/pattern', async (c) => {
       const newSuccessRate = newSuccessCount / newExecutionCount;
       const newAvgDuration = ((pattern.avg_duration_ms * pattern.execution_count) + (body.duration_ms || 0)) / newExecutionCount;
 
-      const updated = await surrealDB.query<PrerequisitePattern[]>(
+      const updated = await surrealDB.query<PrerequisitePattern>(
         `UPDATE prerequisite_patterns SET
           execution_count = $execution_count,
           success_count = $success_count,
@@ -278,7 +278,7 @@ app.get('/find-satisfier', async (c) => {
 
   try {
     // Find patterns that produce this impulse type (Thompson Sampling)
-    const patterns = await surrealDB.query<PrerequisitePattern[]>(
+    const patterns = await surrealDB.query<PrerequisitePattern>(
       `SELECT * FROM prerequisite_patterns
        WHERE required_impulse_type = $type
        ORDER BY success_rate DESC, execution_count DESC
@@ -288,7 +288,7 @@ app.get('/find-satisfier', async (c) => {
 
     if (!patterns || patterns.length === 0) {
       // Fallback: check activity prerequisites for what produces this impulse
-      const prerequisites = await surrealDB.query<ActivityPrerequisite[]>(
+      const prerequisites = await surrealDB.query<ActivityPrerequisite>(
         `SELECT * FROM activity_prerequisites
          WHERE produces_impulses[*].type CONTAINS $type`,
         { type: impulseType }

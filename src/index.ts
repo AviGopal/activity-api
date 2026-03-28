@@ -12,7 +12,7 @@ import { logger as honoLogger } from 'hono/logger';
 import { config } from './config';
 import { logger } from './utils/logger';
 import { authMiddleware } from './middleware/auth';
-import { jwtAuthMiddleware } from './middleware/jwtAuth';
+import { jwtAuthMiddleware, JwtAuthContext } from './middleware/jwtAuth';
 import authRoutes from './routes/auth';
 import sessionRoutes from './routes/session';
 import activitiesRoutes from './routes/activities';
@@ -23,10 +23,19 @@ import ciRoutes from './routes/ci';
 import executionTracesRoutes from './routes/execution-traces';
 import codeVariantsRoutes from './routes/code-variants';
 import vesselsRoutes from './routes/vessels';
+import connectionsRoutes from './routes/connections';
+import resolveRoutes from './routes/resolve';
 import { broadcaster } from './websocket/broadcaster';
 import type { ServerWebSocket } from 'bun';
 
-const app = new Hono();
+// Define app-wide environment type with jwtAuth context variable
+type AppEnv = {
+  Variables: {
+    jwtAuth: JwtAuthContext | null;
+  };
+};
+
+const app = new Hono<AppEnv>();
 
 // ============================================================================
 // Middleware
@@ -160,6 +169,12 @@ app.route('/v2/activities/code-variants', codeVariantsRoutes);
 // Vessel status routes (GET /v2/vessels/status, POST /v2/vessels/heartbeat)
 app.route('/v2/vessels', vesselsRoutes);
 
+// Connection slot routes (POST /v2/connections/acquire, heartbeat, reconnect, release)
+app.route('/v2/connections', connectionsRoutes);
+
+// Resolution routes (POST /v2/resolve - tiered resolver system)
+app.route('/v2', resolveRoutes);
+
 // ============================================================================
 // Error Handling
 // ============================================================================
@@ -284,6 +299,34 @@ const server = Bun.serve<WebSocketData>({
 
 logger.info(`Server running at http://localhost:${server.port}`);
 logger.info(`WebSocket endpoint available at ws://localhost:${server.port}/ws`);
+
+// ============================================================================
+// Heartbeat Worker (Connection Slot Management)
+// ============================================================================
+
+const heartbeatWorkerEnabled = process.env.HEARTBEAT_WORKER_ENABLED !== 'false';
+if (heartbeatWorkerEnabled) {
+  import('./workers/heartbeat').then(({ startHeartbeatWorker }) => {
+    startHeartbeatWorker();
+    logger.info('[Server] Heartbeat worker started');
+  }).catch(err => {
+    logger.error('[Server] Failed to start heartbeat worker', { error: err.message });
+  });
+}
+
+// ============================================================================
+// Budget Sync Worker (Token Budget Management)
+// ============================================================================
+
+const budgetWorkerEnabled = process.env.BUDGET_WORKER_ENABLED !== 'false';
+if (budgetWorkerEnabled) {
+  import('./resolvers/budget').then(({ startBudgetWorker }) => {
+    startBudgetWorker();
+    logger.info('[Server] Budget sync worker started');
+  }).catch(err => {
+    logger.error('[Server] Failed to start budget worker', { error: err.message });
+  });
+}
 
 // ============================================================================
 // Scheduled Task Generation (Self-Development Loop)

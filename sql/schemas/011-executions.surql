@@ -429,6 +429,78 @@ DEFINE INDEX IF NOT EXISTS idx_tool_usage_composite
   ON tool_usage FIELDS activity_id, tool_name;
 
 -- =============================================================================
+-- Table: thompson_selection_log
+-- =============================================================================
+-- Logs Thompson Sampling selection events for explainability
+-- Records the actual sampled value and parameters at selection time
+-- RBAC: Scoped by organization
+-- =============================================================================
+
+DEFINE TABLE IF NOT EXISTS thompson_selection_log SCHEMAFULL
+  PERMISSIONS
+    FOR select WHERE org_id = $auth.org_id
+    FOR create WHERE $auth.org_id != NONE
+    FOR update WHERE org_id = $auth.org_id AND $auth.role = 'admin'
+    FOR delete WHERE org_id = $auth.org_id AND $auth.role = 'admin';
+
+DEFINE FIELD IF NOT EXISTS execution_id ON thompson_selection_log TYPE string
+  ASSERT $value != NONE
+  COMMENT "Execution ID this selection resulted in";
+
+DEFINE FIELD IF NOT EXISTS activity_id ON thompson_selection_log TYPE string
+  ASSERT $value != NONE
+  COMMENT "Activity that was selected";
+
+DEFINE FIELD IF NOT EXISTS thompson_sample ON thompson_selection_log TYPE float
+  ASSERT $value >= 0 AND $value <= 1
+  COMMENT "Actual sampled value from Beta(alpha, beta) distribution";
+
+DEFINE FIELD IF NOT EXISTS alpha ON thompson_selection_log TYPE float
+  ASSERT $value > 0
+  COMMENT "Alpha parameter at time of selection";
+
+DEFINE FIELD IF NOT EXISTS beta ON thompson_selection_log TYPE float
+  ASSERT $value > 0
+  COMMENT "Beta parameter at time of selection";
+
+DEFINE FIELD IF NOT EXISTS selection_method ON thompson_selection_log TYPE string
+  ASSERT $value IN ['thompson_sampling', 'exploration_forced', 'improvisation', 'deterministic']
+  VALUE $value OR 'thompson_sampling'
+  COMMENT "How this activity was selected";
+
+DEFINE FIELD IF NOT EXISTS candidates_count ON thompson_selection_log TYPE option<int>
+  COMMENT "Number of candidates considered";
+
+DEFINE FIELD IF NOT EXISTS org_id ON thompson_selection_log TYPE record<organizations>
+  ASSERT $value != NONE
+  VALUE $value OR $auth.org_id
+  COMMENT "Organization ID (required for RBAC)";
+
+DEFINE FIELD IF NOT EXISTS project_id ON thompson_selection_log TYPE option<record<projects>>
+  VALUE $value OR $auth.project_id
+  COMMENT "Project ID (optional)";
+
+DEFINE FIELD IF NOT EXISTS selected_at ON thompson_selection_log TYPE datetime
+  VALUE $value OR time::now()
+  COMMENT "When selection occurred";
+
+-- Indexes
+DEFINE INDEX IF NOT EXISTS idx_thompson_selection_execution
+  ON thompson_selection_log FIELDS execution_id UNIQUE;
+
+DEFINE INDEX IF NOT EXISTS idx_thompson_selection_activity
+  ON thompson_selection_log FIELDS activity_id;
+
+DEFINE INDEX IF NOT EXISTS idx_thompson_selection_org
+  ON thompson_selection_log FIELDS org_id;
+
+DEFINE INDEX IF NOT EXISTS idx_thompson_selection_time
+  ON thompson_selection_log FIELDS selected_at;
+
+DEFINE INDEX IF NOT EXISTS idx_thompson_selection_method
+  ON thompson_selection_log FIELDS selection_method;
+
+-- =============================================================================
 -- Backward compatibility views
 -- =============================================================================
 

@@ -107,6 +107,11 @@ class MigrationRunner {
       '011-executions.surql',
       '012-composition.surql',
       '013-impulse-tool-usage.surql',
+      '015-impulse-metadata.surql',
+      // Paradigm alignment tables (schema-paradigm-alignment)
+      '020-paradigm-core-tables.surql',
+      '021-paradigm-computed-views.surql',
+      '022-paradigm-compat-views.surql',
     ];
 
     const schemasPath = join(process.cwd(), 'sql', 'schemas');

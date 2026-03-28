@@ -100,6 +100,9 @@ LOG_FORMAT=text             # text or json
 
 # CORS
 CORS_ORIGINS=*              # Comma-separated list
+
+# Thompson Sampling
+THOMPSON_SAMPLING_SEED=     # Optional: integer seed for reproducible sampling (testing only)
 ```
 
 ## Development
@@ -218,6 +221,50 @@ Authorization: Bearer <token>
 
 Get execution history
 ```
+
+## Thompson Sampling
+
+The API uses Thompson Sampling for probabilistic template selection via the `/v2/activities/recommend` endpoint. This provides a principled approach to the exploration/exploitation tradeoff when recommending activity templates.
+
+### How It Works
+
+Each template maintains:
+- `thompson_alpha`: Prior successes + 1 (starts at 1)
+- `thompson_beta`: Prior failures + 1 (starts at 1)
+
+When recommending templates, the API:
+1. Samples from Beta(alpha, beta) distribution for each candidate
+2. Ranks templates by sample value (highest first)
+3. Returns top N recommendations
+
+This means:
+- **New templates** (alpha=1, beta=1) have high variance → explored more often
+- **Proven templates** (high alpha) have high expected value → selected more reliably
+- **Failed templates** (high beta) have low expected value → selected less often
+
+### Testing with Seeds
+
+For reproducible tests, set `THOMPSON_SAMPLING_SEED`:
+
+```bash
+THOMPSON_SAMPLING_SEED=42 bun run start
+```
+
+This makes the sampler deterministic - the same sequence of recommendations will be produced for the same inputs.
+
+### Running Thompson Sampling Tests
+
+```bash
+# Run unit tests for Beta distribution sampling
+bun test src/routes/activities.test.ts
+```
+
+Tests cover:
+- Beta distribution properties (values between 0-1, variance)
+- Exploration behavior (uncertain templates explored)
+- Exploitation behavior (proven templates selected)
+- Edge cases (large values, skewed distributions)
+- Performance (10ms for 10 templates)
 
 ## Data Flow Verification
 

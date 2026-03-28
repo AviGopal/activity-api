@@ -195,6 +195,14 @@ export async function queryWithAuth<T = any>(
     });
 
     const result = await db.query(sql, params);
+
+    logger.info('Authenticated query result', {
+      resultType: typeof result,
+      resultIsArray: Array.isArray(result),
+      resultLength: Array.isArray(result) ? result.length : 'N/A',
+      firstElement: Array.isArray(result) && result.length > 0 ? (Array.isArray(result[0]) ? `array(${result[0].length})` : typeof result[0]) : 'N/A',
+    });
+
     const firstResult = Array.isArray(result) && result.length > 0 ? result[0] : [];
     return firstResult as T[];
   } finally {

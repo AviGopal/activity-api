@@ -262,7 +262,7 @@ app.get('/', async (c) => {
  */
 app.get('/:variantId', async (c) => {
   try {
-    const variantId = c.param('variantId');
+    const variantId = c.req.param('variantId');
 
     const query = `
       SELECT

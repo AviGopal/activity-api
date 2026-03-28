@@ -204,7 +204,7 @@ export class TaskGenerator {
       LIMIT 5
     `;
 
-    const failingTemplates = await surrealDB.query<TemplateMetrics[]>(query, {
+    const failingTemplates = await surrealDB.query<TemplateMetrics>(query, {
       minExecutions: CONFIG.minExecutionsForAnalysis,
       threshold: CONFIG.failureThreshold,
     });
@@ -227,7 +227,7 @@ export class TaskGenerator {
 
       let recentFailures: ExecutionTrace[] = [];
       try {
-        recentFailures = await surrealDB.query<ExecutionTrace[]>(failuresQuery, {
+        recentFailures = await surrealDB.query<ExecutionTrace>(failuresQuery, {
           templateId: template.variant_id,
         });
       } catch (e) {
@@ -277,7 +277,7 @@ export class TaskGenerator {
 
     let globalAvg = 30000; // Default 30 seconds
     try {
-      const avgResult = await surrealDB.query<{ global_avg: number }[]>(avgQuery, {
+      const avgResult = await surrealDB.query<{ global_avg: number }>(avgQuery, {
         minExecutions: CONFIG.minExecutionsForAnalysis,
       });
       if (avgResult.length > 0 && avgResult[0].global_avg) {
@@ -304,7 +304,7 @@ export class TaskGenerator {
       LIMIT 3
     `;
 
-    const slowTemplates = await surrealDB.query<TemplateMetrics[]>(query, {
+    const slowTemplates = await surrealDB.query<TemplateMetrics>(query, {
       minExecutions: CONFIG.minExecutionsForAnalysis,
       threshold: slowThreshold,
     });
@@ -451,7 +451,7 @@ export class TaskGenerator {
 
     let templatesNeedingAttention = 0;
     try {
-      const result = await surrealDB.query<{ count: number }[]>(attentionQuery, {
+      const result = await surrealDB.query<{ count: number }>(attentionQuery, {
         minExecutions: CONFIG.minExecutionsForAnalysis,
         threshold: CONFIG.failureThreshold,
       });

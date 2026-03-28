@@ -35,8 +35,8 @@ DEFINE FIELD IF NOT EXISTS goal_pattern ON goal_execution_paths TYPE option<stri
   COMMENT "Normalized goal pattern (for matching)";
 
 DEFINE FIELD IF NOT EXISTS goal_category ON goal_execution_paths TYPE string
-  ASSERT $value IN ['feature', 'bugfix', 'refactor', 'tool', 'infrastructure']
-  COMMENT "Goal category for filtering";
+  ASSERT $value IN ['feature', 'bugfix', 'refactor', 'tool', 'infrastructure', 'meta']
+  COMMENT "Goal category for filtering (meta = self-referential goals)";
 
 DEFINE FIELD IF NOT EXISTS goal_embedding ON goal_execution_paths TYPE option<array<float>>
   COMMENT "Goal text embedding for semantic matching";

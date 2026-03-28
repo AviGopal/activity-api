@@ -1,5 +1,31 @@
 import { z } from 'zod';
 
+// =============================================================================
+// HIERARCHICAL TAG SYSTEM
+// =============================================================================
+
+/**
+ * Tag validation schema
+ * Tags use dot-notation for hierarchy: feature.vessel.state.communication
+ */
+export const TagSchema = z.string()
+  .regex(/^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)*$/, {
+    message: 'Tags must be lowercase alphanumeric with dots (e.g., "feature.vessel.state")',
+  })
+  .max(100, 'Tag must be at most 100 characters');
+
+/**
+ * Legacy category enum for backward compatibility
+ */
+export const LegacyCategorySchema = z.enum([
+  'feature',
+  'bugfix',
+  'refactor',
+  'tool',
+  'infrastructure',
+  'meta',
+]);
+
 // Session schemas
 export const SessionPostRequestSchema = z.object({
   org_id: z.string().optional(),
@@ -68,7 +94,11 @@ export const ActivityTemplateSchema = z.object({
   activity_id: z.string(),
   variant_name: z.string(),
   description: z.string(),
-  category: z.string(),
+  // Hierarchical tags (primary classification)
+  tags: z.array(z.string()).default([]),
+  tag_prefixes: z.array(z.string()).optional(),
+  // Legacy category (deprecated, kept for backward compatibility)
+  category: z.string().optional(),
   task_steps: z.array(TemplateTaskSchema).optional(),
   scope: z.string().nullable(),
   org_id: z.string().nullable(),
@@ -85,19 +115,57 @@ export const TemplateListResponseSchema = z.object({
   total: z.number(),
 });
 
+// Template impulse pointer schema
+export const TemplateImpulseSchema = z.object({
+  id: z.string(),
+  pointer: z.object({
+    type: z.string(),
+  }).passthrough(), // Allow additional fields
+  budget: z.number(),
+  priority: z.enum(['critical', 'high', 'medium', 'low']),
+  description: z.string().optional(),
+});
+
 // Template Registration/Creation schemas
 export const CreateTemplateRequestSchema = z.object({
   variant_id: z.string(),
   activity_id: z.string(),
   variant_name: z.string(),
   description: z.string(),
-  category: z.enum(['feature', 'bugfix', 'refactor', 'tool', 'infrastructure']),
+  // Primary: Hierarchical tags using dot-notation
+  tags: z.array(TagSchema).min(1).optional(),
+  // Deprecated: Legacy category (auto-converted to tags if tags not provided)
+  category: LegacyCategorySchema.optional(),
   task_steps: z.array(TemplateTaskSchema),
   scope: z.enum(['global', 'org', 'project']).default('global'),
   org_id: z.string().nullable().optional(),
   project_id: z.string().nullable().optional(),
   genealogy: z.record(z.any()).optional(),
-});
+  // Template-level impulse definitions
+  impulses: z.array(TemplateImpulseSchema).optional(),
+  // Input/output schemas for composition
+  input_schema: z.object({
+    required: z.array(z.object({
+      shape: z.string(),
+      description: z.string().optional(),
+      collection: z.boolean().optional(),
+    })).optional(),
+    optional: z.array(z.object({
+      shape: z.string(),
+      description: z.string().optional(),
+      collection: z.boolean().optional(),
+    })).optional(),
+  }).optional(),
+  output_schema: z.object({
+    produces: z.array(z.object({
+      shape: z.string(),
+      description: z.string().optional(),
+    })).optional(),
+  }).optional(),
+}).refine(
+  data => data.tags?.length || data.category,
+  { message: 'Either tags or category must be provided' }
+);
 
 export const CreateTemplateResponseSchema = z.object({
   success: z.boolean(),
@@ -412,7 +480,7 @@ export type ExecutionSequenceResponse = z.infer<typeof ExecutionSequenceResponse
 export const GoalExecutionPathSchema = z.object({
   goal_hash: z.string(),
   goal_text: z.string(),
-  goal_category: z.enum(['feature', 'bugfix', 'refactor', 'tool', 'infrastructure']),
+  goal_category: z.enum(['feature', 'bugfix', 'refactor', 'tool', 'infrastructure', 'meta']),
   
   // Path definition
   path_activities: z.array(z.string()),
@@ -443,7 +511,7 @@ export const GoalExecutionPathSchema = z.object({
 
 export const PathRecordRequestSchema = z.object({
   goal_text: z.string(),
-  goal_category: z.enum(['feature', 'bugfix', 'refactor', 'tool', 'infrastructure']),
+  goal_category: z.enum(['feature', 'bugfix', 'refactor', 'tool', 'infrastructure', 'meta']),
   path_activities: z.array(z.string()).min(1),
   success: z.boolean(),
   duration_ms: z.number().int(),
@@ -456,7 +524,7 @@ export const PathRecordRequestSchema = z.object({
 export const PathQuerySchema = z.object({
   goal_text: z.string().optional(),
   goal_hash: z.string().optional(),
-  goal_category: z.enum(['feature', 'bugfix', 'refactor', 'tool', 'infrastructure']).optional(),
+  goal_category: z.enum(['feature', 'bugfix', 'refactor', 'tool', 'infrastructure', 'meta']).optional(),
   min_executions: z.number().int().positive().default(1),
   limit: z.number().int().positive().default(10),
   offset: z.number().int().nonnegative().default(0),
@@ -464,7 +532,7 @@ export const PathQuerySchema = z.object({
 
 export const PathRecommendationRequestSchema = z.object({
   goal_text: z.string(),
-  goal_category: z.enum(['feature', 'bugfix', 'refactor', 'tool', 'infrastructure']).optional(),
+  goal_category: z.enum(['feature', 'bugfix', 'refactor', 'tool', 'infrastructure', 'meta']).optional(),
   exploration_rate: z.number().min(0).max(1).default(0.1), // 10% exploration
   top_k: z.number().int().positive().default(3),
 });
@@ -621,18 +689,24 @@ export const ImpulseResolveRequestSchema = z.object({
     activityId: z.string().optional(),
     // For recentExecutions pointer type
     filter: z.enum(['failed', 'successful', 'all']).optional(),
-    limit: z.number().int().positive().optional(),
+    limit: z.union([z.number(), z.string().transform(v => parseInt(v, 10))]).pipe(z.number().int().positive()).optional(),
     since: z.string().optional(), // ISO date string
     // Analysis-specific pointer types (M3 - Impulse Bridge)
     resultId: z.string().optional(), // For analysisResult pointer
     componentIds: z.array(z.string()).optional(), // For cochangeSuggestions pointer
     changedFiles: z.array(z.string()).optional(), // For impactAnalysis pointer
-    query: z.string().optional(), // For codebaseSearch pointer
+    query: z.string().optional(), // For codebaseSearch and activityTemplateRecommendation pointer
     maxDepth: z.number().int().positive().optional(), // For impactAnalysis
     format: z.enum(['full', 'summary']).optional(), // For analysisResult
     severity: z.array(z.string()).optional(), // For codebaseSearch filters
-    category: z.array(z.string()).optional(), // For codebaseSearch filters
+    category: z.union([z.array(z.string()), z.string()]).optional(), // For codebaseSearch/template filters (accepts string or array)
     status: z.enum(['open', 'in_progress', 'resolved', 'ignored']).optional(), // For problemCluster filter
+    // For activityExecutionTrace pointer type
+    includeImpulses: z.boolean().optional(), // Include referenced impulses in response
+    // For bootstrap template pointer types
+    sortBy: z.enum(['success_rate', 'total_executions', 'avg_duration_ms']).optional(), // For activityTemplatesByMetrics
+    minExecutions: z.union([z.number(), z.string().transform(v => parseInt(v, 10))]).pipe(z.number().int().nonnegative()).optional(), // For activityTemplatesByMetrics
+    success: z.boolean().optional(), // For executionTraces - filter by success/failure
   }),
 });
 
@@ -790,3 +864,57 @@ export type CILintStageResult = z.infer<typeof CILintStageResultSchema>;
 export type CIResultRequest = z.infer<typeof CIResultRequestSchema>;
 export type CIResultResponse = z.infer<typeof CIResultResponseSchema>;
 export type CIResultsListResponse = z.infer<typeof CIResultsListResponseSchema>;
+
+// =============================================================================
+// LEARNED CORPUS DASHBOARD SCHEMAS
+// =============================================================================
+
+/**
+ * ActivityScore - Thompson Sampling data from v_activity_score view
+ * Used for visualizing learned corpus beliefs
+ */
+export const ActivityScoreSchema = z.object({
+  activity_id: z.string(),
+  org_id: z.string(),
+  total_executions: z.number().int(),
+  alpha: z.number(), // Thompson: successes + 1
+  beta: z.number(), // Thompson: failures + 1
+  successes: z.number().int(),
+  failures: z.number().int(),
+  avg_duration_ms: z.number(),
+  avg_cost_usd: z.number(),
+  total_cost_usd: z.number(),
+  total_tokens_in: z.number().int(),
+  total_tokens_out: z.number().int(),
+  last_executed_at: z.string().optional(),
+  first_executed_at: z.string().optional(),
+});
+
+/**
+ * ActivityScoresResponse - Response for GET /v2/activities/scores
+ */
+export const ActivityScoresResponseSchema = z.object({
+  scores: z.array(ActivityScoreSchema),
+  total: z.number().int(),
+  path: z.enum(['paradigm', 'legacy']),
+});
+
+/**
+ * CorpusSummaryResponse - Aggregate metrics for GET /v2/activities/corpus-summary
+ */
+export const CorpusSummaryResponseSchema = z.object({
+  total_activities: z.number().int(),
+  total_executions: z.number().int(),
+  total_successes: z.number().int(),
+  total_failures: z.number().int(),
+  overall_success_rate: z.number(),
+  total_cost_usd: z.number(),
+  avg_belief: z.number(), // Mean of all alpha/(alpha+beta)
+  exploration_count: z.number().int(), // Activities with <5 executions
+  exploitation_count: z.number().int(), // Activities with >=10 executions
+});
+
+// Type exports for Learned Corpus Dashboard
+export type ActivityScore = z.infer<typeof ActivityScoreSchema>;
+export type ActivityScoresResponse = z.infer<typeof ActivityScoresResponseSchema>;
+export type CorpusSummaryResponse = z.infer<typeof CorpusSummaryResponseSchema>;

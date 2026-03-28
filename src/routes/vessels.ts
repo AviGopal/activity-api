@@ -242,7 +242,7 @@ app.post('/heartbeat', async (c) => {
  */
 app.get('/:podName/status', async (c) => {
   try {
-    const podName = c.param('podName');
+    const podName = c.req.param('podName');
 
     const query = `
       SELECT * FROM vessel_heartbeats

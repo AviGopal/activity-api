@@ -277,7 +277,7 @@ router.post('/ci-result', async (c) => {
     }
 
     // Broadcast CI result via WebSocket for live updates
-    broadcaster.broadcast({
+    broadcaster.emit({
       type: 'ci_result',
       data: {
         execution_id: request.execution_id,
@@ -303,12 +303,9 @@ router.post('/ci-result', async (c) => {
 
         const deploymentTask = {
           id: `deploy-${request.commit.substring(0, 8)}-${Date.now()}`,
-          type: 'deployment' as const,
           priority: 'medium' as const,
-          activityId: 'deploy-to-staging',
-          category: 'infrastructure' as const,
           goal: `Deploy ${request.branch} (${request.commit.substring(0, 8)}) to staging environment`,
-          context: {
+          variables: {
             execution_id: request.execution_id,
             template_id,
             branch: request.branch,
@@ -316,9 +313,8 @@ router.post('/ci-result', async (c) => {
             ci_run_url: request.run_url,
             artifacts: request.artifacts,
           },
-          estimatedCost: 0.02, // Deployment is typically cheap (just kubectl/helm commands)
-          estimatedDuration: 60000, // 1 minute
-          createdAt: now,
+          reason: `CI success on ${request.branch}: deploy to staging`,
+          createdAt: Date.now(),
         };
 
         await enqueueTask(deploymentTask);

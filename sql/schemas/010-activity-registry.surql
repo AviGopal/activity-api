@@ -48,10 +48,20 @@ DEFINE FIELD IF NOT EXISTS description ON activity_registry TYPE string
   ASSERT $value != NONE
   COMMENT "What this activity does";
 
-DEFINE FIELD IF NOT EXISTS category ON activity_registry TYPE string
-  ASSERT $value IN ['feature', 'bugfix', 'refactor', 'tool', 'infrastructure']
-  VALUE $value OR 'infrastructure'
-  COMMENT "Activity category";
+-- DEPRECATED: Use tags field instead. Kept for backward compatibility.
+DEFINE FIELD IF NOT EXISTS category ON activity_registry TYPE option<string>
+  COMMENT "DEPRECATED: Activity category. Use tags field for hierarchical classification.";
+
+-- Hierarchical tags using dot-notation (e.g., feature.vessel.state.communication)
+DEFINE FIELD IF NOT EXISTS tags ON activity_registry TYPE array<string>
+  DEFAULT []
+  COMMENT "Hierarchical tags using dot-notation (e.g., feature.vessel.state, utility.code.trace)";
+
+-- Computed tag prefixes for efficient prefix queries
+-- Extracts all prefixes from tags: ["feature.vessel.state"] -> ["feature", "feature.vessel", "feature.vessel.state"]
+DEFINE FIELD IF NOT EXISTS tag_prefixes ON activity_registry TYPE array<string>
+  DEFAULT []
+  COMMENT "Auto-computed tag prefixes for hierarchical queries";
 
 -- Execution format (how to invoke this activity)
 DEFINE FIELD IF NOT EXISTS execution_format ON activity_registry TYPE string
@@ -150,9 +160,7 @@ DEFINE FIELD IF NOT EXISTS created_by ON activity_registry TYPE option<record<us
 DEFINE FIELD IF NOT EXISTS genealogy ON activity_registry TYPE option<object>
   COMMENT "Activity genealogy (extracted_from, variant_of, etc.)";
 
-DEFINE FIELD IF NOT EXISTS tags ON activity_registry TYPE array
-  VALUE $value OR []
-  COMMENT "Activity tags for filtering and discovery";
+-- Note: tags field is now defined earlier with full type specification
 
 DEFINE FIELD IF NOT EXISTS created_at ON activity_registry TYPE datetime
   VALUE $value OR time::now()
@@ -185,6 +193,11 @@ DEFINE INDEX IF NOT EXISTS idx_activity_scope_category
   ON activity_registry FIELDS scope, category;
 DEFINE INDEX IF NOT EXISTS idx_activity_public_global
   ON activity_registry FIELDS public, scope;
+
+-- Tag indexes for hierarchical queries
+DEFINE INDEX IF NOT EXISTS idx_activity_tags ON activity_registry FIELDS tags;
+DEFINE INDEX IF NOT EXISTS idx_activity_tag_prefixes ON activity_registry FIELDS tag_prefixes;
+DEFINE INDEX IF NOT EXISTS idx_activity_org_tags ON activity_registry FIELDS org_id, tags;
 
 -- =============================================================================
 -- Table: variant_performance_metrics
@@ -277,6 +290,14 @@ DEFINE INDEX IF NOT EXISTS idx_variant_performance_org
 DEFINE INDEX IF NOT EXISTS idx_variant_performance_project
   ON variant_performance_metrics FIELDS project_id;
 
+-- Index for Thompson Sampling belief queries (dashboard convergence metrics)
+DEFINE INDEX IF NOT EXISTS idx_variant_performance_thompson
+  ON variant_performance_metrics FIELDS thompson_alpha, thompson_beta;
+
+-- Composite index for success rate filtering
+DEFINE INDEX IF NOT EXISTS idx_variant_performance_success_rate
+  ON variant_performance_metrics FIELDS org_id, success_rate;
+
 -- =============================================================================
 -- Table: activity_template (DEPRECATED)
 -- =============================================================================
@@ -291,6 +312,8 @@ DEFINE TABLE IF NOT EXISTS view_activity_template AS
     name AS variant_name,
     description,
     category,
+    tags,
+    tag_prefixes,
     task_steps,
     scope,
     org_id,

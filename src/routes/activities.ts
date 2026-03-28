@@ -14,10 +14,12 @@ import beta from '@stdlib/random-base-beta';
 import { surrealDB, queryWithAuth } from '../db/surreal';
 import { RedisClient } from '../db/redis';
 import { logger } from '../utils/logger';
+import { ensureTags, computeTagPrefixes, deriveCategory } from '../utils/tags';
 import {
   insertActivity,
   insertExecution,
   getActivityScores,
+  getShapeConditionedScores,
   queryActivitiesByShapes,
   transformToLegacyTemplate,
   isDualWriteEnabled,
@@ -91,7 +93,11 @@ interface ActivityTemplate {
   activity_id: string;
   variant_name: string;
   description: string;
-  category: string;
+  // Hierarchical tags (primary classification)
+  tags: string[];
+  tag_prefixes?: string[];
+  // Legacy category (deprecated)
+  category?: string;
   task_steps?: any[];
   scope: string | null;
   org_id: string | null;
@@ -341,6 +347,36 @@ async function listAllTemplatesFromDB(
 }
 
 /**
+ * List public templates from SurrealDB.
+ *
+ * Public templates are globally scoped templates with public=true.
+ * No authentication required - these are visible to all users.
+ */
+async function listPublicTemplatesFromDB(
+  limit: number
+): Promise<ActivityTemplate[]> {
+  const query = `
+    SELECT * FROM activity_template
+    WHERE scope = 'global' AND public = true
+    ORDER BY created_at DESC
+    LIMIT $limit
+  `;
+  const params = { limit };
+
+  logger.debug('Fetching public templates from SurrealDB', { limit });
+  const result = await surrealDB.query<ActivityTemplate>(query, params);
+
+  logger.info('SurrealDB public templates fetched', {
+    count: result.length
+  });
+
+  // Enrich templates with metrics before returning
+  const enrichedTemplates = await enrichTemplatesWithMetrics(result);
+  logger.info('Public templates enriched with metrics', { enrichedCount: enrichedTemplates.length });
+  return enrichedTemplates;
+}
+
+/**
  * POST /v2/activities/templates
  * Register a new activity template variant
  * 
@@ -373,11 +409,19 @@ app.post('/templates', async (c) => {
     const body = await c.req.json();
     const validated = CreateTemplateRequestSchema.parse(body);
 
+    // Convert category to tags if needed (backward compatibility)
+    const tags = ensureTags({ tags: validated.tags, category: validated.category });
+    const tagPrefixes = computeTagPrefixes(tags);
+    // Derive category for backward compat (first tag's root segment if known)
+    const derivedCategory = deriveCategory(tags) || validated.category || tags[0]?.split('.')[0] || 'uncategorized';
+
     logger.info('POST /v2/activities/templates', {
       variant_id: validated.variant_id,
       activity_id: validated.activity_id,
       variant_name: validated.variant_name,
-      category: validated.category,
+      tags,
+      tagPrefixes,
+      category: derivedCategory,
       scope: validated.scope,
     });
 
@@ -407,7 +451,11 @@ app.post('/templates', async (c) => {
       activity_id: validated.activity_id,
       variant_name: validated.variant_name,
       description: validated.description,
-      category: validated.category,
+      // Hierarchical tags (primary classification)
+      tags,
+      tag_prefixes: tagPrefixes,
+      // Legacy category for backward compatibility
+      category: derivedCategory,
       scope: validated.scope || 'global',
     };
 
@@ -423,6 +471,17 @@ app.post('/templates', async (c) => {
     }
     if (validated.genealogy && Object.keys(validated.genealogy).length > 0) {
       templateRecord.genealogy = validated.genealogy;
+    }
+    // Add impulse definitions for bootstrap templates
+    if (validated.impulses && validated.impulses.length > 0) {
+      templateRecord.impulses = validated.impulses;
+    }
+    // Add input/output schemas for composition
+    if (validated.input_schema) {
+      templateRecord.input_schema = validated.input_schema;
+    }
+    if (validated.output_schema) {
+      templateRecord.output_schema = validated.output_schema;
     }
 
     // Build dynamic query with only provided fields
@@ -451,7 +510,11 @@ app.post('/templates', async (c) => {
         input_shapes: [], // Legacy templates don't have shapes yet
         output_shapes: [],
         execution_type: 'template',
-        category: validated.category,
+        // Hierarchical tags (primary classification)
+        tags,
+        tag_prefixes: tagPrefixes,
+        // Legacy category for backward compatibility
+        category: derivedCategory,
         tasks: validated.task_steps,
         scope: validated.scope || 'org',
         public: validated.scope === 'global',
@@ -528,6 +591,13 @@ app.post('/templates', async (c) => {
     });
 
     logger.info('Template registered successfully', {
+      variant_id: validated.variant_id,
+    });
+
+    // Invalidate Redis cache so the new template appears in list queries
+    const redis = RedisClient.getInstance();
+    await redis.del(CACHE_LIST_KEY);
+    logger.debug('Redis template list cache invalidated after template registration', {
       variant_id: validated.variant_id,
     });
 
@@ -758,13 +828,61 @@ app.get('/templates', async (c) => {
 });
 
 /**
+ * GET /v2/activities/public
+ * List public templates visible to all users (no auth required)
+ *
+ * Public templates are globally scoped templates with public=true.
+ * This endpoint is unauthenticated - anyone can browse public templates.
+ *
+ * Query parameters:
+ * - limit: Maximum number of templates to return (default: 50, max: 100)
+ */
+app.get('/public', async (c) => {
+  try {
+    const limitStr = c.req.query('limit') || '50';
+    let limit = parseInt(limitStr, 10);
+
+    // Validate limit
+    if (isNaN(limit) || limit < 1) {
+      limit = 50;
+    }
+    limit = Math.min(limit, 100);
+
+    logger.info('GET /v2/activities/public', { limit });
+
+    // Load public templates from SurrealDB (no auth required)
+    const templates = await listPublicTemplatesFromDB(limit);
+
+    logger.info('Public templates fetched', {
+      count: templates.length,
+      limit,
+    });
+
+    return c.json({
+      templates,
+      total: templates.length,
+    });
+  } catch (error: any) {
+    logger.error('GET /v2/activities/public failed', {
+      error: error.message,
+      stack: error.stack,
+    });
+
+    return c.json({
+      error: 'Failed to fetch public templates',
+      message: error.message,
+    }, 500);
+  }
+});
+
+/**
  * GET /v2/activities/templates/:variantId
  * Get specific template variant by ID
  */
 app.get('/templates/:variantId', async (c) => {
   try {
     const variantId = c.req.param('variantId');
-    
+
     logger.info('GET /v2/activities/templates/:variantId', { variantId });
 
     // Check Redis cache first
@@ -809,16 +927,20 @@ app.get('/templates/:variantId', async (c) => {
 
     const template = result[0];
 
-    // Cache the result
+    // Enrich with metrics before caching
+    const enrichedTemplates = await enrichTemplatesWithMetrics([template]);
+    const enrichedTemplate = enrichedTemplates[0] || template;
+
+    // Cache the enriched result
     await redis.set(
       `${CACHE_KEY_PREFIX}${variantId}`,
-      JSON.stringify(template),
+      JSON.stringify(enrichedTemplate),
       TEMPLATE_CACHE_TTL
     );
 
-    logger.info('Template fetched from SurrealDB', { variantId });
+    logger.info('Template fetched from SurrealDB', { variantId, hasMetrics: !!enrichedTemplate.metrics });
 
-    return c.json(template);
+    return c.json(enrichedTemplate);
 
   } catch (error: any) {
     logger.error('GET /v2/activities/templates/:variantId failed', {
@@ -838,7 +960,7 @@ app.get('/templates/:variantId', async (c) => {
  * Record activity execution and update Thompson Sampling metrics
  * 
  * This endpoint closes the learning loop by:
- * 1. Recording execution result in activity_executions table
+ * 1. Recording execution result in activity_execution_traces table
  * 2. Updating variant_performance_metrics with Thompson Sampling parameters
  * 3. Invalidating Redis cache for updated template
  */
@@ -851,8 +973,16 @@ app.post('/executions', async (c) => {
     const session = (c.get as any)('session') as SessionData | undefined;
 
     // Use JWT auth claims if available, otherwise fall back to session
-    const orgId = jwtAuth?.orgId || session?.org_id || null;
-    const projectId = jwtAuth?.projectId || session?.project_id || null;
+    // Ensure record format (organizations:xxx) for SurrealDB schema requirements
+    const rawOrgId = jwtAuth?.orgId || session?.org_id || null;
+    const rawProjectId = jwtAuth?.projectId || session?.project_id || null;
+
+    const orgId = rawOrgId
+      ? (rawOrgId.startsWith('organizations:') ? rawOrgId : `organizations:${rawOrgId}`)
+      : null;
+    const projectId = rawProjectId
+      ? (rawProjectId.startsWith('projects:') ? rawProjectId : `projects:${rawProjectId}`)
+      : null;
 
     // Parse and validate request body
     const body = await c.req.json();
@@ -869,6 +999,13 @@ app.post('/executions', async (c) => {
 
     // Generate execution ID
     const executionId = `exec_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
+
+    // Look up template to get activity_id (required for activity_execution_traces table)
+    const templateLookup = await surrealDB.query<{ activity_id: string }>(
+      'SELECT activity_id FROM activity_template WHERE variant_id = $variant_id LIMIT 1',
+      { variant_id: validated.variant_id }
+    );
+    const activityId = templateLookup[0]?.activity_id || validated.variant_id;
 
     // Emit execution_started event via WebSocket
     const executionStartedData: any = {
@@ -888,8 +1025,10 @@ app.post('/executions', async (c) => {
     // Build execution record, only include fields with values (SurrealDB doesn't accept null)
     const executionRecord: Record<string, any> = {
       execution_id: executionId,
+      activity_id: activityId,
       variant_id: validated.variant_id,
       success: validated.success,
+      status: validated.success ? 'success' : 'failure',
       duration_ms: validated.duration_ms,
       cost_usd: validated.cost,
       tokens_input: validated.tokens.input,
@@ -938,9 +1077,15 @@ app.post('/executions', async (c) => {
     }
 
     // Build dynamic query with only provided fields
-    const execFields = Object.keys(executionRecord).map(k => `${k}: $${k}`).join(',\n        ');
+    // org_id and project_id need type::record() casting for SurrealDB
+    const execFields = Object.keys(executionRecord).map(k => {
+      if (k === 'org_id' || k === 'project_id') {
+        return `${k}: type::record($${k})`;
+      }
+      return `${k}: $${k}`;
+    }).join(',\n        ');
     const insertExecutionQuery = `
-      INSERT INTO activity_executions {
+      INSERT INTO activity_execution_traces {
         ${execFields},
         executed_at: time::now(),
         created_at: time::now()
@@ -949,7 +1094,7 @@ app.post('/executions', async (c) => {
 
     await surrealDB.query(insertExecutionQuery, executionRecord);
 
-    logger.debug('Execution recorded in activity_executions', { executionId });
+    logger.debug('Execution recorded in activity_execution_traces', { executionId });
 
     // DUAL-WRITE: Also insert into new paradigm execution table (schema-paradigm-alignment)
     // v_activity_score view computes Thompson Sampling from execution table automatically
@@ -1159,7 +1304,7 @@ app.get('/executions', async (c) => {
     });
 
     // Build query with filters
-    let query = 'SELECT * FROM activity_executions WHERE 1=1';
+    let query = 'SELECT * FROM activity_execution_traces WHERE 1=1';
     const params: Record<string, any> = {};
     
     // Multi-tenant filtering (same as templates)
@@ -1619,9 +1764,9 @@ app.get('/metrics/summary', async (c) => {
       total_templates: totalTemplates,
       total_executions: stats.total_executions || 0,
       executions_today: stats.executions_today || 0,
-      average_success_rate: parseFloat((stats.success_rate || 0) * 100).toFixed(1),
+      average_success_rate: ((stats.success_rate || 0) * 100).toFixed(1),
       average_duration_ms: Math.round(stats.avg_duration || 0),
-      total_cost_usd: parseFloat(stats.total_cost || 0).toFixed(2),
+      total_cost_usd: (stats.total_cost || 0).toFixed(2),
     };
 
     logger.info('Metrics summary retrieved', summary);
@@ -1636,6 +1781,143 @@ app.get('/metrics/summary', async (c) => {
 
     return c.json({
       error: 'Failed to fetch metrics summary',
+      message: error.message,
+    }, 500);
+  }
+});
+
+/**
+ * GET /scores
+ *
+ * Get Thompson Sampling scores for all activities in the learned corpus.
+ * Used by the Learned Corpus Dashboard to visualize activity beliefs.
+ *
+ * Query params:
+ * - limit: number (default 100, max 500)
+ * - min_executions: number (optional, filter activities with minimum executions)
+ *
+ * Returns: ActivityScoresResponse
+ */
+app.get('/scores', async (c) => {
+  try {
+    const jwtAuth = getJwtAuthFromContext(c);
+    const session = (c.get as any)('session') as SessionData | undefined;
+    const orgId = jwtAuth?.orgId || session?.org_id || null;
+
+    if (!orgId) {
+      return c.json({ error: 'Organization ID required' }, 401);
+    }
+
+    const limitStr = c.req.query('limit') || '100';
+    let limit = parseInt(limitStr, 10);
+    if (isNaN(limit) || limit < 1) limit = 100;
+    limit = Math.min(limit, 500);
+
+    const minExecutionsStr = c.req.query('min_executions');
+    const minExecutions = minExecutionsStr ? parseInt(minExecutionsStr, 10) : undefined;
+
+    logger.info('GET /v2/activities/scores', {
+      orgId,
+      limit,
+      minExecutions,
+    });
+
+    // Use existing getActivityScores function from paradigm.ts
+    const result = await getActivityScores(orgId, undefined, jwtAuth?.jwtToken);
+
+    // Filter by min_executions if specified
+    let scores = result.data;
+    if (minExecutions && !isNaN(minExecutions)) {
+      scores = scores.filter(s => s.total_executions >= minExecutions);
+    }
+
+    // Apply limit
+    scores = scores.slice(0, limit);
+
+    return c.json({
+      scores,
+      total: result.data.length,
+      path: result.path === 'new' ? 'paradigm' : 'legacy',
+    });
+
+  } catch (error: any) {
+    logger.error('GET /v2/activities/scores failed', {
+      error: error.message,
+      stack: error.stack,
+    });
+
+    return c.json({
+      error: 'Failed to fetch activity scores',
+      message: error.message,
+    }, 500);
+  }
+});
+
+/**
+ * GET /corpus-summary
+ *
+ * Get aggregate metrics for the learned corpus.
+ * Used by the Learned Corpus Dashboard to show corpus statistics.
+ *
+ * Returns: CorpusSummaryResponse
+ */
+app.get('/corpus-summary', async (c) => {
+  try {
+    const jwtAuth = getJwtAuthFromContext(c);
+    const session = (c.get as any)('session') as SessionData | undefined;
+    const orgId = jwtAuth?.orgId || session?.org_id || null;
+
+    if (!orgId) {
+      return c.json({ error: 'Organization ID required' }, 401);
+    }
+
+    logger.info('GET /v2/activities/corpus-summary', { orgId });
+
+    // org_id in v_activity_score is stored as record ID (e.g., "organizations:metabob_internal")
+    const fullOrgId = orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`;
+
+    // Query aggregate metrics from v_activity_score
+    // Note: org_id in the view is a record reference, so we use type::record() to convert
+    const summaryResult = await surrealDB.query(`
+      SELECT
+        count() AS total_activities,
+        math::sum(total_executions) AS total_executions,
+        math::sum(successes) AS total_successes,
+        math::sum(failures) AS total_failures,
+        math::sum(total_cost_usd) AS total_cost_usd,
+        math::mean(<float> alpha / (<float> alpha + <float> beta)) AS avg_belief,
+        count(IF total_executions < 5 THEN 1 ELSE NONE END) AS exploration_count,
+        count(IF total_executions >= 10 THEN 1 ELSE NONE END) AS exploitation_count
+      FROM v_activity_score
+      WHERE org_id = type::record($org_id)
+      GROUP ALL
+    `, { org_id: fullOrgId });
+
+    const stats = summaryResult[0] as any || {};
+
+    const totalExecutions = stats.total_executions || 0;
+    const totalSuccesses = stats.total_successes || 0;
+
+    return c.json({
+      total_activities: stats.total_activities || 0,
+      total_executions: totalExecutions,
+      total_successes: totalSuccesses,
+      total_failures: stats.total_failures || 0,
+      overall_success_rate: totalExecutions > 0 ? totalSuccesses / totalExecutions : 0,
+      total_cost_usd: stats.total_cost_usd || 0,
+      avg_belief: stats.avg_belief || 0.5,
+      exploration_count: stats.exploration_count || 0,
+      exploitation_count: stats.exploitation_count || 0,
+    });
+
+  } catch (error: any) {
+    logger.error('GET /v2/activities/corpus-summary failed', {
+      error: error.message,
+      stack: error.stack,
+    });
+
+    return c.json({
+      error: 'Failed to fetch corpus summary',
       message: error.message,
     }, 500);
   }
@@ -1678,14 +1960,18 @@ app.post('/recommend', async (c) => {
     const {
       task_description,
       category,
+      tags,           // NEW: Filter by exact tags
+      tag_prefix,     // NEW: Filter by tag prefix (e.g., "feature" matches "feature.vessel")
       loaded_impulses = [],
-      impulse_shapes = [],  // NEW: Array of impulse shapes for schema filtering
+      impulse_shapes = [],  // Array of impulse shapes for schema filtering
       limit = 3
     } = body;
 
     logger.info('POST /recommend', {
       task_description: task_description?.substring(0, 100),
       category,
+      tags,
+      tag_prefix,
       loaded_impulses,
       impulse_shapes,
       limit
@@ -1738,6 +2024,8 @@ app.post('/recommend', async (c) => {
           activity_id,
           variant_name,
           category,
+          tags,
+          tag_prefixes,
           input_schema,
           output_schema
         FROM activity_template
@@ -1756,10 +2044,24 @@ app.post('/recommend', async (c) => {
         whereClauses.push(`(scope IS NULL OR scope = 'global')`);
       }
 
-      // Filter by category if provided
+      // Filter by category if provided (legacy)
       if (category) {
         whereClauses.push(`category = $category`);
         params.category = category;
+      }
+
+      // Filter by exact tags if provided
+      if (tags && Array.isArray(tags) && tags.length > 0) {
+        // Match templates that have any of the specified tags
+        whereClauses.push(`tags CONTAINSANY $tags`);
+        params.tags = tags;
+      }
+
+      // Filter by tag prefix if provided
+      if (tag_prefix && typeof tag_prefix === 'string') {
+        // Match templates where any tag_prefix starts with the given prefix
+        whereClauses.push(`tag_prefixes CONTAINS $tag_prefix`);
+        params.tag_prefix = tag_prefix;
       }
 
       if (whereClauses.length > 0) {
@@ -1787,19 +2089,48 @@ app.post('/recommend', async (c) => {
       }
     }
 
-    // Get Thompson Sampling scores from v_activity_score (or fallback to variant_performance_metrics)
+    // Get Thompson Sampling scores
+    // Use shape-conditioned scores when impulse_shapes are provided (goal-aware recommendations)
+    // This allows learning different success rates for different input contexts
     const activityIds = templates.map((t: any) => t.id || t.variant_id);
     let scoresMap = new Map<string, ActivityScore>();
+    let scoreMethod: 'shape_conditioned' | 'global' | 'legacy' = 'legacy';
 
     if (activityIds.length > 0 && orgId) {
-      const scoresResult = await getActivityScores(orgId, activityIds, jwtAuth?.jwtToken);
-      for (const score of scoresResult.data) {
-        scoresMap.set(score.activity_id, score);
+      // Use shape-conditioned scores when shapes are provided
+      if (impulse_shapes && impulse_shapes.length > 0) {
+        const shapeScoresResult = await getShapeConditionedScores(
+          orgId,
+          activityIds,
+          impulse_shapes,
+          jwtAuth?.jwtToken
+        );
+        for (const score of shapeScoresResult.data) {
+          scoresMap.set(score.activity_id, score);
+        }
+        // Check if we got shape-conditioned data or fell back to global
+        const hasShapeData = shapeScoresResult.data.some(
+          (s: any) => s.shape_signature && s.shape_signature.length > 0
+        );
+        scoreMethod = hasShapeData ? 'shape_conditioned' : 'global';
+        logger.info('[paradigm] Shape-conditioned scores fetched', {
+          count: shapeScoresResult.data.length,
+          path: shapeScoresResult.path,
+          scoreMethod,
+          impulse_shapes,
+        });
+      } else {
+        // Fall back to global activity scores
+        const scoresResult = await getActivityScores(orgId, activityIds, jwtAuth?.jwtToken);
+        for (const score of scoresResult.data) {
+          scoresMap.set(score.activity_id, score);
+        }
+        scoreMethod = 'global';
+        logger.debug('[paradigm] Activity scores fetched (global)', {
+          count: scoresResult.data.length,
+          path: scoresResult.path,
+        });
       }
-      logger.debug('[paradigm] Activity scores fetched', {
-        count: scoresResult.data.length,
-        path: scoresResult.path,
-      });
     } else {
       // Fallback: Use enrichTemplatesWithMetrics for legacy path
       templates = await enrichTemplatesWithMetrics(templates);
@@ -1823,17 +2154,23 @@ app.post('/recommend', async (c) => {
           template_id: activityId,
           template_name: template.name || template.variant_name,
           category: template.category,
+          tags: template.tags || [],
           input_shapes: template.input_shapes || [],
           output_shapes: template.output_shapes || [],
           input_schema: template.input_schema || null,
           output_schema: template.output_schema || null,
           selection_metadata: {
             method: 'thompson_sampling',
+            score_source: scoreMethod, // shape_conditioned | global | legacy
             alpha,
             beta: betaVal,
             sample,
             score: sample, // Use sample as score for ranking
             query_path: queryPath, // For monitoring
+            // Include shape signature if shape-conditioned
+            ...(scoreMethod === 'shape_conditioned' && scores && 'shape_signature' in scores
+              ? { shape_signature: (scores as any).shape_signature }
+              : {}),
           },
         };
       })
@@ -1842,10 +2179,77 @@ app.post('/recommend', async (c) => {
       // Take top N
       .slice(0, limit);
 
-    logger.info('Recommendations generated', { 
-      count: recommendations.length,
-      top: recommendations[0]?.template_id 
+    // Generate correlation IDs for selection-to-execution linkage
+    const timestamp = Date.now();
+    const randomSuffix = Math.random().toString(36).substring(2, 8);
+    recommendations.forEach((rec: any, index: number) => {
+      rec.correlation_id = `sel_${timestamp}_${randomSuffix}_${index}`;
     });
+
+    logger.info('Recommendations generated', {
+      count: recommendations.length,
+      top: recommendations[0]?.template_id,
+      correlationIds: recommendations.map((r: any) => r.correlation_id),
+    });
+
+    // Log Thompson Sampling selections for explainability (non-blocking)
+    // Only log if we have an org context and recommendations
+    if (orgId && recommendations.length > 0) {
+      // Log each selection to thompson_selection_log for explainability
+      const selectionLogs = recommendations.map((rec: any, index: number) => ({
+        correlation_id: rec.correlation_id, // Link to execution via correlation_id
+        execution_id: `recommend-${timestamp}-${index}`, // Placeholder until actual execution
+        activity_id: rec.template_id,
+        thompson_sample: rec.selection_metadata.sample,
+        alpha: rec.selection_metadata.alpha,
+        beta: rec.selection_metadata.beta,
+        selection_method: 'thompson_sampling',
+        candidates_count: templates.length,
+      }));
+
+      // Insert selection logs with record references (fire-and-forget for performance)
+      // Use FOR loop to handle array inserts properly
+      // Note: Use type::record() for reliable string-to-record conversion
+      surrealDB.query(`
+        FOR $log IN $logs {
+          CREATE thompson_selection_log CONTENT {
+            correlation_id: $log.correlation_id,
+            execution_id: $log.execution_id,
+            activity_id: $log.activity_id,
+            thompson_sample: $log.thompson_sample,
+            alpha: $log.alpha,
+            beta: $log.beta,
+            selection_method: $log.selection_method,
+            candidates_count: $log.candidates_count,
+            org_id: type::record('organizations', $org_name),
+            project_id: IF $project_name IS NOT NONE AND $project_name IS NOT NULL THEN type::record('projects', $project_name) ELSE NONE END
+          }
+        }
+      `, {
+        logs: selectionLogs,
+        org_name: orgId, // Just the name part, not the full record ref
+        project_name: projectId, // Just the name part
+      }).catch((err: any) => {
+        logger.warn('Failed to log Thompson selections', { error: err.message });
+      });
+
+      // Increment total_selections for recommended activities
+      const activityIds = recommendations.map((r: any) => r.template_id);
+      surrealDB.query(`
+        UPDATE variant_performance_metrics
+        SET total_selections = total_selections + 1,
+            updated_at = time::now()
+        WHERE variant_id IN $activity_ids
+          AND org_id = $org_id
+      `, { activity_ids: activityIds, org_id: orgId }).catch((err: any) => {
+        logger.warn('Failed to update total_selections', { error: err.message });
+      });
+
+      logger.debug('Selection metrics queued for persistence', {
+        selectionCount: selectionLogs.length,
+        activityIds,
+      });
+    }
 
     return c.json({ recommendations });
   } catch (error: any) {
@@ -3133,6 +3537,136 @@ app.get('/execution-sequences', async (c) => {
     
     return c.json({
       error: 'Failed to query execution sequences',
+      message: error.message,
+    }, 500);
+  }
+});
+
+// =============================================================================
+// Tag Endpoints
+// =============================================================================
+
+/**
+ * GET /tags/suggest
+ *
+ * Get tag suggestions based on a prefix
+ *
+ * Query params:
+ *   prefix?: string - The prefix to match (e.g., "feat" matches "feature", "feature.vessel")
+ *   limit?: number - Maximum suggestions to return (default: 20)
+ *
+ * Returns:
+ * {
+ *   suggestions: string[],
+ *   total: number
+ * }
+ */
+app.get('/tags/suggest', async (c) => {
+  try {
+    const prefix = c.req.query('prefix') || '';
+    const limit = parseInt(c.req.query('limit') || '20', 10);
+
+    logger.info('GET /tags/suggest', { prefix, limit });
+
+    // Query tag prefixes (deduplication happens in code)
+    const query = `
+      SELECT tag_prefixes FROM activity_template
+      WHERE array::len(tag_prefixes) > 0
+      LIMIT 1000
+    `;
+
+    const result = await surrealDB.query(query);
+
+    // Flatten and dedupe all tag_prefixes, filtering by prefix
+    const allPrefixes = new Set<string>();
+    for (const row of (result || [])) {
+      if (row.tag_prefixes && Array.isArray(row.tag_prefixes)) {
+        for (const p of row.tag_prefixes) {
+          if (!prefix || p.startsWith(prefix)) {
+            allPrefixes.add(p);
+          }
+        }
+      }
+    }
+
+    // Sort and limit
+    const suggestions = Array.from(allPrefixes)
+      .sort()
+      .slice(0, limit);
+
+    return c.json({
+      suggestions,
+      total: allPrefixes.size,
+      prefix: prefix || null,
+    });
+
+  } catch (error: any) {
+    logger.error('Failed to get tag suggestions', { error: error.message });
+    return c.json({
+      error: 'Failed to get tag suggestions',
+      message: error.message,
+    }, 500);
+  }
+});
+
+/**
+ * GET /tags/stats
+ *
+ * Get tag usage statistics
+ *
+ * Query params:
+ *   prefix?: string - Filter to tags with this prefix
+ *
+ * Returns:
+ * {
+ *   stats: { tag: string, count: number }[],
+ *   total_templates: number
+ * }
+ */
+app.get('/tags/stats', async (c) => {
+  try {
+    const prefix = c.req.query('prefix') || '';
+
+    logger.info('GET /tags/stats', { prefix });
+
+    // Query templates and count tag occurrences
+    const query = `
+      SELECT tags FROM activity_template
+      WHERE array::len(tags) > 0
+    `;
+
+    const result = await surrealDB.query(query);
+
+    // Count tag occurrences
+    const tagCounts = new Map<string, number>();
+    let totalTemplates = 0;
+
+    for (const row of (result || [])) {
+      if (row.tags && Array.isArray(row.tags)) {
+        totalTemplates++;
+        for (const tag of row.tags) {
+          if (!prefix || tag.startsWith(prefix)) {
+            tagCounts.set(tag, (tagCounts.get(tag) || 0) + 1);
+          }
+        }
+      }
+    }
+
+    // Convert to sorted array
+    const stats = Array.from(tagCounts.entries())
+      .map(([tag, count]) => ({ tag, count }))
+      .sort((a, b) => b.count - a.count);
+
+    return c.json({
+      stats,
+      total_templates: totalTemplates,
+      prefix: prefix || null,
+    });
+
+  } catch (error: any) {
+    logger.error('Failed to get tag stats', { error: error.message });
+    return c.json({
+      error: 'Failed to get tag stats',
       message: error.message,
     }, 500);
   }
