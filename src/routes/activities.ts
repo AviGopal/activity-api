@@ -15,6 +15,8 @@ import { surrealDB, queryWithAuth } from '../db/surreal';
 import { RedisClient } from '../db/redis';
 import { logger } from '../utils/logger';
 import { ensureTags, computeTagPrefixes, deriveCategory } from '../utils/tags';
+import { analyzeTaskSemantics } from '../utils/semantic-tags';
+import { calculateImpulseRelevancyBoosts, discoverMissingImpulses } from '../utils/impulse-relevancy';
 import {
   insertActivity,
   insertExecution,
@@ -1984,6 +1986,25 @@ app.post('/recommend', async (c) => {
       }, 400);
     }
 
+    // SEMANTIC ANALYSIS: Extract tag prefixes and implied shapes from task description
+    const semantics = analyzeTaskSemantics(task_description, loaded_impulses);
+
+    // Use extracted tag prefixes if not explicitly provided
+    const effectiveTagPrefix = tag_prefix || semantics.tagPrefixes[0] || null;
+    const effectiveTags = tags || (semantics.tagPrefixes.length > 0 ? semantics.tagPrefixes.slice(0, 3) : null);
+
+    // Augment impulse_shapes with semantically implied shapes
+    const effectiveShapes = [...new Set([...impulse_shapes, ...semantics.impliedShapes])];
+
+    logger.info('Semantic analysis', {
+      extractedTags: semantics.tagPrefixes,
+      impliedShapes: semantics.impliedShapes,
+      primaryIntent: semantics.primaryIntent,
+      effectiveTagPrefix,
+      effectiveTags,
+      effectiveShapes,
+    });
+
     // Get session data for multi-tenant filtering
     const sessionData = (c.get as any)('session') as SessionData | undefined;
     const jwtAuth = getJwtAuthFromContext(c);
@@ -1995,10 +2016,10 @@ app.post('/recommend', async (c) => {
     let templates: any[] = [];
     let queryPath: 'new' | 'legacy' = 'legacy';
 
-    if (impulse_shapes && impulse_shapes.length > 0) {
-      // Use shape-based matching with new activity table
+    if (effectiveShapes && effectiveShapes.length > 0) {
+      // Use shape-based matching with new activity table (includes semantically implied shapes)
       const paradigmResult = await queryActivitiesByShapes(
-        impulse_shapes,
+        effectiveShapes,
         orgId,
         category,
         limit * 3, // Fetch more to account for filtering
@@ -2050,18 +2071,18 @@ app.post('/recommend', async (c) => {
         params.category = category;
       }
 
-      // Filter by exact tags if provided
-      if (tags && Array.isArray(tags) && tags.length > 0) {
+      // Filter by exact tags if provided (uses semantic extraction if not explicit)
+      if (effectiveTags && Array.isArray(effectiveTags) && effectiveTags.length > 0) {
         // Match templates that have any of the specified tags
-        whereClauses.push(`tags CONTAINSANY $tags`);
-        params.tags = tags;
+        whereClauses.push(`tag_prefixes CONTAINSANY $tags`);
+        params.tags = effectiveTags;
       }
 
-      // Filter by tag prefix if provided
-      if (tag_prefix && typeof tag_prefix === 'string') {
+      // Filter by tag prefix if provided (uses semantic extraction if not explicit)
+      if (effectiveTagPrefix && typeof effectiveTagPrefix === 'string') {
         // Match templates where any tag_prefix starts with the given prefix
         whereClauses.push(`tag_prefixes CONTAINS $tag_prefix`);
-        params.tag_prefix = tag_prefix;
+        params.tag_prefix = effectiveTagPrefix;
       }
 
       if (whereClauses.length > 0) {
@@ -2076,15 +2097,15 @@ app.post('/recommend', async (c) => {
 
       logger.info('Templates fetched for recommendation', { count: templates.length, path: queryPath });
 
-      // Apply schema-based filtering if impulse_shapes provided (legacy fallback)
-      if (impulse_shapes && impulse_shapes.length > 0) {
+      // Apply schema-based filtering if shapes provided (includes semantic extraction)
+      if (effectiveShapes && effectiveShapes.length > 0) {
         const beforeCount = templates.length;
-        templates = filterByInputSchema(templates, impulse_shapes);
+        templates = filterByInputSchema(templates, effectiveShapes);
         logger.info('Schema filtering applied (legacy)', {
           before: beforeCount,
           after: templates.length,
-          providedShapes: impulse_shapes,
-          reduction: `${Math.round((1 - templates.length / beforeCount) * 100)}%`
+          providedShapes: effectiveShapes,
+          reduction: beforeCount > 0 ? `${Math.round((1 - templates.length / beforeCount) * 100)}%` : '0%'
         });
       }
     }
@@ -2097,12 +2118,12 @@ app.post('/recommend', async (c) => {
     let scoreMethod: 'shape_conditioned' | 'global' | 'legacy' = 'legacy';
 
     if (activityIds.length > 0 && orgId) {
-      // Use shape-conditioned scores when shapes are provided
-      if (impulse_shapes && impulse_shapes.length > 0) {
+      // Use shape-conditioned scores when shapes are provided (includes semantically implied shapes)
+      if (effectiveShapes && effectiveShapes.length > 0) {
         const shapeScoresResult = await getShapeConditionedScores(
           orgId,
           activityIds,
-          impulse_shapes,
+          effectiveShapes,
           jwtAuth?.jwtToken
         );
         for (const score of shapeScoresResult.data) {
@@ -2117,7 +2138,9 @@ app.post('/recommend', async (c) => {
           count: shapeScoresResult.data.length,
           path: shapeScoresResult.path,
           scoreMethod,
-          impulse_shapes,
+          original_shapes: impulse_shapes,
+          effective_shapes: effectiveShapes,
+          semantic_additions: semantics.impliedShapes,
         });
       } else {
         // Fall back to global activity scores
@@ -2136,19 +2159,77 @@ app.post('/recommend', async (c) => {
       templates = await enrichTemplatesWithMetrics(templates);
     }
 
-    // Apply Thompson Sampling
+    // Calculate impulse relevancy boosts
+    const impulseBoostsMap = await calculateImpulseRelevancyBoosts(activityIds, loaded_impulses);
+
+    // Discover missing impulses that would unlock better activities
+    const missingImpulseSuggestions = await discoverMissingImpulses(activityIds, loaded_impulses, 5);
+
+    if (missingImpulseSuggestions.length > 0) {
+      logger.info('Missing impulse suggestions', {
+        count: missingImpulseSuggestions.length,
+        top_suggestion: missingImpulseSuggestions[0]?.impulse_id,
+        suggestions: missingImpulseSuggestions.map(s => ({
+          impulse: s.impulse_id,
+          unlocks: s.unlocks_activities.length,
+        })),
+      });
+    }
+
+    // Apply Thompson Sampling with heuristic prior boosting
     const recommendations = templates
       .map((template: any) => {
         // Try to get alpha/beta from v_activity_score first
         const activityId = template.id || template.variant_id;
         const scores = scoresMap.get(activityId);
-        const alpha = scores?.alpha || template.metrics?.thompson_alpha || 1.0;
+        let alpha = scores?.alpha || template.metrics?.thompson_alpha || 1.0;
         const betaVal = scores?.beta || template.metrics?.thompson_beta || 1.0;
+
+        // HEURISTIC BOOSTS: Encode domain knowledge as informative priors
+        const templateTags = template.tags || [];
+        const templateShapes = template.input_shapes || [];
+        let totalBoost = 0;
+
+        // 1. Tag match quality boost (+0 to +6 based on match quality)
+        const tagMatchQuality = semantics.getMatchQuality(templateTags);
+        const tagBoost = Math.floor(tagMatchQuality * 6);
+        totalBoost += tagBoost;
+
+        // 2. Shape compatibility boost (+3 if input_shapes ⊆ available shapes)
+        const shapeCompatible = templateShapes.length === 0 ||
+          templateShapes.every((shape: string) => effectiveShapes.includes(shape));
+        const shapeBoost = shapeCompatible ? 3 : 0;
+        totalBoost += shapeBoost;
+
+        // 3. Recency boost (+1 for templates created in last 30 days)
+        const createdAt = template.created_at ? new Date(template.created_at) : null;
+        const daysSinceCreation = createdAt ? (Date.now() - createdAt.getTime()) / (1000 * 60 * 60 * 24) : Infinity;
+        const recencyBoost = daysSinceCreation < 30 ? 1 : 0;
+        totalBoost += recencyBoost;
+
+        // 4. Execution history boost (proven templates get +1 to +5)
+        const executionCount = (scores?.successes || 0) + (scores?.failures || 0);
+        const historyBoost = Math.min(5, Math.floor(executionCount / 10));
+        totalBoost += historyBoost;
+
+        // 5. Scope preference boost (+1 for org-specific templates)
+        const scopeBoost = template.scope === 'org' || template.scope === 'project' ? 1 : 0;
+        totalBoost += scopeBoost;
+
+        // 6. Impulse relevancy boost (based on loaded impulses)
+        const impulseBoost = impulseBoostsMap.get(activityId);
+        const impulseAlphaBoost = impulseBoost?.alphaBoost || 0;
+        const impulseBetaPenalty = impulseBoost?.betaPenalty || 0;
+        totalBoost += impulseAlphaBoost;
+
+        // Apply boosts and penalties
+        alpha += totalBoost;
+        const adjustedBeta = betaVal + impulseBetaPenalty;
 
         // Sample from Beta(alpha, beta) distribution for Thompson Sampling
         // This enables exploration (high variance for uncertain templates) and
         // exploitation (high mean for proven templates) tradeoff
-        const sample = betaSample(alpha, betaVal);
+        const sample = betaSample(alpha, adjustedBeta);
 
         return {
           template_id: activityId,
@@ -2163,10 +2244,30 @@ app.post('/recommend', async (c) => {
             method: 'thompson_sampling',
             score_source: scoreMethod, // shape_conditioned | global | legacy
             alpha,
-            beta: betaVal,
+            beta: adjustedBeta,
+            original_beta: betaVal,
             sample,
             score: sample, // Use sample as score for ranking
             query_path: queryPath, // For monitoring
+            // Semantic matching quality
+            tag_match_quality: tagMatchQuality,
+            heuristic_boost: totalBoost,
+            boost_breakdown: {
+              tag_match: tagBoost,
+              shape_compatible: shapeBoost,
+              recency: recencyBoost,
+              execution_history: historyBoost,
+              scope_preference: scopeBoost,
+              impulse_relevancy: impulseAlphaBoost,
+            },
+            // Impulse relevancy details
+            impulse_analysis: impulseBoost ? {
+              alpha_boost: impulseBoost.alphaBoost,
+              beta_penalty: impulseBoost.betaPenalty,
+              relevant_impulses: impulseBoost.relevantImpulses,
+              missing_critical_impulses: impulseBoost.missingCriticalImpulses,
+              details: impulseBoost.details,
+            } : null,
             // Include shape signature if shape-conditioned
             ...(scoreMethod === 'shape_conditioned' && scores && 'shape_signature' in scores
               ? { shape_signature: (scores as any).shape_signature }
@@ -2251,7 +2352,18 @@ app.post('/recommend', async (c) => {
       });
     }
 
-    return c.json({ recommendations });
+    return c.json({
+      recommendations,
+      // Include missing impulse suggestions if any were found
+      ...(missingImpulseSuggestions.length > 0 ? {
+        missing_impulses: missingImpulseSuggestions.map(s => ({
+          impulse_id: s.impulse_id,
+          reason: s.reason,
+          unlocks_activities: s.unlocks_activities.length,
+          avg_relevance_boost: s.avg_relevance_boost,
+        })),
+      } : {}),
+    });
   } catch (error: any) {
     logger.error('POST /recommend failed', { 
       error: error.message,

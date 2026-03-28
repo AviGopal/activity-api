@@ -1,0 +1,282 @@
+/**
+ * Semantic tag extraction and mapping
+ *
+ * Maps natural language keywords in task descriptions to hierarchical tags.
+ * Used to pre-filter activity templates before Thompson Sampling.
+ */
+
+/**
+ * Keyword to tag prefix mappings
+ *
+ * Structure: keyword → tag prefixes (ordered by specificity)
+ * When multiple keywords match, all tag prefixes are combined.
+ */
+const KEYWORD_TO_TAGS: Record<string, string[]> = {
+  // Testing
+  'test': ['utility.code.test', 'utility'],
+  'tests': ['utility.code.test', 'utility'],
+  'testing': ['utility.code.test', 'utility'],
+  'unit test': ['utility.code.test', 'utility'],
+  'integration test': ['utility.code.test', 'utility'],
+  'e2e': ['utility.code.test', 'utility'],
+
+  // Debugging and analysis
+  'debug': ['meta.debug', 'meta'],
+  'debugging': ['meta.debug', 'meta'],
+  'analyze': ['meta.debug', 'meta.learning'],
+  'analyse': ['meta.debug', 'meta.learning'],
+  'investigate': ['meta.debug', 'meta'],
+  'diagnose': ['meta.debug', 'meta'],
+  'troubleshoot': ['meta.debug', 'meta'],
+  'failure': ['meta.debug', 'meta'],
+  'error': ['meta.debug', 'meta'],
+  'failed': ['meta.debug', 'meta'],
+  'failing': ['meta.debug', 'meta'],
+
+  // Feature development
+  'implement': ['feature', 'feature.vessel'],
+  'add': ['feature', 'feature.vessel'],
+  'create': ['feature', 'utility'],
+  'build': ['feature', 'feature.vessel'],
+  'develop': ['feature', 'meta.develop'],
+  'feature': ['feature'],
+  'endpoint': ['feature.vessel.api', 'feature'],
+  'api': ['feature.vessel.api', 'feature'],
+  'route': ['feature.vessel.api', 'feature'],
+
+  // Refactoring
+  'refactor': ['meta.refactor', 'meta'],
+  'refactoring': ['meta.refactor', 'meta'],
+  'cleanup': ['meta.refactor', 'meta'],
+  'simplify': ['meta.refactor', 'meta'],
+  'optimize': ['meta.refactor', 'meta'],
+  'improve': ['meta.refactor', 'meta.learning'],
+  'restructure': ['meta.refactor', 'meta'],
+
+  // Bug fixing
+  'fix': ['bugfix', 'meta.debug'],
+  'bugfix': ['bugfix'],
+  'bug': ['bugfix', 'meta.debug'],
+  'patch': ['bugfix'],
+  'repair': ['bugfix', 'meta.debug'],
+
+  // Code exploration
+  'explore': ['utility.exploration', 'utility'],
+  'exploration': ['utility.exploration', 'utility'],
+  'understand': ['utility.exploration', 'meta.learning'],
+  'analyze structure': ['utility.exploration', 'utility'],
+  'codebase': ['utility.exploration', 'utility'],
+  'dependencies': ['utility.exploration', 'utility'],
+  'architecture': ['utility.exploration', 'meta'],
+
+  // Meta-learning
+  'extract': ['meta.learning', 'meta'],
+  'learn': ['meta.learning', 'meta'],
+  'pattern': ['meta.learning', 'meta'],
+  'discover': ['meta.learning', 'meta.debug'],
+  'template': ['meta.learning', 'meta'],
+  'variant': ['meta.learning', 'meta'],
+  'generalize': ['meta.learning', 'meta'],
+  'specialize': ['meta.learning', 'meta'],
+
+  // Instrumentation
+  'instrument': ['tool.instrumentation', 'tool'],
+  'instrumentation': ['tool.instrumentation', 'tool'],
+  'trace': ['tool.instrumentation', 'utility.code.trace'],
+  'tracing': ['tool.instrumentation', 'utility.code.trace'],
+  'monitor': ['tool.instrumentation', 'tool'],
+  'observability': ['tool.instrumentation', 'tool'],
+
+  // Documentation
+  'document': ['utility.documentation', 'utility'],
+  'documentation': ['utility.documentation', 'utility'],
+  'readme': ['utility.documentation', 'utility'],
+  'docs': ['utility.documentation', 'utility'],
+  'comment': ['utility.documentation', 'utility'],
+
+  // Infrastructure
+  'deploy': ['infrastructure', 'tool.deployment'],
+  'deployment': ['infrastructure', 'tool.deployment'],
+  'configure': ['infrastructure', 'feature.vessel.state'],
+  'setup': ['infrastructure', 'feature.vessel'],
+  'infrastructure': ['infrastructure'],
+  'devops': ['infrastructure', 'tool'],
+
+  // State management
+  'state': ['feature.vessel.state', 'feature'],
+  'persistence': ['feature.vessel.state', 'feature'],
+  'storage': ['feature.vessel.state', 'feature'],
+  'database': ['feature.vessel.state', 'infrastructure'],
+
+  // Communication
+  'websocket': ['feature.vessel.state.communication', 'feature'],
+  'notification': ['feature.vessel.state.communication', 'feature'],
+  'event': ['feature.vessel.state.communication', 'feature'],
+  'message': ['feature.vessel.state.communication', 'feature'],
+
+  // Code quality
+  'lint': ['utility.code.quality', 'utility'],
+  'format': ['utility.code.quality', 'utility'],
+  'type': ['utility.code.quality', 'utility'],
+  'types': ['utility.code.quality', 'utility'],
+  'typescript': ['utility.code.quality', 'utility'],
+};
+
+/**
+ * Extract tag prefixes from a task description
+ *
+ * @param taskDescription - Natural language goal description
+ * @returns Array of tag prefixes to filter by, ordered by confidence
+ */
+export function extractTagPrefixes(taskDescription: string): string[] {
+  const lowerDesc = taskDescription.toLowerCase();
+  const matchedTags = new Set<string>();
+  const tagScores = new Map<string, number>();
+
+  // Find all matching keywords
+  for (const [keyword, tagPrefixes] of Object.entries(KEYWORD_TO_TAGS)) {
+    if (lowerDesc.includes(keyword)) {
+      // Add all associated tag prefixes
+      for (let i = 0; i < tagPrefixes.length; i++) {
+        const tag = tagPrefixes[i];
+        matchedTags.add(tag);
+
+        // Score by specificity (first tag in list = most specific = highest score)
+        const specificityScore = tagPrefixes.length - i;
+        const currentScore = tagScores.get(tag) || 0;
+        tagScores.set(tag, currentScore + specificityScore);
+      }
+    }
+  }
+
+  // Sort by score (descending)
+  const sortedTags = Array.from(matchedTags).sort((a, b) => {
+    const scoreA = tagScores.get(a) || 0;
+    const scoreB = tagScores.get(b) || 0;
+    if (scoreB !== scoreA) return scoreB - scoreA;
+
+    // Tie-break: more specific (more dots) wins
+    const dotsA = (a.match(/\./g) || []).length;
+    const dotsB = (b.match(/\./g) || []).length;
+    return dotsB - dotsA;
+  });
+
+  return sortedTags;
+}
+
+/**
+ * Calculate tag match quality between extracted tags and template tags
+ *
+ * @param extractedPrefixes - Tag prefixes from task description
+ * @param templateTags - Tags assigned to activity template
+ * @returns Match quality score (0.0 to 1.0)
+ */
+export function calculateTagMatchQuality(
+  extractedPrefixes: string[],
+  templateTags: string[]
+): number {
+  if (extractedPrefixes.length === 0 || templateTags.length === 0) {
+    return 0;
+  }
+
+  let totalScore = 0;
+  let maxScore = 0;
+
+  for (let i = 0; i < extractedPrefixes.length; i++) {
+    const prefix = extractedPrefixes[i];
+    const prefixWeight = 1.0 / (i + 1); // First match = 1.0, second = 0.5, third = 0.33...
+    maxScore += prefixWeight;
+
+    // Check if any template tag starts with this prefix
+    const hasMatch = templateTags.some(tag => tag.startsWith(prefix));
+    if (hasMatch) {
+      totalScore += prefixWeight;
+    }
+  }
+
+  return maxScore > 0 ? totalScore / maxScore : 0;
+}
+
+/**
+ * Extract specific entities that might map to impulse shapes
+ *
+ * @param taskDescription - Natural language goal description
+ * @returns Suggested impulse shapes to look for
+ */
+export function extractImpliedShapes(taskDescription: string): string[] {
+  const shapes = new Set<string>();
+  const lowerDesc = taskDescription.toLowerCase();
+
+  // File/code patterns
+  if (lowerDesc.match(/\b\w+\.(ts|js|py|go|rs|java)\b/)) {
+    shapes.add('source_code');
+    shapes.add('file');
+  }
+
+  // Error/failure patterns
+  if (lowerDesc.match(/\b(error|exception|failure|crash|bug)\b/)) {
+    shapes.add('error');
+    shapes.add('trace');
+  }
+
+  // Execution/trace patterns
+  if (lowerDesc.match(/\b(execution|trace|activity|run|running)\b/)) {
+    shapes.add('activityExecutionTrace');
+  }
+
+  // Template/pattern patterns
+  if (lowerDesc.match(/\b(template|activity|pattern|variant)\b/)) {
+    shapes.add('activityTemplate');
+  }
+
+  // Metrics/performance patterns
+  if (lowerDesc.match(/\b(metric|performance|stats|success rate|failing)\b/)) {
+    shapes.add('activityMetrics');
+  }
+
+  // Test patterns
+  if (lowerDesc.match(/\b(test|spec|suite)\b/)) {
+    shapes.add('test_suite');
+    shapes.add('source_code');
+  }
+
+  // Goal/requirement patterns
+  if (lowerDesc.match(/\b(goal|requirement|spec|requirement)\b/)) {
+    shapes.add('goal_text');
+  }
+
+  return Array.from(shapes);
+}
+
+/**
+ * Compute comprehensive semantic analysis of task description
+ *
+ * @param taskDescription - Natural language goal description
+ * @param loadedImpulses - Currently available impulse IDs (optional)
+ * @returns Analysis with tag prefixes, match quality helper, and shape suggestions
+ */
+export function analyzeTaskSemantics(taskDescription: string, loadedImpulses?: string[]) {
+  const tagPrefixes = extractTagPrefixes(taskDescription);
+  const impliedShapes = extractImpliedShapes(taskDescription);
+
+  return {
+    tagPrefixes,
+    impliedShapes,
+
+    /**
+     * Helper to calculate match quality for a given template
+     */
+    getMatchQuality: (templateTags: string[]) =>
+      calculateTagMatchQuality(tagPrefixes, templateTags),
+
+    /**
+     * Get the primary intent category
+     */
+    primaryIntent: tagPrefixes[0]?.split('.')[0] || null,
+
+    /**
+     * Get all intents (top-level categories)
+     */
+    allIntents: [...new Set(tagPrefixes.map(t => t.split('.')[0]))],
+  };
+}
