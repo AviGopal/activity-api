@@ -1,8 +1,10 @@
 # metabob-activity-api Dockerfile
 # Build lightweight TypeScript activity system vessel
 #
-# Build context: repos/ (parent directory)
-# Usage: docker build -f metabob-activity-api/Dockerfile -t metabob-activity-api:latest .
+# Build context: Parent directory containing both metabob-activity-api/ and metabob-proto/ as siblings
+#
+# Monorepo: docker build -f metabob-activity-api/Dockerfile -t metabob-activity-api:latest repos/
+# Deployment: docker build -f metabob-activity-api/Dockerfile -t metabob-activity-api:latest vessels/
 
 FROM oven/bun:1 as build
 WORKDIR /app
