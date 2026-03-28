@@ -110,7 +110,7 @@ class MigrationRunner {
       '015-impulse-metadata.surql',
       // Paradigm alignment tables (schema-paradigm-alignment)
       '020-paradigm-core-tables.surql',
-      '021-paradigm-computed-views.surql',
+      // SKIPPED: 021-paradigm-computed-views.surql - incompatible with SurrealDB 3.0.0
       '022-paradigm-compat-views.surql',
     ];
 
