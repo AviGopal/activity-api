@@ -244,18 +244,17 @@ export async function insertActivity(
       .map(k => `${k}: $${k}`)
       .join(',\n        ');
 
-    // For org_id: if JWT token is provided, use <record> $auth.org_id to convert
-    // string to record type. Otherwise, convert string parameter to record type.
-    // Note: $auth.org_id is a string like "organizations:metabob_internal" that needs conversion.
+    // For org_id: org_id is a STRING field in paradigm schema (not a record)
+    // $auth.org_id is already a plain string like "metabob_internal"
     const orgIdClause = jwtToken
-      ? `,\n        org_id: <record> $auth.org_id` // Convert $auth.org_id string to record
-      : (activity.org_id ? `,\n        org_id: type::record('organizations', $org_id)` : '');
+      ? `,\n        org_id: $auth.org_id` // Use string directly from $auth
+      : (activity.org_id ? `,\n        org_id: $org_id` : '');
     if (!jwtToken && activity.org_id) record.org_id = activity.org_id;
 
-    // For project_id: similar logic, but $auth.project_id may be null
+    // For project_id: optional record field, let schema VALUE clause handle it from $auth
     const projectIdClause = jwtToken
-      ? '' // project_id is optional, let schema handle it
-      : (activity.project_id ? `,\n        project_id: type::record('projects', $project_id)` : '');
+      ? '' // Let schema auto-populate from $auth.project_id
+      : (activity.project_id ? `,\n        project_id: $project_id` : '');
     if (!jwtToken && activity.project_id) record.project_id = activity.project_id;
 
     const query = `
@@ -331,18 +330,17 @@ export async function insertExecution(
       .map(k => `${k}: $${k}`)
       .join(',\n        ');
 
-    // For org_id: if JWT token is provided, use <record> $auth.org_id to convert
-    // string to record type. Otherwise, convert string parameter to record type.
-    // Note: $auth.org_id is a string like "organizations:metabob_internal" that needs conversion.
+    // For org_id: org_id is a STRING field in paradigm schema (not a record)
+    // $auth.org_id is already a plain string like "metabob_internal"
     const orgIdClause = jwtToken
-      ? `,\n        org_id: <record> $auth.org_id` // Convert $auth.org_id string to record
-      : (execution.org_id ? `,\n        org_id: type::record('organizations', $org_id)` : '');
+      ? `,\n        org_id: $auth.org_id` // Use string directly from $auth
+      : (execution.org_id ? `,\n        org_id: $org_id` : '');
     if (!jwtToken && execution.org_id) record.org_id = execution.org_id;
 
-    // For project_id: similar logic, but $auth.project_id may be null
+    // For project_id: optional record field, let schema VALUE clause handle it from $auth
     const projectIdClause = jwtToken
-      ? '' // project_id is optional, let schema handle it
-      : (execution.project_id ? `,\n        project_id: type::record('projects', $project_id)` : '');
+      ? '' // Let schema auto-populate from $auth.project_id
+      : (execution.project_id ? `,\n        project_id: $project_id` : '');
     if (!jwtToken && execution.project_id) record.project_id = execution.project_id;
 
     const query = `

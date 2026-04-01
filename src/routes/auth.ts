@@ -83,6 +83,7 @@ auth.post('/minibob/signin', async (c) => {
 
     // Query $auth to get org_id and project_id from the authenticated session
     // After RECORD signin, $auth contains the minibob_instance record
+    // NOTE: org_id is already a STRING (not a record ID), so no conversion needed
     const authQuery = await db.query<[{
       org_id: string;
       project_id?: string;
@@ -101,10 +102,11 @@ auth.post('/minibob/signin', async (c) => {
       }, 500)
     }
 
+    // org_id is already a string from minibob_instance schema - no conversion needed
     return c.json({
       token: jwtToken,
-      org_id: instance.org_id.toString().replace('organizations:', ''),
-      project_id: instance.project_id ? instance.project_id.toString().replace('projects:', '') : undefined,
+      org_id: instance.org_id,
+      project_id: instance.project_id,
     })
 
   } catch (error) {

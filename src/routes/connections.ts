@@ -269,7 +269,7 @@ connections.post('/acquire', async (c) => {
 
       // Get oldest connection info
       const activeConnections = await surrealDB.query<Connection>(
-        `SELECT * FROM connection
+        `SELECT * FROM active_connections
          WHERE api_key_id = $apiKeyId AND status IN ['active', 'grace']
          ORDER BY connected_at ASC LIMIT 1`,
         { apiKeyId: matchedKey.id }
@@ -516,7 +516,7 @@ connections.post('/reconnect', async (c) => {
 
     // Find connection by session token
     const connectionsResult = await surrealDB.query<Connection>(
-      `SELECT * FROM connection WHERE session_token = $sessionToken LIMIT 1`,
+      `SELECT * FROM active_connections WHERE session_token = $sessionToken LIMIT 1`,
       { sessionToken: session_token }
     );
 
@@ -736,7 +736,7 @@ connections.get('/count', async (c) => {
 
     // Also get from SurrealDB for accuracy (in case Redis is stale)
     const dbConnections = await surrealDB.query<{ count: number }>(
-      `SELECT count() as count FROM connection
+      `SELECT count() as count FROM active_connections
        WHERE api_key_id = $apiKeyId AND status IN ['active', 'grace']
        GROUP ALL`,
       { apiKeyId }
@@ -796,7 +796,7 @@ connections.get('/status', async (c) => {
     // Get all connections for this org
     const orgConnections = await queryWithAuth<Connection>(
       jwtAuth!.jwtToken,
-      `SELECT * FROM connection WHERE status IN ['active', 'grace'] ORDER BY connected_at DESC`
+      `SELECT * FROM active_connections WHERE status IN ['active', 'grace'] ORDER BY connected_at DESC`
     );
 
     return c.json({

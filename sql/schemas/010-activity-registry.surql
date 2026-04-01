@@ -142,7 +142,7 @@ DEFINE FIELD IF NOT EXISTS public ON activity_registry TYPE bool
 
 DEFINE FIELD IF NOT EXISTS org_id ON activity_registry TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON activity_registry TYPE option<record<projects>>
@@ -224,7 +224,7 @@ DEFINE FIELD IF NOT EXISTS activity_id ON variant_performance_metrics TYPE strin
   COMMENT "Base activity identifier";
 
 DEFINE FIELD IF NOT EXISTS org_id ON variant_performance_metrics TYPE option<string>
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string identifier)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON variant_performance_metrics TYPE option<string>

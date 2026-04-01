@@ -878,16 +878,8 @@ app.post('/', async (c) => {
 
     const optionalFieldsStr = optionalFields.length > 0 ? `,\n        ${optionalFields.join(',\n        ')}` : '';
 
-    // Build org_id/project_id record link expressions
-    // SurrealDB expects record links (organizations:xxx) not plain strings
-    // Use type::record() to construct record links from string IDs
-    const orgIdExpr = trace.org_id
-      ? `type::record('organizations', $org_id)`
-      : 'NONE';
-    const projectIdExpr = trace.project_id
-      ? `type::record('projects', $project_id)`
-      : 'NONE';
-
+    // NOTE: org_id is a STRING field in schema (not a record link)
+    // project_id is option<record<projects>> but can be passed as string if set
     const query = `
       INSERT INTO activity_execution_traces {
         execution_id: $execution_id,
@@ -899,8 +891,8 @@ app.post('/', async (c) => {
         tokens_input: $tokens_input,
         tokens_output: $tokens_output,
         tokens_cache: $tokens_cache,
-        org_id: ${orgIdExpr},
-        project_id: ${projectIdExpr},
+        org_id: $org_id,
+        project_id: $project_id,
         executed_at: $executed_at,
         created_at: $created_at${optionalFieldsStr}
       }

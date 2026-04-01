@@ -127,7 +127,7 @@ DEFINE FIELD IF NOT EXISTS duration_ms ON state_transition TYPE int;
 -- Multi-tenancy
 DEFINE FIELD IF NOT EXISTS org_id ON state_transition TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id;
+  VALUE $value OR <string>$auth.org_id;
 
 DEFINE FIELD IF NOT EXISTS created_at ON state_transition TYPE datetime
   VALUE $value OR time::now();
@@ -180,7 +180,7 @@ DEFINE FIELD IF NOT EXISTS success_rate ON impulse_state_pattern TYPE float
 
 -- Multi-tenancy
 DEFINE FIELD IF NOT EXISTS org_id ON impulse_state_pattern TYPE string
-  VALUE $value OR $auth.org_id;
+  VALUE $value OR <string>$auth.org_id;
 
 DEFINE FIELD IF NOT EXISTS scope ON impulse_state_pattern TYPE string
   ASSERT $value IN ['global', 'org', 'project']

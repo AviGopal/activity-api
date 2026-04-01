@@ -58,7 +58,7 @@ DEFINE FIELD IF NOT EXISTS content ON impulse TYPE option<string>
 -- Multi-tenancy
 DEFINE FIELD IF NOT EXISTS org_id ON impulse TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON impulse TYPE option<record<projects>>
@@ -166,7 +166,7 @@ DEFINE FIELD IF NOT EXISTS public ON activity TYPE bool
 -- Multi-tenancy
 DEFINE FIELD IF NOT EXISTS org_id ON activity TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON activity TYPE option<record<projects>>;
@@ -262,7 +262,7 @@ DEFINE FIELD IF NOT EXISTS trace ON execution TYPE option<object> FLEXIBLE
 -- Multi-tenancy
 DEFINE FIELD IF NOT EXISTS org_id ON execution TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON execution TYPE option<record<projects>>

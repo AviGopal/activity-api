@@ -46,7 +46,7 @@ DEFINE FIELD IF NOT EXISTS variant_id ON activity_execution_traces TYPE option<s
 -- Multi-tenancy (REQUIRED for RBAC)
 DEFINE FIELD IF NOT EXISTS org_id ON activity_execution_traces TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON activity_execution_traces TYPE option<record<projects>>
@@ -222,7 +222,7 @@ DEFINE FIELD IF NOT EXISTS execution_id ON activity_composition_graph TYPE strin
 
 DEFINE FIELD IF NOT EXISTS org_id ON activity_composition_graph TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON activity_composition_graph TYPE option<record<projects>>
@@ -296,7 +296,7 @@ DEFINE FIELD IF NOT EXISTS activity_variant_id ON impulse_relevance_metrics TYPE
 
 DEFINE FIELD IF NOT EXISTS org_id ON impulse_relevance_metrics TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON impulse_relevance_metrics TYPE option<record<projects>>
@@ -375,7 +375,7 @@ DEFINE FIELD IF NOT EXISTS execution_id ON tool_usage TYPE string
 
 DEFINE FIELD IF NOT EXISTS org_id ON tool_usage TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON tool_usage TYPE option<record<projects>>
@@ -473,7 +473,7 @@ DEFINE FIELD IF NOT EXISTS candidates_count ON thompson_selection_log TYPE optio
 
 DEFINE FIELD IF NOT EXISTS org_id ON thompson_selection_log TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON thompson_selection_log TYPE option<record<projects>>

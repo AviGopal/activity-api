@@ -55,19 +55,20 @@ async function initTestData() {
     // Check if default organization exists
     console.log(`\nChecking for organization: ${DEFAULT_ORG_ID}...`);
     const orgCheck = await db.query(
-      `SELECT * FROM organizations WHERE id = type::record('organizations', $org_id)`,
-      { org_id: DEFAULT_ORG_ID }
+      `SELECT * FROM organizations WHERE id = $org_id`,
+      { org_id: `organizations:${DEFAULT_ORG_ID}` }
     );
 
     if (!orgCheck[0] || orgCheck[0].length === 0) {
       console.log(`Creating default organization: ${DEFAULT_ORG_NAME}...`);
       const orgResult = await db.query(
-        `CREATE organizations:$org_id SET
-          name = $name,
-          created_at = time::now(),
-          updated_at = time::now()`,
+        `UPDATE $org_id CONTENT {
+          name: $name,
+          created_at: time::now(),
+          updated_at: time::now()
+        }`,
         {
-          org_id: DEFAULT_ORG_ID,
+          org_id: `organizations:${DEFAULT_ORG_ID}`,
           name: DEFAULT_ORG_NAME,
         }
       );
@@ -95,15 +96,16 @@ async function initTestData() {
       const apiKeyHash = hashResult[0];
 
       const instanceResult = await db.query(
-        `CREATE minibob_instance SET
-          instance_id = $instance_id,
-          org_id = $org_id,
-          project_id = NONE,
-          api_key_hash = $api_key_hash,
-          vessel_id = $vessel_id,
-          is_active = true,
-          created_at = time::now(),
-          last_active_at = time::now()`,
+        `CREATE minibob_instance CONTENT {
+          instance_id: $instance_id,
+          org_id: $org_id,
+          project_id: NONE,
+          api_key_hash: $api_key_hash,
+          vessel_id: $vessel_id,
+          is_active: true,
+          created_at: time::now(),
+          last_active_at: time::now()
+        }`,
         {
           instance_id: MINIBOB_INSTANCE_ID,
           org_id: DEFAULT_ORG_ID,

@@ -46,7 +46,7 @@ async function processHeartbeats(): Promise<void> {
   try {
     // Find active connections that missed heartbeat
     const staleConnections = await surrealDB.query<Connection>(
-      `SELECT * FROM connection
+      `SELECT * FROM active_connections
        WHERE status = 'active'
        AND last_heartbeat < $threshold`,
       { threshold: staleThreshold }
@@ -78,7 +78,7 @@ async function processHeartbeats(): Promise<void> {
         });
 
         logger.info('[HeartbeatWorker] Connection entered grace period', {
-          connectionId: conn.id,
+          active_connectionsId: conn.id,
           apiKeyId: conn.api_key_id,
           gracePeriodMs,
           graceUntil,
@@ -86,8 +86,8 @@ async function processHeartbeats(): Promise<void> {
         });
       } catch (error) {
         const err = error as Error;
-        logger.error('[HeartbeatWorker] Failed to transition connection to grace', {
-          connectionId: conn.id,
+        logger.error('[HeartbeatWorker] Failed to transition active_connections to grace', {
+          active_connectionsId: conn.id,
           error: err.message
         });
       }
@@ -95,7 +95,7 @@ async function processHeartbeats(): Promise<void> {
 
     // Find grace periods that have expired
     const expiredConnections = await surrealDB.query<Connection>(
-      `SELECT * FROM connection
+      `SELECT * FROM active_connections
        WHERE status = 'grace'
        AND grace_until < $now`,
       { now: new Date().toISOString() }
@@ -127,8 +127,8 @@ async function processHeartbeats(): Promise<void> {
             { execId: conn.current_execution, now: nowIso }
           );
 
-          logger.warn('[HeartbeatWorker] Orphaned execution due to connection loss', {
-            connectionId: conn.id,
+          logger.warn('[HeartbeatWorker] Orphaned execution due to active_connections loss', {
+            active_connectionsId: conn.id,
             executionId: conn.current_execution
           });
         }
@@ -137,14 +137,14 @@ async function processHeartbeats(): Promise<void> {
         await releaseSlot(conn.api_key_id, conn.id);
 
         logger.info('[HeartbeatWorker] Connection grace period expired', {
-          connectionId: conn.id,
+          active_connectionsId: conn.id,
           apiKeyId: conn.api_key_id,
           hadExecution: !!conn.current_execution
         });
       } catch (error) {
         const err = error as Error;
-        logger.error('[HeartbeatWorker] Failed to expire connection', {
-          connectionId: conn.id,
+        logger.error('[HeartbeatWorker] Failed to expire active_connections', {
+          active_connectionsId: conn.id,
           error: err.message
         });
       }
@@ -175,7 +175,7 @@ async function cleanupOldConnections(): Promise<void> {
 
   try {
     const deleted = await surrealDB.query<{ count: number }>(
-      `DELETE connection WHERE status = 'disconnected' AND disconnected_at < $cutoff RETURN COUNT()`
+      `DELETE active_connections WHERE status = 'disconnected' AND disconnected_at < $cutoff RETURN COUNT()`
     , { cutoff });
 
     const count = deleted[0]?.count || 0;

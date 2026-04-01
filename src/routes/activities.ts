@@ -2151,9 +2151,9 @@ app.post('/recommend', async (c) => {
         candidates_count: templates.length,
       }));
 
-      // Insert selection logs with record references (fire-and-forget for performance)
+      // Insert selection logs (fire-and-forget for performance)
       // Use FOR loop to handle array inserts properly
-      // Note: Use type::record() for reliable string-to-record conversion
+      // NOTE: org_id is STRING type in schema, not a record
       surrealDB.query(`
         FOR $log IN $logs {
           CREATE thompson_selection_log CONTENT {
@@ -2165,14 +2165,14 @@ app.post('/recommend', async (c) => {
             beta: $log.beta,
             selection_method: $log.selection_method,
             candidates_count: $log.candidates_count,
-            org_id: type::record('organizations', $org_name),
+            org_id: $org_name,
             project_id: IF $project_name IS NOT NONE AND $project_name IS NOT NULL THEN type::record('projects', $project_name) ELSE NONE END
           }
         }
       `, {
         logs: selectionLogs,
-        org_name: orgId, // Just the name part, not the full record ref
-        project_name: projectId, // Just the name part
+        org_name: orgId, // Plain string org_id
+        project_name: projectId, // project_id can be record or string
       }).catch((err: any) => {
         logger.warn('Failed to log Thompson selections', { error: err.message });
       });

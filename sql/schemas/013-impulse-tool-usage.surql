@@ -42,7 +42,7 @@ DEFINE FIELD IF NOT EXISTS impulse_id ON impulse_data TYPE string
 -- Multi-tenancy (REQUIRED for RBAC)
 DEFINE FIELD IF NOT EXISTS org_id ON impulse_data TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON impulse_data TYPE option<record<projects>>
@@ -167,7 +167,7 @@ DEFINE FIELD IF NOT EXISTS execution_id ON impulse_usage_history TYPE string
 -- Multi-tenancy (REQUIRED for RBAC)
 DEFINE FIELD IF NOT EXISTS org_id ON impulse_usage_history TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON impulse_usage_history TYPE option<record<projects>>
@@ -236,7 +236,7 @@ DEFINE FIELD IF NOT EXISTS run_id ON ci_runs TYPE string
 -- Multi-tenancy (REQUIRED for RBAC)
 DEFINE FIELD IF NOT EXISTS org_id ON ci_runs TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON ci_runs TYPE option<record<projects>>
@@ -318,7 +318,7 @@ DEFINE FIELD IF NOT EXISTS variant_id ON code_variants TYPE string
 -- Multi-tenancy (REQUIRED for RBAC)
 DEFINE FIELD IF NOT EXISTS org_id ON code_variants TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON code_variants TYPE option<record<projects>>

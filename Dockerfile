@@ -9,18 +9,15 @@
 FROM oven/bun:1 as build
 WORKDIR /app
 
-# Install SSH client and git for private dependencies
-RUN apt-get update && apt-get install -y openssh-client git && rm -rf /var/lib/apt/lists/*
+# Copy metabob-proto dependency first (required for file: dependency in package.json)
+COPY metabob-proto /metabob-proto
 
-# Copy activity-api package files
-COPY metabob-activity-api/package.json metabob-activity-api/bun.lock* ./
+# Copy activity-api package files (no lockfile - will regenerate)
+COPY metabob-activity-api/package.json ./
 
-# Install dependencies (with SSH for git dependencies)
-RUN --mount=type=ssh \
-  mkdir -p ~/.ssh && \
-  ssh-keyscan github.com >> ~/.ssh/known_hosts && \
-  git config --global url."git@github.com:".insteadOf "https://github.com/" && \
-  bun install --frozen-lockfile --production
+# Install dependencies (includes local @metabob/proto)
+# Note: Lockfile regenerated due to file: dependency change
+RUN bun install --production
 
 # Copy activity-api source code
 COPY metabob-activity-api/src ./src
@@ -28,7 +25,7 @@ COPY metabob-activity-api/scripts ./scripts
 COPY metabob-activity-api/sql ./sql
 COPY metabob-activity-api/tsconfig.json ./
 
-# Copy metabob-proto for schema migrations
+# Copy metabob-proto to final location for schema migrations
 COPY metabob-proto ./repos/metabob-proto
 
 # Verify TypeScript compilation

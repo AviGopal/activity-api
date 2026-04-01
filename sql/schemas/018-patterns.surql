@@ -38,7 +38,7 @@ DEFINE FIELD IF NOT EXISTS pattern_id ON pattern TYPE string
 -- Multi-tenancy (REQUIRED for RBAC)
 DEFINE FIELD IF NOT EXISTS org_id ON pattern TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON pattern TYPE option<record<projects>>

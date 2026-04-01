@@ -44,7 +44,7 @@ DEFINE FIELD IF NOT EXISTS goal_embedding ON goal_execution_paths TYPE option<ar
 -- Multi-tenancy (REQUIRED for RBAC)
 DEFINE FIELD IF NOT EXISTS org_id ON goal_execution_paths TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON goal_execution_paths TYPE option<record<projects>>
@@ -238,7 +238,7 @@ DEFINE FIELD IF NOT EXISTS execution_id ON activity_dataflows TYPE string
 -- Multi-tenancy (REQUIRED for RBAC)
 DEFINE FIELD IF NOT EXISTS org_id ON activity_dataflows TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON activity_dataflows TYPE option<record<projects>>
@@ -324,7 +324,7 @@ DEFINE FIELD IF NOT EXISTS variant_id ON activity_prerequisites TYPE string
 -- Multi-tenancy (REQUIRED for RBAC)
 DEFINE FIELD IF NOT EXISTS org_id ON activity_prerequisites TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON activity_prerequisites TYPE option<record<projects>>
@@ -404,7 +404,7 @@ DEFINE FIELD IF NOT EXISTS satisfying_activity_id ON prerequisite_patterns TYPE 
 -- Multi-tenancy (REQUIRED for RBAC)
 DEFINE FIELD IF NOT EXISTS org_id ON prerequisite_patterns TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON prerequisite_patterns TYPE option<record<projects>>
@@ -478,7 +478,7 @@ DEFINE FIELD IF NOT EXISTS goal_description ON execution_sequences TYPE string
 -- Multi-tenancy (REQUIRED for RBAC)
 DEFINE FIELD IF NOT EXISTS org_id ON execution_sequences TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON execution_sequences TYPE option<record<projects>>

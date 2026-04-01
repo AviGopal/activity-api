@@ -234,12 +234,13 @@ router.post('/', async (c) => {
 
     // Create impulse record with timestamps
     // Use SurrealDB's time::now() function for datetime fields (REBUILD MARKER)
+    // NOTE: org_id is a STRING field in schema, not a record link
     const createQuery = `
       CREATE impulse_data CONTENT {
         impulse_id: $impulse_id,
         api_key: $api_key,
         project_id: $project_id,
-        org_id: type::record('organizations', $org_id),
+        org_id: $org_id,
         impulse_data: $impulse_data,
         created_at: time::now(),
         updated_at: time::now()

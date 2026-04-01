@@ -33,7 +33,7 @@ DEFINE TABLE IF NOT EXISTS llm_resolution_log SCHEMAFULL
 -- Multi-tenancy (REQUIRED for RBAC)
 DEFINE FIELD IF NOT EXISTS org_id ON llm_resolution_log TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON llm_resolution_log TYPE option<record<projects>>

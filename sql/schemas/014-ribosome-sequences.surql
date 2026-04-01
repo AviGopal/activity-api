@@ -65,7 +65,7 @@ DEFINE FIELD IF NOT EXISTS composition_weights ON composite_sequence_patterns TY
 -- Multi-tenant isolation
 DEFINE FIELD IF NOT EXISTS org_id ON composite_sequence_patterns TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
+  VALUE $value OR <string>$auth.org_id
   COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON composite_sequence_patterns TYPE option<record<projects>>
