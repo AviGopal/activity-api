@@ -949,23 +949,23 @@ app.get('/templates/:variantId', async (c) => {
 
     let result: ActivityTemplate[] = [];
 
-    // First, try to query by variant_id field (most common case)
-    // Filter by execution_type to ensure we're getting a template, not an execution
+    // Query from activity_registry (the canonical table for templates)
+    // Use the id field directly since variant_id is aliased to id in activity_template view
     const variantQuery = `
-      SELECT * FROM activity
-      WHERE variant_id = $variant_id
-        AND execution_type = 'template'
+      SELECT * FROM activity_registry
+      WHERE id = $variant_id
+        AND execution_format = 'template'
       LIMIT 1
     `;
     result = await surrealDB.query<ActivityTemplate>(variantQuery, { variant_id: variantId });
 
-    // If not found by variant_id, try by SurrealDB record ID (for activity_template:xyz format)
-    if (result.length === 0 && variantId.startsWith('activity_template:')) {
+    // If not found by id, try by SurrealDB record ID (for activity_registry:xyz format)
+    if (result.length === 0 && variantId.startsWith('activity_registry:')) {
       try {
         const recordQuery = `
-          SELECT * FROM activity
+          SELECT * FROM activity_registry
           WHERE id = type::record($variant_id)
-            AND execution_type = 'template'
+            AND execution_format = 'template'
         `;
         result = await surrealDB.query<ActivityTemplate>(recordQuery, { variant_id: variantId });
       } catch (recordError) {
