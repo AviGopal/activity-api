@@ -69,7 +69,7 @@ DEFINE FIELD IF NOT EXISTS execution_format ON activity_registry TYPE string
   COMMENT "How to execute this activity";
 
 -- Template-based activities (execution_format = 'template')
-DEFINE FIELD IF NOT EXISTS task_steps ON activity_registry TYPE option<array> FLEXIBLE
+DEFINE FIELD IF NOT EXISTS task_steps ON activity_registry TYPE option<array<object>> FLEXIBLE
   COMMENT "Task steps for template-based activities";
 
 -- Vessel function activities (execution_format = 'vessel-function')
