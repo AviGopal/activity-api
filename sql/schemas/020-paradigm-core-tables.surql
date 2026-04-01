@@ -34,7 +34,7 @@ DEFINE FIELD IF NOT EXISTS id ON impulse TYPE string
   COMMENT "Unique impulse identifier (uuid or semantic: goal-{hash}, trace-{id})";
 
 -- Pointer: WHERE the data is
-DEFINE FIELD IF NOT EXISTS pointer ON impulse TYPE object
+DEFINE FIELD IF NOT EXISTS pointer ON impulse TYPE object FLEXIBLE
   ASSERT $value != NONE
   COMMENT "Pointer structure varies by type: file, memo, trace, activity, goal, error";
 
@@ -143,10 +143,10 @@ DEFINE FIELD IF NOT EXISTS tasks.* ON activity TYPE object FLEXIBLE
 DEFINE FIELD IF NOT EXISTS tool_name ON activity TYPE option<string>;
 
 -- Composition-specific: Ordered child activity IDs
-DEFINE FIELD IF NOT EXISTS child_activities ON activity TYPE option<array<string>>;
+DEFINE FIELD IF NOT EXISTS child_activities ON activity TYPE option<array<string>> FLEXIBLE;
 
 -- Vessel function-specific: Location in codebase
-DEFINE FIELD IF NOT EXISTS source_location ON activity TYPE option<object>;
+DEFINE FIELD IF NOT EXISTS source_location ON activity TYPE option<object> FLEXIBLE;
 
 -- Lineage (for ribosome-extracted activities)
 DEFINE FIELD IF NOT EXISTS extracted_from ON activity TYPE option<string>
@@ -235,7 +235,7 @@ DEFINE FIELD IF NOT EXISTS output_impulses ON execution TYPE array<string>
 DEFINE FIELD IF NOT EXISTS success ON execution TYPE bool
   ASSERT $value != NONE;
 
-DEFINE FIELD IF NOT EXISTS error ON execution TYPE option<object>
+DEFINE FIELD IF NOT EXISTS error ON execution TYPE option<object> FLEXIBLE
   COMMENT "Error details if success=false: {message, type, task_id, stack}";
 
 -- Metrics
@@ -278,10 +278,10 @@ DEFINE FIELD IF NOT EXISTS created_by ON execution TYPE option<record<users> | r
 DEFINE FIELD IF NOT EXISTS improvisation ON execution TYPE option<bool>
   COMMENT "Whether this was an LLM improvisation (no template matched)";
 
-DEFINE FIELD IF NOT EXISTS input_impulse_shapes ON execution TYPE option<array<string>>
+DEFINE FIELD IF NOT EXISTS input_impulse_shapes ON execution TYPE option<array<string>> FLEXIBLE
   COMMENT "Shapes of input impulses for edge learning";
 
-DEFINE FIELD IF NOT EXISTS output_impulse_shapes ON execution TYPE option<array<string>>
+DEFINE FIELD IF NOT EXISTS output_impulse_shapes ON execution TYPE option<array<string>> FLEXIBLE
   COMMENT "Shapes of output impulses for edge learning";
 
 DEFINE FIELD IF NOT EXISTS metadata ON execution TYPE option<object> FLEXIBLE

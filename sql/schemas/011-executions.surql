@@ -100,13 +100,13 @@ DEFINE FIELD IF NOT EXISTS failed_task_id ON activity_execution_traces TYPE opti
   COMMENT "Task ID where failure occurred";
 
 -- Context and relationships
-DEFINE FIELD IF NOT EXISTS impulses_used ON activity_execution_traces TYPE option<array<string>>
+DEFINE FIELD IF NOT EXISTS impulses_used ON activity_execution_traces TYPE option<array<string>> FLEXIBLE
   COMMENT "Array of impulse IDs used in this execution";
 
-DEFINE FIELD IF NOT EXISTS component_changes ON activity_execution_traces TYPE option<array<string>>
+DEFINE FIELD IF NOT EXISTS component_changes ON activity_execution_traces TYPE option<array<string>> FLEXIBLE
   COMMENT "Array of component IDs changed in this execution";
 
-DEFINE FIELD IF NOT EXISTS execution_trace ON activity_execution_traces TYPE option<object>
+DEFINE FIELD IF NOT EXISTS execution_trace ON activity_execution_traces TYPE option<object> FLEXIBLE
   COMMENT "Full execution trace data (task-by-task details)";
 
 DEFINE FIELD IF NOT EXISTS state_snapshot ON activity_execution_traces TYPE option<object> FLEXIBLE
@@ -122,10 +122,10 @@ DEFINE FIELD IF NOT EXISTS parent_execution_id ON activity_execution_traces TYPE
 DEFINE FIELD IF NOT EXISTS improvisation ON activity_execution_traces TYPE option<bool>
   COMMENT "Whether this was an LLM improvisation (no template matched)";
 
-DEFINE FIELD IF NOT EXISTS input_impulse_shapes ON activity_execution_traces TYPE option<array<string>>
+DEFINE FIELD IF NOT EXISTS input_impulse_shapes ON activity_execution_traces TYPE option<array<string>> FLEXIBLE
   COMMENT "Shapes of input impulses (goal, task, previous_result, error_context, etc.)";
 
-DEFINE FIELD IF NOT EXISTS output_impulse_shapes ON activity_execution_traces TYPE option<array<string>>
+DEFINE FIELD IF NOT EXISTS output_impulse_shapes ON activity_execution_traces TYPE option<array<string>> FLEXIBLE
   COMMENT "Shapes of output impulses produced (documentation, source_code, command_result, etc.)";
 
 DEFINE FIELD IF NOT EXISTS output_impulses ON activity_execution_traces TYPE option<array<object>> FLEXIBLE
@@ -401,7 +401,7 @@ DEFINE FIELD IF NOT EXISTS avg_duration_ms ON tool_usage TYPE float
   VALUE $value OR 0.0
   COMMENT "Average tool call duration";
 
-DEFINE FIELD IF NOT EXISTS parameters ON tool_usage TYPE option<object>
+DEFINE FIELD IF NOT EXISTS parameters ON tool_usage TYPE option<object> FLEXIBLE
   COMMENT "Common parameters used with this tool";
 
 DEFINE FIELD IF NOT EXISTS created_at ON tool_usage TYPE datetime

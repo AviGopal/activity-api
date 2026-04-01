@@ -21,10 +21,10 @@ DEFINE FIELD endpoint ON vessel TYPE string;
 
 -- Capabilities
 DEFINE FIELD shapes ON vessel TYPE array<string>;
-DEFINE FIELD capabilities ON vessel TYPE array<object>;
+DEFINE FIELD capabilities ON vessel TYPE array<object> FLEXIBLE;
 
 -- Metadata
-DEFINE FIELD metadata ON vessel TYPE option<object>;
+DEFINE FIELD metadata ON vessel TYPE option<object> FLEXIBLE;
 DEFINE FIELD version ON vessel TYPE option<string>;
 DEFINE FIELD environment ON vessel TYPE option<string>;
 

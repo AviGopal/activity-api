@@ -7,6 +7,7 @@
 
 import { Hono } from "hono"
 import Redis from "ioredis"
+import { logger } from '../utils/logger'
 
 const app = new Hono()
 
@@ -45,10 +46,10 @@ function getRedisClient(): Redis {
     redisClient = new Redis(redisUrl)
 
     redisClient.on("error", (err) => {
-      console.error("[Boredom] Redis error:", err)
+      logger.error("[Boredom] Redis error", { error: String(err) })
     })
 
-    console.log("[Boredom] Redis client connected")
+    logger.info("[Boredom] Redis client connected")
   }
 
   return redisClient
@@ -82,7 +83,7 @@ export async function enqueueTask(task: BoredomTask): Promise<void> {
   const score = Date.now() // FIFO within priority level
   await redis.zadd(queueKey, score, task.id)
 
-  console.log(`[Boredom] Enqueued task ${task.id} with priority ${task.priority}`)
+  logger.info(`[Boredom] Enqueued task ${task.id} with priority ${task.priority}`)
 }
 
 /**
@@ -116,7 +117,7 @@ async function fetchTask(): Promise<BoredomTask | null> {
       await redis.zrem(queueKey, taskId)
 
       const task = JSON.parse(taskJson) as BoredomTask
-      console.log(`[Boredom] Fetched task ${taskId} (priority: ${priority})`)
+      logger.info(`[Boredom] Fetched task ${taskId} (priority: ${priority})`)
 
       return task
     }
@@ -159,7 +160,7 @@ app.get("/boredom-tasks", async (c) => {
 
     return c.json({ tasks: [task] })
   } catch (error) {
-    console.error("[Boredom] Error fetching tasks:", error)
+    logger.error("[Boredom] Error fetching tasks", { error: String(error) })
     return c.json({ error: "Failed to fetch tasks", tasks: [] }, 500)
   }
 })
@@ -188,7 +189,7 @@ app.post("/v2/activities/boredom/enqueue", async (c) => {
 
     await enqueueTask(task)
 
-    console.log(`[Boredom] Enqueued ${body.goal ? 'goal' : 'template'}-based task: ${task.id}`)
+    logger.info(`[Boredom] Enqueued ${body.goal ? 'goal' : 'template'}-based task: ${task.id}`)
 
     return c.json({
       success: true,
@@ -196,7 +197,7 @@ app.post("/v2/activities/boredom/enqueue", async (c) => {
       type: body.goal ? 'goal' : 'template'
     })
   } catch (error) {
-    console.error("[Boredom] Error enqueuing task:", error)
+    logger.error("[Boredom] Error enqueuing task", { error: String(error) })
     return c.json({ error: "Failed to enqueue task" }, 500)
   }
 })
@@ -214,7 +215,7 @@ app.get("/v2/activities/boredom/queue", async (c) => {
       byPriority: stats
     })
   } catch (error) {
-    console.error("[Boredom] Error getting queue stats:", error)
+    logger.error("[Boredom] Error getting queue stats", { error: String(error) })
     return c.json({ error: "Failed to get queue stats" }, 500)
   }
 })
@@ -239,7 +240,7 @@ app.post("/boredom-tasks/:taskId/result", async (c) => {
     const taskJson = await redis.get(taskKey)
 
     if (!taskJson) {
-      console.log(`[Boredom] Task ${taskId} not found (may have expired)`)
+      logger.info(`[Boredom] Task ${taskId} not found (may have expired)`)
       return c.json({ success: true, message: "Task not found but result accepted" })
     }
 
@@ -260,14 +261,14 @@ app.post("/boredom-tasks/:taskId/result", async (c) => {
     // Delete task data (completed)
     await redis.del(taskKey)
 
-    console.log(`[Boredom] Task ${taskId} completed: ${body.success ? "success" : "failed"}`)
+    logger.info(`[Boredom] Task ${taskId} completed: ${body.success ? "success" : "failed"}`)
 
     return c.json({
       success: true,
       message: `Result recorded for task ${taskId}`
     })
   } catch (error) {
-    console.error("[Boredom] Error recording result:", error)
+    logger.error("[Boredom] Error recording result", { error: String(error) })
     return c.json({ error: "Failed to record result" }, 500)
   }
 })
@@ -296,7 +297,7 @@ app.post("/v2/activities/boredom/results", async (c) => {
     const taskJson = await redis.get(taskKey)
 
     if (!taskJson) {
-      console.log(`[Boredom] Task ${body.taskId} not found (may have expired)`)
+      logger.info(`[Boredom] Task ${body.taskId} not found (may have expired)`)
       return c.json({ success: true, message: "Task not found but result accepted" })
     }
 
@@ -317,14 +318,14 @@ app.post("/v2/activities/boredom/results", async (c) => {
     // Delete task data (completed)
     await redis.del(taskKey)
 
-    console.log(`[Boredom] Task ${body.taskId} completed: ${body.success ? "success" : "failed"}`)
+    logger.info(`[Boredom] Task ${body.taskId} completed: ${body.success ? "success" : "failed"}`)
 
     return c.json({
       success: true,
       message: `Result recorded for task ${body.taskId}`
     })
   } catch (error) {
-    console.error("[Boredom] Error recording result:", error)
+    logger.error("[Boredom] Error recording result", { error: String(error) })
     return c.json({ error: "Failed to record result" }, 500)
   }
 })
@@ -356,7 +357,7 @@ app.get("/v2/activities/boredom/results", async (c) => {
       total: results.length
     })
   } catch (error) {
-    console.error("[Boredom] Error getting results:", error)
+    logger.error("[Boredom] Error getting results", { error: String(error) })
     return c.json({ error: "Failed to get results" }, 500)
   }
 })
@@ -381,7 +382,7 @@ app.post("/v2/activities/boredom/generate", async (c) => {
         await enqueueTask(task)
         enqueued.push(task.id)
       } catch (e) {
-        console.error(`[Boredom] Failed to enqueue task ${task.id}:`, e)
+        logger.error(`[Boredom] Failed to enqueue task ${task.id}`, { error: String(e) })
       }
     }
 
@@ -400,7 +401,7 @@ app.post("/v2/activities/boredom/generate", async (c) => {
       queueStats: stats,
     })
   } catch (error) {
-    console.error("[Boredom] Error generating tasks:", error)
+    logger.error("[Boredom] Error generating tasks", { error: String(error) })
     return c.json({ error: "Failed to generate tasks" }, 500)
   }
 })
@@ -421,7 +422,7 @@ app.get("/v2/activities/boredom/stats", async (c) => {
       totalPending: Object.values(queueStats).reduce((a, b) => a + b, 0),
     })
   } catch (error) {
-    console.error("[Boredom] Error getting stats:", error)
+    logger.error("[Boredom] Error getting stats", { error: String(error) })
     return c.json({ error: "Failed to get stats" }, 500)
   }
 })

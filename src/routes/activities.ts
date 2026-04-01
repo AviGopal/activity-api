@@ -491,12 +491,12 @@ app.post('/templates', async (c) => {
       } as CreateTemplateResponse, 409);
     }
 
-    // Build activity record using new paradigm schema
+    // Build activity record using activity_registry schema
     const activityRecord: Record<string, any> = {
       id: validated.variant_id,
       name: validated.variant_name,
       description: validated.description,
-      execution_type: 'template',
+      execution_format: 'template',
       // Hierarchical tags (primary classification)
       tags,
       tag_prefixes: tagPrefixes,
@@ -507,39 +507,23 @@ app.post('/templates', async (c) => {
       org_id: validated.org_id || orgId,
     };
 
-    // Convert input_schema/output_schema to input_shapes/output_shapes
-    if (validated.input_schema?.required) {
-      activityRecord.input_shapes = validated.input_schema.required.map(r => r.shape);
-    } else {
-      activityRecord.input_shapes = [];
-    }
-
-    if (validated.output_schema?.produces) {
-      activityRecord.output_shapes = validated.output_schema.produces.map(p => p.shape);
-    } else {
-      activityRecord.output_shapes = [];
-    }
-
-    // Add tasks (renamed from task_steps for new paradigm)
+    // Add task_steps (schema field name)
     if (validated.task_steps && validated.task_steps.length > 0) {
-      activityRecord.tasks = validated.task_steps;
+      activityRecord.task_steps = validated.task_steps;
     }
 
+    // Add optional fields only if provided
     if (validated.project_id || projectId) {
       activityRecord.project_id = validated.project_id || projectId;
     }
     if (validated.genealogy && Object.keys(validated.genealogy).length > 0) {
       activityRecord.genealogy = validated.genealogy;
     }
-    // Add impulse definitions for bootstrap templates
-    if (validated.impulses && validated.impulses.length > 0) {
-      activityRecord.impulses = validated.impulses;
-    }
 
     // Build dynamic query with only provided fields
     const fields = Object.keys(activityRecord).map(k => `${k}: $${k}`).join(',\n        ');
     const insertActivityQuery = `
-      INSERT INTO activity_template {
+      INSERT INTO activity_registry {
         ${fields},
         created_at: time::now(),
         updated_at: time::now()
@@ -2292,12 +2276,13 @@ app.post('/create-goal-seeking', async (c) => {
       },
     });
 
-    // Insert template into database
+    // Insert template into database (activity_registry is the base table)
     const templateRecord: Record<string, any> = {
-      variant_id: generated.variant_id,
+      id: generated.variant_id,
       activity_id: generated.activity_id,
-      variant_name: generated.variant_name,
+      name: generated.variant_name,
       description: generated.description,
+      execution_format: 'template',
       category: generated.category,
       task_steps: generated.task_steps,
       scope: generated.scope,
@@ -2312,7 +2297,7 @@ app.post('/create-goal-seeking', async (c) => {
 
     const fields = Object.keys(templateRecord).map(k => `${k}: $${k}`).join(',\n        ');
     const insertTemplateQuery = `
-      INSERT INTO activity_template {
+      INSERT INTO activity_registry {
         ${fields},
         created_at: time::now(),
         updated_at: time::now()
@@ -2321,13 +2306,13 @@ app.post('/create-goal-seeking', async (c) => {
 
     try {
       await surrealDB.query(insertTemplateQuery, templateRecord);
-      logger.debug('Generated template inserted into activity_template', {
+      logger.debug('Generated template inserted into activity_registry', {
         variant_id: generated.variant_id,
       });
     } catch (insertError: any) {
       // Check if this is a duplicate key error
       if (insertError?.message?.includes('already contains') ||
-          insertError?.message?.includes('idx_activity_template_variant_id')) {
+          insertError?.message?.includes('idx_activity_registry_id')) {
         logger.info('Template already exists, returning existing template', {
           variant_id: generated.variant_id,
         });

@@ -59,14 +59,14 @@ DEFINE FIELD IF NOT EXISTS api_key ON impulse_data TYPE option<string>
   COMMENT "DEPRECATED: API key for tenant isolation (use org_id instead)";
 
 -- Impulse content and metadata
-DEFINE FIELD IF NOT EXISTS impulse_data ON impulse_data TYPE object
+DEFINE FIELD IF NOT EXISTS impulse_data ON impulse_data TYPE object FLEXIBLE
   ASSERT $value != NONE
   COMMENT "Full impulse data blob (pointer, content, metadata)";
 
 DEFINE FIELD IF NOT EXISTS impulse_type ON impulse_data TYPE option<string>
   COMMENT "Impulse type (file, memo, activityExecutionTrace, etc.)";
 
-DEFINE FIELD IF NOT EXISTS pointer ON impulse_data TYPE option<object>
+DEFINE FIELD IF NOT EXISTS pointer ON impulse_data TYPE option<object> FLEXIBLE
   COMMENT "Impulse pointer metadata (type, path, offset, limit)";
 
 DEFINE FIELD IF NOT EXISTS content ON impulse_data TYPE option<string>
@@ -269,7 +269,7 @@ DEFINE FIELD IF NOT EXISTS completed_at ON ci_runs TYPE option<datetime>
 DEFINE FIELD IF NOT EXISTS duration_ms ON ci_runs TYPE option<int>
   COMMENT "Run duration in milliseconds";
 
-DEFINE FIELD IF NOT EXISTS test_results ON ci_runs TYPE option<object>
+DEFINE FIELD IF NOT EXISTS test_results ON ci_runs TYPE option<object> FLEXIBLE
   COMMENT "Test results summary";
 
 DEFINE FIELD IF NOT EXISTS created_at ON ci_runs TYPE datetime
@@ -339,7 +339,7 @@ DEFINE FIELD IF NOT EXISTS parent_variant_id ON code_variants TYPE option<string
 DEFINE FIELD IF NOT EXISTS test_status ON code_variants TYPE option<string>
   COMMENT "Test execution status";
 
-DEFINE FIELD IF NOT EXISTS test_results ON code_variants TYPE option<object>
+DEFINE FIELD IF NOT EXISTS test_results ON code_variants TYPE option<object> FLEXIBLE
   COMMENT "Test results data";
 
 DEFINE FIELD IF NOT EXISTS ci_run_id ON code_variants TYPE option<string>

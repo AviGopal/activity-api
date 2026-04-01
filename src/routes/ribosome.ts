@@ -575,14 +575,15 @@ app.post('/extract', async (c) => {
       impulseCount: template.impulses.length,
     });
 
-    // Store the extracted template
+    // Store the extracted template (activity_registry is the base table)
     const storeQuery = `
-      INSERT INTO activity_templates {
-        template_id: $template_id,
+      INSERT INTO activity_registry {
+        id: $id,
         name: $name,
         description: $description,
+        execution_format: 'template',
         category: $category,
-        tasks: $tasks,
+        task_steps: $task_steps,
         validation: $validation,
         variables: $variables,
         impulses: $impulses,
@@ -598,11 +599,11 @@ app.post('/extract', async (c) => {
     `;
 
     await surrealDB.query(storeQuery, {
-      template_id: template.id,
+      id: template.id,
       name: template.name,
       description: template.description,
       category: template.category,
-      tasks: template.tasks,
+      task_steps: template.tasks,
       validation: template.validation,
       variables: template.variables,
       impulses: template.impulses,

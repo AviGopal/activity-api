@@ -13,6 +13,8 @@
 import { Hono } from 'hono'
 import { surrealDB } from '../db/surreal'
 import { authRateLimiter, signinRateLimiter } from '../middleware/rateLimiter'
+import { authenticateMiniBob } from '../services/auth'
+import { logger } from '../utils/logger'
 
 const auth = new Hono()
 
@@ -56,11 +58,22 @@ auth.post('/minibob/signin', async (c) => {
       }, 400)
     }
 
-    const db = await surrealDB.getInstance()
+    // Use centralized authentication service
+    const result = await authenticateMiniBob(instance_id, api_key)
 
-    // Authenticate using RECORD access
-    // This will verify the API key hash and return a JWT token
-    // SurrealDB SDK v2 returns { access: "JWT..." } object
+    if (!result.authenticated || !result.orgId) {
+      logger.warn('[auth] MiniBob authentication failed', {
+        instanceId: instance_id,
+        reason: result.reason,
+      })
+      return c.json({
+        error: 'Authentication failed',
+        message: result.reason || 'Invalid instance_id or api_key'
+      }, 401)
+    }
+
+    // Get JWT token from SurrealDB after successful RECORD access
+    const db = await surrealDB.getInstance()
     const authResult = await db.signin({
       access: 'minibob_record',
       variables: {
@@ -70,10 +83,11 @@ auth.post('/minibob/signin', async (c) => {
     })
 
     if (!authResult) {
+      logger.error('[auth] Failed to get JWT token after authentication')
       return c.json({
-        error: 'Authentication failed',
-        message: 'Invalid instance_id or api_key'
-      }, 401)
+        error: 'Internal server error',
+        message: 'Failed to generate authentication token'
+      }, 500)
     }
 
     // Extract JWT string from SDK v2 response format
@@ -81,38 +95,21 @@ auth.post('/minibob/signin', async (c) => {
       ? authResult
       : (authResult as { access: string }).access
 
-    // Query $auth to get org_id and project_id from the authenticated session
-    // After RECORD signin, $auth contains the minibob_instance record
-    // NOTE: org_id is already a STRING (not a record ID), so no conversion needed
-    const authQuery = await db.query<[{
-      org_id: string;
-      project_id?: string;
-    }]>(
-      `RETURN {
-        org_id: $auth.org_id,
-        project_id: $auth.project_id
-      }`
-    )
+    logger.info('[auth] MiniBob signed in successfully', {
+      instanceId: instance_id,
+      orgId: result.orgId,
+    })
 
-    const instance = authQuery[0]
-    if (!instance || !instance.org_id) {
-      return c.json({
-        error: 'Instance authenticated but session details not found',
-        message: 'Authentication succeeded but $auth not populated'
-      }, 500)
-    }
-
-    // org_id is already a string from minibob_instance schema - no conversion needed
     return c.json({
       token: jwtToken,
-      org_id: instance.org_id,
-      project_id: instance.project_id,
+      org_id: result.orgId,
     })
 
   } catch (error) {
-    console.error('[auth] MiniBob signin error:', error)
+    logger.error('[auth] MiniBob signin error', {
+      error: error instanceof Error ? error.message : String(error),
+    })
 
-    // SurrealDB returns specific error messages for auth failures
     const errorMessage = error instanceof Error ? error.message : String(error)
 
     if (errorMessage.includes('No access method found') ||
@@ -127,7 +124,7 @@ auth.post('/minibob/signin', async (c) => {
     return c.json({
       error: 'Internal server error',
       message: 'Failed to authenticate MiniBob instance',
-      details: errorMessage
+      details: process.env.NODE_ENV === 'development' ? errorMessage : undefined
     }, 500)
   }
 })

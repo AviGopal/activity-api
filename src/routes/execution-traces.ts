@@ -875,11 +875,13 @@ app.post('/', async (c) => {
     if (trace.metadata) optionalFields.push('metadata: $metadata');
     // Selection-to-execution correlation
     if ((trace as any).correlation_id) optionalFields.push('correlation_id: $correlation_id');
+    // Project ID - only include if set (MiniBob instances may not have projects)
+    if (trace.project_id) optionalFields.push('project_id: $project_id');
 
     const optionalFieldsStr = optionalFields.length > 0 ? `,\n        ${optionalFields.join(',\n        ')}` : '';
 
     // NOTE: org_id is a STRING field in schema (not a record link)
-    // project_id is option<record<projects>> but can be passed as string if set
+    // project_id is optional - only included in query if set (handled in optionalFields)
     const query = `
       INSERT INTO activity_execution_traces {
         execution_id: $execution_id,
@@ -892,7 +894,6 @@ app.post('/', async (c) => {
         tokens_output: $tokens_output,
         tokens_cache: $tokens_cache,
         org_id: $org_id,
-        project_id: $project_id,
         executed_at: $executed_at,
         created_at: $created_at${optionalFieldsStr}
       }

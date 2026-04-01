@@ -69,14 +69,14 @@ DEFINE FIELD IF NOT EXISTS execution_format ON activity_registry TYPE string
   COMMENT "How to execute this activity";
 
 -- Template-based activities (execution_format = 'template')
-DEFINE FIELD IF NOT EXISTS task_steps ON activity_registry TYPE option<array>
+DEFINE FIELD IF NOT EXISTS task_steps ON activity_registry TYPE option<array> FLEXIBLE
   COMMENT "Task steps for template-based activities";
 
 -- Vessel function activities (execution_format = 'vessel-function')
-DEFINE FIELD IF NOT EXISTS source_location ON activity_registry TYPE option<object>
+DEFINE FIELD IF NOT EXISTS source_location ON activity_registry TYPE option<object> FLEXIBLE
   COMMENT "Source location for vessel functions: { vesselId, file, line, functionName, className }";
 
-DEFINE FIELD IF NOT EXISTS intent ON activity_registry TYPE option<object>
+DEFINE FIELD IF NOT EXISTS intent ON activity_registry TYPE option<object> FLEXIBLE
   COMMENT "Inferred intent: { purpose, confidence, source, rationale }";
 
 -- Learned data (populated from runtime observations)
@@ -88,17 +88,17 @@ DEFINE FIELD IF NOT EXISTS tools ON activity_registry TYPE array
   VALUE $value OR []
   COMMENT "Tools called by this activity (learned from executions)";
 
-DEFINE FIELD IF NOT EXISTS typical_inputs ON activity_registry TYPE option<object>
+DEFINE FIELD IF NOT EXISTS typical_inputs ON activity_registry TYPE option<object> FLEXIBLE
   COMMENT "Typical input shape (learned from executions)";
 
-DEFINE FIELD IF NOT EXISTS typical_outputs ON activity_registry TYPE option<object>
+DEFINE FIELD IF NOT EXISTS typical_outputs ON activity_registry TYPE option<object> FLEXIBLE
   COMMENT "Typical output shape (learned from executions)";
 
 -- Schema-based activity matching (self-development loop)
-DEFINE FIELD IF NOT EXISTS input_schema ON activity_registry TYPE option<object>
+DEFINE FIELD IF NOT EXISTS input_schema ON activity_registry TYPE option<object> FLEXIBLE
   COMMENT "Input schema: { required: ImpulseShape[], optional?: ImpulseShape[] }";
 
-DEFINE FIELD IF NOT EXISTS output_schema ON activity_registry TYPE option<object>
+DEFINE FIELD IF NOT EXISTS output_schema ON activity_registry TYPE option<object> FLEXIBLE
   COMMENT "Output schema: { produces: ImpulseShape[] }";
 
 -- Thompson Sampling (shared across all activity formats)
@@ -157,7 +157,7 @@ DEFINE FIELD IF NOT EXISTS created_by ON activity_registry TYPE option<record<us
   COMMENT "User or MiniBob instance who created this activity";
 
 -- Metadata
-DEFINE FIELD IF NOT EXISTS genealogy ON activity_registry TYPE option<object>
+DEFINE FIELD IF NOT EXISTS genealogy ON activity_registry TYPE option<object> FLEXIBLE
   COMMENT "Activity genealogy (extracted_from, variant_of, etc.)";
 
 -- Note: tags field is now defined earlier with full type specification

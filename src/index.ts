@@ -241,23 +241,57 @@ const server = Bun.serve<WebSocketData>({
       logger.info('[WebSocket] Client connected, awaiting authentication');
     },
     
-    message(ws, message) {
+    async message(ws, message) {
       try {
         const data = JSON.parse(message.toString());
-        
+
         // Handle authentication
         if (data.type === 'authenticate' && data.token) {
-          // TODO: Validate token against session store
-          // For now, mark as authenticated (will implement proper auth in next iteration)
+          // CRITICAL: Validate JWT token before marking as authenticated
+          const { validateJwtToken } = await import('./services/auth');
+          const validation = await validateJwtToken(data.token);
+
+          if (!validation.valid || !validation.payload) {
+            logger.warn('[WebSocket] Authentication failed', {
+              error: validation.error || 'Invalid token',
+            });
+
+            ws.send(JSON.stringify({
+              type: 'auth_error',
+              error: 'Authentication failed',
+              message: validation.error || 'Invalid or expired token',
+              timestamp: new Date().toISOString(),
+            }));
+
+            ws.close(1008, 'Authentication failed');
+            return;
+          }
+
+          // Extract org_id from validated JWT payload
+          const orgId = validation.payload.org_id?.toString().replace('organizations:', '') || '';
+
+          if (!orgId) {
+            logger.warn('[WebSocket] Token missing org_id claim');
+            ws.send(JSON.stringify({
+              type: 'auth_error',
+              error: 'Invalid token claims',
+              message: 'Token must contain org_id',
+              timestamp: new Date().toISOString(),
+            }));
+            ws.close(1008, 'Invalid token claims');
+            return;
+          }
+
+          // Mark as authenticated with validated claims
           ws.data.authenticated = true;
-          ws.data.sessionId = data.sessionId || 'default';
-          ws.data.orgId = data.orgId || 'default';
-          
+          ws.data.sessionId = data.sessionId || `session-${Date.now()}`;
+          ws.data.orgId = orgId;
+
           logger.info('[WebSocket] Client authenticated', {
             sessionId: ws.data.sessionId,
             orgId: ws.data.orgId,
           });
-          
+
           // Send auth confirmation
           ws.send(JSON.stringify({
             type: 'authenticated',

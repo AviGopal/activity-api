@@ -37,6 +37,7 @@ export interface Config {
   // Security
   auth: {
     requireAuth: boolean;  // Set to false for development
+    jwtSecret: string;     // JWT signing secret
   };
 
   // Logging
@@ -108,6 +109,7 @@ export function loadConfig(): Config {
 
     auth: {
       requireAuth: parseEnvBool('REQUIRE_AUTH', false),
+      jwtSecret: process.env.JWT_SECRET || 'dev-secret-change-in-production',
     },
     
     logLevel: (process.env.LOG_LEVEL || 'info') as Config['logLevel'],

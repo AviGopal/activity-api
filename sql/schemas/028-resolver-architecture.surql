@@ -107,10 +107,10 @@ DEFINE FIELD IF NOT EXISTS execution_id ON state_transition TYPE string
   COMMENT "Execution that caused this state transition";
 
 -- State snapshots
-DEFINE FIELD IF NOT EXISTS before_state ON state_transition TYPE object
+DEFINE FIELD IF NOT EXISTS before_state ON state_transition TYPE object FLEXIBLE
   COMMENT "Impulse state before execution: {impulses: [{id, shape, metadata}], state_vector}";
 
-DEFINE FIELD IF NOT EXISTS after_state ON state_transition TYPE object
+DEFINE FIELD IF NOT EXISTS after_state ON state_transition TYPE object FLEXIBLE
   COMMENT "Impulse state after execution: {impulses: [{id, shape, metadata}], state_vector}";
 
 -- Transition details
@@ -160,7 +160,7 @@ DEFINE FIELD IF NOT EXISTS pattern_type ON impulse_state_pattern TYPE string
   ASSERT $value IN ['shape_combination', 'state_vector_cluster', 'metadata_condition']
   COMMENT "Type of pattern: shapes present, embedding cluster, metadata filters";
 
-DEFINE FIELD IF NOT EXISTS pattern ON impulse_state_pattern TYPE object
+DEFINE FIELD IF NOT EXISTS pattern ON impulse_state_pattern TYPE object FLEXIBLE
   COMMENT "Pattern definition (varies by type)";
 
 -- What activity works with this pattern?

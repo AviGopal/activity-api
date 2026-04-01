@@ -48,9 +48,9 @@ export const SessionPostResponseSchema = z.object({
 // Activity Template schemas
 export const TemplateTaskSchema = z.object({
   id: z.string(),
-  subagent: z.string(),
+  subagent: z.string().optional(),
   description: z.string(),
-  dependencies: z.array(z.string()),
+  dependencies: z.array(z.string()).optional(),
   prompt: z.object({
     template: z.string(),
     maxTokens: z.number().optional(),
@@ -250,8 +250,9 @@ export const ImpulseDataSchema = z.object({
 
 export const ImpulseCreateRequestSchema = z.object({
   impulse_id: z.string(),
-  project_id: z.string(),
+  project_id: z.string().optional(), // Optional for MiniBob instances without projects
   impulse_data: ImpulseDataSchema,
+  org_id: z.string().optional(), // Optional, inferred from auth context if not provided
 });
 
 export const ImpulseResponseSchema = z.object({

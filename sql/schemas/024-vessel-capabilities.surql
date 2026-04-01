@@ -28,7 +28,7 @@ DEFINE FIELD endpoint ON vessel_capabilities TYPE string;
 DEFINE FIELD shapes ON vessel_capabilities TYPE array;
 
 -- metadata: Optional vessel metadata (version, capabilities, environment, etc.)
-DEFINE FIELD metadata ON vessel_capabilities TYPE object DEFAULT {};
+DEFINE FIELD metadata ON vessel_capabilities TYPE object DEFAULT {} FLEXIBLE;
 
 -- registered_at: When the vessel first registered
 DEFINE FIELD registered_at ON vessel_capabilities TYPE datetime;

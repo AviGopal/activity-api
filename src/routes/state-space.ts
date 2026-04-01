@@ -10,6 +10,7 @@
 import { Hono } from 'hono'
 import { z } from 'zod'
 import { db } from '../db/surrealdb'
+import { logger } from '../utils/logger'
 
 const app = new Hono()
 
@@ -82,13 +83,13 @@ app.post('/transitions', async (c) => {
 
     // Trigger pattern learning (async)
     learnPatternsFromTransition(transition).catch(err =>
-      console.error('Pattern learning failed:', err)
+      logger.error('Pattern learning failed:', err)
     )
 
     return c.json({ recorded: true, transition: result[0] })
   } catch (error) {
-    console.error('State transition recording failed:', error)
-    return c.json({ error: error.message }, 400)
+    logger.error('State transition recording failed:', { error: error instanceof Error ? error.message : String(error) })
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 400)
   }
 })
 
@@ -112,8 +113,8 @@ app.get('/transitions/:execution_id', async (c) => {
 
     return c.json({ transition: result[0] })
   } catch (error) {
-    console.error('Transition fetch failed:', error)
-    return c.json({ error: error.message }, 500)
+    logger.error('Transition fetch failed:', { error: error instanceof Error ? error.message : String(error) })
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 500)
   }
 })
 
@@ -174,8 +175,8 @@ app.post('/patterns/learn', async (c) => {
       patterns
     })
   } catch (error) {
-    console.error('Pattern learning failed:', error)
-    return c.json({ error: error.message }, 500)
+    logger.error('Pattern learning failed:', { error: error instanceof Error ? error.message : String(error) })
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 500)
   }
 })
 
@@ -197,8 +198,8 @@ app.get('/patterns/list', async (c) => {
 
     return c.json({ patterns, count: patterns.length })
   } catch (error) {
-    console.error('Pattern list failed:', error)
-    return c.json({ error: error.message }, 500)
+    logger.error('Pattern list failed:', { error: error instanceof Error ? error.message : String(error) })
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 500)
   }
 })
 
@@ -258,8 +259,8 @@ app.post('/recommend', async (c) => {
       input_state: { impulses, shapes: inputShapes }
     })
   } catch (error) {
-    console.error('State-space recommendation failed:', error)
-    return c.json({ error: error.message }, 500)
+    logger.error('State-space recommendation failed:', { error: error instanceof Error ? error.message : String(error) })
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 500)
   }
 })
 
@@ -290,8 +291,8 @@ app.get('/analyze', async (c) => {
 
     return c.json(coverage)
   } catch (error) {
-    console.error('State space analysis failed:', error)
-    return c.json({ error: error.message }, 500)
+    logger.error('State space analysis failed:', { error: error instanceof Error ? error.message : String(error) })
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 500)
   }
 })
 

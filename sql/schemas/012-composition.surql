@@ -38,7 +38,7 @@ DEFINE FIELD IF NOT EXISTS goal_category ON goal_execution_paths TYPE string
   ASSERT $value IN ['feature', 'bugfix', 'refactor', 'tool', 'infrastructure', 'meta']
   COMMENT "Goal category for filtering (meta = self-referential goals)";
 
-DEFINE FIELD IF NOT EXISTS goal_embedding ON goal_execution_paths TYPE option<array<float>>
+DEFINE FIELD IF NOT EXISTS goal_embedding ON goal_execution_paths TYPE option<array<float>> FLEXIBLE
   COMMENT "Goal text embedding for semantic matching";
 
 -- Multi-tenancy (REQUIRED for RBAC)
@@ -60,14 +60,14 @@ DEFINE FIELD IF NOT EXISTS path_signature ON goal_execution_paths TYPE string
   ASSERT $value != NONE
   COMMENT "Hash of path_activities for uniqueness";
 
-DEFINE FIELD IF NOT EXISTS activity_sequence ON goal_execution_paths TYPE option<array<object>>
+DEFINE FIELD IF NOT EXISTS activity_sequence ON goal_execution_paths TYPE option<array<object>> FLEXIBLE
   COMMENT "Detailed activity sequence with per-step metrics";
 
 -- Initial state context
-DEFINE FIELD IF NOT EXISTS initial_state ON goal_execution_paths TYPE option<object>
+DEFINE FIELD IF NOT EXISTS initial_state ON goal_execution_paths TYPE option<object> FLEXIBLE
   COMMENT "Initial state when goal was started";
 
-DEFINE FIELD IF NOT EXISTS initial_impulses ON goal_execution_paths TYPE option<array<string>>
+DEFINE FIELD IF NOT EXISTS initial_impulses ON goal_execution_paths TYPE option<array<string>> FLEXIBLE
   COMMENT "Impulse types available at start";
 
 -- Thompson Sampling parameters (Beta distribution)
@@ -129,10 +129,10 @@ DEFINE FIELD IF NOT EXISTS avg_token_usage ON goal_execution_paths TYPE int
   COMMENT "Average total tokens used";
 
 -- Context metadata (for analysis)
-DEFINE FIELD IF NOT EXISTS typical_files_modified ON goal_execution_paths TYPE option<array<string>>
+DEFINE FIELD IF NOT EXISTS typical_files_modified ON goal_execution_paths TYPE option<array<string>> FLEXIBLE
   COMMENT "Most frequently modified files in successful executions";
 
-DEFINE FIELD IF NOT EXISTS typical_tools_used ON goal_execution_paths TYPE option<array<string>>
+DEFINE FIELD IF NOT EXISTS typical_tools_used ON goal_execution_paths TYPE option<array<string>> FLEXIBLE
   COMMENT "Most frequently used tools in this path";
 
 -- Timestamps
@@ -245,10 +245,10 @@ DEFINE FIELD IF NOT EXISTS project_id ON activity_dataflows TYPE option<record<p
   VALUE $value OR $auth.project_id
   COMMENT "Project ID (optional)";
 
-DEFINE FIELD IF NOT EXISTS data_passed ON activity_dataflows TYPE option<object>
+DEFINE FIELD IF NOT EXISTS data_passed ON activity_dataflows TYPE option<object> FLEXIBLE
   COMMENT "Data passed from caller to callee (impulses, args)";
 
-DEFINE FIELD IF NOT EXISTS data_returned ON activity_dataflows TYPE option<object>
+DEFINE FIELD IF NOT EXISTS data_returned ON activity_dataflows TYPE option<object> FLEXIBLE
   COMMENT "Data returned from callee to caller";
 
 DEFINE FIELD IF NOT EXISTS success ON activity_dataflows TYPE bool
@@ -332,19 +332,19 @@ DEFINE FIELD IF NOT EXISTS project_id ON activity_prerequisites TYPE option<reco
   COMMENT "Project ID (optional)";
 
 -- Preconditions: What this activity REQUIRES to run
-DEFINE FIELD IF NOT EXISTS required_impulses ON activity_prerequisites TYPE array<object>
+DEFINE FIELD IF NOT EXISTS required_impulses ON activity_prerequisites TYPE array<object> FLEXIBLE
   VALUE $value OR []
   COMMENT "Impulses required for execution";
 
-DEFINE FIELD IF NOT EXISTS state_requirements ON activity_prerequisites TYPE option<object>
+DEFINE FIELD IF NOT EXISTS state_requirements ON activity_prerequisites TYPE option<object> FLEXIBLE
   COMMENT "State conditions that must be met";
 
 -- Postconditions: What this activity GUARANTEES to create
-DEFINE FIELD IF NOT EXISTS produces_impulses ON activity_prerequisites TYPE array<object>
+DEFINE FIELD IF NOT EXISTS produces_impulses ON activity_prerequisites TYPE array<object> FLEXIBLE
   VALUE $value OR []
   COMMENT "Impulses produced by execution";
 
-DEFINE FIELD IF NOT EXISTS state_changes ON activity_prerequisites TYPE option<object>
+DEFINE FIELD IF NOT EXISTS state_changes ON activity_prerequisites TYPE option<object> FLEXIBLE
   COMMENT "Expected state delta after execution";
 
 -- Timestamps
@@ -393,7 +393,7 @@ DEFINE FIELD IF NOT EXISTS required_impulse_type ON prerequisite_patterns TYPE s
   ASSERT $value != NONE
   COMMENT "Type of impulse required";
 
-DEFINE FIELD IF NOT EXISTS required_state ON prerequisite_patterns TYPE option<object>
+DEFINE FIELD IF NOT EXISTS required_state ON prerequisite_patterns TYPE option<object> FLEXIBLE
   COMMENT "Required state conditions";
 
 -- What satisfies it

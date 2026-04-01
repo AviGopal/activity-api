@@ -8,6 +8,7 @@
 import { Hono } from 'hono'
 import { z } from 'zod'
 import { db } from '../db/surrealdb'
+import { logger } from '../utils/logger'
 
 const app = new Hono()
 
@@ -68,8 +69,8 @@ app.post('/register', async (c) => {
 
     return c.json({ registered: true, resolver: result[0] })
   } catch (error) {
-    console.error('Resolver registration failed:', error)
-    return c.json({ error: error.message }, 400)
+    logger.error('Resolver registration failed:', { error: error instanceof Error ? error.message : String(error) })
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 400)
   }
 })
 
@@ -112,8 +113,8 @@ app.get('/discover', async (c) => {
       query: { inputShape, outputShape, scope }
     })
   } catch (error) {
-    console.error('Resolver discovery failed:', error)
-    return c.json({ error: error.message }, 500)
+    logger.error('Resolver discovery failed:', { error: error instanceof Error ? error.message : String(error) })
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 500)
   }
 })
 
@@ -132,8 +133,8 @@ app.get('/list', async (c) => {
 
     return c.json({ resolvers, count: resolvers.length })
   } catch (error) {
-    console.error('Resolver list failed:', error)
-    return c.json({ error: error.message }, 500)
+    logger.error('Resolver list failed:', { error: error instanceof Error ? error.message : String(error) })
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 500)
   }
 })
 
@@ -154,8 +155,8 @@ app.get('/:id', async (c) => {
 
     return c.json({ resolver: result[0] })
   } catch (error) {
-    console.error('Resolver fetch failed:', error)
-    return c.json({ error: error.message }, 500)
+    logger.error('Resolver fetch failed:', { error: error instanceof Error ? error.message : String(error) })
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 500)
   }
 })
 
@@ -185,8 +186,8 @@ app.post('/:id/metrics', async (c) => {
 
     return c.json({ updated: true, resolver: result[0] })
   } catch (error) {
-    console.error('Resolver metrics update failed:', error)
-    return c.json({ error: error.message }, 500)
+    logger.error('Resolver metrics update failed:', { error: error instanceof Error ? error.message : String(error) })
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 500)
   }
 })
 
@@ -202,8 +203,8 @@ app.delete('/:id', async (c) => {
     await db.query(`UPDATE resolver:${id} SET is_active = false`)
     return c.json({ deactivated: true })
   } catch (error) {
-    console.error('Resolver deactivation failed:', error)
-    return c.json({ error: error.message }, 500)
+    logger.error('Resolver deactivation failed:', { error: error instanceof Error ? error.message : String(error) })
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 500)
   }
 })
 
