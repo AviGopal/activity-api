@@ -9,11 +9,18 @@
 FROM oven/bun:1 as build
 WORKDIR /app
 
+# Install SSH client and git for private dependencies
+RUN apt-get update && apt-get install -y openssh-client git && rm -rf /var/lib/apt/lists/*
+
 # Copy activity-api package files
 COPY metabob-activity-api/package.json metabob-activity-api/bun.lock* ./
 
 # Install dependencies (with SSH for git dependencies)
-RUN --mount=type=ssh bun install --frozen-lockfile --production
+RUN --mount=type=ssh \
+  mkdir -p ~/.ssh && \
+  ssh-keyscan github.com >> ~/.ssh/known_hosts && \
+  git config --global url."git@github.com:".insteadOf "https://github.com/" && \
+  bun install --frozen-lockfile --production
 
 # Copy activity-api source code
 COPY metabob-activity-api/src ./src
