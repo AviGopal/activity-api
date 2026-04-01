@@ -9,15 +9,14 @@
 FROM oven/bun:1 as build
 WORKDIR /app
 
-# Copy metabob-proto dependency first (required for file: dependency in package.json)
-COPY metabob-proto /metabob-proto
+# Copy metabob-proto first (needed by package.json file: reference)
+COPY metabob-proto ../metabob-proto
 
-# Copy activity-api package files (no lockfile - will regenerate)
-COPY metabob-activity-api/package.json ./
+# Copy activity-api package files
+COPY metabob-activity-api/package.json metabob-activity-api/bun.lock* ./
 
-# Install dependencies (includes local @metabob/proto)
-# Note: Lockfile regenerated due to file: dependency change
-RUN bun install --production
+# Install dependencies (uses local metabob-proto via file: reference)
+RUN bun install --frozen-lockfile --production
 
 # Copy activity-api source code
 COPY metabob-activity-api/src ./src
@@ -25,7 +24,7 @@ COPY metabob-activity-api/scripts ./scripts
 COPY metabob-activity-api/sql ./sql
 COPY metabob-activity-api/tsconfig.json ./
 
-# Copy metabob-proto to final location for schema migrations
+# Copy metabob-proto for schema migrations (runtime access)
 COPY metabob-proto ./repos/metabob-proto
 
 # Verify TypeScript compilation

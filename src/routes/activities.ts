@@ -539,7 +539,7 @@ app.post('/templates', async (c) => {
     // Build dynamic query with only provided fields
     const fields = Object.keys(activityRecord).map(k => `${k}: $${k}`).join(',\n        ');
     const insertActivityQuery = `
-      INSERT INTO activity {
+      INSERT INTO activity_template {
         ${fields},
         created_at: time::now(),
         updated_at: time::now()
@@ -871,7 +871,7 @@ app.get('/templates', async (c) => {
 
     // Enrich templates with execution metrics
     templates = await enrichTemplatesWithMetrics(templates);
-    console.log("ENRICHMENT POINT REACHED", templates.length);
+    logger.debug('Template enrichment point reached', { count: templates.length });
     logger.info('Templates enriched with metrics', { templatesWithMetrics: templates.filter(t => t.metrics).length });
 
     return c.json({

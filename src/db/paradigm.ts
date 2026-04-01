@@ -258,7 +258,7 @@ export async function insertActivity(
     if (!jwtToken && activity.project_id) record.project_id = activity.project_id;
 
     const query = `
-      INSERT INTO activity {
+      INSERT INTO activity_template {
         ${fields}${orgIdClause}${projectIdClause},
         created_at: time::now(),
         updated_at: time::now()
