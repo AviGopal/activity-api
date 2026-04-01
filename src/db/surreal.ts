@@ -30,17 +30,27 @@ class SurrealDBClient {
 
         this.db = new Surreal();
         await this.db.connect(config.surrealdb.url);
-        
-        // SurrealDB v3.0.0: Use RootAuth for root user, then switch namespace
-        await this.db.signin({
-          username: config.surrealdb.username,
-          password: config.surrealdb.password,
-        });
 
+        // SurrealDB v3.0.0: Use namespace and database before signin
         await this.db.use({
           namespace: config.surrealdb.namespace,
           database: config.surrealdb.database,
         });
+
+        // Root user signin (after USE to establish context)
+        if (config.surrealdb.authEnabled) {
+          await this.db.signin({
+            username: config.surrealdb.username,
+            password: config.surrealdb.password,
+          });
+          logger.info('Signed in to SurrealDB as root user', {
+            username: config.surrealdb.username,
+            namespace: config.surrealdb.namespace,
+            database: config.surrealdb.database
+          });
+        } else {
+          logger.info('SurrealDB auth disabled, skipping signin');
+        }
 
         // Verify namespace access by attempting a simple query
         try {

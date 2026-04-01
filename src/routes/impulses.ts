@@ -13,7 +13,7 @@
  */
 
 import { Hono } from 'hono';
-import { surrealDB } from '../db/surreal';
+import { surrealDB, queryWithAuth } from '../db/surreal';
 import { logger } from '../utils/logger';
 import {
   ImpulseCreateRequestSchema,
@@ -31,11 +31,28 @@ import {
   formatSearchResultsAsMarkdown,
 } from '../services/impulse-formatters';
 import { getJwtAuthFromContext, type JwtAuthContext } from '../middleware/jwtAuth';
+import activitiesRouter from './activities';
 
 const router = new Hono();
 
 /**
- * Proxy request to Analysis API with retry and timeout
+ * Proxy request to Analysis API [DEPRECATED - ARCHITECTURE DRIFT]
+ *
+ * TODO: This violates "Resolvers live WHERE THE DATA IS" principle.
+ *
+ * PROBLEM: The activity-api backend is proxying Analysis API data through
+ * impulse resolution. This makes the backend act as a universal resolver
+ * instead of letting vessels access the Analysis API directly.
+ *
+ * SOLUTION: Analysis API should provide its own /v2/impulses/resolve endpoint
+ * - Vessels can call Analysis API directly for their impulse types
+ * - Analysis API resolves impulses like 'analysisResult', 'cochangeSuggestions', etc.
+ * - Activity-api backend only stores traces, doesn't proxy data
+ *
+ * This function is retained for reference but analysis types now return
+ * an error directing vessels to use the Analysis API directly.
+ *
+ * Original: Proxy request to Analysis API with retry and timeout
  * Returns null on failure (graceful degradation)
  */
 async function proxyToAnalysisApi<T>(
@@ -147,17 +164,21 @@ router.post('/', async (c) => {
       authorization: c.req.header('Authorization') ? 'present' : 'missing',
     });
 
-    // Get api_key from session, JWT auth, or internal header
+    // Get api_key and org_id from session, JWT auth, or internal header
     let api_key: string;
+    let org_id: string;
 
     if (session?.api_key) {
       api_key = session.api_key;
+      org_id = session.org_id || 'metabob_internal';
     } else if (jwtAuth) {
       // JWT auth from MiniBob instances - use instance info
       api_key = `minibob:${jwtAuth.instanceId || jwtAuth.orgId}`;
+      org_id = jwtAuth.orgId;
       logger.debug('Using JWT auth', { orgId: jwtAuth.orgId, projectId: jwtAuth.projectId });
     } else if (internalApiKey) {
       api_key = internalApiKey;
+      org_id = 'metabob_internal'; // Default for internal services
       logger.debug('Using internal service api_key', { api_key: api_key.substring(0, 8) + '...' });
     } else {
       logger.warn('POST /v2/impulses: no auth', { hasSession: !!session, hasJwtAuth: !!jwtAuth, hasInternalKey: !!internalApiKey });
@@ -177,6 +198,16 @@ router.post('/', async (c) => {
       impulse_type: impulse_data.type 
     });
 
+    // Helper to execute queries with proper auth context
+    // Use authenticated query when JWT is present (for RBAC), otherwise root
+    const executeQuery = async <T>(sql: string, params: Record<string, any>): Promise<T[]> => {
+      if (jwtAuth?.jwtToken) {
+        logger.debug('Using authenticated query with JWT', { hasToken: true });
+        return queryWithAuth<T>(jwtAuth.jwtToken, sql, params);
+      }
+      return surrealDB.query<T>(sql, params);
+    };
+
     // Check if impulse already exists (composite key: api_key, project_id, impulse_id)
     const existsQuery = `
       SELECT * FROM impulse_data
@@ -185,8 +216,8 @@ router.post('/', async (c) => {
         AND project_id = $project_id
       LIMIT 1
     `;
-    
-    const existing = await surrealDB.query<any>(existsQuery, {
+
+    const existing = await executeQuery<any>(existsQuery, {
       impulse_id,
       api_key,
       project_id,
@@ -202,35 +233,46 @@ router.post('/', async (c) => {
     }
 
     // Create impulse record with timestamps
-    const now = new Date().toISOString();
+    // Use SurrealDB's time::now() function for datetime fields (REBUILD MARKER)
     const createQuery = `
       CREATE impulse_data CONTENT {
         impulse_id: $impulse_id,
         api_key: $api_key,
         project_id: $project_id,
+        org_id: type::record('organizations', $org_id),
         impulse_data: $impulse_data,
-        created_at: $created_at,
-        updated_at: $updated_at
+        created_at: time::now(),
+        updated_at: time::now()
       }
     `;
 
-    const result = await surrealDB.query<any>(createQuery, {
+    const result = await executeQuery<any>(createQuery, {
       impulse_id,
       api_key,
       project_id,
+      org_id,
       impulse_data,
-      created_at: now,
-      updated_at: now,
     });
 
-    if (!result || result.length === 0) {
+    // CREATE may return empty with some auth contexts, query the created record
+    const selectQuery = `SELECT * FROM impulse_data WHERE impulse_id = $impulse_id AND api_key = $api_key AND project_id = $project_id LIMIT 1`;
+    const selectResult = await executeQuery<any>(selectQuery, {
+      impulse_id,
+      api_key,
+      project_id
+    });
+
+    if (!selectResult || selectResult.length === 0) {
+      logger.error('Failed to retrieve created impulse', { impulse_id });
       throw new Error('Failed to create impulse in SurrealDB');
     }
+
+    const created = selectResult[0];
 
     logger.info('Impulse created', {
       impulse_id,
       project_id,
-      created_at: now,
+      created_at: created.created_at,
     });
 
     // Return response matching Python ImpulseResponse schema
@@ -239,8 +281,8 @@ router.post('/', async (c) => {
       api_key,
       project_id,
       impulse_data,
-      created_at: now,
-      updated_at: now,
+      created_at: created.created_at,
+      updated_at: created.updated_at,
     };
 
     return c.json(response, 201);
@@ -826,10 +868,31 @@ router.post('/resolve', async (c) => {
       }
 
       // =============================================================================
-      // ANALYSIS API POINTER TYPES (M3 - Impulse Bridge)
-      // These proxy to metabob-analysis-api for CPG and analysis data
+      // ANALYSIS API POINTER TYPES (M3 - Impulse Bridge) [DEPRECATED]
+      // TODO: These cases violate "Resolvers live WHERE THE DATA IS"
+      // Analysis API should provide its own /v2/impulses/resolve endpoint
+      // Vessels should call Analysis API directly, not proxy through activity-api
       // =============================================================================
 
+      case 'analysisResult':
+      case 'cochangeSuggestions':
+      case 'impactAnalysis':
+      case 'codebaseSearch': {
+        // Return helpful error directing vessels to Analysis API
+        return c.json({
+          success: false,
+          error: 'resolver_moved',
+          message: `Analysis API impulse types (${pointer.type}) should be resolved by calling ` +
+                   `the Analysis API directly, not through activity-api. ` +
+                   `This follows the "Resolvers live WHERE THE DATA IS" principle.`,
+          todo: 'Analysis API should implement /v2/impulses/resolve endpoint',
+          analysis_api_url: config.analysisApi.url,
+          pointer_type: pointer.type,
+          suggested_approach: 'Vessels should include Analysis API client code to resolve these impulse types locally'
+        } as ImpulseResolveResponse, 410); // 410 Gone - permanent deprecation
+      }
+
+      /* ORIGINAL IMPLEMENTATION - COMMENTED OUT FOR REFERENCE
       case 'analysisResult': {
         // Load a single analysis problem/issue
         if (!pointer.resultId) {
@@ -957,6 +1020,7 @@ router.post('/resolve', async (c) => {
         }
         break;
       }
+      END COMMENTED OUT ORIGINAL IMPLEMENTATION */
 
       case 'problemCluster': {
         // Impulse-driven problem investigation - returns METADATA not content
@@ -1192,6 +1256,141 @@ router.post('/resolve', async (c) => {
           content = formatMultipleTracesAsMarkdown(traces, templateId, success);
         }
         break;
+      }
+
+      case 'goal': {
+        // Goal impulse resolver: Returns activity recommendations via Thompson Sampling
+        // Used by MiniBob to get recommendations based on goal description + impulse context
+
+        const goalDescription = pointer.content;
+        const category = pointer.category;
+        const impulseRefs = pointer.impulseRefs || [];
+        const limit = pointer.limit || 3;
+        const excludeActivities = pointer.excludeActivities || [];
+
+        // Validate required fields
+        if (!goalDescription) {
+          return c.json({
+            success: false,
+            error: 'content (goal description) required for goal pointer',
+          } as ImpulseResolveResponse, 400);
+        }
+
+        logger.info('Resolving goal impulse', {
+          goal: goalDescription.substring(0, 100),
+          category,
+          impulseRefsCount: impulseRefs.length,
+          limit,
+        });
+
+        // Get session data for multi-tenant filtering
+        const sessionData = (c.get as any)('session') as SessionData | undefined;
+        const jwtAuth = getJwtAuthFromContext(c);
+        const orgId = jwtAuth?.orgId || sessionData?.org_id || null;
+        const projectId = jwtAuth?.projectId || sessionData?.project_id || null;
+
+        // Load impulse metadata for context (optional - used by Thompson Sampling for relevance scoring)
+        let impulseContext: any[] = [];
+        let impulseShapes: string[] = [];
+        if (impulseRefs.length > 0) {
+          try {
+            const contextQuery = `
+              SELECT id, shape, summary FROM impulse
+              WHERE id IN $impulse_ids
+            `;
+            impulseContext = await surrealDB.query(contextQuery, {
+              impulse_ids: impulseRefs,
+            });
+            impulseShapes = impulseContext.map((i: any) => i.shape).filter(Boolean);
+            logger.debug('Loaded impulse context for goal', {
+              count: impulseContext.length,
+              shapes: impulseShapes,
+            });
+          } catch (error) {
+            logger.warn('Failed to load impulse context', {
+              error: error instanceof Error ? error.message : String(error),
+            });
+            // Continue without context - not critical
+          }
+        }
+
+        // Call internal recommendation logic (reusing existing /recommend endpoint logic)
+        // This is essentially an internal API call to avoid code duplication
+        try {
+          const recommendRequest = new Request(`http://internal/recommend`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              // Forward auth headers
+              ...(jwtAuth?.jwtToken ? { 'Authorization': `Bearer ${jwtAuth.jwtToken}` } : {}),
+            },
+            body: JSON.stringify({
+              task_description: goalDescription,
+              category,
+              loaded_impulses: impulseRefs,
+              impulse_shapes: impulseShapes,
+              limit,
+              exclude_activities: excludeActivities,
+            }),
+          });
+
+          const recommendResponse = await activitiesRouter.fetch(recommendRequest);
+
+          if (!recommendResponse.ok) {
+            const errorData = await recommendResponse.json();
+            logger.error('Recommendation request failed', {
+              status: recommendResponse.status,
+              error: errorData,
+            });
+            return c.json({
+              success: false,
+              error: `Failed to get recommendations: ${errorData.error || 'Unknown error'}`,
+            } as ImpulseResolveResponse, 500);
+          }
+
+          const recommendData = await recommendResponse.json();
+          const recommendations = recommendData.recommendations || [];
+
+          // Format as impulse content
+          const contentData = {
+            recommendations,
+            metadata: {
+              impulse_context_size: impulseRefs.length,
+              impulse_context_shapes: impulseShapes,
+              sampling_method: 'thompson',
+              total_candidates: recommendations.length,
+            },
+          };
+
+          content = JSON.stringify(contentData, null, 2);
+
+          // Return with metadata
+          logger.info('Goal impulse resolved successfully', {
+            recommendationsCount: recommendations.length,
+            topActivity: recommendations[0]?.template_id,
+          });
+
+          return c.json({
+            success: true,
+            content,
+            metadata: {
+              shape: 'activityRecommendations',
+              rowCount: recommendations.length,
+              summary: `${recommendations.length} activities recommended for: "${goalDescription.substring(0, 50)}..."`,
+              availableOps: ['select', 'execute', 'compare'],
+            },
+          } as ImpulseResolveResponse, 200);
+
+        } catch (error: any) {
+          logger.error('Goal impulse resolution failed', {
+            error: error.message,
+            stack: error.stack,
+          });
+          return c.json({
+            success: false,
+            error: `Failed to resolve goal impulse: ${error.message}`,
+          } as ImpulseResolveResponse, 500);
+        }
       }
 
       default:

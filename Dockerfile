@@ -12,8 +12,8 @@ WORKDIR /app
 # Copy activity-api package files
 COPY metabob-activity-api/package.json metabob-activity-api/bun.lock* ./
 
-# Install dependencies
-RUN bun install --frozen-lockfile --production
+# Install dependencies (with SSH for git dependencies)
+RUN --mount=type=ssh bun install --frozen-lockfile --production
 
 # Copy activity-api source code
 COPY metabob-activity-api/src ./src

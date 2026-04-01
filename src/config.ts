@@ -14,13 +14,13 @@ export interface Config {
     database: string;
     username: string;
     password: string;
+    authEnabled: boolean;  // Whether SurrealDB requires authentication
   };
 
   // Redis
   redis: {
     url: string;
     ttl: {
-      session: number;      // Session TTL in seconds
       template: number;     // Template cache TTL
       metrics: number;      // Metrics cache TTL
     };
@@ -88,12 +88,12 @@ export function loadConfig(): Config {
       database: process.env.SURREALDB_DATABASE || 'learning_loop',
       username: process.env.SURREALDB_USERNAME || 'root',
       password: process.env.SURREALDB_PASSWORD || 'changeme',
+      authEnabled: parseEnvBool('SURREALDB_AUTH_ENABLED', true),  // Default true for safety
     },
     
     redis: {
       url: process.env.REDIS_URL || 'redis://localhost:6379',
       ttl: {
-        session: parseEnvInt('REDIS_SESSION_TTL', 86400), // 24 hours
         template: parseEnvInt('REDIS_TEMPLATE_TTL', 3600), // 1 hour
         metrics: parseEnvInt('REDIS_METRICS_TTL', 300),    // 5 minutes
       },

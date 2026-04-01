@@ -1,8 +1,20 @@
 /**
- * LLM Proxy Client
+ * LLM Proxy Client [DEPRECATED - ARCHITECTURE DRIFT]
  *
- * Wraps the Anthropic API for Tier 3-5 resolution.
- * Handles:
+ * TODO: This module violates the "Resolvers live WHERE THE DATA IS" principle.
+ *
+ * PROBLEM: The backend is making LLM calls on behalf of vessels, acting as
+ * a proxy. This makes the backend a universal resolver instead of a trace
+ * store and pattern learner.
+ *
+ * SOLUTION: Vessels should call LLMs directly:
+ * - MiniBob already has LLM client code (src/llm.ts)
+ * - Other vessels can include their own LLM clients
+ * - Backend receives traces of what happened, doesn't orchestrate calls
+ *
+ * This module is retained for reference but should not be used going forward.
+ *
+ * Original functionality:
  * - Model-specific methods (Haiku, Sonnet, Opus)
  * - Full request/response tracing
  * - Rate limiting and retries

@@ -362,34 +362,6 @@ app.get("/v2/activities/boredom/results", async (c) => {
 })
 
 /**
- * POST /v2/vessels/register - Register vessel capabilities
- */
-app.post("/v2/vessels/register", async (c) => {
-  try {
-    const body = await c.req.json() as {
-      id: string
-      name: string
-      version: string
-      capabilities: string[]
-      tools: string[]
-      metadata?: Record<string, unknown>
-    }
-
-    // For now, just log registration
-    // Could store in Redis or SurrealDB for capability routing
-    console.log(`[Vessels] Registered vessel: ${body.id} with capabilities: ${body.capabilities.join(", ")}`)
-
-    return c.json({
-      success: true,
-      message: `Vessel ${body.id} registered successfully`
-    })
-  } catch (error) {
-    console.error("[Vessels] Error registering vessel:", error)
-    return c.json({ error: "Failed to register vessel" }, 500)
-  }
-})
-
-/**
  * POST /v2/activities/boredom/generate - Generate self-development tasks
  *
  * Analyzes execution metrics and generates improvement opportunities.

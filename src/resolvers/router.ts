@@ -1,7 +1,19 @@
 /**
- * Resolver Router
+ * Resolver Router [DEPRECATED - ARCHITECTURE DRIFT]
  *
- * Selects the appropriate resolver tier for an impulse:
+ * TODO: This module violates the "Resolvers live WHERE THE DATA IS" principle.
+ *
+ * PROBLEM: This implements LLM tier selection logic in the backend, making
+ * the backend responsible for choosing which model to use. This is universal
+ * resolver behavior, which contradicts the foundation where vessels should
+ * resolve data where they have access to it.
+ *
+ * SOLUTION: Move this logic to MiniBob and other vessels:
+ * - Vessels have context about their task complexity
+ * - Vessels should decide which LLM tier they need
+ * - Backend should only learn from traces of what vessels chose
+ *
+ * Original tiers:
  * - Tier 1: Pattern match (exact) - $0
  * - Tier 2: Interpolation (similar) - $0
  * - Tier 3: Haiku - $

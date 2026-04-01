@@ -12,6 +12,7 @@ const SURREALDB_NAMESPACE = process.env.SURREALDB_NAMESPACE || 'activity-system'
 const SURREALDB_DATABASE = process.env.SURREALDB_DATABASE || 'learning_loop';
 const SURREALDB_USERNAME = process.env.SURREALDB_USERNAME || 'root';
 const SURREALDB_PASSWORD = process.env.SURREALDB_PASSWORD || 'surrealdb-local-dev-123';
+const SURREALDB_AUTH_ENABLED = process.env.SURREALDB_AUTH_ENABLED?.toLowerCase() !== 'false';
 
 const SQL_DIR = join(import.meta.dir, '../sql');
 
@@ -28,14 +29,19 @@ async function applySQLFile(filePath: string): Promise<boolean> {
   try {
     const sqlContent = await readFile(filePath, 'utf-8');
 
+    // Build headers - only include Authorization when auth is enabled
+    const headers: Record<string, string> = {
+      'Accept': 'application/json',
+      'surreal-ns': SURREALDB_NAMESPACE,
+      'surreal-db': SURREALDB_DATABASE,
+    };
+    if (SURREALDB_AUTH_ENABLED) {
+      headers['Authorization'] = 'Basic ' + Buffer.from(`${SURREALDB_USERNAME}:${SURREALDB_PASSWORD}`).toString('base64');
+    }
+
     const response = await fetch(`${SURREALDB_URL}/sql`, {
       method: 'POST',
-      headers: {
-        'Accept': 'application/json',
-        'surreal-ns': SURREALDB_NAMESPACE,
-        'surreal-db': SURREALDB_DATABASE,
-        'Authorization': 'Basic ' + Buffer.from(`${SURREALDB_USERNAME}:${SURREALDB_PASSWORD}`).toString('base64'),
-      },
+      headers,
       body: sqlContent,
     });
 
@@ -122,11 +128,25 @@ async function main() {
     process.exit(1);
   }
 
-  // Find all .surql files in sql directory
+  // Find all .surql files in sql directory and schemas subdirectory
   const files = await readdir(SQL_DIR);
   const sqlFiles = files
     .filter(f => f.endsWith('.surql'))
-    .sort(); // Apply migrations in order (001-, 002-, etc.)
+    .sort(); // Apply migrations in order (000-, 001-, etc.)
+
+  // Also include schema files from sql/schemas/ subdirectory
+  const schemasDir = join(SQL_DIR, 'schemas');
+  try {
+    const schemaFiles = await readdir(schemasDir);
+    const schemasSqlFiles = schemaFiles
+      .filter(f => f.endsWith('.surql'))
+      .map(f => `schemas/${f}`)  // Prefix with subdirectory
+      .sort();
+    sqlFiles.push(...schemasSqlFiles);
+  } catch (error) {
+    // schemas directory may not exist, that's okay
+    console.log('[Init] No schemas subdirectory found, skipping...');
+  }
 
   if (sqlFiles.length === 0) {
     console.log('[Init] No migration files found');

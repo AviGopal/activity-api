@@ -13,12 +13,14 @@
 -- Note: api_key field deprecated in favor of org_id for consistency
 -- =============================================================================
 
-DEFINE TABLE IF NOT EXISTS impulse_data SCHEMAFULL
+-- OVERWRITE ensures PERMISSIONS are always applied (critical for MiniBob RBAC)
+DEFINE TABLE OVERWRITE impulse_data SCHEMAFULL
   PERMISSIONS
     -- SELECT: Users can see impulses in their org and assigned projects
+    -- Note: When $auth.project_ids IS NONE, user has full org access (no project restriction)
     FOR select WHERE
       org_id = $auth.org_id
-      AND (project_id IS NONE OR project_id IN $auth.project_ids)
+      AND (project_id IS NONE OR $auth.project_ids IS NONE OR project_id IN $auth.project_ids)
 
     -- CREATE: Any authenticated user can create impulses
     FOR create WHERE $auth.org_id != NONE
@@ -38,10 +40,10 @@ DEFINE FIELD IF NOT EXISTS impulse_id ON impulse_data TYPE string
   COMMENT "Unique impulse identifier within organization";
 
 -- Multi-tenancy (REQUIRED for RBAC)
-DEFINE FIELD IF NOT EXISTS org_id ON impulse_data TYPE record<organizations>
+DEFINE FIELD IF NOT EXISTS org_id ON impulse_data TYPE string
   ASSERT $value != NONE
   VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (required for all impulses)";
+  COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON impulse_data TYPE option<record<projects>>
   VALUE $value OR $auth.project_id
@@ -163,10 +165,10 @@ DEFINE FIELD IF NOT EXISTS execution_id ON impulse_usage_history TYPE string
   COMMENT "Execution trace ID";
 
 -- Multi-tenancy (REQUIRED for RBAC)
-DEFINE FIELD IF NOT EXISTS org_id ON impulse_usage_history TYPE record<organizations>
+DEFINE FIELD IF NOT EXISTS org_id ON impulse_usage_history TYPE string
   ASSERT $value != NONE
   VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (required)";
+  COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON impulse_usage_history TYPE option<record<projects>>
   VALUE $value OR $auth.project_id
@@ -232,10 +234,10 @@ DEFINE FIELD IF NOT EXISTS run_id ON ci_runs TYPE string
   COMMENT "Unique CI run identifier";
 
 -- Multi-tenancy (REQUIRED for RBAC)
-DEFINE FIELD IF NOT EXISTS org_id ON ci_runs TYPE record<organizations>
+DEFINE FIELD IF NOT EXISTS org_id ON ci_runs TYPE string
   ASSERT $value != NONE
   VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (required)";
+  COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON ci_runs TYPE option<record<projects>>
   VALUE $value OR $auth.project_id
@@ -314,10 +316,10 @@ DEFINE FIELD IF NOT EXISTS variant_id ON code_variants TYPE string
   COMMENT "Unique variant identifier";
 
 -- Multi-tenancy (REQUIRED for RBAC)
-DEFINE FIELD IF NOT EXISTS org_id ON code_variants TYPE record<organizations>
+DEFINE FIELD IF NOT EXISTS org_id ON code_variants TYPE string
   ASSERT $value != NONE
   VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (required)";
+  COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON code_variants TYPE option<record<projects>>
   VALUE $value OR $auth.project_id

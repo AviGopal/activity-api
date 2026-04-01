@@ -44,10 +44,10 @@ DEFINE FIELD IF NOT EXISTS variant_id ON activity_execution_traces TYPE option<s
   COMMENT "Template variant identifier (for backward compatibility)";
 
 -- Multi-tenancy (REQUIRED for RBAC)
-DEFINE FIELD IF NOT EXISTS org_id ON activity_execution_traces TYPE record<organizations>
+DEFINE FIELD IF NOT EXISTS org_id ON activity_execution_traces TYPE string
   ASSERT $value != NONE
   VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (required for all executions)";
+  COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON activity_execution_traces TYPE option<record<projects>>
   VALUE $value OR $auth.project_id
@@ -220,10 +220,10 @@ DEFINE FIELD IF NOT EXISTS execution_id ON activity_composition_graph TYPE strin
   ASSERT $value != NONE
   COMMENT "Last execution ID where composition occurred";
 
-DEFINE FIELD IF NOT EXISTS org_id ON activity_composition_graph TYPE record<organizations>
+DEFINE FIELD IF NOT EXISTS org_id ON activity_composition_graph TYPE string
   ASSERT $value != NONE
   VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (required for RBAC)";
+  COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON activity_composition_graph TYPE option<record<projects>>
   VALUE $value OR $auth.project_id
@@ -294,10 +294,10 @@ DEFINE FIELD IF NOT EXISTS activity_variant_id ON impulse_relevance_metrics TYPE
   ASSERT $value != NONE
   COMMENT "Activity variant that uses this impulse";
 
-DEFINE FIELD IF NOT EXISTS org_id ON impulse_relevance_metrics TYPE record<organizations>
+DEFINE FIELD IF NOT EXISTS org_id ON impulse_relevance_metrics TYPE string
   ASSERT $value != NONE
   VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (required for RBAC)";
+  COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON impulse_relevance_metrics TYPE option<record<projects>>
   VALUE $value OR $auth.project_id
@@ -373,10 +373,10 @@ DEFINE FIELD IF NOT EXISTS execution_id ON tool_usage TYPE string
   ASSERT $value != NONE
   COMMENT "Execution where tool was called";
 
-DEFINE FIELD IF NOT EXISTS org_id ON tool_usage TYPE record<organizations>
+DEFINE FIELD IF NOT EXISTS org_id ON tool_usage TYPE string
   ASSERT $value != NONE
   VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (required for RBAC)";
+  COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON tool_usage TYPE option<record<projects>>
   VALUE $value OR $auth.project_id
@@ -471,10 +471,10 @@ DEFINE FIELD IF NOT EXISTS selection_method ON thompson_selection_log TYPE strin
 DEFINE FIELD IF NOT EXISTS candidates_count ON thompson_selection_log TYPE option<int>
   COMMENT "Number of candidates considered";
 
-DEFINE FIELD IF NOT EXISTS org_id ON thompson_selection_log TYPE record<organizations>
+DEFINE FIELD IF NOT EXISTS org_id ON thompson_selection_log TYPE string
   ASSERT $value != NONE
   VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (required for RBAC)";
+  COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON thompson_selection_log TYPE option<record<projects>>
   VALUE $value OR $auth.project_id
@@ -508,6 +508,7 @@ DEFINE INDEX IF NOT EXISTS idx_thompson_selection_method
 -- Note: SurrealDB 3.0 views cannot use CASE expressions, so we pass status through as-is
 DEFINE TABLE IF NOT EXISTS view_execution_traces AS
   SELECT
+    execution_id AS id,   -- Use execution_id as record ID for view
     execution_id,
     activity_id AS template_id,
     status,
@@ -522,6 +523,7 @@ DEFINE TABLE IF NOT EXISTS view_execution_traces AS
 -- View: activity_executions (legacy table name from 001-init-schema.surql)
 DEFINE TABLE IF NOT EXISTS view_activity_executions AS
   SELECT
+    execution_id AS id,   -- Use execution_id as record ID for view
     execution_id,
     variant_id,
     org_id,

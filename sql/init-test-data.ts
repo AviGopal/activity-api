@@ -55,7 +55,7 @@ async function initTestData() {
     // Check if default organization exists
     console.log(`\nChecking for organization: ${DEFAULT_ORG_ID}...`);
     const orgCheck = await db.query(
-      `SELECT * FROM organizations WHERE id = type::thing('organizations', $org_id)`,
+      `SELECT * FROM organizations WHERE id = type::record('organizations', $org_id)`,
       { org_id: DEFAULT_ORG_ID }
     );
 
@@ -97,7 +97,7 @@ async function initTestData() {
       const instanceResult = await db.query(
         `CREATE minibob_instance SET
           instance_id = $instance_id,
-          org_id = type::thing('organizations', $org_id),
+          org_id = $org_id,
           project_id = NONE,
           api_key_hash = $api_key_hash,
           vessel_id = $vessel_id,

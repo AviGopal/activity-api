@@ -1,12 +1,23 @@
 /**
- * Resolution Routes
+ * Resolution Routes [DEPRECATED - ARCHITECTURE DRIFT]
  *
- * Handles impulse resolution through the tiered resolver system.
+ * TODO: This file violates the core principle "Resolvers live WHERE THE DATA IS"
  *
- * Endpoints:
+ * PROBLEM: The backend is acting as a universal resolver with tiered LLM resolution
+ * (Haiku → Sonnet → Opus). This makes the backend more than a trace store and
+ * pattern learner, which is architectural drift.
+ *
+ * SOLUTION: Move this functionality to MiniBob and other vessels:
+ * - Vessels should select which LLM tier to use based on their local context
+ * - Vessels should make LLM calls directly with their own API keys
+ * - Backend should only store traces of what happened, not orchestrate resolution
+ *
+ * This route has been DISABLED. See Task #1 of Phase 1: Fix Architecture Drift.
+ *
+ * Original endpoints:
  * - POST /v2/resolve - Resolve an impulse through the tiered system
  *
- * Resolution flow:
+ * Original resolution flow:
  * 1. Check for pattern match (Tier 1) - $0
  * 2. Check for similar pattern (Tier 2) - $0
  * 3. Route to appropriate LLM (Tier 3-5) - $$
@@ -95,7 +106,19 @@ interface LLMResolutionLog {
 // POST /v2/resolve
 // ============================================================================
 
+// DEPRECATED: This endpoint is disabled due to architecture drift
+// See header comment for details
 resolve.post('/resolve', async (c) => {
+  return c.json({
+    error: 'endpoint_deprecated',
+    message: 'This endpoint violates the "Resolvers live WHERE THE DATA IS" principle. ' +
+            'LLM tier selection and resolution should happen in vessels (MiniBob), not in the backend. ' +
+            'The backend should only store traces and learn patterns.',
+    deprecation_reason: 'architecture_drift',
+    todo: 'Move LLM tier selection to MiniBob vessels'
+  }, 410); // 410 Gone - indicates permanent deprecation
+
+  /* ORIGINAL IMPLEMENTATION - COMMENTED OUT
   const startTime = Date.now();
 
   try {
@@ -240,6 +263,7 @@ resolve.post('/resolve', async (c) => {
       message: err.message
     }, 500);
   }
+  */ // END COMMENTED OUT ORIGINAL IMPLEMENTATION
 });
 
 // ============================================================================

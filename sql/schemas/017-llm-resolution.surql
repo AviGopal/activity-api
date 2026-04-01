@@ -31,10 +31,10 @@ DEFINE TABLE IF NOT EXISTS llm_resolution_log SCHEMAFULL
     FOR delete WHERE org_id = $auth.org_id AND $auth.role = 'admin';
 
 -- Multi-tenancy (REQUIRED for RBAC)
-DEFINE FIELD IF NOT EXISTS org_id ON llm_resolution_log TYPE record<organizations>
+DEFINE FIELD IF NOT EXISTS org_id ON llm_resolution_log TYPE string
   ASSERT $value != NONE
   VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (required for all resolutions)";
+  COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON llm_resolution_log TYPE option<record<projects>>
   VALUE $value OR $auth.project_id

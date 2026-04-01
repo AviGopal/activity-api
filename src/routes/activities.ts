@@ -17,6 +17,7 @@ import { logger } from '../utils/logger';
 import { ensureTags, computeTagPrefixes, deriveCategory } from '../utils/tags';
 import { analyzeTaskSemantics } from '../utils/semantic-tags';
 import { calculateImpulseRelevancyBoosts, discoverMissingImpulses } from '../utils/impulse-relevancy';
+import { captureValidationTrace } from '../utils/validation-traces';
 import {
   insertActivity,
   insertExecution,
@@ -129,6 +130,9 @@ interface ActivityTemplate {
  * Filter templates by input schema compatibility
  * A template matches if ALL required shapes in its inputSchema are present in providedShapes
  * Templates without inputSchema match anything (backwards compatible)
+ *
+ * TASK #3 Enhancement: This function now considers output_shapes for composition learning.
+ * When selecting activities, we can track which output shapes lead to successful compositions.
  */
 function filterByInputSchema(
   templates: any[],
@@ -157,6 +161,16 @@ function filterByInputSchema(
       providedSet.has(shape)
     );
 
+    // TASK #3: Log output_shapes for composition learning
+    // When activities succeed, we can learn which output_shapes enable future compositions
+    if (allRequiredPresent && template.output_shapes) {
+      logger.debug('[Composition Learning] Activity produces output shapes', {
+        activity_id: template.id || template.variant_id,
+        input_shapes: requiredShapes,
+        output_shapes: template.output_shapes,
+      });
+    }
+
     return allRequiredPresent;
   });
 }
@@ -181,14 +195,31 @@ async function enrichTemplatesWithMetrics(
     });
     
     // Query metrics for all variants in one go
-    const metricsQuery = `
-      SELECT * FROM variant_performance_metrics
-      WHERE variant_id IN $variant_ids
-    `;
-    
-    const metricsResult = await surrealDB.query<any>(metricsQuery, {
-      variant_ids: variantIds
-    });
+    // Use compatibility view that reads from new v_activity_score
+    // Fallback to old table if view doesn't exist (during migration)
+    let metricsResult: any[] = [];
+
+    try {
+      const metricsQuery = `
+        SELECT * FROM v_paradigm_performance_metrics
+        WHERE variant_id IN $variant_ids
+      `;
+      metricsResult = await surrealDB.query<any>(metricsQuery, {
+        variant_ids: variantIds
+      });
+    } catch (error: any) {
+      // Fallback to old table if view doesn't exist yet
+      logger.warn('Failed to query v_paradigm_performance_metrics, falling back to variant_performance_metrics', {
+        error: error.message
+      });
+      const fallbackQuery = `
+        SELECT * FROM variant_performance_metrics
+        WHERE variant_id IN $variant_ids
+      `;
+      metricsResult = await surrealDB.query<any>(fallbackQuery, {
+        variant_ids: variantIds
+      });
+    }
 
     logger.info('Metrics query result', {
       metricsFound: metricsResult?.length || 0,
@@ -234,17 +265,21 @@ async function listAllTemplatesFromDB(
   orgId?: string | null,
   projectId?: string | null,
   jwtToken?: string | null,
-  scopeFilter?: string | null
+  scopeFilter?: string | null,
+  executionType?: string | null // T8: Allow filtering by execution_type
 ): Promise<ActivityTemplate[]> {
   let query: string;
   let params: Record<string, any>;
+
+  // T8: Default to 'template' for backward compatibility
+  const effectiveExecutionType = executionType || 'template';
 
   if (jwtToken) {
     // JWT AUTH PATH: Use RBAC-enforced query
     // The PERMISSIONS clause on activity_template uses $auth.org_id to filter
     // We just need to query all templates - SurrealDB will filter automatically
     let whereClause = '';
-    params = { limit };
+    params = { limit, execution_type: effectiveExecutionType };
 
     // Apply scope filter if specified
     if (scopeFilter) {
@@ -258,13 +293,14 @@ async function listAllTemplatesFromDB(
     }
 
     query = `
-      SELECT * FROM activity_template
-      ${whereClause}
+      SELECT * FROM activity
+      WHERE execution_type = $execution_type
+      ${whereClause ? 'AND ' + whereClause.replace('WHERE ', '') : ''}
       ORDER BY created_at DESC
       LIMIT $limit
     `;
 
-    logger.debug('Fetching templates with JWT auth (RBAC enforced)', { limit, scopeFilter });
+    logger.debug('Fetching activities with JWT auth (RBAC enforced)', { limit, scopeFilter, executionType: effectiveExecutionType });
     const result = await queryWithAuth<ActivityTemplate>(jwtToken, query, params);
 
     logger.info('SurrealDB templates fetched (RBAC)', {
@@ -292,24 +328,24 @@ async function listAllTemplatesFromDB(
 
   if (orgId) {
     if (projectId) {
-      // User has both org_id and project_id: return global + org + project templates
+      // User has both org_id and project_id: return global + org + project activities
       query = `
-        SELECT * FROM activity_template
-        WHERE (
-          scope IS NULL
-          OR scope = 'global'
+        SELECT * FROM activity
+        WHERE execution_type = $execution_type
+        AND (
+          (scope = 'global' AND public = true)
           OR (scope = 'org' AND org_id = $org_id)
           OR (scope = 'project' AND project_id = $project_id)
         ) ${scopeClause}
         ORDER BY created_at DESC
         LIMIT $limit
       `;
-      params = { limit, org_id: orgId, project_id: projectId };
+      params = { limit, org_id: orgId, project_id: projectId, execution_type: effectiveExecutionType };
     } else {
-      // User has org_id but no project_id: return global + org templates
+      // User has org_id but no project_id: return global + org activities
       query = `
-        SELECT * FROM activity_template
-        WHERE (
+        SELECT * FROM activity
+        WHERE execution_type = $execution_type AND (
           scope IS NULL
           OR scope = 'global'
           OR (scope = 'org' AND org_id = $org_id)
@@ -317,13 +353,13 @@ async function listAllTemplatesFromDB(
         ORDER BY created_at DESC
         LIMIT $limit
       `;
-      params = { limit, org_id: orgId };
+      params = { limit, org_id: orgId, execution_type: effectiveExecutionType };
     }
   } else {
-    // No org_id: return only global templates
+    // No org_id: return only global activities
     query = `
-      SELECT * FROM activity_template
-      WHERE (
+      SELECT * FROM activity
+      WHERE execution_type = $execution_type AND (
         scope IS NULL
         OR scope = 'global'
       ) ${scopeClause}
@@ -358,8 +394,10 @@ async function listPublicTemplatesFromDB(
   limit: number
 ): Promise<ActivityTemplate[]> {
   const query = `
-    SELECT * FROM activity_template
-    WHERE scope = 'global' AND public = true
+    SELECT * FROM activity
+    WHERE execution_type = 'template'
+      AND scope = 'global'
+      AND public = true
     ORDER BY created_at DESC
     LIMIT $limit
   `;
@@ -390,9 +428,15 @@ async function listPublicTemplatesFromDB(
  * Automatically creates initial performance metrics with Thompson Sampling parameters
  */
 app.post('/templates', async (c) => {
+  // Parse body early for validation trace capture
+  let body: any;
+  let jwtAuth: any;
+  let orgId: string | null = null;
+  let projectId: string | null = null;
+
   try {
     // Check for JWT auth first (MiniBob instances)
-    const jwtAuth = getJwtAuthFromContext(c);
+    jwtAuth = getJwtAuthFromContext(c);
 
     logger.info('POST /templates - JWT auth context', {
       hasJwtAuth: !!jwtAuth,
@@ -404,11 +448,11 @@ app.post('/templates', async (c) => {
     const session = (c.get as any)('session') as SessionData | undefined;
 
     // Use JWT auth claims if available, otherwise fall back to session
-    const orgId = jwtAuth?.orgId || session?.org_id || null;
-    const projectId = jwtAuth?.projectId || session?.project_id || null;
+    orgId = jwtAuth?.orgId || session?.org_id || null;
+    projectId = jwtAuth?.projectId || session?.project_id || null;
 
     // Parse and validate request body
-    const body = await c.req.json();
+    body = await c.req.json();
     const validated = CreateTemplateRequestSchema.parse(body);
 
     // Convert category to tags if needed (backward compatibility)
@@ -427,15 +471,15 @@ app.post('/templates', async (c) => {
       scope: validated.scope,
     });
 
-    // Check if template already exists
+    // Check if activity already exists
     const existingQuery = `
-      SELECT * FROM activity_template
-      WHERE variant_id = $variant_id
+      SELECT * FROM activity
+      WHERE id = $id
       LIMIT 1
     `;
-    
+
     const existing = await surrealDB.query<ActivityTemplate>(existingQuery, {
-      variant_id: validated.variant_id,
+      id: validated.variant_id,
     });
 
     if (existing.length > 0) {
@@ -447,98 +491,69 @@ app.post('/templates', async (c) => {
       } as CreateTemplateResponse, 409);
     }
 
-    // Build template record, only include fields with values (SurrealDB doesn't accept null)
-    const templateRecord: Record<string, any> = {
-      variant_id: validated.variant_id,
-      activity_id: validated.activity_id,
-      variant_name: validated.variant_name,
+    // Build activity record using new paradigm schema
+    const activityRecord: Record<string, any> = {
+      id: validated.variant_id,
+      name: validated.variant_name,
       description: validated.description,
+      execution_type: 'template',
       // Hierarchical tags (primary classification)
       tags,
       tag_prefixes: tagPrefixes,
       // Legacy category for backward compatibility
       category: derivedCategory,
       scope: validated.scope || 'global',
+      public: validated.public !== undefined ? validated.public : (validated.scope === 'global'),
+      org_id: validated.org_id || orgId,
     };
 
-    // Only add optional fields if they have values
+    // Convert input_schema/output_schema to input_shapes/output_shapes
+    if (validated.input_schema?.required) {
+      activityRecord.input_shapes = validated.input_schema.required.map(r => r.shape);
+    } else {
+      activityRecord.input_shapes = [];
+    }
+
+    if (validated.output_schema?.produces) {
+      activityRecord.output_shapes = validated.output_schema.produces.map(p => p.shape);
+    } else {
+      activityRecord.output_shapes = [];
+    }
+
+    // Add tasks (renamed from task_steps for new paradigm)
     if (validated.task_steps && validated.task_steps.length > 0) {
-      templateRecord.task_steps = validated.task_steps;
+      activityRecord.tasks = validated.task_steps;
     }
-    if (validated.org_id || orgId) {
-      templateRecord.org_id = validated.org_id || orgId;
-    }
+
     if (validated.project_id || projectId) {
-      templateRecord.project_id = validated.project_id || projectId;
+      activityRecord.project_id = validated.project_id || projectId;
     }
     if (validated.genealogy && Object.keys(validated.genealogy).length > 0) {
-      templateRecord.genealogy = validated.genealogy;
+      activityRecord.genealogy = validated.genealogy;
     }
     // Add impulse definitions for bootstrap templates
     if (validated.impulses && validated.impulses.length > 0) {
-      templateRecord.impulses = validated.impulses;
-    }
-    // Add input/output schemas for composition
-    if (validated.input_schema) {
-      templateRecord.input_schema = validated.input_schema;
-    }
-    if (validated.output_schema) {
-      templateRecord.output_schema = validated.output_schema;
+      activityRecord.impulses = validated.impulses;
     }
 
     // Build dynamic query with only provided fields
-    const fields = Object.keys(templateRecord).map(k => `${k}: $${k}`).join(',\n        ');
-    const insertTemplateQuery = `
-      INSERT INTO activity_template {
+    const fields = Object.keys(activityRecord).map(k => `${k}: $${k}`).join(',\n        ');
+    const insertActivityQuery = `
+      INSERT INTO activity {
         ${fields},
         created_at: time::now(),
         updated_at: time::now()
       }
     `;
 
-    await surrealDB.query(insertTemplateQuery, templateRecord);
+    await surrealDB.query(insertActivityQuery, activityRecord);
 
-    logger.debug('Template inserted into activity_template');
-
-    // DUAL-WRITE: Also insert into new paradigm activity table (schema-paradigm-alignment)
-    // This enables gradual migration to the 4-table schema
-    // P4.1: Feature flag controlled
-    if (isDualWriteEnabled()) {
-      try {
-        const paradigmActivity: Partial<ParadigmActivity> = {
-        id: validated.variant_id,
-        name: validated.variant_name,
-        description: validated.description,
-        input_shapes: [], // Legacy templates don't have shapes yet
-        output_shapes: [],
-        execution_type: 'template',
-        // Hierarchical tags (primary classification)
-        tags,
-        tag_prefixes: tagPrefixes,
-        // Legacy category for backward compatibility
-        category: derivedCategory,
-        tasks: validated.task_steps,
-        scope: validated.scope || 'org',
-        public: validated.scope === 'global',
-        org_id: validated.org_id || orgId || undefined,
-        project_id: validated.project_id || projectId || undefined,
-      };
-
-      const paradigmResult = await insertActivity(paradigmActivity, jwtAuth?.jwtToken);
-      if (paradigmResult) {
-        logger.info('[paradigm] Template also written to activity table', {
-          id: validated.variant_id,
-          path: 'dual-write',
-        });
-      }
-      } catch (paradigmError) {
-        // Don't fail the request if paradigm write fails - legacy write succeeded
-        logger.warn('[paradigm] Dual-write to activity table failed (non-blocking)', {
-          variant_id: validated.variant_id,
-          error: paradigmError instanceof Error ? paradigmError.message : String(paradigmError),
-        });
-      }
-    } // end isDualWriteEnabled()
+    logger.info('Activity template inserted into activity table', {
+      id: validated.variant_id,
+      name: validated.variant_name,
+      scope: activityRecord.scope,
+      public: activityRecord.public,
+    });
 
     // Create initial performance metrics
     // org_id is optional - use session org or request value if provided
@@ -617,6 +632,20 @@ app.post('/templates', async (c) => {
 
     // Check if it's a validation error
     if (error.name === 'ZodError') {
+      // Capture validation error as trace for pattern detection
+      // This enables auto-detection of schema mismatches like snake_case vs camelCase
+      captureValidationTrace(
+        '/v2/activities/templates',
+        'POST',
+        error.errors,
+        body,
+        {
+          callerId: jwtAuth?.instanceId,
+          orgId: orgId || undefined,
+          projectId: projectId || undefined,
+        }
+      );
+
       return c.json({
         error: 'Validation failed',
         message: error.message,
@@ -628,6 +657,37 @@ app.post('/templates', async (c) => {
       error: 'Failed to register template',
       message: error.message,
     }, 500);
+  }
+});
+
+/**
+ * GET /v2/activities/validation-patterns
+ * Detect recurring validation errors for self-healing
+ *
+ * Returns patterns of validation failures that occur frequently,
+ * enabling auto-detection of schema drift and field naming mismatches.
+ */
+app.get('/validation-patterns', async (c) => {
+  try {
+    const { detectValidationPatterns } = await import('../utils/validation-traces');
+    const timeWindowHours = parseInt(c.req.query('hours') || '24', 10);
+    const minFrequency = parseInt(c.req.query('min_frequency') || '3', 10);
+
+    const patterns = await detectValidationPatterns(timeWindowHours, minFrequency);
+
+    return c.json({
+      patterns,
+      query: {
+        time_window_hours: timeWindowHours,
+        min_frequency: minFrequency,
+      },
+      total: patterns.length,
+    });
+  } catch (error: any) {
+    logger.error('GET /v2/activities/validation-patterns failed', {
+      error: error.message,
+    });
+    return c.json({ error: error.message }, 500);
   }
 });
 
@@ -653,6 +713,7 @@ app.get('/templates', async (c) => {
     // Extract query parameters
     const category = c.req.query('category') || null;
     const scopeFilter = c.req.query('scope') || null; // Filter by scope: global, org, project
+    const executionType = c.req.query('execution_type') || null; // T8: Filter by execution_type
     const limitStr = c.req.query('limit') || '50';
     let limit = parseInt(limitStr, 10);
 
@@ -665,6 +726,7 @@ app.get('/templates', async (c) => {
     logger.info('GET /v2/activities/templates', {
       category,
       scopeFilter,
+      executionType,
       limit,
       orgId,
       projectId,
@@ -728,7 +790,8 @@ app.get('/templates', async (c) => {
             orgId,
             projectId,
             jwtAuth?.jwtToken || null,
-            scopeFilter
+            scopeFilter,
+            executionType // T8: Pass execution_type filter
           );
 
           // Populate Redis cache (only for non-JWT queries to avoid polluting global cache)
@@ -903,8 +966,12 @@ app.get('/templates/:variantId', async (c) => {
     let result: ActivityTemplate[] = [];
 
     // First, try to query by variant_id field (most common case)
+    // Filter by execution_type to ensure we're getting a template, not an execution
     const variantQuery = `
-      SELECT * FROM activity_template WHERE variant_id = $variant_id LIMIT 1
+      SELECT * FROM activity
+      WHERE variant_id = $variant_id
+        AND execution_type = 'template'
+      LIMIT 1
     `;
     result = await surrealDB.query<ActivityTemplate>(variantQuery, { variant_id: variantId });
 
@@ -912,7 +979,9 @@ app.get('/templates/:variantId', async (c) => {
     if (result.length === 0 && variantId.startsWith('activity_template:')) {
       try {
         const recordQuery = `
-          SELECT * FROM activity_template WHERE id = type::record($variant_id)
+          SELECT * FROM activity
+          WHERE id = type::record($variant_id)
+            AND execution_type = 'template'
         `;
         result = await surrealDB.query<ActivityTemplate>(recordQuery, { variant_id: variantId });
       } catch (recordError) {
@@ -1004,7 +1073,7 @@ app.post('/executions', async (c) => {
 
     // Look up template to get activity_id (required for activity_execution_traces table)
     const templateLookup = await surrealDB.query<{ activity_id: string }>(
-      'SELECT activity_id FROM activity_template WHERE variant_id = $variant_id LIMIT 1',
+      'SELECT activity_id FROM activity WHERE variant_id = $variant_id LIMIT 1',
       { variant_id: validated.variant_id }
     );
     const activityId = templateLookup[0]?.activity_id || validated.variant_id;
@@ -1306,7 +1375,7 @@ app.get('/executions', async (c) => {
     });
 
     // Build query with filters
-    let query = 'SELECT * FROM activity_execution_traces WHERE 1=1';
+    let query = 'SELECT * FROM v_paradigm_execution_traces WHERE 1=1';
     const params: Record<string, any> = {};
     
     // Multi-tenant filtering (same as templates)
@@ -1406,255 +1475,6 @@ app.get('/executions', async (c) => {
  *   execution_id: string,
  *   message?: string
  * }
- */
-// DEPRECATED: This handler moved to src/routes/execution-traces.ts
-// Commenting out to prevent duplicate handler conflict
-/*
-app.post('/execution-traces', async (c) => {
-  try {
-    const body = await c.req.json();
-    const validated = StoreExecutionTraceRequestSchema.parse(body);
-    
-    logger.info('POST /v2/activities/execution-traces', {
-      execution_id: validated.execution_id,
-      template_id: validated.template_id,
-      status: validated.status,
-      tasks_count: validated.execution_trace.tasks.length,
-      duration_ms: validated.duration_ms,
-      cost_usd: validated.cost_usd,
-    });
-
-    // Check if trace already exists
-    const existsQuery = `
-      SELECT * FROM execution_traces
-      WHERE execution_id = $execution_id
-      LIMIT 1
-    `;
-    
-    const existing = await surrealDB.query<any>(existsQuery, {
-      execution_id: validated.execution_id,
-    });
-
-    if (existing.length > 0) {
-      logger.warn('Execution trace already exists', { execution_id: validated.execution_id });
-      return c.json({
-        success: false,
-        execution_id: validated.execution_id,
-        message: 'Execution trace already exists',
-      } as StoreExecutionTraceResponse, 409);
-    }
-
-    // Store execution trace
-    const createQuery = `
-      CREATE execution_traces CONTENT {
-        execution_id: $execution_id,
-        template_id: $template_id,
-        status: $status,
-        duration_ms: $duration_ms,
-        cost_usd: $cost_usd,
-        execution_trace: $execution_trace,
-        stored_at: time::now(),
-        created_at: time::now(),
-        updated_at: time::now()
-      }
-    `;
-    
-    await surrealDB.query(createQuery, {
-      execution_id: validated.execution_id,
-      template_id: validated.template_id,
-      status: validated.status,
-      duration_ms: validated.duration_ms,
-      cost_usd: validated.cost_usd,
-      execution_trace: validated.execution_trace,
-    });
-
-    logger.info('Execution trace stored successfully', {
-      execution_id: validated.execution_id,
-      template_id: validated.template_id,
-      status: validated.status,
-    });
-
-    // Post-execution hook: Generate debug tasks for failures
-    if (validated.status === 'failure') {
-      try {
-        const { taskGenerator } = await import('../services/task-generator');
-        const { enqueueTask } = await import('./boredom');
-
-        const debugTasks = await taskGenerator.analyzeExecution({
-          execution_id: validated.execution_id,
-          template_id: validated.template_id,
-          status: validated.status,
-          duration_ms: validated.duration_ms,
-          cost_usd: validated.cost_usd,
-          execution_trace: validated.execution_trace,
-          created_at: new Date().toISOString(),
-        });
-
-        for (const task of debugTasks) {
-          await enqueueTask(task);
-        }
-
-        if (debugTasks.length > 0) {
-          logger.info('[TaskGenerator] Generated debug tasks for failed execution', {
-            execution_id: validated.execution_id,
-            taskCount: debugTasks.length,
-          });
-        }
-      } catch (hookError) {
-        // Don't fail the request if hook fails
-        logger.error('[TaskGenerator] Post-execution hook failed', { error: hookError });
-      }
-    }
-
-    return c.json({
-      success: true,
-      execution_id: validated.execution_id,
-      message: 'Execution trace stored successfully',
-    } as StoreExecutionTraceResponse, 201);
-
-  } catch (error: any) {
-    logger.error('POST /v2/activities/execution-traces failed', {
-      error: error.message,
-      stack: error.stack,
-    });
-
-    if (error.name === 'ZodError') {
-      return c.json({
-        success: false,
-        execution_id: '',
-        message: 'Validation failed: ' + error.message,
-      } as StoreExecutionTraceResponse, 400);
-    }
-
-    return c.json({
-      success: false,
-      execution_id: '',
-      message: error.message,
-    } as StoreExecutionTraceResponse, 500);
-  }
-});
-*/
-
-/**
- * GET /v2/activities/execution-traces/:executionId
- * 
- * Retrieve execution trace by ID.
- * 
- * Use cases:
- * - Debugging: Load trace to understand what went wrong
- * - Analysis: Review successful execution patterns
- * - Ribosome: Extract trace to generate new template
- * 
- * Returns full trace with all tasks, tool calls, state transitions.
- */
-// DEPRECATED: Moved to src/routes/execution-traces.ts
-/*
-app.get('/execution-traces/:executionId', async (c) => {
-  try {
-    const executionId = c.req.param('executionId');
-
-    logger.info('GET /v2/activities/execution-traces/:executionId', { executionId });
-
-    const query = `
-      SELECT * FROM execution_traces
-      WHERE execution_id = $execution_id
-      LIMIT 1
-    `;
-
-    const result = await surrealDB.query<any>(query, {
-      execution_id: executionId,
-    });
-
-    if (result.length === 0) {
-      return c.json({
-        error: 'Execution trace not found',
-        execution_id: executionId,
-      }, 404);
-    }
-
-    const trace = result[0];
-
-    logger.info('Execution trace retrieved', { executionId });
-
-    return c.json(trace);
-
-  } catch (error: any) {
-    logger.error('GET /v2/activities/execution-traces/:executionId failed', {
-      error: error.message,
-      stack: error.stack,
-    });
-
-    return c.json({
-      error: 'Failed to retrieve execution trace',
-      message: error.message,
-    }, 500);
-  }
-});
-*/
-
-// DEPRECATED: Moved to src/routes/execution-traces.ts
-/*
-app.get('/execution-traces', async (c) => {
-  try {
-    const templateId = c.req.query('template_id');
-    const status = c.req.query('status');
-    const limitStr = c.req.query('limit') || '50';
-    const offsetStr = c.req.query('offset') || '0';
-
-    const limit = Math.min(Math.max(parseInt(limitStr, 10), 1), 100);
-    const offset = Math.max(parseInt(offsetStr, 10), 0);
-
-    logger.info('GET /v2/activities/execution-traces', {
-      template_id: templateId,
-      status,
-      limit,
-      offset,
-    });
-
-    // Build query with filters
-    let query = 'SELECT * FROM execution_traces WHERE 1=1';
-    const params: Record<string, any> = {};
-
-    if (templateId) {
-      query += ' AND template_id = $template_id';
-      params.template_id = templateId;
-    }
-
-    if (status) {
-      query += ' AND status = $status';
-      params.status = status;
-    }
-
-    query += ' ORDER BY stored_at DESC';
-    query += ' LIMIT $limit START $offset';
-    params.limit = limit;
-    params.offset = offset;
-
-    const result = await surrealDB.query(query, params);
-    const traces = Array.isArray(result) ? result : [];
-
-    logger.info('Execution traces retrieved', { count: traces.length });
-
-    return c.json({
-      executions: traces,
-      total: traces.length,
-      limit,
-      offset,
-    });
-
-  } catch (error: any) {
-    logger.error('GET /v2/activities/execution-traces failed', {
-      error: error.message,
-      stack: error.stack,
-    });
-
-    return c.json({
-      error: 'Failed to list execution traces',
-      message: error.message,
-    }, 500);
-  }
-});
-*/
 
 /**
  * GET /v2/activities/metrics/trend
@@ -1746,7 +1566,7 @@ app.get('/metrics/summary', async (c) => {
     logger.info('GET /v2/activities/metrics/summary');
 
     // Query aggregate metrics
-    const templateCountResult = await surrealDB.query('SELECT count() AS count FROM activity_template GROUP ALL');
+    const templateCountResult = await surrealDB.query('SELECT count() AS count FROM activity GROUP ALL');
     const totalTemplates = (templateCountResult[0] as any)?.count || 0;
 
     const executionStatsResult = await surrealDB.query(`
@@ -1964,9 +1784,11 @@ app.post('/recommend', async (c) => {
       category,
       tags,           // NEW: Filter by exact tags
       tag_prefix,     // NEW: Filter by tag prefix (e.g., "feature" matches "feature.vessel")
+      execution_type, // T8: Filter by execution type (template, tool, composition, vessel_function)
       loaded_impulses = [],
       impulse_shapes = [],  // Array of impulse shapes for schema filtering
-      limit = 3
+      limit = 3,
+      exclude_activities = []  // T4: Blacklist of activity IDs to exclude
     } = body;
 
     logger.info('POST /recommend', {
@@ -1974,6 +1796,7 @@ app.post('/recommend', async (c) => {
       category,
       tags,
       tag_prefix,
+      execution_type,
       loaded_impulses,
       impulse_shapes,
       limit
@@ -2022,6 +1845,7 @@ app.post('/recommend', async (c) => {
         effectiveShapes,
         orgId,
         category,
+        execution_type as 'template' | 'tool' | 'composition' | 'vessel_function' | null | undefined, // T8: Pass execution_type filter
         limit * 3, // Fetch more to account for filtering
         jwtAuth?.jwtToken
       );
@@ -2049,7 +1873,7 @@ app.post('/recommend', async (c) => {
           tag_prefixes,
           input_schema,
           output_schema
-        FROM activity_template
+        FROM activity
       `;
 
       const params: Record<string, any> = {};
@@ -2085,6 +1909,12 @@ app.post('/recommend', async (c) => {
         params.tag_prefix = effectiveTagPrefix;
       }
 
+      // T8: Filter by execution_type if provided
+      if (execution_type) {
+        whereClauses.push(`execution_type = $execution_type`);
+        params.execution_type = execution_type;
+      }
+
       if (whereClauses.length > 0) {
         query += ` WHERE ${whereClauses.join(' AND ')}`;
       }
@@ -2108,6 +1938,18 @@ app.post('/recommend', async (c) => {
           reduction: beforeCount > 0 ? `${Math.round((1 - templates.length / beforeCount) * 100)}%` : '0%'
         });
       }
+    }
+
+    // T4: Filter out excluded activities (within-goal blacklisting)
+    if (exclude_activities && exclude_activities.length > 0) {
+      const beforeCount = templates.length;
+      const excludeSet = new Set(exclude_activities);
+      templates = templates.filter((t: any) => !excludeSet.has(t.variant_id));
+      logger.info('Blacklist filtering applied', {
+        before: beforeCount,
+        after: templates.length,
+        excluded: exclude_activities
+      });
     }
 
     // Get Thompson Sampling scores
@@ -2236,6 +2078,7 @@ app.post('/recommend', async (c) => {
           template_name: template.name || template.variant_name,
           category: template.category,
           tags: template.tags || [],
+          tag_prefixes: template.tag_prefixes || [],
           input_shapes: template.input_shapes || [],
           output_shapes: template.output_shapes || [],
           input_schema: template.input_schema || null,
@@ -3682,7 +3525,7 @@ app.get('/tags/suggest', async (c) => {
 
     // Query tag prefixes (deduplication happens in code)
     const query = `
-      SELECT tag_prefixes FROM activity_template
+      SELECT tag_prefixes FROM activity
       WHERE array::len(tag_prefixes) > 0
       LIMIT 1000
     `;
@@ -3743,7 +3586,7 @@ app.get('/tags/stats', async (c) => {
 
     // Query templates and count tag occurrences
     const query = `
-      SELECT tags FROM activity_template
+      SELECT tags FROM activity
       WHERE array::len(tags) > 0
     `;
 

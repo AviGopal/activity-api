@@ -46,7 +46,8 @@ export interface GeneratedActivity {
     };
     retry: {
       strategy: string;
-      maxAttempts: number;
+      max_attempts?: number;
+      maxAttempts?: number;
     };
   }>;
   scope: string;

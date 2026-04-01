@@ -56,9 +56,10 @@ DEFINE FIELD IF NOT EXISTS content ON impulse TYPE option<string>
   COMMENT "Materialized content (null = not loaded yet)";
 
 -- Multi-tenancy
-DEFINE FIELD IF NOT EXISTS org_id ON impulse TYPE record<organizations>
+DEFINE FIELD IF NOT EXISTS org_id ON impulse TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id;
+  VALUE $value OR $auth.org_id
+  COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON impulse TYPE option<record<projects>>
   VALUE $value OR $auth.project_id;
@@ -163,9 +164,10 @@ DEFINE FIELD IF NOT EXISTS public ON activity TYPE bool
   VALUE $value OR false;
 
 -- Multi-tenancy
-DEFINE FIELD IF NOT EXISTS org_id ON activity TYPE record<organizations>
+DEFINE FIELD IF NOT EXISTS org_id ON activity TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id;
+  VALUE $value OR $auth.org_id
+  COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON activity TYPE option<record<projects>>;
 
@@ -258,9 +260,10 @@ DEFINE FIELD IF NOT EXISTS trace ON execution TYPE option<object> FLEXIBLE
   COMMENT "Full execution trace: tasks, tool_calls, state_transition, impulse_evolution";
 
 -- Multi-tenancy
-DEFINE FIELD IF NOT EXISTS org_id ON execution TYPE record<organizations>
+DEFINE FIELD IF NOT EXISTS org_id ON execution TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id;
+  VALUE $value OR $auth.org_id
+  COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON execution TYPE option<record<projects>>
   VALUE $value OR $auth.project_id;
@@ -343,8 +346,9 @@ DEFINE FIELD IF NOT EXISTS is_active ON vessel TYPE bool
   VALUE $value OR true;
 
 -- Multi-tenancy
-DEFINE FIELD IF NOT EXISTS org_id ON vessel TYPE record<organizations>
-  ASSERT $value != NONE;
+DEFINE FIELD IF NOT EXISTS org_id ON vessel TYPE string
+  ASSERT $value != NONE
+  COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON vessel TYPE option<record<projects>>;
 

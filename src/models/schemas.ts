@@ -64,9 +64,14 @@ export const TemplateTaskSchema = z.object({
     commands: z.array(z.any()).optional(),
   }).optional(),
   retry: z.object({
-    maxAttempts: z.number(),
+    // Accept both snake_case (from MiniBob MCP) and camelCase (from ribosome)
+    max_attempts: z.number().optional(),
+    maxAttempts: z.number().optional(),
     strategy: z.string(),
-  }).optional(),
+  }).refine(
+    (data) => data.max_attempts !== undefined || data.maxAttempts !== undefined,
+    { message: "Either max_attempts or maxAttempts is required" }
+  ).optional(),
 });
 
 export const TemplateMetricsSchema = z.object({

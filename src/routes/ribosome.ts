@@ -103,6 +103,16 @@ interface ExtractedTemplate {
     extractedFrom: string;
     defaultValue?: unknown;
   }>;
+  impulses: Array<{
+    id: string;
+    pointer: {
+      type: string;
+      [key: string]: unknown;
+    };
+    budget: number;
+    priority: 'critical' | 'high' | 'medium' | 'low';
+    description?: string;
+  }>;
   confidence: number;
   generatedAt: string;
 }
@@ -315,6 +325,101 @@ function extractValidation(traces: ExecutionTrace[]): {
 }
 
 /**
+ * Extract impulse pointers from tool calls
+ * Converts data access patterns into reusable impulse definitions
+ */
+function extractImpulses(traces: ExecutionTrace[]): Array<{
+  id: string;
+  pointer: {
+    type: string;
+    [key: string]: unknown;
+  };
+  budget: number;
+  priority: 'critical' | 'high' | 'medium' | 'low';
+  description?: string;
+}> {
+  const impulses: Array<{
+    id: string;
+    pointer: { type: string; [key: string]: unknown };
+    budget: number;
+    priority: 'critical' | 'high' | 'medium' | 'low';
+    description?: string;
+  }> = [];
+
+  const seenFiles = new Set<string>();
+  let impulseIndex = 0;
+
+  for (const trace of traces) {
+    if (!trace.tasks) continue;
+
+    for (const task of trace.tasks) {
+      if (!task.tool_calls) continue;
+
+      for (const toolCall of task.tool_calls) {
+        const args = toolCall.args as Record<string, unknown> | undefined;
+        if (!args) continue;
+
+        // Extract file read operations as file impulses
+        if (toolCall.tool === 'read' && args.file_path && typeof args.file_path === 'string') {
+          if (!seenFiles.has(args.file_path)) {
+            seenFiles.add(args.file_path);
+            impulses.push({
+              id: `file_${impulseIndex++}`,
+              pointer: {
+                type: 'file',
+                path: args.file_path,
+              },
+              budget: 3000,
+              priority: 'high',
+              description: `File read from ${toolCall.tool} call`,
+            });
+          }
+        }
+
+        // Extract grep patterns as file impulses with pattern
+        if (toolCall.tool === 'grep' && args.pattern && args.path) {
+          const key = `${args.path}:${args.pattern}`;
+          if (!seenFiles.has(key)) {
+            seenFiles.add(key);
+            impulses.push({
+              id: `grep_${impulseIndex++}`,
+              pointer: {
+                type: 'file',
+                path: args.path as string,
+                pattern: args.pattern as string,
+              },
+              budget: 2000,
+              priority: 'medium',
+              description: `Grep search for pattern in ${args.path}`,
+            });
+          }
+        }
+
+        // Extract glob patterns as file collection impulses
+        if (toolCall.tool === 'glob' && args.pattern) {
+          const key = `glob:${args.pattern}`;
+          if (!seenFiles.has(key)) {
+            seenFiles.add(key);
+            impulses.push({
+              id: `glob_${impulseIndex++}`,
+              pointer: {
+                type: 'file',
+                glob: args.pattern as string,
+              },
+              budget: 5000,
+              priority: 'medium',
+              description: `File collection matching ${args.pattern}`,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  return impulses;
+}
+
+/**
  * Calculate confidence score for extracted template
  */
 function calculateConfidence(traces: ExecutionTrace[]): number {
@@ -364,6 +469,7 @@ function deriveTemplateName(traces: ExecutionTrace[]): string {
 function extractTemplateFromTraces(traces: ExecutionTrace[]): ExtractedTemplate {
   const tasks = groupToolCallsIntoTasks(traces);
   const validation = extractValidation(traces);
+  const impulses = extractImpulses(traces);
   const confidence = calculateConfidence(traces);
   const name = deriveTemplateName(traces);
 
@@ -390,6 +496,7 @@ function extractTemplateFromTraces(traces: ExecutionTrace[]): ExtractedTemplate 
     tasks,
     validation,
     variables: Array.from(allVariables.values()),
+    impulses,
     confidence,
     generatedAt: new Date().toISOString(),
   };
@@ -465,6 +572,7 @@ app.post('/extract', async (c) => {
       taskCount: template.tasks.length,
       confidence: template.confidence,
       variableCount: template.variables.length,
+      impulseCount: template.impulses.length,
     });
 
     // Store the extracted template
@@ -477,6 +585,7 @@ app.post('/extract', async (c) => {
         tasks: $tasks,
         validation: $validation,
         variables: $variables,
+        impulses: $impulses,
         metadata: {
           extracted: true,
           extractedFrom: $extracted_from,
@@ -496,6 +605,7 @@ app.post('/extract', async (c) => {
       tasks: template.tasks,
       validation: template.validation,
       variables: template.variables,
+      impulses: template.impulses,
       extracted_from: template.extractedFrom,
       confidence: template.confidence,
       generated_at: template.generatedAt,

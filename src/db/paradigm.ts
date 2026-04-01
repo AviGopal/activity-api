@@ -130,6 +130,17 @@ export interface ParadigmActivity {
   description?: string;
   input_shapes: string[];
   output_shapes: string[];
+  /**
+   * Execution type determines how this activity is executed and which patterns it matches.
+   *
+   * - `template`: Multi-task workflows with LLM-guided execution (e.g., debug-activity, create-feature)
+   * - `tool`: Single tool invocations wrapped as activities (e.g., bash-run, file-read)
+   * - `composition`: Multi-activity sequences orchestrated together (e.g., test-and-deploy pipeline)
+   * - `vessel_function`: Code-based resolvers that transform impulses directly (e.g., extract-error-from-logs)
+   *
+   * This differentiation improves Thompson Sampling by preventing tool wrappers from being mixed
+   * with templates in recommendations, and enables specialized execution paths for each type.
+   */
   execution_type: 'template' | 'tool' | 'composition' | 'vessel_function';
   // Hierarchical tags (primary classification)
   tags?: string[];
@@ -509,12 +520,15 @@ export async function getActivityScores(
  * @param availableShapes - Shapes the caller has available (impulse_shapes)
  * @param orgId - Organization ID for multi-tenant filtering
  * @param category - Optional category filter
+ * @param executionType - Optional execution_type filter (template, tool, composition, vessel_function)
+ * @param limit - Maximum number of results to return
  * @param jwtToken - Optional JWT token for RBAC
  */
 export async function queryActivitiesByShapes(
   availableShapes: string[],
   orgId?: string | null,
   category?: string | null,
+  executionType?: 'template' | 'tool' | 'composition' | 'vessel_function' | null,
   limit: number = 50,
   jwtToken?: string | null
 ): Promise<QueryPathResult<ParadigmActivity>> {
@@ -542,6 +556,12 @@ export async function queryActivitiesByShapes(
     if (category) {
       whereClauses.push(`category = $category`);
       params.category = category;
+    }
+
+    // T8: Filter by execution_type if provided
+    if (executionType) {
+      whereClauses.push(`execution_type = $execution_type`);
+      params.execution_type = executionType;
     }
 
     // Multi-tenant filtering
@@ -634,6 +654,8 @@ export async function queryActivitiesByShapes(
         variant_name AS name,
         description,
         category,
+        tags,
+        tag_prefixes,
         task_steps AS tasks,
         scope,
         org_id,
@@ -659,6 +681,8 @@ export async function queryActivitiesByShapes(
       output_shapes: [],
       execution_type: 'template' as const,
       category: t.category,
+      tags: t.tags || [],
+      tag_prefixes: t.tag_prefixes || [],
       tasks: t.tasks,
       scope: t.scope || 'global',
       public: t.scope === 'global',

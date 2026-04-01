@@ -58,11 +58,42 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
 
   const token = match[1];
 
-  // Detect if this is a JWT token (contains periods) vs a Base64 Redis session key
+  // Detect if this is a JWT token (contains periods) vs a simple base64 token
   // JWT format: header.payload.signature (3 parts separated by .)
-  // Base64 Redis key: no periods, typically shorter
+  // Simple base64: no periods (our simplified MiniBob auth)
   if (!token.includes('.')) {
-    // Not a JWT - let Redis session auth handle it
+    // Try to parse as simple base64 token (from simplified MiniBob auth)
+    try {
+      const decoded = JSON.parse(Buffer.from(token, 'base64').toString());
+      if (decoded.instanceId && decoded.orgId && decoded.expiresAt) {
+        // Check if token is expired
+        if (decoded.expiresAt < Date.now()) {
+          logger.warn('Token expired', { expiresAt: new Date(decoded.expiresAt) });
+          c.set('jwtAuth', null);
+          await next();
+          return;
+        }
+
+        // Valid simple base64 token
+        const jwtAuth: JwtAuthContext = {
+          jwtToken: token,
+          orgId: decoded.orgId,
+          projectId: decoded.projectId,
+          instanceId: decoded.instanceId,
+        };
+        c.set('jwtAuth', jwtAuth);
+        logger.info('Simple base64 token authenticated', { orgId: decoded.orgId, instanceId: decoded.instanceId });
+        await next();
+        return;
+      }
+    } catch (e) {
+      // Not a valid simple token - let Redis session auth handle it
+      c.set('jwtAuth', null);
+      await next();
+      return;
+    }
+
+    // Not a valid token format
     c.set('jwtAuth', null);
     await next();
     return;

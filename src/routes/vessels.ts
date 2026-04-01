@@ -283,4 +283,236 @@ app.get('/:podName/status', async (c) => {
   }
 });
 
+/**
+ * POST /v2/vessels/register
+ *
+ * Register a vessel's capabilities for discovery
+ * Vessels announce what impulse shapes they can resolve
+ *
+ * Request body:
+ * {
+ *   vesselId: string,
+ *   vesselName: string,
+ *   endpoint: string,
+ *   shapes: string[],
+ *   metadata?: object
+ * }
+ */
+app.post('/register', async (c) => {
+  try {
+    const body = await c.req.json();
+
+    // Validate required fields
+    if (!body.vesselId || !body.vesselName || !body.endpoint || !body.shapes) {
+      return c.json({
+        error: 'Missing required fields',
+        required: ['vesselId', 'vesselName', 'endpoint', 'shapes'],
+      }, 400);
+    }
+
+    if (!Array.isArray(body.shapes) || body.shapes.length === 0) {
+      return c.json({
+        error: 'shapes must be a non-empty array',
+      }, 400);
+    }
+
+    const registration = {
+      vessel_id: body.vesselId,
+      vessel_name: body.vesselName,
+      endpoint: body.endpoint,
+      shapes: body.shapes,
+      metadata: body.metadata || {},
+      registered_at: new Date().toISOString(),
+      last_seen: new Date().toISOString(),
+    };
+
+    // Upsert vessel registration (update if exists, insert if not)
+    const query = `
+      UPSERT vessel_capabilities SET
+        vessel_id = $vessel_id,
+        vessel_name = $vessel_name,
+        endpoint = $endpoint,
+        shapes = $shapes,
+        metadata = $metadata,
+        registered_at = $registered_at,
+        last_seen = $last_seen
+      WHERE vessel_id = $vessel_id
+    `;
+
+    await surrealDB.query(query, registration);
+
+    logger.info('Vessel registered', {
+      vesselId: body.vesselId,
+      vesselName: body.vesselName,
+      endpoint: body.endpoint,
+      shapes: body.shapes,
+    });
+
+    return c.json({
+      success: true,
+      vesselId: body.vesselId,
+      timestamp: registration.registered_at,
+      message: 'Vessel registered successfully',
+    });
+
+  } catch (error) {
+    logger.error('Failed to register vessel', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+
+    return c.json({
+      error: 'Failed to register vessel',
+      message: error instanceof Error ? error.message : 'Unknown error',
+    }, 500);
+  }
+});
+
+/**
+ * GET /v2/vessels/discover?shape=<shape>
+ *
+ * Discover vessels that can resolve a specific impulse shape
+ *
+ * Query params:
+ * - shape: The impulse shape to query for (e.g., "terminalState", "execution_trace")
+ *
+ * Returns:
+ * {
+ *   vessels: [{ vesselId, vesselName, endpoint, shapes, metadata }],
+ *   shape: string,
+ *   found: boolean
+ * }
+ */
+app.get('/discover', async (c) => {
+  try {
+    const shape = c.req.query('shape');
+
+    if (!shape) {
+      return c.json({
+        error: 'Missing required query parameter: shape',
+      }, 400);
+    }
+
+    // Query vessels that can resolve this shape
+    // Only include vessels that have sent heartbeat in last 5 minutes
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+
+    const query = `
+      SELECT
+        vessel_id,
+        vessel_name,
+        endpoint,
+        shapes,
+        metadata,
+        last_seen
+      FROM vessel_capabilities
+      WHERE $shape IN shapes
+        AND last_seen >= $since
+      ORDER BY last_seen DESC
+    `;
+
+    const vessels = await surrealDB.query(query, {
+      shape,
+      since: fiveMinutesAgo,
+    });
+
+    // Map to VesselCapability format
+    const vesselCapabilities = (vessels || []).map((v: any) => ({
+      vesselId: v.vessel_id,
+      vesselName: v.vessel_name,
+      endpoint: v.endpoint,
+      shapes: v.shapes,
+      metadata: v.metadata || {},
+    }));
+
+    logger.info('Vessel discovery query', {
+      shape,
+      found: vesselCapabilities.length,
+    });
+
+    if (vesselCapabilities.length === 0) {
+      return c.json({
+        vessels: [],
+        shape,
+        found: false,
+        message: `No vessels found that can resolve shape: ${shape}`,
+      }, 404);
+    }
+
+    return c.json({
+      vessels: vesselCapabilities,
+      shape,
+      found: true,
+    });
+
+  } catch (error) {
+    logger.error('Failed to discover vessels', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+
+    return c.json({
+      error: 'Failed to discover vessels',
+      message: error instanceof Error ? error.message : 'Unknown error',
+    }, 500);
+  }
+});
+
+/**
+ * GET /v2/vessels/capabilities
+ *
+ * List all registered vessel capabilities
+ */
+app.get('/capabilities', async (c) => {
+  try {
+    // Get all vessel capabilities registered in last hour
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+
+    const query = `
+      SELECT
+        vessel_id,
+        vessel_name,
+        endpoint,
+        shapes,
+        metadata,
+        registered_at,
+        last_seen
+      FROM vessel_capabilities
+      WHERE last_seen >= $since
+      ORDER BY last_seen DESC
+    `;
+
+    const vessels = await surrealDB.query(query, {
+      since: oneHourAgo,
+    });
+
+    const vesselCapabilities = (vessels || []).map((v: any) => ({
+      vesselId: v.vessel_id,
+      vesselName: v.vessel_name,
+      endpoint: v.endpoint,
+      shapes: v.shapes,
+      metadata: v.metadata || {},
+      registeredAt: v.registered_at,
+      lastSeen: v.last_seen,
+    }));
+
+    logger.info('Listed vessel capabilities', {
+      count: vesselCapabilities.length,
+    });
+
+    return c.json({
+      vessels: vesselCapabilities,
+      total: vesselCapabilities.length,
+    });
+
+  } catch (error) {
+    logger.error('Failed to list vessel capabilities', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+
+    return c.json({
+      error: 'Failed to list vessel capabilities',
+      message: error instanceof Error ? error.message : 'Unknown error',
+    }, 500);
+  }
+});
+
 export default app;

@@ -36,10 +36,10 @@ DEFINE FIELD IF NOT EXISTS pattern_id ON pattern TYPE string
   COMMENT "Unique pattern identifier (e.g., pattern-{hash}-{timestamp})";
 
 -- Multi-tenancy (REQUIRED for RBAC)
-DEFINE FIELD IF NOT EXISTS org_id ON pattern TYPE record<organizations>
+DEFINE FIELD IF NOT EXISTS org_id ON pattern TYPE string
   ASSERT $value != NONE
   VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (required for all patterns)";
+  COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON pattern TYPE option<record<projects>>
   VALUE $value OR $auth.project_id

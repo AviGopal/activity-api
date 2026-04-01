@@ -111,7 +111,8 @@ class MigrationRunner {
       // Paradigm alignment tables (schema-paradigm-alignment)
       '020-paradigm-core-tables.surql',
       // SKIPPED: 021-paradigm-computed-views.surql - incompatible with SurrealDB 3.0.0
-      // SKIPPED: 022-paradigm-compat-views.surql - depends on 021
+      '022-paradigm-compat-views.surql',  // Backward-compatibility views for migration
+      '026-activity-template-alias.surql', // activity_template alias for old code
     ];
 
     const schemasPath = join(process.cwd(), 'sql', 'schemas');

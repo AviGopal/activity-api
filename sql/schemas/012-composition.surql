@@ -42,10 +42,10 @@ DEFINE FIELD IF NOT EXISTS goal_embedding ON goal_execution_paths TYPE option<ar
   COMMENT "Goal text embedding for semantic matching";
 
 -- Multi-tenancy (REQUIRED for RBAC)
-DEFINE FIELD IF NOT EXISTS org_id ON goal_execution_paths TYPE record<organizations>
+DEFINE FIELD IF NOT EXISTS org_id ON goal_execution_paths TYPE string
   ASSERT $value != NONE
   VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (required for all paths)";
+  COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON goal_execution_paths TYPE option<record<projects>>
   VALUE $value OR $auth.project_id
@@ -236,10 +236,10 @@ DEFINE FIELD IF NOT EXISTS execution_id ON activity_dataflows TYPE string
   COMMENT "Execution trace ID where this flow occurred";
 
 -- Multi-tenancy (REQUIRED for RBAC)
-DEFINE FIELD IF NOT EXISTS org_id ON activity_dataflows TYPE record<organizations>
+DEFINE FIELD IF NOT EXISTS org_id ON activity_dataflows TYPE string
   ASSERT $value != NONE
   VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (required)";
+  COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON activity_dataflows TYPE option<record<projects>>
   VALUE $value OR $auth.project_id
@@ -322,10 +322,10 @@ DEFINE FIELD IF NOT EXISTS variant_id ON activity_prerequisites TYPE string
   COMMENT "Variant identifier";
 
 -- Multi-tenancy (REQUIRED for RBAC)
-DEFINE FIELD IF NOT EXISTS org_id ON activity_prerequisites TYPE record<organizations>
+DEFINE FIELD IF NOT EXISTS org_id ON activity_prerequisites TYPE string
   ASSERT $value != NONE
   VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (required)";
+  COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON activity_prerequisites TYPE option<record<projects>>
   VALUE $value OR $auth.project_id
@@ -402,10 +402,10 @@ DEFINE FIELD IF NOT EXISTS satisfying_activity_id ON prerequisite_patterns TYPE 
   COMMENT "Activity that satisfies this requirement";
 
 -- Multi-tenancy (REQUIRED for RBAC)
-DEFINE FIELD IF NOT EXISTS org_id ON prerequisite_patterns TYPE record<organizations>
+DEFINE FIELD IF NOT EXISTS org_id ON prerequisite_patterns TYPE string
   ASSERT $value != NONE
   VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (required)";
+  COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON prerequisite_patterns TYPE option<record<projects>>
   VALUE $value OR $auth.project_id
@@ -476,10 +476,10 @@ DEFINE FIELD IF NOT EXISTS goal_description ON execution_sequences TYPE string
   COMMENT "Goal description text";
 
 -- Multi-tenancy (REQUIRED for RBAC)
-DEFINE FIELD IF NOT EXISTS org_id ON execution_sequences TYPE record<organizations>
+DEFINE FIELD IF NOT EXISTS org_id ON execution_sequences TYPE string
   ASSERT $value != NONE
   VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (required)";
+  COMMENT "Organization ID (string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS project_id ON execution_sequences TYPE option<record<projects>>
   VALUE $value OR $auth.project_id
