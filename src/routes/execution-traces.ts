@@ -713,8 +713,9 @@ app.post('/', async (c) => {
     const session = ((c.get as any)('session') as SessionData | undefined) || { session_id: 'internal', org_id: null, project_id: null, api_key: null, latest_job_id: null };
 
     // Use JWT auth claims if available, otherwise fall back to session
-    const orgId = jwtAuth?.orgId || session.org_id || null;
-    const projectId = jwtAuth?.projectId || session.project_id || null;
+    // Default to 'public' for unauthenticated/improvised executions (schema requires non-null string)
+    const orgId = jwtAuth?.orgId || session?.org_id || 'public';
+    const projectId = jwtAuth?.projectId || session?.project_id || null;
 
     const body = await c.req.json();
 
@@ -908,6 +909,21 @@ app.post('/', async (c) => {
         created_at: $created_at${optionalFieldsStr}
       }
     `;
+
+    // Ensure org_id is always a non-null string (schema requirement)
+    if (!trace.org_id || typeof trace.org_id !== 'string') {
+      logger.info('Fixing org_id for execution trace', {
+        original_org_id: trace.org_id,
+        org_id_type: typeof trace.org_id
+      });
+      trace.org_id = 'public';
+    }
+
+    logger.debug('Executing trace query', {
+      execution_id: trace.execution_id,
+      org_id: trace.org_id,
+      org_id_type: typeof trace.org_id
+    });
 
     const result = await surrealDB.query(query, trace);
 
