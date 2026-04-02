@@ -425,8 +425,14 @@ app.get('/', async (c) => {
       }
     }
 
+    // Ensure execution_id is populated (use SurrealDB id as fallback for legacy data)
+    const executionsNormalized = executionsWithSelection.map((trace: any) => ({
+      ...trace,
+      execution_id: trace.execution_id || trace.id?.toString().split(':')[1] || trace.id,
+    }));
+
     const response: ListExecutionTracesResponse = {
-      executions: executionsWithSelection,
+      executions: executionsNormalized,
       total,
       limit,
       offset,
@@ -565,10 +571,14 @@ app.get('/:executionId', async (c) => {
     }
 
     // Return trace with optional selection data
-    return c.json({
+    // Ensure execution_id is populated (use SurrealDB id as fallback for legacy data)
+    const traceNormalized = {
       ...trace,
+      execution_id: trace.execution_id || (trace as any).id?.toString().split(':')[1] || (trace as any).id,
       selection_attribution: selectionData,
-    });
+    };
+
+    return c.json(traceNormalized);
 
   } catch (error) {
     logger.error('Failed to get execution trace', {
