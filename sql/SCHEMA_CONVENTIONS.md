@@ -4,13 +4,26 @@
 
 **Always use `TYPE string` for org_id fields.**
 
+### Format Standard
+
+The `org_id` value should use **record reference format**: `"organizations:org_name"`
+
+For example:
+- Correct: `"organizations:metabob_internal"`
+- Incorrect: `"metabob_internal"` (plain string without prefix)
+
+This ensures consistency between:
+- JWT tokens (which contain `org_id: "organizations:..."`)
+- MiniBob RECORD authentication (`$auth.org_id` from minibob_instance)
+- All data stored in database tables
+
 ### Rationale
 
 - Organization records are managed by identity-vessel (separate service)
 - No true foreign key constraints across services
-- String references are simpler and avoid RECORD type mismatches
-- RBAC enforcement works identically with string comparison
-- JWT tokens contain `org_id` as a string claim, not a record reference
+- Using record format strings ensures RBAC comparisons work consistently
+- JWT tokens contain `org_id` in record format: `"organizations:metabob_internal"`
+- MiniBob instances store `org_id` in record format for consistency
 - Consistent with microservices architecture where foreign keys don't span service boundaries
 
 ### Standard Pattern
@@ -18,9 +31,11 @@
 ```sql
 DEFINE FIELD IF NOT EXISTS org_id ON table_name TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (string reference to identity-vessel)";
+  VALUE $value OR <string>$auth.org_id
+  COMMENT "Organization ID (record format string reference to identity-vessel)";
 ```
+
+Note: The `<string>` cast ensures type safety regardless of how SurrealDB represents `$auth.org_id` internally.
 
 ### RBAC Enforcement
 
@@ -40,9 +55,9 @@ DEFINE TABLE table_name SCHEMAFULL
 ```
 
 This works because:
-- `$auth.org_id` from JWT is a string
+- `$auth.org_id` from JWT/RECORD auth is in record format
+- Data is stored in the same record format
 - String comparison `org_id = $auth.org_id` is direct and efficient
-- No RECORD type casting or dereferencing required
 - SurrealDB enforces these rules at the query level
 
 ### Benefits of String References
@@ -62,8 +77,8 @@ If you have existing schemas using `TYPE record<organizations>`, migrate them us
 -- Update field definition
 DEFINE FIELD IF NOT EXISTS org_id ON table_name TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (string reference to identity-vessel)";
+  VALUE $value OR <string>$auth.org_id
+  COMMENT "Organization ID (record format string reference to identity-vessel)";
 ```
 
 The `IF NOT EXISTS` clause makes this idempotent and safe to re-run.
@@ -85,19 +100,27 @@ For cross-service references like `org_id`, `project_id` (from identity-vessel),
 -- Core paradigm tables
 DEFINE FIELD IF NOT EXISTS org_id ON impulse TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (string reference to identity-vessel)";
+  VALUE $value OR <string>$auth.org_id
+  COMMENT "Organization ID (record format string reference to identity-vessel)";
 
 DEFINE FIELD IF NOT EXISTS org_id ON activity TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (string reference to identity-vessel)";
+  VALUE $value OR <string>$auth.org_id
+  COMMENT "Organization ID (record format string reference to identity-vessel)";
 
 -- Legacy tables
 DEFINE FIELD IF NOT EXISTS org_id ON activity_registry TYPE string
   ASSERT $value != NONE
-  VALUE $value OR $auth.org_id
-  COMMENT "Organization ID (string reference to identity-vessel)";
+  VALUE $value OR <string>$auth.org_id
+  COMMENT "Organization ID (record format string reference to identity-vessel)";
+```
+
+**Creating data programmatically:**
+
+```typescript
+// Always use record format for org_id values
+const org_id = `organizations:${orgName}`;  // Correct
+// const org_id = orgName;                  // Incorrect - missing prefix
 ```
 
 **Incorrect usage (don't do this):**

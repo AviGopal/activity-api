@@ -36,8 +36,12 @@ const DEFAULT_ORG_ID = process.env.DEFAULT_ORG_ID || 'metabob_internal';
 const INITIAL_ALPHA = parseFloat(process.env.INITIAL_ALPHA || '3');
 const PROTO_PATH = process.env.PROTO_PATH || join(import.meta.dir, '../node_modules/@metabob/proto');
 
-// Bootstrap templates directory
-const BOOTSTRAP_DIR = join(PROTO_PATH, 'activities/bootstrap');
+// Template directories to seed (order matters for logging)
+const TEMPLATE_DIRS = [
+  { name: 'bootstrap', path: join(PROTO_PATH, 'activities/bootstrap') },
+  { name: 'reliability', path: join(PROTO_PATH, 'activities/reliability') },
+  { name: 'hypothesis', path: join(PROTO_PATH, 'activities/hypothesis') },
+];
 
 interface BootstrapTemplate {
   name: string;
@@ -72,22 +76,40 @@ function generateTagPrefixes(tags: string[]): string[] {
 }
 
 /**
- * Load all bootstrap templates from @metabob/proto
+ * Load all templates from @metabob/proto (bootstrap, reliability, hypothesis)
  */
-async function loadBootstrapTemplates(): Promise<Array<{ filename: string; template: BootstrapTemplate }>> {
-  const templates: Array<{ filename: string; template: BootstrapTemplate }> = [];
+async function loadBootstrapTemplates(): Promise<Array<{ filename: string; template: BootstrapTemplate; source: string }>> {
+  const templates: Array<{ filename: string; template: BootstrapTemplate; source: string }> = [];
 
-  // Use readdirSync instead of Bun.Glob (Glob doesn't work well with symlinks)
-  const files = readdirSync(BOOTSTRAP_DIR).filter(f => f.endsWith('.json'));
-
-  for (const file of files) {
+  for (const { name, path } of TEMPLATE_DIRS) {
     try {
-      const filePath = join(BOOTSTRAP_DIR, file);
-      const content = await Bun.file(filePath).text();
-      const template = JSON.parse(content) as BootstrapTemplate;
-      templates.push({ filename: file, template });
+      // Check if directory exists
+      const dirExists = await Bun.file(join(path, '.')).exists().catch(() => false);
+      if (!dirExists) {
+        // Try to read directory - if it fails, skip
+        try {
+          readdirSync(path);
+        } catch {
+          console.log(`[Seed] Skipping ${name} directory (not found): ${path}`);
+          continue;
+        }
+      }
+
+      const files = readdirSync(path).filter(f => f.endsWith('.json'));
+      console.log(`[Seed] Loading ${files.length} templates from ${name}/`);
+
+      for (const file of files) {
+        try {
+          const filePath = join(path, file);
+          const content = await Bun.file(filePath).text();
+          const template = JSON.parse(content) as BootstrapTemplate;
+          templates.push({ filename: file, template, source: name });
+        } catch (error) {
+          console.warn(`[Seed] Skipping ${name}/${file}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
     } catch (error) {
-      console.warn(`[Seed] Skipping ${file}: ${error instanceof Error ? error.message : String(error)}`);
+      console.warn(`[Seed] Error reading ${name} directory: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -106,6 +128,7 @@ async function seedTemplates() {
     console.log(`Org ID: ${DEFAULT_ORG_ID}`);
     console.log(`Initial Alpha: ${INITIAL_ALPHA}`);
     console.log(`Proto Path: ${PROTO_PATH}`);
+    console.log(`Template Dirs: ${TEMPLATE_DIRS.map(d => d.name).join(', ')}`);
     console.log('='.repeat(80));
 
     // Connect
@@ -154,9 +177,10 @@ async function seedTemplates() {
     let skipCount = 0;
     let errorCount = 0;
 
-    for (const { filename, template } of templates) {
+    for (const { filename, template, source } of templates) {
       // Determine template ID
       const id = template.variant_id || template.activity_id || filename.replace('.json', '');
+      const displayName = `${source}/${filename}`;
 
       // Check if already exists
       const existing = await db.query<any[][]>(
@@ -166,7 +190,7 @@ async function seedTemplates() {
 
       if (existing[0] && existing[0].length > 0) {
         skipCount++;
-        console.log(`  ○ ${filename} → ${id} (already exists)`);
+        console.log(`  ○ ${displayName} → ${id} (already exists)`);
         continue;
       }
 
@@ -206,16 +230,17 @@ async function seedTemplates() {
             tags,
             task_steps: taskSteps,
             impulses: template.impulses || [],
-            org_id: DEFAULT_ORG_ID,
+            // Use record format for consistency with JWT $auth.org_id
+            org_id: `organizations:${DEFAULT_ORG_ID}`,
             alpha: INITIAL_ALPHA,
           }
         );
 
         successCount++;
-        console.log(`  ✓ ${filename} → ${id} (α=${INITIAL_ALPHA})`);
+        console.log(`  ✓ ${displayName} → ${id} (α=${INITIAL_ALPHA})`);
       } catch (error) {
         errorCount++;
-        console.error(`  ✗ ${filename} → ${error instanceof Error ? error.message : String(error)}`);
+        console.error(`  ✗ ${displayName} → ${error instanceof Error ? error.message : String(error)}`);
       }
     }
 

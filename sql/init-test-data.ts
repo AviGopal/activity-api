@@ -95,6 +95,8 @@ async function initTestData() {
       );
       const apiKeyHash = hashResult[0];
 
+      // Use record format for org_id to match JWT $auth.org_id format
+      // This ensures consistency across RECORD and JWT authentication methods
       const instanceResult = await db.query(
         `CREATE minibob_instance CONTENT {
           instance_id: $instance_id,
@@ -108,7 +110,7 @@ async function initTestData() {
         }`,
         {
           instance_id: MINIBOB_INSTANCE_ID,
-          org_id: DEFAULT_ORG_ID,
+          org_id: `organizations:${DEFAULT_ORG_ID}`,
           api_key_hash: apiKeyHash,
           vessel_id: MINIBOB_VESSEL_ID,
         }

@@ -55,6 +55,8 @@ async function createInstance() {
     console.log(`Hash: ${apiKeyHash.substring(0, 20)}...`);
 
     // Create instance
+    // Use record format for org_id to match JWT $auth.org_id format
+    // This ensures consistency across RECORD and JWT authentication methods
     console.log(`Creating MiniBob instance...`);
     const instanceResult = await db.query(
       `CREATE minibob_instance CONTENT {
@@ -69,7 +71,7 @@ async function createInstance() {
       }`,
       {
         instance_id: MINIBOB_INSTANCE_ID,
-        org_id: ORG_ID,
+        org_id: `organizations:${ORG_ID}`,
         api_key_hash: apiKeyHash,
         vessel_id: VESSEL_ID,
       }

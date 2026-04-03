@@ -240,9 +240,10 @@ class MigrationRunner {
     let processed = 0;
 
     while (processed < count) {
+      // Use record format for org_id (organizations:metabob_internal)
       const updateSql = `
         UPDATE ${tableName}
-        SET org_id = organization:metabob_internal
+        SET org_id = "organizations:metabob_internal"
         WHERE org_id IS NONE
         LIMIT ${batchSize};
       `;
