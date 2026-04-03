@@ -38,7 +38,7 @@ DEFINE FIELD IF NOT EXISTS goal_category ON goal_execution_paths TYPE string
   ASSERT $value IN ['feature', 'bugfix', 'refactor', 'tool', 'infrastructure', 'meta']
   COMMENT "Goal category for filtering (meta = self-referential goals)";
 
-DEFINE FIELD IF NOT EXISTS goal_embedding ON goal_execution_paths TYPE option<array<float>> FLEXIBLE
+DEFINE FIELD IF NOT EXISTS goal_embedding ON goal_execution_paths TYPE option<array<float>>
   COMMENT "Goal text embedding for semantic matching";
 
 -- Multi-tenancy (REQUIRED for RBAC)
@@ -67,7 +67,7 @@ DEFINE FIELD IF NOT EXISTS activity_sequence ON goal_execution_paths TYPE option
 DEFINE FIELD IF NOT EXISTS initial_state ON goal_execution_paths TYPE option<object> FLEXIBLE
   COMMENT "Initial state when goal was started";
 
-DEFINE FIELD IF NOT EXISTS initial_impulses ON goal_execution_paths TYPE option<array<string>> FLEXIBLE
+DEFINE FIELD IF NOT EXISTS initial_impulses ON goal_execution_paths TYPE option<array<string>>
   COMMENT "Impulse types available at start";
 
 -- Thompson Sampling parameters (Beta distribution)
@@ -129,10 +129,10 @@ DEFINE FIELD IF NOT EXISTS avg_token_usage ON goal_execution_paths TYPE int
   COMMENT "Average total tokens used";
 
 -- Context metadata (for analysis)
-DEFINE FIELD IF NOT EXISTS typical_files_modified ON goal_execution_paths TYPE option<array<string>> FLEXIBLE
+DEFINE FIELD IF NOT EXISTS typical_files_modified ON goal_execution_paths TYPE option<array<string>>
   COMMENT "Most frequently modified files in successful executions";
 
-DEFINE FIELD IF NOT EXISTS typical_tools_used ON goal_execution_paths TYPE option<array<string>> FLEXIBLE
+DEFINE FIELD IF NOT EXISTS typical_tools_used ON goal_execution_paths TYPE option<array<string>>
   COMMENT "Most frequently used tools in this path";
 
 -- Timestamps

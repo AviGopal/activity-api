@@ -1911,117 +1911,80 @@ app.post('/recommend', async (c) => {
     const orgId = jwtAuth?.orgId || sessionData?.org_id || null;
     const projectId = jwtAuth?.projectId || sessionData?.project_id || null;
 
-    // PARADIGM PATH: Try new schema with shape-based matching first
-    // Falls back to legacy activity_template if new schema fails or returns empty
+    // Query the canonical 'activity' table
+    const queryPath = 'canonical';  // Single unified query path (no legacy fallback)
     let templates: any[] = [];
-    let queryPath: 'new' | 'legacy' = 'legacy';
+    const params: Record<string, any> = { limit: limit * 3 };
+    const whereClauses: string[] = ['execution_type = \'template\''];
 
+    // Multi-tenant filtering: global/public OR matching org/project
+    if (orgId) {
+      whereClauses.push(`(public = true OR org_id = $org_id OR (scope = 'project' AND project_id = $project_id))`);
+      params.org_id = orgId;
+      params.project_id = projectId;
+    } else {
+      // No auth - only show public templates
+      whereClauses.push(`public = true`);
+    }
+
+    // Category filter
+    if (category) {
+      whereClauses.push(`category = $category`);
+      params.category = category;
+    }
+
+    // Tag filter (uses semantic extraction if not explicit)
+    if (effectiveTags && effectiveTags.length > 0) {
+      whereClauses.push(`tag_prefixes CONTAINSANY $tags`);
+      params.tags = effectiveTags;
+    }
+
+    // Shape-based matching (activities whose input_shapes are satisfied by available shapes)
     if (effectiveShapes && effectiveShapes.length > 0) {
-      // Use shape-based matching with new activity table (includes semantically implied shapes)
-      const paradigmResult = await queryActivitiesByShapes(
-        effectiveShapes,
-        orgId,
+      // Activity is matchable if its input_shapes are empty OR all are in effectiveShapes
+      whereClauses.push(`(input_shapes = [] OR input_shapes ALLINSIDE $available_shapes)`);
+      params.available_shapes = effectiveShapes;
+    }
+
+    const query = `
+      SELECT
+        id,
+        name,
+        description,
         category,
-        execution_type as 'template' | 'tool' | 'composition' | 'vessel_function' | null | undefined, // T8: Pass execution_type filter
-        limit * 3, // Fetch more to account for filtering
-        jwtAuth?.jwtToken
-      );
+        tags,
+        tag_prefixes,
+        tasks,
+        execution_type,
+        input_shapes,
+        output_shapes,
+        scope,
+        public,
+        org_id,
+        created_at
+      FROM activity
+      WHERE ${whereClauses.join(' AND ')}
+      ORDER BY created_at DESC
+      LIMIT $limit
+    `;
 
-      if (paradigmResult.data.length > 0) {
-        templates = paradigmResult.data;
-        queryPath = paradigmResult.path;
-        logger.info('[paradigm] Activities fetched with shape matching', {
-          count: templates.length,
-          path: queryPath,
-          impulse_shapes,
-        });
-      }
-    }
+    logger.debug('Recommendation query', { query, params });
 
-    // Fall back to legacy query if paradigm path returned no results
-    if (templates.length === 0) {
-      let query = `
-        SELECT
-          variant_id,
-          activity_id,
-          variant_name,
-          category,
-          tags,
-          tag_prefixes,
-          input_schema,
-          output_schema
-        FROM activity
-      `;
+    const result = await surrealDB.query(query, params);
+    templates = result || [];
 
-      const params: Record<string, any> = {};
-
-      // Build WHERE clause for multi-tenant filtering
-      const whereClauses: string[] = [];
-
-      if (orgId) {
-        whereClauses.push(`(scope IS NULL OR scope = 'global' OR (scope = 'org' AND org_id = $org_id) OR (scope = 'project' AND project_id = $project_id))`);
-        params.org_id = orgId;
-        params.project_id = projectId;
-      } else {
-        whereClauses.push(`(scope IS NULL OR scope = 'global')`);
-      }
-
-      // Filter by category if provided (legacy)
-      if (category) {
-        whereClauses.push(`category = $category`);
-        params.category = category;
-      }
-
-      // Filter by exact tags if provided (uses semantic extraction if not explicit)
-      if (effectiveTags && Array.isArray(effectiveTags) && effectiveTags.length > 0) {
-        // Match templates that have any of the specified tags
-        whereClauses.push(`tag_prefixes CONTAINSANY $tags`);
-        params.tags = effectiveTags;
-      }
-
-      // Filter by tag prefix if provided (uses semantic extraction if not explicit)
-      if (effectiveTagPrefix && typeof effectiveTagPrefix === 'string') {
-        // Match templates where any tag_prefix starts with the given prefix
-        whereClauses.push(`tag_prefixes CONTAINS $tag_prefix`);
-        params.tag_prefix = effectiveTagPrefix;
-      }
-
-      // T8: Filter by execution_type if provided
-      if (execution_type) {
-        whereClauses.push(`execution_type = $execution_type`);
-        params.execution_type = execution_type;
-      }
-
-      if (whereClauses.length > 0) {
-        query += ` WHERE ${whereClauses.join(' AND ')}`;
-      }
-
-      logger.debug('Recommendation query (legacy)', { query, params });
-
-      const result = await surrealDB.query(query, params);
-      templates = result || [];
-      queryPath = 'legacy';
-
-      logger.info('Templates fetched for recommendation', { count: templates.length, path: queryPath });
-
-      // Apply schema-based filtering if shapes provided (includes semantic extraction)
-      if (effectiveShapes && effectiveShapes.length > 0) {
-        const beforeCount = templates.length;
-        templates = filterByInputSchema(templates, effectiveShapes);
-        logger.info('Schema filtering applied (legacy)', {
-          before: beforeCount,
-          after: templates.length,
-          providedShapes: effectiveShapes,
-          reduction: beforeCount > 0 ? `${Math.round((1 - templates.length / beforeCount) * 100)}%` : '0%'
-        });
-      }
-    }
+    logger.info('Templates fetched for recommendation', {
+      count: templates.length,
+      orgId,
+      effectiveShapes: effectiveShapes?.length || 0,
+      effectiveTags: effectiveTags?.length || 0
+    });
 
     // T4: Filter out excluded activities (within-goal blacklisting)
     if (exclude_activities && exclude_activities.length > 0) {
       const beforeCount = templates.length;
       const excludeSet = new Set(exclude_activities);
-      templates = templates.filter((t: any) => !excludeSet.has(t.variant_id));
+      templates = templates.filter((t: any) => !excludeSet.has(t.id));
       logger.info('Blacklist filtering applied', {
         before: beforeCount,
         after: templates.length,
@@ -2032,7 +1995,7 @@ app.post('/recommend', async (c) => {
     // Get Thompson Sampling scores
     // Use shape-conditioned scores when impulse_shapes are provided (goal-aware recommendations)
     // This allows learning different success rates for different input contexts
-    const activityIds = templates.map((t: any) => t.id || t.variant_id);
+    const activityIds = templates.map((t: any) => t.id);
     let scoresMap = new Map<string, ActivityScore>();
     let scoreMethod: 'shape_conditioned' | 'global' | 'legacy' = 'legacy';
 
@@ -2096,16 +2059,20 @@ app.post('/recommend', async (c) => {
     }
 
     // Filter out templates without a valid ID before processing
+    // Note: SurrealDB 3.x returns RecordId objects, not strings. Convert to string for validation.
     const validTemplates = templates.filter((template: any) => {
-      const templateId = template.id || template.variant_id;
-      if (!templateId || typeof templateId !== 'string' || templateId.trim() === '') {
+      // Handle both string IDs and SurrealDB RecordId objects
+      const idStr = template.id ? String(template.id) : '';
+      if (!idStr || idStr.trim() === '' || idStr === 'undefined' || idStr === 'null') {
         logger.warn('Filtering out template without valid ID', {
-          template_name: template.name || template.variant_name,
+          template_name: template.name,
           template_id: template.id,
-          variant_id: template.variant_id,
+          id_type: typeof template.id,
         });
         return false;
       }
+      // Store the string version for later use
+      template._idStr = idStr;
       return true;
     });
 
@@ -2120,8 +2087,8 @@ app.post('/recommend', async (c) => {
     // Apply Thompson Sampling with heuristic prior boosting
     const recommendations = validTemplates
       .map((template: any) => {
-        // Try to get alpha/beta from v_activity_score first
-        const activityId = template.id || template.variant_id;
+        // Use string ID (handles SurrealDB RecordId objects)
+        const activityId = template._idStr || String(template.id);
         const scores = scoresMap.get(activityId);
         let alpha = scores?.alpha || template.metrics?.thompson_alpha || 1.0;
         const betaVal = scores?.beta || template.metrics?.thompson_beta || 1.0;
@@ -2174,7 +2141,8 @@ app.post('/recommend', async (c) => {
 
         return {
           template_id: activityId,
-          template_name: template.name || template.variant_name,
+          template_name: template.name,
+          description: template.description,
           category: template.category,
           tags: template.tags || [],
           tag_prefixes: template.tag_prefixes || [],

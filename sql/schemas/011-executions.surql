@@ -144,10 +144,10 @@ DEFINE FIELD IF NOT EXISTS failed_task_id ON activity_execution_traces TYPE opti
   COMMENT "Task ID where failure occurred";
 
 -- Context and relationships
-DEFINE FIELD IF NOT EXISTS impulses_used ON activity_execution_traces TYPE option<array<string>> FLEXIBLE
+DEFINE FIELD IF NOT EXISTS impulses_used ON activity_execution_traces TYPE option<array<string>>
   COMMENT "Array of impulse IDs used in this execution";
 
-DEFINE FIELD IF NOT EXISTS component_changes ON activity_execution_traces TYPE option<array<string>> FLEXIBLE
+DEFINE FIELD IF NOT EXISTS component_changes ON activity_execution_traces TYPE option<array<string>>
   COMMENT "Array of component IDs changed in this execution";
 
 DEFINE FIELD IF NOT EXISTS execution_trace ON activity_execution_traces TYPE option<object> FLEXIBLE
@@ -166,10 +166,10 @@ DEFINE FIELD IF NOT EXISTS parent_execution_id ON activity_execution_traces TYPE
 DEFINE FIELD IF NOT EXISTS improvisation ON activity_execution_traces TYPE option<bool>
   COMMENT "Whether this was an LLM improvisation (no template matched)";
 
-DEFINE FIELD IF NOT EXISTS input_impulse_shapes ON activity_execution_traces TYPE option<array<string>> FLEXIBLE
+DEFINE FIELD IF NOT EXISTS input_impulse_shapes ON activity_execution_traces TYPE option<array<string>>
   COMMENT "Shapes of input impulses (goal, task, previous_result, error_context, etc.)";
 
-DEFINE FIELD IF NOT EXISTS output_impulse_shapes ON activity_execution_traces TYPE option<array<string>> FLEXIBLE
+DEFINE FIELD IF NOT EXISTS output_impulse_shapes ON activity_execution_traces TYPE option<array<string>>
   COMMENT "Shapes of output impulses produced (documentation, source_code, command_result, etc.)";
 
 DEFINE FIELD IF NOT EXISTS output_impulses ON activity_execution_traces TYPE option<array<object>> FLEXIBLE
