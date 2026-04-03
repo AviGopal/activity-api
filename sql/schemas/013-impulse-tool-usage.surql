@@ -6,7 +6,49 @@
 -- =============================================================================
 
 -- =============================================================================
--- Table: impulse_data
+-- ██████╗ ███████╗██████╗ ██████╗ ███████╗ ██████╗ █████╗ ████████╗███████╗██████╗
+-- ██╔══██╗██╔════╝██╔══██╗██╔══██╗██╔════╝██╔════╝██╔══██╗╚══██╔══╝██╔════╝██╔══██╗
+-- ██║  ██║█████╗  ██████╔╝██████╔╝█████╗  ██║     ███████║   ██║   █████╗  ██║  ██║
+-- ██║  ██║██╔══╝  ██╔═══╝ ██╔══██╗██╔══╝  ██║     ██╔══██║   ██║   ██╔══╝  ██║  ██║
+-- ██████╔╝███████╗██║     ██║  ██║███████╗╚██████╗██║  ██║   ██║   ███████╗██████╔╝
+-- ╚═════╝ ╚══════╝╚═╝     ╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═════╝
+-- =============================================================================
+-- Table: impulse_data [DEPRECATED - R004]
+-- =============================================================================
+--
+-- ⚠️  THIS TABLE IS DEPRECATED ⚠️
+--
+-- New code should use the `impulse` table defined in:
+--   020-paradigm-core-tables.surql
+--
+-- The `impulse` table is the canonical paradigm-aligned schema that:
+--   - Uses `id` instead of `impulse_id` for record identity
+--   - Uses `pointer` object for data location (consistent with activity paradigm)
+--   - Uses `shape` field for activity matching (replaces impulse_type)
+--   - Removes redundant fields (loaded is derived from content != null)
+--   - Integrates with activity/execution/vessel tables
+--
+-- Migration Guide: See repos/metabob-activity-api/sql/migrations/IMPULSE_DATA_DEPRECATION.md
+--
+-- FIELD MAPPING (impulse_data → impulse):
+--   impulse_id        → id
+--   impulse_data      → pointer + content + metadata
+--   impulse_type      → pointer.type / shape
+--   budget            → (tracked in impulse_usage_history or activity config)
+--   priority          → (tracked in impulse_usage_history or activity config)
+--   loaded            → (derived: content != null)
+--   size_bytes        → (can be computed or stored in metadata)
+--   token_count       → token_estimate
+--   usage_count       → (query impulse_usage_history)
+--   last_used_at      → (query impulse_usage_history)
+--   expires_at        → expires_at (same)
+--   created_at        → created_at (same)
+--   org_id            → org_id (same)
+--   project_id        → project_id (same)
+--   created_by        → created_by (same)
+--   api_key           → (REMOVED - use org_id)
+--
+-- This table will be removed in a future release after migration is complete.
 -- =============================================================================
 -- Multi-tenant impulse storage with org/project scoping
 -- RBAC: Users can only access impulses in their org/projects
@@ -183,6 +225,20 @@ DEFINE FIELD IF NOT EXISTS success ON impulse_usage_history TYPE bool
 
 DEFINE FIELD IF NOT EXISTS tokens_consumed ON impulse_usage_history TYPE option<int>
   COMMENT "Tokens consumed from this impulse";
+
+-- Budget learning fields (impulse-budget-learning enhancement)
+-- These fields enable learning optimal budget allocation per (activity, impulse_type) pair
+DEFINE FIELD IF NOT EXISTS budget_requested ON impulse_usage_history TYPE option<int>
+  COMMENT "Original budget requested for this impulse";
+
+DEFINE FIELD IF NOT EXISTS was_truncated ON impulse_usage_history TYPE option<bool>
+  COMMENT "Whether content was truncated to fit budget";
+
+DEFINE FIELD IF NOT EXISTS priority_level ON impulse_usage_history TYPE option<string>
+  COMMENT "Impulse priority: critical, high, medium, low";
+
+DEFINE FIELD IF NOT EXISTS truncation_ratio ON impulse_usage_history TYPE option<float>
+  COMMENT "original_tokens / budget_requested (>1.0 means truncation needed)";
 
 DEFINE FIELD IF NOT EXISTS used_at ON impulse_usage_history TYPE datetime
   VALUE $value OR time::now()
