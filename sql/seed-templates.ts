@@ -182,9 +182,9 @@ async function seedTemplates() {
       const id = template.variant_id || template.activity_id || filename.replace('.json', '');
       const displayName = `${source}/${filename}`;
 
-      // Check if already exists (use 'activity' table - the canonical paradigm table)
+      // Check if already exists
       const existing = await db.query<any[][]>(
-        `SELECT id FROM activity WHERE id = $id`,
+        `SELECT id FROM activity_registry WHERE id = $id`,
         { id }
       );
 
@@ -208,21 +208,17 @@ async function seedTemplates() {
       });
 
       try {
-        // Insert into canonical 'activity' table (activity_template is a read-only view)
         await db.query(
-          `CREATE activity SET
+          `CREATE activity_template SET
             id = $id,
-            name = $name,
+            variant_id = $id,
+            activity_id = $id,
+            variant_name = $name,
             description = $description,
             category = $category,
             tags = $tags,
-            tag_prefixes = $tag_prefixes,
-            tasks = $tasks,
-            execution_type = 'template',
-            input_shapes = [],
-            output_shapes = [],
+            task_steps = $task_steps,
             scope = 'global',
-            public = true,
             org_id = $org_id,
             created_at = time::now(),
             updated_at = time::now()`,
@@ -232,10 +228,11 @@ async function seedTemplates() {
             description: template.description,
             category: template.category || tags[0] || 'uncategorized',
             tags,
-            tag_prefixes: tagPrefixes,
-            tasks: taskSteps,
-            // Use string org_id for consistency with paradigm tables
-            org_id: DEFAULT_ORG_ID,
+            task_steps: taskSteps,
+            impulses: template.impulses || [],
+            // Use record format for consistency with JWT $auth.org_id
+            org_id: `organizations:${DEFAULT_ORG_ID}`,
+            alpha: INITIAL_ALPHA,
           }
         );
 

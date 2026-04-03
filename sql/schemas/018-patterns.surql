@@ -150,7 +150,7 @@ DEFINE FIELD IF NOT EXISTS source_resolution_count ON pattern TYPE int
   DEFAULT 0
   COMMENT "Number of LLM resolutions used to extract this pattern";
 
-DEFINE FIELD IF NOT EXISTS source_resolutions ON pattern TYPE option<array<record<llm_resolution_log>>>
+DEFINE FIELD IF NOT EXISTS source_resolutions ON pattern TYPE option<array<record<llm_resolution_log>>> FLEXIBLE
   COMMENT "References to source LLM resolutions";
 
 -- Extraction metadata

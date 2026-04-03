@@ -106,7 +106,7 @@ class MigrationRunner {
       // Paradigm alignment tables (schema-paradigm-alignment) - canonical activity model
       '020-paradigm-core-tables.surql',
       // SKIPPED: 021-paradigm-computed-views.surql - incompatible with SurrealDB 3.0.0
-      // SKIPPED: 022-paradigm-compat-views.surql - depends on v_activity_score from 021
+      '022-paradigm-compat-views.surql',  // Backward-compatibility views for migration
       // Supporting tables (depend on paradigm core tables)
       '011-executions.surql',
       '012-composition.surql',

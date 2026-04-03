@@ -2,8 +2,12 @@
 /**
  * Test SurrealDB RECORD authentication directly
  *
- * Validates that the apikey_record and minibob_record ACCESS methods work correctly.
+ * Validates that the minibob_record ACCESS method works correctly.
  * This bypasses the HTTP API to test SurrealDB auth directly.
+ *
+ * NOTE (2026-04-03): apikey_record ACCESS has been removed.
+ * API key authentication is now handled via identity-vessel HMAC pattern.
+ * See repos/identity-vessel for API key validation.
  */
 import { Surreal } from 'surrealdb';
 
@@ -99,56 +103,21 @@ async function setupTestData() {
   return { apiKey, instanceId, instanceKey, orgId, projectId };
 }
 
-async function testApiKeyAuth(apiKey: string) {
-  console.log('\n=== Test: API Key RECORD Authentication ===\n');
-
-  const db = new Surreal();
-  await db.connect(SURREALDB_URL);
-  await db.use({ namespace: 'activity-system', database: 'learning_loop' });
-
-  try {
-    // Attempt RECORD signin with API key
-    const token = await db.signin({
-      access: 'apikey_record',
-      variables: { api_key: apiKey },
-    });
-
-    test('API key signin returns token', !!token);
-
-    // SurrealDB SDK v2 returns { access: "JWT..." }
-    const jwtToken = typeof token === 'string' ? token : (token as { access: string }).access;
-    if (jwtToken) {
-      // JWT only contains ID - claims are looked up via $auth at query time
-      const parts = jwtToken.split('.');
-      if (parts.length === 3) {
-        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
-        console.log('JWT payload (ID only):', payload.ID);
-        test('JWT contains record ID', !!payload.ID);
-      }
-
-      // Query $auth to verify claims are accessible
-      const authResult = await db.query<[{ id: string; org_id: string; user_id: string; scopes: string[] }]>(
-        'RETURN { id: $auth.id, org_id: $auth.org_id, user_id: $auth.user_id, scopes: $auth.scopes }'
-      );
-      const authData = authResult[0];
-      console.log('$auth fields:', JSON.stringify(authData, null, 2));
-
-      test('$auth.org_id accessible', !!authData?.org_id);
-      test('$auth.user_id accessible', !!authData?.user_id);
-      test('$auth.scopes accessible', Array.isArray(authData?.scopes));
-
-      // Test that authenticated session can query
-      const result = await db.query('SELECT count() FROM activity_registry GROUP ALL');
-      test('Authenticated session can query activity_registry', true);
-      console.log('Query result:', JSON.stringify(result));
-    }
-
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    test('API key signin', false, msg);
-  }
-
-  await db.close();
+// =============================================================================
+// REMOVED: testApiKeyAuth (2026-04-03)
+// =============================================================================
+// The apikey_record SurrealDB ACCESS method has been removed.
+// API key authentication is now handled via identity-vessel HMAC pattern.
+//
+// To test API key auth, use identity-vessel endpoints:
+//   POST http://identity-vessel:8080/v1/auth/resolve
+//   { impulse: { type: 'authentication', pointer: { type: 'apiKey', apiKey: '...' } } }
+// =============================================================================
+async function testApiKeyAuth(_apiKey: string) {
+  console.log('\n=== SKIPPED: API Key RECORD Authentication ===');
+  console.log('apikey_record ACCESS has been removed (2026-04-03)');
+  console.log('API keys are now validated via identity-vessel HMAC pattern');
+  test('apikey_record removed - use identity-vessel', true);
 }
 
 async function testMiniBobAuth(instanceId: string, instanceKey: string) {
@@ -206,15 +175,8 @@ async function testInvalidCredentials() {
   await db.connect(SURREALDB_URL);
   await db.use({ namespace: 'activity-system', database: 'learning_loop' });
 
-  try {
-    await db.signin({
-      access: 'apikey_record',
-      variables: { api_key: 'mb_invalid_key_12345' },
-    });
-    test('Invalid API key rejected', false, 'Should have thrown');
-  } catch {
-    test('Invalid API key rejected', true);
-  }
+  // Note: apikey_record test removed (2026-04-03) - use identity-vessel instead
+  console.log('Note: apikey_record test skipped - use identity-vessel for API key validation');
 
   try {
     await db.signin({
@@ -257,7 +219,8 @@ async function main() {
   console.log('╔════════════════════════════════════════════════════════════╗');
   console.log('║    SurrealDB RECORD Authentication Direct Test             ║');
   console.log('╠════════════════════════════════════════════════════════════╣');
-  console.log('║  Validates: apikey_record and minibob_record ACCESS        ║');
+  console.log('║  Validates: minibob_record ACCESS                          ║');
+  console.log('║  Note: apikey_record removed (2026-04-03)                  ║');
   console.log('╚════════════════════════════════════════════════════════════╝');
 
   try {

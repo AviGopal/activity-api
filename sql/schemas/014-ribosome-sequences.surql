@@ -59,7 +59,7 @@ DEFINE FIELD IF NOT EXISTS avg_duration_ms ON composite_sequence_patterns TYPE o
 DEFINE FIELD IF NOT EXISTS avg_cost_usd ON composite_sequence_patterns TYPE option<float>
   COMMENT "Average cost of pattern executions in USD";
 
-DEFINE FIELD IF NOT EXISTS composition_weights ON composite_sequence_patterns TYPE option<array<float>>
+DEFINE FIELD IF NOT EXISTS composition_weights ON composite_sequence_patterns TYPE option<array<float>> FLEXIBLE
   COMMENT "Edge weights from composition graph for each transition (e.g., [0.85, 0.92] for A→B→C)";
 
 -- Multi-tenant isolation

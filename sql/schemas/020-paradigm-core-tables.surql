@@ -160,15 +160,6 @@ DEFINE FIELD IF NOT EXISTS extracted_from ON activity TYPE option<string>
 DEFINE FIELD IF NOT EXISTS variant_of ON activity TYPE option<string>
   COMMENT "Activity ID this is a variant of";
 
--- Tags for filtering and discovery
-DEFINE FIELD IF NOT EXISTS tags ON activity TYPE array<string>
-  VALUE $value OR []
-  COMMENT "Hierarchical tags for activity classification";
-
-DEFINE FIELD IF NOT EXISTS tag_prefixes ON activity TYPE array<string>
-  VALUE $value OR []
-  COMMENT "Tag prefixes for activity categorization and filtering";
-
 -- Scope
 DEFINE FIELD IF NOT EXISTS scope ON activity TYPE string
   ASSERT $value IN ['global', 'org', 'project', 'vessel']
