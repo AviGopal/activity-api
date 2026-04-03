@@ -148,7 +148,7 @@ DEFINE FIELD IF NOT EXISTS tasks.* ON activity TYPE object FLEXIBLE
 DEFINE FIELD IF NOT EXISTS tool_name ON activity TYPE option<string>;
 
 -- Composition-specific: Ordered child activity IDs
-DEFINE FIELD IF NOT EXISTS child_activities ON activity TYPE option<array<string>> FLEXIBLE;
+DEFINE FIELD IF NOT EXISTS child_activities ON activity TYPE option<array<string>>;
 
 -- Vessel function-specific: Location in codebase
 DEFINE FIELD IF NOT EXISTS source_location ON activity TYPE option<object> FLEXIBLE;
@@ -286,10 +286,10 @@ DEFINE FIELD IF NOT EXISTS created_by ON execution TYPE option<record<users> | r
 DEFINE FIELD IF NOT EXISTS improvisation ON execution TYPE option<bool>
   COMMENT "Whether this was an LLM improvisation (no template matched)";
 
-DEFINE FIELD IF NOT EXISTS input_impulse_shapes ON execution TYPE option<array<string>> FLEXIBLE
+DEFINE FIELD IF NOT EXISTS input_impulse_shapes ON execution TYPE option<array<string>>
   COMMENT "Shapes of input impulses for edge learning";
 
-DEFINE FIELD IF NOT EXISTS output_impulse_shapes ON execution TYPE option<array<string>> FLEXIBLE
+DEFINE FIELD IF NOT EXISTS output_impulse_shapes ON execution TYPE option<array<string>>
   COMMENT "Shapes of output impulses for edge learning";
 
 DEFINE FIELD IF NOT EXISTS metadata ON execution TYPE option<object> FLEXIBLE

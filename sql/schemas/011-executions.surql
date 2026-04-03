@@ -6,10 +6,54 @@
 -- =============================================================================
 
 -- =============================================================================
--- Table: activity_execution_traces
+-- ██████╗ ███████╗██████╗ ██████╗ ███████╗ ██████╗ █████╗ ████████╗███████╗██████╗
+-- ██╔══██╗██╔════╝██╔══██╗██╔══██╗██╔════╝██╔════╝██╔══██╗╚══██╔══╝██╔════╝██╔══██╗
+-- ██║  ██║█████╗  ██████╔╝██████╔╝█████╗  ██║     ███████║   ██║   █████╗  ██║  ██║
+-- ██║  ██║██╔══╝  ██╔═══╝ ██╔══██╗██╔══╝  ██║     ██╔══██║   ██║   ██╔══╝  ██║  ██║
+-- ██████╔╝███████╗██║     ██║  ██║███████╗╚██████╗██║  ██║   ██║   ███████╗██████╔╝
+-- ╚═════╝ ╚══════╝╚═╝     ╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═════╝
 -- =============================================================================
--- Records individual activity execution results
--- RBAC: Users can only access execution traces in their org/projects
+-- Table: activity_execution_traces [DEPRECATED]
+-- =============================================================================
+--
+-- WARNING: THIS TABLE IS DEPRECATED
+--
+-- New code should use the `execution` table defined in:
+--   020-paradigm-core-tables.surql
+--
+-- The `execution` table is the canonical paradigm-aligned schema that:
+--   - Uses `id` instead of `execution_id` for record identity
+--   - Uses `input_impulses` and `output_impulses` for impulse tracking
+--   - Uses `trace` object for full execution details
+--   - Integrates with activity/impulse/vessel tables
+--
+-- FIELD MAPPING (activity_execution_traces -> execution):
+--   execution_id         -> id
+--   activity_id          -> activity_id (same)
+--   variant_id           -> (use activity_id, variants are separate activities)
+--   success              -> success (same)
+--   status               -> (derived: success ? 'success' : 'failure')
+--   duration_ms          -> duration_ms (same)
+--   cost_usd             -> cost_usd (same)
+--   tokens_input         -> tokens_in
+--   tokens_output        -> tokens_out
+--   error_message        -> error.message
+--   error_type           -> error.type
+--   failed_task_id       -> error.task_id
+--   impulses_used        -> input_impulses
+--   execution_trace      -> trace
+--   state_snapshot       -> trace.state_transition
+--   tasks                -> trace.tasks
+--   parent_execution_id  -> parent_execution_id (same)
+--   executed_at          -> executed_at (same)
+--   org_id               -> org_id (same)
+--   project_id           -> project_id (same)
+--
+-- Backward compatibility views are provided in:
+--   021-paradigm-computed-views.surql (v_paradigm_execution_traces)
+--   011-executions.surql (view_execution_traces, view_activity_executions)
+--
+-- This table will be removed in a future release after migration is complete.
 -- =============================================================================
 
 DEFINE TABLE IF NOT EXISTS activity_execution_traces SCHEMAFULL
@@ -38,7 +82,7 @@ DEFINE FIELD IF NOT EXISTS execution_id ON activity_execution_traces TYPE string
 
 DEFINE FIELD IF NOT EXISTS activity_id ON activity_execution_traces TYPE string
   ASSERT $value != NONE
-  COMMENT "Activity identifier (FK to activity_registry)";
+  COMMENT "Activity identifier (FK to activity table)";
 
 DEFINE FIELD IF NOT EXISTS variant_id ON activity_execution_traces TYPE option<string>
   COMMENT "Template variant identifier (for backward compatibility)";

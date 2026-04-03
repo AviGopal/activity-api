@@ -22,13 +22,20 @@ export interface GenerateActivityParams {
   };
 }
 
+// =============================================================================
+// GeneratedActivity Interface (Canonical Field Names)
+// =============================================================================
+// Aligned with 020-paradigm-core-tables.surql 'activity' table schema.
+// Uses canonical field names: id, name, tasks (not variant_id, variant_name, task_steps)
+// =============================================================================
 export interface GeneratedActivity {
-  variant_id: string;
-  activity_id: string;
-  variant_name: string;
+  // Canonical fields
+  id: string;
+  name: string;
   description: string;
   category: string;
-  task_steps: Array<{
+  // Canonical: 'tasks' (was task_steps)
+  tasks: Array<{
     id: string;
     description: string;
     dependencies: string[];
@@ -51,6 +58,7 @@ export interface GeneratedActivity {
     };
   }>;
   scope: string;
+  execution_type: string;
 }
 
 /**
@@ -119,17 +127,19 @@ export async function generateActivity(
   ];
 
   const generated: GeneratedActivity = {
-    variant_id: variantId,
-    activity_id: activityId,
-    variant_name: params.templateName || `Generated: ${params.goalDescription.substring(0, 50)}`,
+    // Canonical field names
+    id: variantId,
+    name: params.templateName || `Generated: ${params.goalDescription.substring(0, 50)}`,
     description: `Auto-generated activity for: ${params.goalDescription}`,
     category: params.category,
-    task_steps: taskSteps,
+    // Canonical: 'tasks' (was task_steps)
+    tasks: taskSteps,
     scope: 'global',
+    execution_type: 'template',
   };
 
   logger.info('Generated activity template', {
-    variant_id: variantId,
+    id: variantId,
     tasks: taskSteps.length,
   });
 

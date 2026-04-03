@@ -100,29 +100,18 @@ export function logDualWriteConfig(): void {
   });
 }
 
-// Field mapping: legacy -> new schema
-const ACTIVITY_FIELD_MAP = {
-  variant_id: 'id',
-  activity_id: 'id', // In new schema, activity_id is just id
-  variant_name: 'name',
-  description: 'description',
-  tags: 'tags',
-  tag_prefixes: 'tag_prefixes',
-  category: 'category',
-  task_steps: 'tasks',
-  scope: 'scope',
-  org_id: 'org_id',
-  project_id: 'project_id',
-  created_at: 'created_at',
-  updated_at: 'updated_at',
-} as const;
-
-// Reverse mapping for compatibility
-const ACTIVITY_REVERSE_MAP = {
-  id: 'variant_id',
-  name: 'variant_name',
-  tasks: 'task_steps',
-} as const;
+// =============================================================================
+// CANONICAL FIELD NAMES (aligned with 020-paradigm-core-tables.surql)
+// =============================================================================
+// The activity table uses these canonical field names:
+//   id           - Unique activity identifier (was variant_id)
+//   name         - Human-readable activity name (was variant_name)
+//   tasks        - Task steps array (was task_steps)
+//   variant_of   - Activity lineage (was genealogy)
+//
+// Legacy field names are accepted in API requests but converted to canonical
+// names before database operations. Response objects use canonical names only.
+// =============================================================================
 
 export interface ParadigmActivity {
   id: string;
@@ -259,7 +248,7 @@ export async function insertActivity(
     if (!jwtToken && activity.project_id) record.project_id = activity.project_id;
 
     const query = `
-      INSERT INTO activity_template {
+      INSERT INTO activity {
         ${fields}${orgIdClause}${projectIdClause},
         created_at: time::now(),
         updated_at: time::now()

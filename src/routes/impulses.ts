@@ -1,15 +1,14 @@
 /**
  * Impulse Management Routes
- * 
- * Implements impulse endpoints matching Python RPC API:
- * - POST /v2/impulses - Store impulse data with project-scoped isolation
- * - GET /v2/impulses/:id - Retrieve impulse by impulse_id with tenant filtering
+ *
+ * Implements impulse endpoints using the new `impulse` table schema:
+ * - POST /v2/impulses - Create impulse with org-scoped isolation
+ * - GET /v2/impulses/:id - Retrieve impulse by ID
  * - GET /v2/impulses - List impulses with pagination
- * 
- * Reference: repos/metabob-rpc-api/server/routes/impulse.py
- * Database: repos/metabob-rpc-api/server/db/operations/impulse_data.py
- * 
- * Multi-tenant isolation enforced via composite key: (api_key, project_id, impulse_id)
+ * - POST /v2/impulses/resolve - Resolve impulse pointers to content
+ * - POST /v2/impulses/:id/usage - Track impulse usage for analytics
+ *
+ * Multi-tenant isolation enforced via SurrealDB PERMISSIONS (org_id from JWT auth).
  */
 
 import { Hono } from 'hono';
@@ -133,27 +132,22 @@ async function proxyToAnalysisApi<T>(
 
 /**
  * POST /v2/impulses
- * Create impulse with project-scoped isolation
+ * Create impulse with org-scoped isolation
  *
- * Matches Python implementation:
- * repos/metabob-rpc-api/server/routes/impulse.py:104-189
- * repos/metabob-rpc-api/server/db/operations/impulse_data.py:create_impulse
+ * Uses the new `impulse` table from 020-paradigm-core-tables.surql.
+ * Multi-tenant isolation via org_id from JWT auth context.
+ * SurrealDB PERMISSIONS handle RBAC filtering automatically.
  *
  * Flow:
- * 1. Extract session from context (authMiddleware provides api_key, project_id)
+ * 1. Extract org_id from JWT auth context
  * 2. Parse request body with ImpulseCreateRequestSchema
- * 3. Check if impulse already exists (composite key lookup)
+ * 3. Check if impulse already exists (by id and org_id)
  * 4. If exists, return 400 error
- * 5. Create impulse in SurrealDB impulse_data table
+ * 5. Create impulse in SurrealDB impulse table
  * 6. Return 201 with impulse data
- *
- * TODO [R004-MIGRATION]: This endpoint uses the DEPRECATED `impulse_data` table.
- * Migrate to use the new `impulse` table from 020-paradigm-core-tables.surql.
- * See: repos/metabob-activity-api/sql/migrations/IMPULSE_DATA_DEPRECATION.md
  */
 router.post('/', async (c) => {
   try {
-    const session = (c.get as any)('session') as SessionData | null;
     const jwtAuth = getJwtAuthFromContext(c);
 
     // Allow internal service calls with X-Internal-Api-Key header
@@ -161,34 +155,29 @@ router.post('/', async (c) => {
 
     // Debug: log all headers
     logger.debug('POST /v2/impulses headers', {
-      hasSession: !!session,
       hasJwtAuth: !!jwtAuth,
       hasInternalKey: !!internalApiKey,
       internalKeyPrefix: internalApiKey ? internalApiKey.substring(0, 10) + '...' : 'none',
       authorization: c.req.header('Authorization') ? 'present' : 'missing',
     });
 
-    // Get api_key and org_id from session, JWT auth, or internal header
-    let api_key: string;
+    // Get org_id from JWT auth or internal header
     let org_id: string;
+    let created_by: string;
 
-    if (session?.api_key) {
-      api_key = session.api_key;
-      // Use record format for consistency with JWT $auth.org_id
-      org_id = session.org_id || 'organizations:metabob_internal';
-    } else if (jwtAuth) {
-      // JWT auth from MiniBob instances - use instance info
-      api_key = `minibob:${jwtAuth.instanceId || jwtAuth.orgId}`;
+    if (jwtAuth) {
+      // JWT auth from MiniBob instances or users
       org_id = jwtAuth.orgId;
+      created_by = jwtAuth.instanceId || jwtAuth.orgId || 'unknown';
       logger.debug('Using JWT auth', { orgId: jwtAuth.orgId, projectId: jwtAuth.projectId });
     } else if (internalApiKey) {
-      api_key = internalApiKey;
       // Use record format for consistency with JWT $auth.org_id
       org_id = 'organizations:metabob_internal'; // Default for internal services
-      logger.debug('Using internal service api_key', { api_key: api_key.substring(0, 8) + '...' });
+      created_by = 'internal-service';
+      logger.debug('Using internal service api_key', { key: internalApiKey.substring(0, 8) + '...' });
     } else {
-      logger.warn('POST /v2/impulses: no auth', { hasSession: !!session, hasJwtAuth: !!jwtAuth, hasInternalKey: !!internalApiKey });
-      return c.json({ error: 'Unauthorized - valid session, JWT token, or X-Internal-Api-Key required' }, 401);
+      logger.warn('POST /v2/impulses: no auth', { hasJwtAuth: !!jwtAuth, hasInternalKey: !!internalApiKey });
+      return c.json({ error: 'Unauthorized - valid JWT token or X-Internal-Api-Key required' }, 401);
     }
 
     // Parse request body
@@ -196,12 +185,12 @@ router.post('/', async (c) => {
     const request = ImpulseCreateRequestSchema.parse(body);
 
     const { impulse_id, project_id, impulse_data } = request;
-    
-    logger.info('POST /v2/impulses', { 
-      impulse_id, 
-      project_id, 
-      api_key: api_key.substring(0, 8) + '...',
-      impulse_type: impulse_data.type 
+
+    logger.info('POST /v2/impulses', {
+      impulse_id,
+      project_id,
+      org_id: org_id.substring(0, 20) + '...',
+      impulse_type: impulse_data.type
     });
 
     // Helper to execute queries with proper auth context
@@ -214,21 +203,15 @@ router.post('/', async (c) => {
       return surrealDB.query<T>(sql, params);
     };
 
-    // TODO [R004-MIGRATION]: Query uses DEPRECATED impulse_data table.
-    // Migrate to: SELECT * FROM impulse WHERE id = $impulse_id AND org_id = $org_id
-    // Check if impulse already exists (composite key: api_key, project_id, impulse_id)
+    // Check if impulse already exists (by id, RBAC handles org_id filtering)
     const existsQuery = `
-      SELECT * FROM impulse_data
-      WHERE impulse_id = $impulse_id
-        AND api_key = $api_key
-        AND project_id = $project_id
+      SELECT id FROM impulse
+      WHERE id = $impulse_id
       LIMIT 1
     `;
 
     const existing = await executeQuery<any>(existsQuery, {
       impulse_id,
-      api_key,
-      project_id,
     });
 
     if (existing.length > 0) {
@@ -240,39 +223,43 @@ router.post('/', async (c) => {
       }, 400);
     }
 
-    // TODO [R004-MIGRATION]: CREATE uses DEPRECATED impulse_data table.
-    // Migrate to use `impulse` table with paradigm-aligned schema:
-    //   CREATE impulse SET id = $id, pointer = {...}, shape = $shape, ...
-    // Create impulse record with timestamps
-    // Use SurrealDB's time::now() function for datetime fields (REBUILD MARKER)
-    // NOTE: org_id is a STRING field in schema, not a record link
+    // Derive shape from impulse_data.type, use pointer directly from impulse_data
+    const shape = impulse_data.type || 'unknown';
+    // Use the pointer from impulse_data directly (already has proper structure)
+    const pointer = impulse_data.pointer;
+
+    // Create impulse record using new schema
     const createQuery = `
-      CREATE impulse_data CONTENT {
-        impulse_id: $impulse_id,
-        api_key: $api_key,
-        project_id: $project_id,
+      CREATE impulse CONTENT {
+        id: $impulse_id,
+        pointer: $pointer,
+        shape: $shape,
+        content: $content,
+        metadata: $metadata,
+        token_estimate: $token_estimate,
         org_id: $org_id,
-        impulse_data: $impulse_data,
-        created_at: time::now(),
-        updated_at: time::now()
+        project_id: $project_id,
+        created_by: $created_by,
+        created_at: time::now()
       }
     `;
 
-    const result = await executeQuery<any>(createQuery, {
+    await executeQuery<any>(createQuery, {
       impulse_id,
-      api_key,
-      project_id,
+      pointer,
+      shape,
+      content: pointer.content || null,
+      metadata: impulse_data.metadata || {},
+      token_estimate: impulse_data.budget || 0,
       org_id,
-      impulse_data,
+      project_id,
+      created_by,
     });
 
-    // TODO [R004-MIGRATION]: SELECT uses DEPRECATED impulse_data table.
-    // CREATE may return empty with some auth contexts, query the created record
-    const selectQuery = `SELECT * FROM impulse_data WHERE impulse_id = $impulse_id AND api_key = $api_key AND project_id = $project_id LIMIT 1`;
+    // Query the created record to get timestamps
+    const selectQuery = `SELECT * FROM impulse WHERE id = $impulse_id LIMIT 1`;
     const selectResult = await executeQuery<any>(selectQuery, {
       impulse_id,
-      api_key,
-      project_id
     });
 
     if (!selectResult || selectResult.length === 0) {
@@ -288,14 +275,20 @@ router.post('/', async (c) => {
       created_at: created.created_at,
     });
 
-    // Return response matching Python ImpulseResponse schema
+    // Return response matching ImpulseResponse schema
+    // Map new schema fields back to legacy response format for compatibility
     const response: ImpulseResponse = {
-      impulse_id,
-      api_key,
-      project_id,
-      impulse_data,
+      impulse_id: created.id,
+      api_key: created_by, // Legacy field - use created_by
+      project_id: created.project_id,
+      impulse_data: {
+        type: created.shape,
+        content: created.content,
+        ...created.pointer,
+        ...created.metadata,
+      },
       created_at: created.created_at,
-      updated_at: created.updated_at,
+      updated_at: created.created_at, // New schema doesn't have updated_at
     };
 
     return c.json(response, 201);
@@ -325,71 +318,50 @@ router.post('/', async (c) => {
  * GET /v2/impulses/:impulseId
  * Retrieve impulse by ID with multi-tenant isolation
  *
- * Matches Python implementation:
- * repos/metabob-rpc-api/server/routes/impulse.py:192-231
- * repos/metabob-rpc-api/server/db/operations/impulse_data.py:get_impulse
+ * Uses the new `impulse` table from 020-paradigm-core-tables.surql.
+ * SurrealDB PERMISSIONS handle org_id filtering automatically via JWT auth.
  *
  * Flow:
- * 1. Extract session (api_key) from context
+ * 1. Extract JWT auth context
  * 2. Extract impulse_id from URL params
- * 3. Extract project_id from query params (required)
- * 4. Query SurrealDB with composite key (api_key, project_id, impulse_id)
- * 5. Return 200 with impulse data or 404 if not found
- *
- * TODO [R004-MIGRATION]: This endpoint uses the DEPRECATED `impulse_data` table.
- * Migrate to use the new `impulse` table from 020-paradigm-core-tables.surql.
- * The new schema uses `id` field and org_id-based isolation (not api_key).
- * See: repos/metabob-activity-api/sql/migrations/IMPULSE_DATA_DEPRECATION.md
+ * 3. Query SurrealDB (RBAC handles org_id filtering)
+ * 4. Return 200 with impulse data or 404 if not found
  */
 router.get('/:impulseId', async (c) => {
   try {
-    const session = (c.get as any)('session') as SessionData | null;
     const jwtAuth = getJwtAuthFromContext(c);
     const internalApiKey = c.req.header('X-Internal-Api-Key');
 
-    let api_key: string;
-    if (session?.api_key) {
-      api_key = session.api_key;
-    } else if (jwtAuth) {
-      api_key = `minibob:${jwtAuth.instanceId || jwtAuth.orgId}`;
-    } else if (internalApiKey) {
-      api_key = internalApiKey;
-    } else {
-      return c.json({ error: 'Unauthorized - valid session, JWT token, or X-Internal-Api-Key required' }, 401);
+    if (!jwtAuth && !internalApiKey) {
+      return c.json({ error: 'Unauthorized - valid JWT token or X-Internal-Api-Key required' }, 401);
     }
 
     const impulse_id = c.req.param('impulseId');
-    const project_id = c.req.query('project_id');
-
-    if (!project_id) {
-      return c.json({
-        error: 'Missing required query parameter: project_id',
-      }, 400);
-    }
+    const project_id = c.req.query('project_id'); // Optional filter
 
     logger.info('GET /v2/impulses/:impulseId', {
       impulse_id,
-      project_id,
-      api_key: api_key.substring(0, 8) + '...',
+      project_id: project_id || 'not specified',
     });
 
-    // TODO [R004-MIGRATION]: Query uses DEPRECATED impulse_data table.
-    // Migrate to: SELECT * FROM impulse WHERE id = $impulse_id
-    // RBAC permissions will handle org_id filtering automatically.
-    // Query with composite key for multi-tenant isolation
-    const query = `
-      SELECT * FROM impulse_data
-      WHERE impulse_id = $impulse_id
-        AND api_key = $api_key
-        AND project_id = $project_id
-      LIMIT 1
-    `;
+    // Query impulse by id - RBAC permissions handle org_id filtering
+    let query = `SELECT * FROM impulse WHERE id = $impulse_id`;
+    const params: Record<string, any> = { impulse_id };
 
-    const result = await surrealDB.query<any>(query, {
-      impulse_id,
-      api_key,
-      project_id,
-    });
+    // Add optional project_id filter
+    if (project_id) {
+      query += ` AND project_id = $project_id`;
+      params.project_id = project_id;
+    }
+    query += ` LIMIT 1`;
+
+    // Use authenticated query when JWT is present
+    let result: any[];
+    if (jwtAuth?.jwtToken) {
+      result = await queryWithAuth<any>(jwtAuth.jwtToken, query, params);
+    } else {
+      result = await surrealDB.query<any>(query, params);
+    }
 
     if (result.length === 0) {
       logger.debug('Impulse not found', { impulse_id, project_id });
@@ -402,16 +374,21 @@ router.get('/:impulseId', async (c) => {
 
     const impulse = result[0];
 
-    logger.info('Impulse retrieved', { impulse_id, project_id });
+    logger.info('Impulse retrieved', { impulse_id, project_id: impulse.project_id });
 
-    // Return response matching Python ImpulseResponse schema
+    // Return response mapping new schema to legacy ImpulseResponse format
     const response: ImpulseResponse = {
-      impulse_id: impulse.impulse_id,
-      api_key: impulse.api_key,
+      impulse_id: impulse.id,
+      api_key: impulse.created_by || 'unknown', // Legacy field
       project_id: impulse.project_id,
-      impulse_data: impulse.impulse_data,
+      impulse_data: {
+        type: impulse.shape,
+        content: impulse.content,
+        ...impulse.pointer,
+        ...impulse.metadata,
+      },
       created_at: impulse.created_at,
-      updated_at: impulse.updated_at,
+      updated_at: impulse.created_at, // New schema doesn't have updated_at
     };
 
     return c.json(response, 200);
@@ -433,110 +410,94 @@ router.get('/:impulseId', async (c) => {
  * GET /v2/impulses
  * List impulses with pagination and multi-tenant filtering
  *
- * Matches Python implementation:
- * repos/metabob-rpc-api/server/routes/impulse.py:234-283
- * repos/metabob-rpc-api/server/db/operations/impulse_data.py:list_impulses
+ * Uses the new `impulse` table from 020-paradigm-core-tables.surql.
+ * SurrealDB PERMISSIONS handle org_id filtering automatically via JWT auth.
  *
  * Flow:
- * 1. Extract session (api_key) from context
- * 2. Extract query params: project_id (required), limit (default=100, max=1000), offset (default=0)
- * 3. Query SurrealDB with composite key (api_key, project_id) and pagination
+ * 1. Extract JWT auth context
+ * 2. Extract query params: project_id (optional), limit (default=100, max=1000), offset (default=0)
+ * 3. Query SurrealDB with RBAC-enforced filtering
  * 4. Return 200 with array of impulses
- *
- * TODO [R004-MIGRATION]: This endpoint uses the DEPRECATED `impulse_data` table.
- * Migrate to use the new `impulse` table from 020-paradigm-core-tables.surql.
- * The new schema uses org_id-based RBAC filtering (api_key is removed).
- * See: repos/metabob-activity-api/sql/migrations/IMPULSE_DATA_DEPRECATION.md
  */
 router.get('/', async (c) => {
   try {
-    const session = (c.get as any)('session') as SessionData | null;
     const jwtAuth = getJwtAuthFromContext(c);
     const internalApiKey = c.req.header('X-Internal-Api-Key');
 
-    let api_key: string;
-    if (session?.api_key) {
-      api_key = session.api_key;
-    } else if (jwtAuth) {
-      api_key = `minibob:${jwtAuth.instanceId || jwtAuth.orgId}`;
-    } else if (internalApiKey) {
-      api_key = internalApiKey;
-    } else {
-      return c.json({ error: 'Unauthorized - valid session, JWT token, or X-Internal-Api-Key required' }, 401);
+    if (!jwtAuth && !internalApiKey) {
+      return c.json({ error: 'Unauthorized - valid JWT token or X-Internal-Api-Key required' }, 401);
     }
 
-    const project_id = c.req.query('project_id');
-    
-    if (!project_id) {
-      return c.json({
-        error: 'Missing required query parameter: project_id',
-      }, 400);
-    }
+    const project_id = c.req.query('project_id'); // Now optional
 
-    // Parse pagination params (match Python defaults)
+    // Parse pagination params
     const limitStr = c.req.query('limit') || '100';
     const offsetStr = c.req.query('offset') || '0';
-    
+
     let limit = parseInt(limitStr, 10);
     let offset = parseInt(offsetStr, 10);
-    
-    // Validate and cap limit (Python max=1000)
+
+    // Validate and cap limit (max=1000)
     if (isNaN(limit) || limit < 1) {
       limit = 100;
     }
     if (limit > 1000) {
       limit = 1000;
     }
-    
+
     if (isNaN(offset) || offset < 0) {
       offset = 0;
     }
 
     logger.info('GET /v2/impulses', {
-      project_id,
-      limit,
-      offset,
-      api_key: api_key.substring(0, 8) + '...',
-    });
-
-    // TODO [R004-MIGRATION]: Query uses DEPRECATED impulse_data table.
-    // Migrate to: SELECT * FROM impulse WHERE project_id = $project_id ORDER BY ...
-    // RBAC permissions will handle org_id filtering automatically.
-    // Query with composite key and pagination (ORDER BY created_at DESC matches Python)
-    const query = `
-      SELECT * FROM impulse_data
-      WHERE api_key = $api_key
-        AND project_id = $project_id
-      ORDER BY created_at DESC
-      LIMIT $limit
-      START $offset
-    `;
-
-    const result = await surrealDB.query<any>(query, {
-      api_key,
-      project_id,
+      project_id: project_id || 'all',
       limit,
       offset,
     });
+
+    // Build query with optional project_id filter
+    // RBAC permissions handle org_id filtering automatically
+    let query = `SELECT * FROM impulse`;
+    const params: Record<string, any> = { limit, offset };
+
+    if (project_id) {
+      query += ` WHERE project_id = $project_id`;
+      params.project_id = project_id;
+    }
+
+    query += ` ORDER BY created_at DESC LIMIT $limit START $offset`;
+
+    // Use authenticated query when JWT is present
+    let result: any[];
+    if (jwtAuth?.jwtToken) {
+      result = await queryWithAuth<any>(jwtAuth.jwtToken, query, params);
+    } else {
+      result = await surrealDB.query<any>(query, params);
+    }
 
     logger.info('Impulses retrieved', {
       count: result.length,
-      project_id,
+      project_id: project_id || 'all',
       limit,
       offset,
     });
 
-    // Map to ImpulseResponse schema
+    // Map new schema to legacy ImpulseResponse format
     const impulses: ImpulseResponse[] = result.map((impulse: any) => ({
-      impulse_id: impulse.impulse_id,
-      api_key: impulse.api_key,
+      impulse_id: impulse.id,
+      api_key: impulse.created_by || 'unknown', // Legacy field
       project_id: impulse.project_id,
-      impulse_data: impulse.impulse_data,
+      impulse_data: {
+        type: impulse.shape,
+        content: impulse.content,
+        ...impulse.pointer,
+        ...impulse.metadata,
+      },
       created_at: impulse.created_at,
-      updated_at: impulse.updated_at,
+      updated_at: impulse.created_at, // New schema doesn't have updated_at
     }));
 
-    // Return response matching Python ImpulseListResponse schema
+    // Return response matching ImpulseListResponse schema
     const response: ImpulseListResponse = {
       impulses,
       total: impulses.length,
@@ -693,15 +654,15 @@ router.post('/resolve', async (c) => {
           } as ImpulseResolveResponse, 400);
         }
 
-        // Load template from database
+        // Load template from canonical 'activity' table using 'id' field
         const query = `
-          SELECT * FROM activity_template
-          WHERE variant_id = $variant_id
+          SELECT * FROM activity
+          WHERE id = $activity_id
           LIMIT 1
         `;
-        
+
         const result = await surrealDB.query<any>(query, {
-          variant_id: pointer.templateId,
+          activity_id: pointer.templateId,
         });
 
         if (result.length === 0) {
@@ -712,7 +673,7 @@ router.post('/resolve', async (c) => {
         }
 
         const template = result[0];
-        
+
         // Format template as markdown
         content = formatTemplateAsMarkdown(template);
         break;
@@ -1290,12 +1251,17 @@ router.post('/resolve', async (c) => {
       case 'goal': {
         // Goal impulse resolver: Returns activity recommendations via Thompson Sampling
         // Used by MiniBob to get recommendations based on goal description + impulse context
+        // NOTE: impulseRefs and excludeActivities are extended pointer fields not in base schema
+        const extendedPointer = pointer as typeof pointer & {
+          impulseRefs?: string[];
+          excludeActivities?: string[];
+        };
 
         const goalDescription = pointer.content;
         const category = pointer.category;
-        const impulseRefs = pointer.impulseRefs || [];
+        const impulseRefs = extendedPointer.impulseRefs || [];
         const limit = pointer.limit || 3;
-        const excludeActivities = pointer.excludeActivities || [];
+        const excludeActivities = extendedPointer.excludeActivities || [];
 
         // Validate required fields
         if (!goalDescription) {
@@ -1366,7 +1332,7 @@ router.post('/resolve', async (c) => {
           const recommendResponse = await activitiesRouter.fetch(recommendRequest);
 
           if (!recommendResponse.ok) {
-            const errorData = await recommendResponse.json();
+            const errorData = await recommendResponse.json() as { error?: string };
             logger.error('Recommendation request failed', {
               status: recommendResponse.status,
               error: errorData,
@@ -1377,7 +1343,7 @@ router.post('/resolve', async (c) => {
             } as ImpulseResolveResponse, 500);
           }
 
-          const recommendData = await recommendResponse.json();
+          const recommendData = await recommendResponse.json() as { recommendations?: any[] };
           const recommendations = recommendData.recommendations || [];
 
           // Format as impulse content
@@ -1662,33 +1628,58 @@ function formatParadigmExecutionAsMarkdown(exec: any): string {
 
 /**
  * Format activity template as markdown
+ * Uses canonical field names: id, name, tasks (not variant_id, variant_name, task_steps)
  */
 function formatTemplateAsMarkdown(template: any): string {
-  let md = `# Activity Template: ${template.variant_name}\n\n`;
-  md += `**ID**: ${template.variant_id}\n`;
-  md += `**Category**: ${template.category}\n`;
-  md += `**Description**: ${template.description}\n\n`;
-  
-  if (template.task_steps && template.task_steps.length > 0) {
+  // Use canonical 'name' field, fall back to legacy 'variant_name'
+  const name = template.name || template.variant_name;
+  // Use canonical 'id' field, fall back to legacy 'variant_id'
+  const id = template.id || template.variant_id;
+  // Use canonical 'tasks' field, fall back to legacy 'task_steps'
+  const tasks = template.tasks || template.task_steps;
+
+  let md = `# Activity Template: ${name}\n\n`;
+  md += `**ID**: ${id}\n`;
+  md += `**Category**: ${template.category || 'uncategorized'}\n`;
+  md += `**Description**: ${template.description}\n`;
+  if (template.execution_type) {
+    md += `**Execution Type**: ${template.execution_type}\n`;
+  }
+  if (template.input_shapes?.length) {
+    md += `**Input Shapes**: ${template.input_shapes.join(', ')}\n`;
+  }
+  if (template.output_shapes?.length) {
+    md += `**Output Shapes**: ${template.output_shapes.join(', ')}\n`;
+  }
+  md += `\n`;
+
+  if (tasks && tasks.length > 0) {
     md += `## Tasks\n\n`;
-    for (const task of template.task_steps) {
+    for (const task of tasks) {
       md += `### ${task.id}\n\n`;
       md += `**Description**: ${task.description}\n`;
-      md += `**Subagent**: ${task.subagent}\n`;
-      md += `**Dependencies**: ${task.dependencies.join(', ') || 'none'}\n\n`;
-      
-      if (task.prompt.variables && task.prompt.variables.length > 0) {
+      if (task.subagent) {
+        md += `**Subagent**: ${task.subagent}\n`;
+      }
+      if (task.dependencies?.length > 0) {
+        md += `**Dependencies**: ${task.dependencies.join(', ')}\n`;
+      }
+      md += `\n`;
+
+      if (task.prompt?.variables && task.prompt.variables.length > 0) {
         md += `**Variables**:\n`;
         for (const v of task.prompt.variables) {
-          md += `- ${v.name} (${v.type})${v.required ? ' *required*' : ''}: ${v.description}\n`;
+          md += `- ${v.name} (${v.type})${v.required ? ' *required*' : ''}: ${v.description || ''}\n`;
         }
         md += `\n`;
       }
-      
-      md += `**Prompt Template**:\n\`\`\`\n${task.prompt.template}\n\`\`\`\n\n`;
+
+      if (task.prompt?.template) {
+        md += `**Prompt Template**:\n\`\`\`\n${task.prompt.template}\n\`\`\`\n\n`;
+      }
     }
   }
-  
+
   return md;
 }
 
@@ -2152,10 +2143,9 @@ function formatTemplateComparisonAsMarkdown(comparisons: any[], activityId: stri
  * - truncationRatio: originalTokenCount / budget (>1.0 means truncation)
  *
  * Flow:
- * 1. Verify impulse exists (404 if not found)
+ * 1. Verify impulse exists in `impulse` table (404 if not found)
  * 2. Store usage record in impulse_usage_history (with budget metadata if provided)
- * 3. Update usage_count and last_used_at on impulse_data
- * 4. Return success
+ * 3. Return success (usage stats tracked via impulse_usage_history queries)
  */
 router.post('/:impulseId/usage', async (c) => {
   try {
@@ -2177,13 +2167,10 @@ router.post('/:impulseId/usage', async (c) => {
       was_truncated: wasTruncated,
     });
 
-    // TODO [R004-MIGRATION]: Query uses DEPRECATED impulse_data table.
-    // Migrate to: SELECT id FROM impulse WHERE id = $impulse_id
-    // Check if impulse exists (we need to query without auth for internal service calls)
-    // For now, just record the usage - we'll validate later when we have proper auth context
+    // Check if impulse exists in new `impulse` table
     const checkQuery = `
-      SELECT impulse_id FROM impulse_data
-      WHERE impulse_id = $impulse_id
+      SELECT id FROM impulse
+      WHERE id = $impulse_id
       LIMIT 1
     `;
 
@@ -2228,18 +2215,9 @@ router.post('/:impulseId/usage', async (c) => {
       truncation_ratio: truncationRatio ?? null,
     });
 
-    // TODO [R004-MIGRATION]: UPDATE uses DEPRECATED impulse_data table.
-    // In new schema, usage stats are tracked via impulse_usage_history queries.
+    // Note: In new schema, usage stats are tracked via impulse_usage_history queries.
     // The `impulse` table does not have usage_count/last_used_at fields.
-    // Update usage stats on the impulse itself
-    const updateQuery = `
-      UPDATE impulse_data SET
-        usage_count = usage_count + 1,
-        last_used_at = time::now()
-      WHERE impulse_id = $impulse_id
-    `;
-
-    await surrealDB.query(updateQuery, { impulse_id: impulseId });
+    // Usage analytics should query impulse_usage_history instead.
 
     logger.info('Impulse usage recorded', {
       impulse_id: impulseId,

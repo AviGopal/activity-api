@@ -14,10 +14,9 @@
  */
 
 import { Hono } from 'hono';
-import { Surreal } from 'surrealdb';
 import * as crypto from 'crypto';
 import * as argon2 from 'argon2';
-import { surrealDB, queryWithAuth, createAuthenticatedClient } from '../db/surreal';
+import { surrealDB, queryWithAuth } from '../db/surreal';
 import { RedisClient } from '../db/redis';
 import { config } from '../config';
 import { logger } from '../utils/logger';
@@ -290,28 +289,39 @@ connections.post('/acquire', async (c) => {
       }, 429);
     }
 
-    // Generate JWT for this connection
-    // We need to create a dedicated DB connection for signin
-    const db = new Surreal();
-    await db.connect(config.surrealdb.url);
-    await db.use({
-      namespace: config.surrealdb.namespace,
-      database: config.surrealdb.database,
-    });
-
+    // Generate JWT for this connection via identity-vessel
+    // The apikey_record SurrealDB ACCESS method has been removed in favor of
+    // HMAC-based validation via identity-vessel (faster, stateless, centralized)
     let jwtToken: string;
     try {
-      // Authenticate using API key RECORD access
-      const authResult = await db.signin({
-        access: 'apikey_record',
-        variables: { api_key },
+      const identityVesselUrl =
+        process.env.IDENTITY_VESSEL_URL ||
+        'http://identity-vessel.activity-system.svc.cluster.local:8080';
+
+      const response = await fetch(`${identityVesselUrl}/v1/auth/exchange`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ api_key }),
+        signal: AbortSignal.timeout(5000),
       });
 
-      jwtToken = typeof authResult === 'string'
-        ? authResult
-        : (authResult as { access: string }).access;
-    } finally {
-      await db.close();
+      if (!response.ok) {
+        logger.warn('Identity vessel token exchange failed', { status: response.status });
+        return c.json({
+          error: 'auth_failed',
+          message: 'Failed to authenticate API key'
+        }, 401);
+      }
+
+      const result = await response.json() as { token: string };
+      jwtToken = result.token;
+    } catch (error) {
+      const err = error as Error;
+      logger.error('Identity vessel token exchange error', { error: err.message });
+      return c.json({
+        error: 'auth_service_unavailable',
+        message: 'Authentication service temporarily unavailable'
+      }, 503);
     }
 
     // Calculate JWT expiry (24 hours for connections)
@@ -554,14 +564,6 @@ connections.post('/reconnect', async (c) => {
       }, 410);
     }
 
-    // Generate new JWT
-    const db = new Surreal();
-    await db.connect(config.surrealdb.url);
-    await db.use({
-      namespace: config.surrealdb.namespace,
-      database: config.surrealdb.database,
-    });
-
     // We need the original API key to regenerate JWT
     // For now, get it from the api_keys table via the api_key_id
     const apiKeysResult = await surrealDB.query<ApiKey>(
@@ -570,7 +572,6 @@ connections.post('/reconnect', async (c) => {
     );
 
     if (apiKeysResult.length === 0) {
-      await db.close();
       return c.json({
         error: 'api_key_not_found',
         message: 'Associated API key not found'
@@ -578,20 +579,18 @@ connections.post('/reconnect', async (c) => {
     }
 
     // For reconnection, we need to use the existing JWT or issue a new one
-    // Since we can't regenerate without the plain API key, use the stored JWT if still valid
+    // Since we can't regenerate without the plain API key (and we no longer use
+    // apikey_record SurrealDB access), use the stored JWT if still valid
     let jwtToken = connection.jwt_token;
     let jwtExpiresAt = connection.jwt_expires_at;
 
     // If JWT is expired or missing, we can't reconnect without the API key
     if (!jwtToken || (jwtExpiresAt && new Date(jwtExpiresAt) < new Date())) {
-      await db.close();
       return c.json({
         error: 'jwt_expired',
         message: 'JWT has expired, please acquire a new connection with your API key'
       }, 410);
     }
-
-    await db.close();
 
     // Restore connection to active status
     const now = new Date().toISOString();

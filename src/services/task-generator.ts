@@ -32,10 +32,17 @@ export interface BoredomTask {
   createdAt: number;
 }
 
+// =============================================================================
+// TemplateMetrics Interface (Canonical Field Names)
+// =============================================================================
+// Metrics are still queried from variant_performance_metrics legacy table
+// but the id field mapping should align with canonical activity.id
+// =============================================================================
 interface TemplateMetrics {
+  // variant_id maps to activity.id in the canonical schema
   variant_id: string;
   activity_id: string;
-  variant_name: string;
+  // Note: variant_name is not in metrics table, would need JOIN
   total_executions: number;
   successful_executions: number;
   failed_executions: number;

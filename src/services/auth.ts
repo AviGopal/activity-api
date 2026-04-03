@@ -352,101 +352,15 @@ export async function validateApiKeyViaIdentityVessel(
   }
 }
 
-/**
- * Authenticate API key via SurrealDB (legacy fallback)
- */
-export async function authenticateApiKeyViaSurrealDB(
-  apiKey: string
-): Promise<AuthContext & { token?: string }> {
-  try {
-    const db = new Surreal();
-    await db.connect(config.surrealdb.url);
-    await db.use({
-      namespace: config.surrealdb.namespace,
-      database: config.surrealdb.database,
-    });
-
-    // Authenticate using RECORD access for API keys
-    const authResult = await db.signin({
-      access: 'apikey_record',
-      variables: { api_key: apiKey },
-    });
-
-    if (!authResult) {
-      await db.close();
-      return {
-        authenticated: false,
-        reason: 'API key is invalid, expired, or revoked',
-      };
-    }
-
-    // Extract JWT string from SDK response
-    const jwtToken =
-      typeof authResult === 'string'
-        ? authResult
-        : (authResult as { access: string }).access;
-
-    // Query $auth to get API key details
-    const authQuery = await db.query<
-      [
-        {
-          id: string;
-          org_id: string;
-          user_id: string;
-          scopes: string[];
-        }
-      ]
-    >(`RETURN {
-      id: $auth.id,
-      org_id: $auth.org_id,
-      user_id: $auth.user_id,
-      scopes: $auth.scopes
-    }`);
-
-    await db.close();
-
-    const keyInfo = authQuery[0];
-    if (!keyInfo || !keyInfo.org_id) {
-      return {
-        authenticated: false,
-        reason: 'API key authenticated but session details not found',
-      };
-    }
-
-    logger.info('[auth] SurrealDB validated API key (legacy)', {
-      keyId: keyInfo.id,
-    });
-
-    return {
-      authenticated: true,
-      token: jwtToken,
-      orgId: keyInfo.org_id.toString().replace('organizations:', ''),
-      userId: keyInfo.user_id.toString().replace('users:', ''),
-      keyId: keyInfo.id,
-      scopes: keyInfo.scopes || [],
-    };
-  } catch (error) {
-    logger.error('[auth] SurrealDB API key authentication error', {
-      error: error instanceof Error ? error.message : String(error),
-    });
-
-    const errorMessage = error instanceof Error ? error.message : String(error);
-
-    if (
-      errorMessage.includes('No access method found') ||
-      errorMessage.includes('Signin failed') ||
-      errorMessage.includes('Invalid credentials') ||
-      errorMessage.includes('No record found')
-    ) {
-      return {
-        authenticated: false,
-        reason: 'API key is invalid, expired, or revoked',
-      };
-    }
-
-    return {
-      authenticated: false,
-      reason: 'Authentication failed',
-    };
-  }
-}
+// =============================================================================
+// LEGACY FUNCTION REMOVED: authenticateApiKeyViaSurrealDB (2026-04-03)
+// =============================================================================
+// The SurrealDB apikey_record ACCESS method has been removed in favor of
+// HMAC-based API key validation via identity-vessel.
+//
+// Use validateApiKeyViaIdentityVessel() instead for API key authentication.
+// Benefits:
+// - Faster (~2ms vs ~50ms for Argon2 hash comparison)
+// - Stateless (no database lookup required for validation)
+// - Centralized (identity-vessel is the single source of truth for auth)
+// =============================================================================

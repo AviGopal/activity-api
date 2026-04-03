@@ -1,17 +1,17 @@
 -- =============================================================================
 -- Create activity_template alias for backward compatibility
 -- =============================================================================
--- Problem: Application code queries 'activity_template' but the actual schema
---          defines 'view_activity_template' (in 010-activity-registry.surql).
---          This mismatch causes "table does not exist" errors at runtime.
+-- Problem: Application code queries 'activity_template' but the canonical
+--          table is 'activity' (in 020-paradigm-core-tables.surql).
+--          This view provides backward compatibility for legacy queries.
 --
--- Solution: Create activity_template as a view with identical definition.
+-- Solution: Create activity_template as a view mapping activity table fields.
 --           This maintains backward compatibility while the codebase is
---           gradually migrated to use view_activity_template.
+--           gradually migrated to query the 'activity' table directly.
 --
 -- Migration Path:
 --   1. Apply this migration (creates activity_template view)
---   2. Gradually update code to use view_activity_template
+--   2. Gradually update code to query 'activity' table directly
 --   3. Remove this file once all code is migrated
 -- =============================================================================
 
@@ -23,15 +23,14 @@ DEFINE TABLE IF NOT EXISTS activity_template AS
     name AS variant_name,
     description,
     category,
-    tags,
-    tag_prefixes,
-    task_steps,
+    -- Map new field names to old names for backward compatibility
+    tasks AS task_steps,
     scope,
     org_id,
     project_id,
-    genealogy,
+    variant_of AS genealogy,
     created_at,
     updated_at
-  FROM activity_registry
-  WHERE execution_format = 'template'
+  FROM activity
+  WHERE execution_type = 'template'
   PERMISSIONS NONE;

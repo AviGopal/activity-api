@@ -24,8 +24,6 @@ import vesselsRoutes from './routes/vessels';
 import vesselRegistryRoutes from './routes/vessel-registry';
 import connectionsRoutes from './routes/connections';
 import ribosomeRoutes from './routes/ribosome';
-// DEPRECATED: Resolve routes disabled due to architecture drift (Task #1, Phase 1)
-// import resolveRoutes from './routes/resolve';
 import { broadcaster } from './websocket/broadcaster';
 import type { ServerWebSocket } from 'bun';
 
@@ -107,7 +105,7 @@ app.get('/health', async (c) => {
   try {
     const surrealStart = Date.now();
     const { surrealDB } = await import('./db/surreal');
-    await surrealDB.query('SELECT * FROM variant_performance_metrics LIMIT 1');
+    await surrealDB.query('SELECT * FROM activity LIMIT 1');
     healthStatus.checks.surrealdb = {
       status: 'healthy',
       latency_ms: Date.now() - surrealStart
@@ -167,10 +165,6 @@ app.route('/v2/connections', connectionsRoutes);
 
 // Ribosome routes (T9: POST /v2/ribosome/extract, POST /v2/ribosome/extract-from-session, GET /v2/ribosome/candidates)
 app.route('/v2/ribosome', ribosomeRoutes);
-
-// DEPRECATED: Resolution routes disabled due to architecture drift (Task #1, Phase 1)
-// Resolution violates "Resolvers live WHERE THE DATA IS" - vessels should resolve, not backend
-// app.route('/v2', resolveRoutes);
 
 // ============================================================================
 // Error Handling
@@ -342,20 +336,6 @@ if (heartbeatWorkerEnabled) {
     logger.info('[Server] Heartbeat worker started');
   }).catch(err => {
     logger.error('[Server] Failed to start heartbeat worker', { error: err.message });
-  });
-}
-
-// ============================================================================
-// Budget Sync Worker (Token Budget Management)
-// ============================================================================
-
-const budgetWorkerEnabled = process.env.BUDGET_WORKER_ENABLED !== 'false';
-if (budgetWorkerEnabled) {
-  import('./resolvers/budget').then(({ startBudgetWorker }) => {
-    startBudgetWorker();
-    logger.info('[Server] Budget sync worker started');
-  }).catch(err => {
-    logger.error('[Server] Failed to start budget worker', { error: err.message });
   });
 }
 

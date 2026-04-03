@@ -6,31 +6,64 @@
  * Creates default organization and MiniBob instance for local development.
  * This script is idempotent - safe to run multiple times.
  *
+ * =============================================================================
+ * API KEY STANDARDIZATION
+ * =============================================================================
+ * The MiniBob instance API key must be consistent across:
+ * 1. This script (creates the hash in SurrealDB)
+ * 2. repos/minibob/.env (MINIBOB_INSTANCE_API_KEY)
+ * 3. repos/deployment/charts/init-data/values.yaml
+ * 4. repos/deployment/charts/minibob/values.yaml
+ *
+ * Standard local development configuration:
+ *   API Key:     minibob-local-dev-key
+ *   Instance ID: minibob-local-001
+ *   Org ID:      organizations:metabob
+ *
+ * This simple, memorable key is used for all local development environments.
+ * =============================================================================
+ *
  * Environment variables:
  * - SURREALDB_URL: SurrealDB connection URL
  * - SURREALDB_NAMESPACE: Database namespace
  * - SURREALDB_DATABASE: Database name
  * - SURREALDB_USERNAME: Auth username
  * - SURREALDB_PASSWORD: Auth password
- * - DEFAULT_ORG_ID: Organization ID (default: metabob_internal)
- * - DEFAULT_ORG_NAME: Organization name (default: Metabob Internal)
+ * - DEFAULT_ORG_ID: Organization ID (default: metabob)
+ * - DEFAULT_ORG_NAME: Organization name (default: Metabob)
  * - MINIBOB_INSTANCE_ID: MiniBob instance ID (default: minibob-local-001)
- * - MINIBOB_API_KEY: MiniBob API key (default: test-api-key-123)
+ * - MINIBOB_API_KEY: MiniBob API key (default: standard local dev key)
  * - MINIBOB_VESSEL_ID: MiniBob vessel ID (default: minibob-cli-local)
  */
 
 import { Surreal } from 'surrealdb';
 
 const SURREAL_URL = process.env.SURREALDB_URL || 'http://localhost:8000';
-const SURREAL_NAMESPACE = process.env.SURREALDB_NAMESPACE || 'metabob';
+const SURREAL_NAMESPACE = process.env.SURREALDB_NAMESPACE || 'activity-system';
 const SURREAL_DATABASE = process.env.SURREALDB_DATABASE || 'learning_loop';
 const SURREAL_USERNAME = process.env.SURREALDB_USERNAME || 'root';
 const SURREAL_PASSWORD = process.env.SURREALDB_PASSWORD || 'root';
 
-const DEFAULT_ORG_ID = process.env.DEFAULT_ORG_ID || 'metabob_internal';
-const DEFAULT_ORG_NAME = process.env.DEFAULT_ORG_NAME || 'Metabob Internal';
+// Organization defaults - "metabob" is the standard org for local dev
+// (matches repos/deployment/secrets/local.secrets.yaml)
+const DEFAULT_ORG_ID = process.env.DEFAULT_ORG_ID || 'metabob';
+const DEFAULT_ORG_NAME = process.env.DEFAULT_ORG_NAME || 'Metabob';
+
+// MiniBob instance defaults
 const MINIBOB_INSTANCE_ID = process.env.MINIBOB_INSTANCE_ID || 'minibob-local-001';
-const MINIBOB_API_KEY = process.env.MINIBOB_API_KEY || 'test-api-key-123';
+
+// =============================================================================
+// STANDARD LOCAL DEVELOPMENT API KEY
+// =============================================================================
+// This key MUST match across all local dev configurations:
+// - repos/minibob/.env (MINIBOB_INSTANCE_API_KEY)
+// - repos/deployment/charts/init-data/values.yaml (minibobInstances[].apiKey)
+// - repos/deployment/charts/minibob/values.yaml (instance documentation)
+//
+// Key: minibob-local-dev-key (simple, memorable for local development)
+// =============================================================================
+const MINIBOB_API_KEY = process.env.MINIBOB_API_KEY || 'minibob-local-dev-key';
+
 const MINIBOB_VESSEL_ID = process.env.MINIBOB_VESSEL_ID || 'minibob-cli-local';
 
 async function initTestData() {

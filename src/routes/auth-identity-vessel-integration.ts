@@ -1,20 +1,20 @@
 /**
  * Identity Vessel Integration for API Key Authentication
  *
- * This file shows the updated /v2/auth/apikey endpoint that:
- * 1. First tries identity-vessel validation (HMAC-based keys)
- * 2. Falls back to SurrealDB validation (legacy keys)
- * 3. Returns JWT token for authenticated requests
+ * API key authentication is now handled exclusively by identity-vessel:
+ * - Uses HMAC-based key validation (fast, stateless)
+ * - No SurrealDB fallback (apikey_record ACCESS removed 2026-04-03)
  *
- * Usage: Replace the /apikey route in auth.ts with this implementation
+ * For API key validation, use the Authorization header:
+ *   Authorization: ApiKey <key>
+ *
+ * The jwtAuth middleware handles validation via identity-vessel automatically.
  */
 
 import { Hono } from 'hono'
-import { surrealDB } from '../db/surreal'
 import { signinRateLimiter } from '../middleware/rateLimiter'
 import {
   validateApiKeyViaIdentityVessel,
-  authenticateApiKeyViaSurrealDB,
   generateJwtToken
 } from '../services/auth'
 import { logger } from '../utils/logger'
@@ -25,19 +25,20 @@ const auth = new Hono()
 auth.use('/apikey', signinRateLimiter)
 
 // =============================================================================
-// ENDPOINT: POST /v2/auth/apikey (Updated with Identity Vessel Integration)
+// ENDPOINT: POST /v2/auth/apikey (Identity Vessel Only)
 // =============================================================================
 
 /**
  * POST /v2/auth/apikey
  *
- * Authenticate user via API key. Supports both:
- * 1. Identity-vessel HMAC keys (preferred)
- * 2. SurrealDB stored keys (legacy, fallback)
+ * Authenticate user via API key using identity-vessel HMAC validation.
+ *
+ * NOTE (2026-04-03): SurrealDB apikey_record fallback has been removed.
+ * All API keys must be validated via identity-vessel HMAC pattern.
  *
  * Request body:
  * {
- *   api_key: string   // Format: mb_<type>_<random> (base64 encoded)
+ *   api_key: string   // Format: mb_{env}_{org}_{keyId}_{hmac}
  * }
  *
  * Response:
@@ -48,7 +49,6 @@ auth.use('/apikey', signinRateLimiter)
  *   org_id: string        // Organization ID
  *   user_id: string       // User ID
  *   scopes: string[]      // API key scopes
- *   source: string        // 'identity-vessel' or 'surrealdb' (for debugging)
  * }
  */
 auth.post('/apikey', async (c) => {
@@ -70,91 +70,48 @@ auth.post('/apikey', async (c) => {
       }, 400)
     }
 
-    // ==========================================================================
-    // PATH 1: Try identity-vessel validation (for HMAC-based keys)
-    // ==========================================================================
-
+    // Validate API key via identity-vessel HMAC pattern
     const validation = await validateApiKeyViaIdentityVessel(api_key)
 
-    if (validation.authenticated && validation.orgId && validation.userId) {
-      logger.info('[auth] Using identity-vessel validated key', {
-        userId: validation.userId,
-      })
-
-      // Generate JWT token with validated auth context
-      const token = await generateJwtToken({
-        orgId: validation.orgId,
-        userId: validation.userId,
-        keyId: validation.keyId || 'unknown',
-        scopes: validation.scopes || ['read', 'write'],
-        expirySeconds: 900,
-      })
-
-      if (!token) {
-        logger.error('[auth] Failed to generate JWT token')
-        return c.json({
-          error: 'internal_error',
-          message: 'Failed to generate authentication token'
-        }, 500)
-      }
-
-      // Calculate expiry (15 minutes)
-      const expiresIn = 900
-      const expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString()
-
-      return c.json({
-        token,
-        expires_at: expiresAt,
-        expires_in: expiresIn,
-        org_id: validation.orgId,
-        user_id: validation.userId,
-        scopes: validation.scopes || ['read', 'write'],
-        source: 'identity-vessel'
-      })
-    }
-
-    // ==========================================================================
-    // PATH 2: Fallback to SurrealDB validation (for legacy keys)
-    // ==========================================================================
-
-    logger.info('[auth] Identity vessel validation failed, trying SurrealDB fallback')
-
-    const surrealResult = await authenticateApiKeyViaSurrealDB(api_key)
-
-    if (!surrealResult.authenticated || !surrealResult.token) {
+    if (!validation.authenticated || !validation.orgId || !validation.userId) {
       return c.json({
         error: 'invalid_api_key',
-        message: surrealResult.reason || 'API key is invalid, expired, or revoked'
+        message: validation.reason || 'API key is invalid, expired, or revoked'
       }, 401)
     }
 
-    // Update last_used_at using root connection (fire and forget)
-    if (surrealResult.keyId) {
-      surrealDB.query(
-        `UPDATE $key_id SET last_used_at = time::now()`,
-        { key_id: surrealResult.keyId }
-      ).catch(err => {
-        logger.warn('[auth] Failed to update last_used_at', {
-          error: err instanceof Error ? err.message : String(err),
-        })
-      })
+    logger.info('[auth] API key validated via identity-vessel', {
+      userId: validation.userId,
+    })
+
+    // Generate JWT token with validated auth context
+    const token = await generateJwtToken({
+      orgId: validation.orgId,
+      userId: validation.userId,
+      keyId: validation.keyId || 'unknown',
+      scopes: validation.scopes || ['read', 'write'],
+      expirySeconds: 900,
+    })
+
+    if (!token) {
+      logger.error('[auth] Failed to generate JWT token')
+      return c.json({
+        error: 'internal_error',
+        message: 'Failed to generate authentication token'
+      }, 500)
     }
 
+    // Calculate expiry (15 minutes)
     const expiresIn = 900
     const expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString()
 
-    logger.info('[auth] Using SurrealDB validated key (legacy)', {
-      keyId: surrealResult.keyId,
-    })
-
     return c.json({
-      token: surrealResult.token,
+      token,
       expires_at: expiresAt,
       expires_in: expiresIn,
-      org_id: surrealResult.orgId,
-      user_id: surrealResult.userId,
-      scopes: surrealResult.scopes || [],
-      source: 'surrealdb'
+      org_id: validation.orgId,
+      user_id: validation.userId,
+      scopes: validation.scopes || ['read', 'write'],
     })
 
   } catch (error) {
@@ -162,23 +119,12 @@ auth.post('/apikey', async (c) => {
       error: error instanceof Error ? error.message : String(error),
     })
 
-    const errorMessage = error instanceof Error ? error.message : String(error)
-
-    // SurrealDB auth error messages
-    if (errorMessage.includes('No access method found') ||
-        errorMessage.includes('Signin failed') ||
-        errorMessage.includes('Invalid credentials') ||
-        errorMessage.includes('No record found')) {
-      return c.json({
-        error: 'invalid_api_key',
-        message: 'API key is invalid, expired, or revoked'
-      }, 401)
-    }
-
     return c.json({
       error: 'internal_error',
       message: 'Authentication failed',
-      details: process.env.NODE_ENV === 'development' ? errorMessage : undefined
+      details: process.env.NODE_ENV === 'development'
+        ? (error instanceof Error ? error.message : String(error))
+        : undefined
     }, 500)
   }
 })

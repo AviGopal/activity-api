@@ -17,7 +17,13 @@ import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
 import type { SequencePattern } from './pattern-miner';
 
-// Simplified types - actual types come from schemas.ts
+// =============================================================================
+// Types (Canonical Field Names)
+// =============================================================================
+// Aligned with 020-paradigm-core-tables.surql 'activity' table schema.
+// Uses canonical field names: id, name, tasks (not variant_id, variant_name, task_steps)
+// =============================================================================
+
 interface ActivityTask {
   id: string;
   description: string;
@@ -45,20 +51,25 @@ interface ActivityTask {
 }
 
 interface ActivityTemplate {
-  variant_id: string;
-  activity_id: string;
-  variant_name: string;
+  // Canonical field names
+  id: string;
+  name: string;
   description: string;
   tags?: string[];
   category?: string;
-  task_steps?: ActivityTask[];
+  // Canonical: 'tasks' (was task_steps)
+  tasks?: ActivityTask[];
   variables?: any[];
   impulses?: any[];
-  genealogy?: any;
+  // Canonical: 'variant_of' (was genealogy)
+  variant_of?: any;
   metadata?: any;
   scope?: string;
   org_id?: string | null;
   project_id?: string | null;
+  input_shapes?: string[];
+  output_shapes?: string[];
+  execution_type?: string;
   created_at?: string;
   updated_at?: string;
 }
@@ -108,7 +119,7 @@ export async function mergeTemplates(
     const depth = getCompositionDepth(template);
     if (depth >= MAX_COMPOSITION_DEPTH) {
       throw new Error(
-        `Template ${template.variant_id} has composition depth ${depth}, max is ${MAX_COMPOSITION_DEPTH}`
+        `Template ${template.id} has composition depth ${depth}, max is ${MAX_COMPOSITION_DEPTH}`
       );
     }
   }
@@ -130,16 +141,16 @@ export async function mergeTemplates(
   const uniqueVariables = deduplicateVariables(sourceTemplates);
   const uniqueImpulses = deduplicateImpulses(sourceTemplates);
 
-  // Step 7: Create composite template
+  // Step 7: Create composite template using canonical field names
   const compositeId = `composite_${pattern.activityIds.join('_')}_${Date.now()}`;
   const compositeName = sourceTemplates
-    .map(t => t.variant_name || t.activity_id)
+    .map(t => t.name || t.id)
     .join(' → ');
 
   const compositeTemplate: ActivityTemplate = {
-    variant_id: compositeId,
-    activity_id: compositeId,
-    variant_name: `Composite: ${compositeName}`,
+    // Canonical fields
+    id: compositeId,
+    name: `Composite: ${compositeName}`,
     description: `Learned composite sequence: ${pattern.activityIds.join(' → ')}\nObserved ${pattern.frequency} times with ${(pattern.successRate * 100).toFixed(1)}% success rate.`,
 
     // Merge all tags from source templates
@@ -148,20 +159,20 @@ export async function mergeTemplates(
     // Derive category from first template
     category: sourceTemplates[0]?.category || 'tool',
 
-    // Merged tasks with renamed IDs and chained dependencies
-    task_steps: mergedTasks,
+    // Canonical: 'tasks' (was task_steps)
+    tasks: mergedTasks,
 
     // Deduplicated variables and impulses
     variables: uniqueVariables,
     impulses: uniqueImpulses,
 
-    // Genealogy for provenance tracking
-    genealogy: {
+    // Canonical: 'variant_of' for provenance tracking (was genealogy)
+    variant_of: {
       source: 'ribosome-sequence',
       sourcePattern: pattern.activityIds,
       sourceTemplates: sourceTemplates.map(t => ({
-        id: t.variant_id,
-        name: t.variant_name || t.activity_id
+        id: t.id,
+        name: t.name
       })),
       frequency: pattern.frequency,
       successRate: pattern.successRate,
@@ -177,6 +188,9 @@ export async function mergeTemplates(
       generatedFrom: 'pattern-mining',
       patternSignature: hashPattern(pattern.activityIds)
     },
+
+    // Execution type for paradigm alignment
+    execution_type: 'composition',
 
     scope: 'global',
     org_id: null,
@@ -204,7 +218,7 @@ export async function mergeTemplates(
 }
 
 /**
- * Load source templates from database
+ * Load source templates from database using canonical field names
  */
 async function loadSourceTemplates(
   activityIds: string[]
@@ -213,15 +227,15 @@ async function loadSourceTemplates(
   const templates: ActivityTemplate[] = [];
 
   for (const activityId of activityIds) {
+    // Query using canonical 'activity' table with 'id' field
     const query = `
-      SELECT * FROM activity_template
-      WHERE activity_id = $activity_id
-        OR variant_id = $activity_id
+      SELECT * FROM activity
+      WHERE id = $activity_id
       LIMIT 1
     `;
 
     try {
-      const results = await surrealDB.query<ActivityTemplate[]>(query, {
+      const results = await surrealDB.query<ActivityTemplate>(query, {
         activity_id: activityId
       });
 
@@ -266,7 +280,8 @@ function renameAndMergeTasks(
     const template = templates[templateIdx];
     const prefix = `step${templateIdx + 1}_`;  // step1_, step2_, step3_
 
-    const tasks = template.task_steps || [];
+    // Use canonical 'tasks' field
+    const tasks = template.tasks || [];
 
     for (const task of tasks) {
       const oldId = task.id;
@@ -391,7 +406,8 @@ function deduplicateImpulses(templates: ActivityTemplate[]): any[] {
  */
 export function validateMergedTemplate(result: MergeResult): void {
   const { compositeTemplate } = result;
-  const tasks = compositeTemplate.task_steps || [];
+  // Use canonical 'tasks' field
+  const tasks = compositeTemplate.tasks || [];
 
   // Check 1: All task IDs are unique
   const taskIds = tasks.map(t => t.id);
@@ -482,11 +498,12 @@ function topologicalSort(tasks: ActivityTask[]): ActivityTask[] {
  * Returns 0 for atomic templates, 1 for composites of atomics, etc.
  */
 function getCompositionDepth(template: ActivityTemplate): number {
-  if (!template.genealogy?.source) return 0;
+  // Use canonical 'variant_of' field (was genealogy)
+  if (!template.variant_of?.source) return 0;
 
-  if (template.genealogy.source === 'ribosome-sequence') {
+  if (template.variant_of.source === 'ribosome-sequence') {
     // This is a composite - check if its sources are also composites
-    const sourceTemplates = template.genealogy.sourceTemplates || [];
+    const sourceTemplates = template.variant_of.sourceTemplates || [];
     if (sourceTemplates.length === 0) return 1;
 
     // Would need to recursively load and check, but for now assume depth 1

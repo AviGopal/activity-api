@@ -103,15 +103,15 @@ class MigrationRunner {
     this.log('Applying activity-specific schemas...');
 
     const schemaFiles = [
-      '010-activity-registry.surql',
+      // Paradigm alignment tables (schema-paradigm-alignment) - canonical activity model
+      '020-paradigm-core-tables.surql',
+      // SKIPPED: 021-paradigm-computed-views.surql - incompatible with SurrealDB 3.0.0
+      '022-paradigm-compat-views.surql',  // Backward-compatibility views for migration
+      // Supporting tables (depend on paradigm core tables)
       '011-executions.surql',
       '012-composition.surql',
       '013-impulse-tool-usage.surql',
       '015-impulse-metadata.surql',
-      // Paradigm alignment tables (schema-paradigm-alignment)
-      '020-paradigm-core-tables.surql',
-      // SKIPPED: 021-paradigm-computed-views.surql - incompatible with SurrealDB 3.0.0
-      '022-paradigm-compat-views.surql',  // Backward-compatibility views for migration
       '026-activity-template-alias.surql', // activity_template alias for old code
     ];
 
@@ -152,7 +152,12 @@ class MigrationRunner {
     await this.ensureDefaultOrganization();
 
     // Backfill org_id on existing records
-    await this.backfillOrgId('activity_registry');
+    // Note: activity_registry removed - use 'activity' table from 020-paradigm-core-tables.surql
+    await this.backfillOrgId('activity');
+    await this.backfillOrgId('execution');
+    await this.backfillOrgId('impulse');
+    await this.backfillOrgId('vessel');
+    // Legacy tables (may not exist in fresh deployments)
     await this.backfillOrgId('activity_execution_traces');
     await this.backfillOrgId('variant_performance_metrics');
     await this.backfillOrgId('activity_composition_graph');

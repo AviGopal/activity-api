@@ -91,26 +91,37 @@ const TEMPLATE_CACHE_TTL = 3600; // 1 hour in seconds
 const CACHE_KEY_PREFIX = 'activity:template:';
 const CACHE_LIST_KEY = 'activity:templates:list';
 
+// =============================================================================
+// ActivityTemplate Interface (Canonical Field Names)
+// =============================================================================
+// Aligned with 020-paradigm-core-tables.surql 'activity' table schema.
+// Uses canonical field names: id, name, tasks (not variant_id, variant_name, task_steps)
+// =============================================================================
 interface ActivityTemplate {
-  variant_id: string;
-  activity_id: string;
-  variant_name: string;
+  // Canonical fields
+  id: string;
+  name: string;
   description: string;
   // Hierarchical tags (primary classification)
   tags: string[];
   tag_prefixes?: string[];
   // Legacy category (deprecated)
   category?: string;
-  task_steps?: any[];
+  // Canonical: 'tasks' (was task_steps)
+  tasks?: any[];
   scope: string | null;
   org_id: string | null;
   project_id: string | null;
-  genealogy?: Record<string, any>;
+  // Input/output shapes for paradigm alignment
+  input_shapes?: string[];
+  output_shapes?: string[];
+  execution_type?: string;
+  // Canonical: 'variant_of' (was genealogy)
+  variant_of?: Record<string, any>;
   created_at: string;
   updated_at: string;
   metrics?: {
-    variant_id: string;
-    activity_id: string;
+    id: string;
     total_executions: number;
     successful_executions: number;
     failed_executions: number;
@@ -127,12 +138,12 @@ interface ActivityTemplate {
 }
 
 /**
- * Filter templates by input schema compatibility
- * A template matches if ALL required shapes in its inputSchema are present in providedShapes
- * Templates without inputSchema match anything (backwards compatible)
+ * Filter templates by input shapes compatibility
+ * Uses canonical 'input_shapes' field (paradigm-aligned)
+ * Falls back to legacy 'input_schema' for backward compatibility
  *
- * TASK #3 Enhancement: This function now considers output_shapes for composition learning.
- * When selecting activities, we can track which output shapes lead to successful compositions.
+ * A template matches if ALL required shapes in its input_shapes are present in providedShapes
+ * Templates without input_shapes match anything (backwards compatible)
  */
 function filterByInputSchema(
   templates: any[],
@@ -145,14 +156,34 @@ function filterByInputSchema(
   const providedSet = new Set(providedShapes);
 
   return templates.filter(template => {
+    // Prefer canonical 'input_shapes' field, fall back to legacy 'input_schema'
+    const inputShapes = template.input_shapes;
     const inputSchema = template.input_schema;
 
-    // Templates without inputSchema match anything (backwards compatible)
-    if (!inputSchema || !inputSchema.required || !Array.isArray(inputSchema.required)) {
+    // Templates without input requirements match anything (backwards compatible)
+    if (!inputShapes?.length && (!inputSchema || !inputSchema.required || !Array.isArray(inputSchema.required))) {
       return true;
     }
 
-    // Check if all required shapes are provided
+    // Use canonical input_shapes if available
+    if (inputShapes?.length) {
+      const allRequiredPresent = inputShapes.every((shape: string) =>
+        providedSet.has(shape)
+      );
+
+      // Log for composition learning
+      if (allRequiredPresent && template.output_shapes) {
+        logger.debug('[Composition Learning] Activity produces output shapes', {
+          activity_id: template.id,
+          input_shapes: inputShapes,
+          output_shapes: template.output_shapes,
+        });
+      }
+
+      return allRequiredPresent;
+    }
+
+    // Fall back to legacy input_schema
     const requiredShapes = inputSchema.required.map((s: any) =>
       typeof s === 'string' ? s : s.shape
     ).filter(Boolean);
@@ -161,11 +192,10 @@ function filterByInputSchema(
       providedSet.has(shape)
     );
 
-    // TASK #3: Log output_shapes for composition learning
-    // When activities succeed, we can learn which output_shapes enable future compositions
+    // Log for composition learning
     if (allRequiredPresent && template.output_shapes) {
       logger.debug('[Composition Learning] Activity produces output shapes', {
-        activity_id: template.id || template.variant_id,
+        activity_id: template.id,
         input_shapes: requiredShapes,
         output_shapes: template.output_shapes,
       });
@@ -176,7 +206,8 @@ function filterByInputSchema(
 }
 
 /**
- * Enrich templates with execution metrics from variant_performance_metrics table
+ * Enrich templates with execution metrics from v_activity_score view
+ * Uses canonical field names (id instead of variant_id)
  */
 async function enrichTemplatesWithMetrics(
   templates: ActivityTemplate[]
@@ -186,62 +217,82 @@ async function enrichTemplatesWithMetrics(
   }
 
   try {
-    // Extract variant IDs
-    const variantIds = templates.map(t => t.variant_id);
-    
-    logger.info('Enriching templates with metrics', { 
+    // Extract activity IDs using canonical 'id' field
+    const activityIds = templates.map(t => t.id);
+
+    logger.info('Enriching templates with metrics', {
       templateCount: templates.length,
-      sampleVariantIds: variantIds.slice(0, 3)
+      sampleIds: activityIds.slice(0, 3)
     });
-    
-    // Query metrics for all variants in one go
-    // Use compatibility view that reads from new v_activity_score
-    // Fallback to old table if view doesn't exist (during migration)
+
+    // Query metrics for all activities in one go
+    // Use v_activity_score view (paradigm-aligned)
+    // Fallback to legacy variant_performance_metrics if view doesn't exist
     let metricsResult: any[] = [];
 
     try {
       const metricsQuery = `
-        SELECT * FROM v_paradigm_performance_metrics
-        WHERE variant_id IN $variant_ids
+        SELECT * FROM v_activity_score
+        WHERE activity_id IN $activity_ids
       `;
       metricsResult = await surrealDB.query<any>(metricsQuery, {
-        variant_ids: variantIds
+        activity_ids: activityIds
       });
     } catch (error: any) {
-      // Fallback to old table if view doesn't exist yet
-      logger.warn('Failed to query v_paradigm_performance_metrics, falling back to variant_performance_metrics', {
+      // Fallback to activity table if view doesn't exist yet
+      logger.warn('Failed to query v_activity_score, falling back to activity table', {
         error: error.message
       });
       const fallbackQuery = `
-        SELECT * FROM variant_performance_metrics
-        WHERE variant_id IN $variant_ids
+        SELECT id as activity_id, name, total_executions,
+               thompson_alpha, thompson_beta, success_rate,
+               avg_duration_ms, avg_cost_usd
+        FROM activity
+        WHERE id IN $activity_ids
       `;
       metricsResult = await surrealDB.query<any>(fallbackQuery, {
-        variant_ids: variantIds
+        activity_ids: activityIds
       });
     }
 
     logger.info('Metrics query result', {
       metricsFound: metricsResult?.length || 0,
-      sampleMetrics: metricsResult?.slice(0, 2).map((m: any) => ({ 
-        variant_id: m.variant_id, 
-        alpha: m.thompson_alpha, 
-        beta: m.thompson_beta 
+      sampleMetrics: metricsResult?.slice(0, 2).map((m: any) => ({
+        id: m.activity_id || m.variant_id,
+        alpha: m.thompson_alpha || m.alpha,
+        beta: m.thompson_beta || m.beta
       }))
     });
 
-    // Create a map of variant_id -> metrics
+    // Create a map of activity_id -> metrics (handle both canonical and legacy field names)
     const metricsMap = new Map();
     for (const metric of metricsResult) {
-      metricsMap.set(metric.variant_id, metric);
+      const id = metric.activity_id || metric.variant_id;
+      // Normalize metrics to canonical field names
+      const normalizedMetric = {
+        id,
+        total_executions: metric.total_executions,
+        successful_executions: metric.successful_executions || metric.successes,
+        failed_executions: metric.failed_executions || metric.failures,
+        success_rate: metric.success_rate,
+        avg_duration_ms: metric.avg_duration_ms,
+        avg_cost_usd: metric.avg_cost_usd,
+        thompson_alpha: metric.thompson_alpha || metric.alpha,
+        thompson_beta: metric.thompson_beta || metric.beta,
+        total_selections: metric.total_selections,
+        last_executed_at: metric.last_executed_at,
+        created_at: metric.created_at,
+        updated_at: metric.updated_at,
+      };
+      metricsMap.set(id, normalizedMetric);
     }
 
-    // Attach metrics to each template
+    // Attach metrics to each template using canonical 'id' field
     return templates.map(template => ({
       ...template,
-      metrics: metricsMap.get(template.variant_id) || undefined
+      metrics: metricsMap.get(template.id) || undefined
     }));
-    
+
   } catch (error) {
     logger.error('Failed to enrich templates with metrics', {
       error: error instanceof Error ? error.message : String(error)
@@ -455,6 +506,12 @@ app.post('/templates', async (c) => {
     body = await c.req.json();
     const validated = CreateTemplateRequestSchema.parse(body);
 
+    // Normalize to canonical field names (accept both legacy and canonical)
+    const activityId = validated.id || validated.variant_id;
+    const activityName = validated.name || validated.variant_name;
+    const activityTasks = validated.tasks || validated.task_steps;
+    const activityVariantOf = validated.variant_of || validated.genealogy;
+
     // Convert category to tags if needed (backward compatibility)
     const tags = ensureTags({ tags: validated.tags, category: validated.category });
     const tagPrefixes = computeTagPrefixes(tags);
@@ -462,9 +519,8 @@ app.post('/templates', async (c) => {
     const derivedCategory = deriveCategory(tags) || validated.category || tags[0]?.split('.')[0] || 'uncategorized';
 
     logger.info('POST /v2/activities/templates', {
-      variant_id: validated.variant_id,
-      activity_id: validated.activity_id,
-      variant_name: validated.variant_name,
+      id: activityId,
+      name: activityName,
       tags,
       tagPrefixes,
       category: derivedCategory,
@@ -479,22 +535,23 @@ app.post('/templates', async (c) => {
     `;
 
     const existing = await surrealDB.query<ActivityTemplate>(existingQuery, {
-      id: validated.variant_id,
+      id: activityId,
     });
 
     if (existing.length > 0) {
-      logger.warn('Template already exists', { variant_id: validated.variant_id });
+      logger.warn('Template already exists', { id: activityId });
       return c.json({
         success: false,
-        variant_id: validated.variant_id,
+        id: activityId,
+        variant_id: activityId, // Legacy alias for backward compatibility
         message: 'Template variant already exists',
       } as CreateTemplateResponse, 409);
     }
 
-    // Build activity record using new activity table schema
+    // Build activity record using canonical field names
     const activityRecord: Record<string, any> = {
-      id: validated.variant_id,
-      name: validated.variant_name,
+      id: activityId,
+      name: activityName,
       description: validated.description,
       execution_type: 'template',
       // Hierarchical tags (primary classification)
@@ -510,17 +567,35 @@ app.post('/templates', async (c) => {
       activityRecord.org_id = validated.org_id || orgId;
     }
 
-    // Add tasks (new schema field name, was task_steps)
-    if (validated.task_steps && validated.task_steps.length > 0) {
-      activityRecord.tasks = validated.task_steps;
+    // Add tasks using canonical field name
+    if (activityTasks && activityTasks.length > 0) {
+      activityRecord.tasks = activityTasks;
+    }
+
+    // Add input/output shapes for paradigm alignment
+    if (validated.input_shapes?.length) {
+      activityRecord.input_shapes = validated.input_shapes;
+    } else if (validated.input_schema?.required) {
+      // Convert legacy input_schema to input_shapes
+      activityRecord.input_shapes = validated.input_schema.required
+        .map((s: any) => typeof s === 'string' ? s : s.shape)
+        .filter(Boolean);
+    }
+    if (validated.output_shapes?.length) {
+      activityRecord.output_shapes = validated.output_shapes;
+    } else if (validated.output_schema?.produces) {
+      // Convert legacy output_schema to output_shapes
+      activityRecord.output_shapes = validated.output_schema.produces
+        .map((s: any) => typeof s === 'string' ? s : s.shape)
+        .filter(Boolean);
     }
 
     // Add optional fields only if provided
     if (validated.project_id || projectId) {
       activityRecord.project_id = validated.project_id || projectId;
     }
-    if (validated.genealogy && Object.keys(validated.genealogy).length > 0) {
-      activityRecord.variant_of = validated.genealogy;
+    if (activityVariantOf && Object.keys(activityVariantOf).length > 0) {
+      activityRecord.variant_of = activityVariantOf;
     }
 
     // Build dynamic query with only provided fields
@@ -536,8 +611,8 @@ app.post('/templates', async (c) => {
     await surrealDB.query(insertActivityQuery, activityRecord);
 
     logger.info('Activity template inserted into activity table', {
-      id: validated.variant_id,
-      name: validated.variant_name,
+      id: activityId,
+      name: activityName,
       scope: activityRecord.scope,
       public: activityRecord.public,
     });
@@ -549,10 +624,12 @@ app.post('/templates', async (c) => {
     const metricsProjectId = validated.project_id || projectId;
 
     // Build metrics query with conditional project_id
+    // Note: variant_performance_metrics is a legacy table but still used for Thompson Sampling
+    // The v_activity_score view reads from this table
     const insertMetricsQuery = metricsProjectId
       ? `
       INSERT INTO variant_performance_metrics {
-        variant_id: $variant_id,
+        variant_id: $activity_id,
         activity_id: $activity_id,
         org_id: $org_id,
         project_id: $project_id,
@@ -571,7 +648,7 @@ app.post('/templates', async (c) => {
     `
       : `
       INSERT INTO variant_performance_metrics {
-        variant_id: $variant_id,
+        variant_id: $activity_id,
         activity_id: $activity_id,
         org_id: $org_id,
         total_executions: 0,
@@ -589,26 +666,26 @@ app.post('/templates', async (c) => {
     `;
 
     await surrealDB.query(insertMetricsQuery, {
-      variant_id: validated.variant_id,
-      activity_id: validated.activity_id,
+      activity_id: activityId,
       org_id: metricsOrgId,
       ...(metricsProjectId ? { project_id: metricsProjectId } : {}),
     });
 
     logger.info('Template registered successfully', {
-      variant_id: validated.variant_id,
+      id: activityId,
     });
 
     // Invalidate Redis cache so the new template appears in list queries
     const redis = RedisClient.getInstance();
     await redis.del(CACHE_LIST_KEY);
     logger.debug('Redis template list cache invalidated after template registration', {
-      variant_id: validated.variant_id,
+      id: activityId,
     });
 
     return c.json({
       success: true,
-      variant_id: validated.variant_id,
+      id: activityId,
+      variant_id: activityId, // Legacy alias for backward compatibility
       message: 'Template registered successfully',
     } as CreateTemplateResponse, 201);
 
@@ -734,9 +811,9 @@ app.get('/templates', async (c) => {
       logger.debug('Template list cache hit', { count: templateIdsSet.length });
       cacheHit = true;
 
-      // Load each template from cache
-      const templatePromises = templateIdsSet.map(async (variantId) => {
-        const cachedData = await redis.get(`${CACHE_KEY_PREFIX}${variantId}`);
+      // Load each template from cache (using canonical 'id' field)
+      const templatePromises = templateIdsSet.map(async (activityId) => {
+        const cachedData = await redis.get(`${CACHE_KEY_PREFIX}${activityId}`);
         if (cachedData) {
           return JSON.parse(cachedData) as ActivityTemplate;
         }
@@ -744,7 +821,7 @@ app.get('/templates', async (c) => {
       });
 
       const cachedTemplates = await Promise.all(templatePromises);
-      
+
       // Filter out null values (cache inconsistencies)
       templates = cachedTemplates.filter((t): t is ActivityTemplate => t !== null);
 
@@ -788,12 +865,13 @@ app.get('/templates', async (c) => {
             const cachePromises: Promise<any>[] = [];
 
             for (const template of dbTemplates) {
-              const variantId = template.variant_id;
+              // Use canonical 'id' field
+              const activityId = template.id;
 
               // Store template data with TTL
               cachePromises.push(
                 redis.set(
-                  `${CACHE_KEY_PREFIX}${variantId}`,
+                  `${CACHE_KEY_PREFIX}${activityId}`,
                   JSON.stringify(template),
                   TEMPLATE_CACHE_TTL
                 )
@@ -801,7 +879,7 @@ app.get('/templates', async (c) => {
 
               // Add to template list set
               cachePromises.push(
-                redis.sadd(CACHE_LIST_KEY, variantId)
+                redis.sadd(CACHE_LIST_KEY, activityId)
               );
             }
 
@@ -953,23 +1031,23 @@ app.get('/templates/:variantId', async (c) => {
 
     let result: ActivityTemplate[] = [];
 
-    // Query from activity_registry (the canonical table for templates)
+    // Query from activity table (the canonical table for templates)
     // Use meta::id() to extract just the ID part (without table prefix) and compare
     const variantQuery = `
-      SELECT * FROM activity_registry
+      SELECT * FROM activity
       WHERE meta::id(id) = $variant_id
-        AND execution_format = 'template'
+        AND execution_type = 'template'
       LIMIT 1
     `;
     result = await surrealDB.query<ActivityTemplate>(variantQuery, { variant_id: variantId });
 
-    // If not found, try treating variant_id as a full record ID (for activity_registry:xyz format)
+    // If not found, try treating variant_id as a full record ID (for activity:xyz format)
     if (result.length === 0 && variantId.includes(':')) {
       try {
         const recordQuery = `
-          SELECT * FROM activity_registry
+          SELECT * FROM activity
           WHERE id = type::record($variant_id)
-            AND execution_format = 'template'
+            AND execution_type = 'template'
         `;
         result = await surrealDB.query<ActivityTemplate>(recordQuery, { variant_id: variantId });
       } catch (recordError) {
@@ -1047,8 +1125,11 @@ app.post('/executions', async (c) => {
     const body = await c.req.json();
     const validated = ExecutionRecordSchema.parse(body);
 
+    // Normalize to canonical field name: activity_id (accept legacy variant_id)
+    const activityIdFromRequest = validated.activity_id || validated.variant_id!;
+
     logger.info('POST /v2/activities/executions', {
-      variant_id: validated.variant_id,
+      activity_id: activityIdFromRequest,
       success: validated.success,
       duration_ms: validated.duration_ms,
       cost: validated.cost,
@@ -1059,17 +1140,20 @@ app.post('/executions', async (c) => {
     // Generate execution ID
     const executionId = `exec_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
 
-    // Look up template to get activity_id (required for activity_execution_traces table)
-    const templateLookup = await surrealDB.query<{ activity_id: string }>(
-      'SELECT activity_id FROM activity WHERE variant_id = $variant_id LIMIT 1',
-      { variant_id: validated.variant_id }
+    // Look up template to verify it exists (using canonical 'activity' table)
+    // The activityIdFromRequest is already the canonical ID
+    const templateLookup = await surrealDB.query<{ id: string }>(
+      'SELECT id FROM activity WHERE id = $activity_id LIMIT 1',
+      { activity_id: activityIdFromRequest }
     );
-    const activityId = templateLookup[0]?.activity_id || validated.variant_id;
+    const activityId = templateLookup[0]?.id || activityIdFromRequest;
 
     // Emit execution_started event via WebSocket
     const executionStartedData: any = {
       execution_id: executionId,
-      variant_id: validated.variant_id,
+      activity_id: activityIdFromRequest,
+      // Legacy field for backward compatibility
+      variant_id: activityIdFromRequest,
     };
     // Add pod_name if available (MiniBob execution context)
     if ((validated as any).pod_name) {
@@ -1085,7 +1169,8 @@ app.post('/executions', async (c) => {
     const executionRecord: Record<string, any> = {
       execution_id: executionId,
       activity_id: activityId,
-      variant_id: validated.variant_id,
+      // Legacy field for backward compatibility with activity_execution_traces table
+      variant_id: activityIdFromRequest,
       success: validated.success,
       status: validated.success ? 'success' : 'failure',
       duration_ms: validated.duration_ms,
@@ -1162,7 +1247,7 @@ app.post('/executions', async (c) => {
       try {
         const paradigmExecution: Partial<ParadigmExecution> = {
         id: executionId,
-        activity_id: validated.variant_id,
+        activity_id: activityIdFromRequest,
         input_impulses: validated.impulses_used || [],
         // Use output_impulses from improvisation traces if available
         output_impulses: validated.output_impulses?.map((imp: any) => imp.shape) || [],
@@ -1189,7 +1274,7 @@ app.post('/executions', async (c) => {
       if (paradigmResult) {
         logger.info('[paradigm] Execution also written to execution table', {
           id: executionId,
-          activity_id: validated.variant_id,
+          activity_id: activityIdFromRequest,
           path: 'dual-write',
         });
       }
@@ -1231,7 +1316,7 @@ app.post('/executions', async (c) => {
     `;
 
     const metricsResult = await surrealDB.query(updateMetricsQuery, {
-      variant_id: validated.variant_id,
+      variant_id: activityIdFromRequest,
       success_delta,
       failure_delta,
       duration_ms: validated.duration_ms,
@@ -1239,17 +1324,17 @@ app.post('/executions', async (c) => {
     });
 
     logger.info('Thompson Sampling metrics updated', {
-      variant_id: validated.variant_id,
+      activity_id: activityIdFromRequest,
       metricsUpdated: metricsResult.length > 0,
     });
 
     // Step 3: Invalidate Redis cache for this template
     const redis = RedisClient.getInstance();
-    await redis.del(`${CACHE_KEY_PREFIX}${validated.variant_id}`);
-    await redis.srem(CACHE_LIST_KEY, validated.variant_id);
+    await redis.del(`${CACHE_KEY_PREFIX}${activityIdFromRequest}`);
+    await redis.srem(CACHE_LIST_KEY, activityIdFromRequest);
 
     logger.debug('Redis cache invalidated for template', {
-      variant_id: validated.variant_id,
+      activity_id: activityIdFromRequest,
     });
 
     // Extract updated metrics from result
@@ -1261,7 +1346,9 @@ app.post('/executions', async (c) => {
       timestamp: new Date().toISOString(),
       data: {
         execution_id: executionId,
-        variant_id: validated.variant_id,
+        activity_id: activityIdFromRequest,
+        // Legacy field for backward compatibility
+        variant_id: activityIdFromRequest,
         success: validated.success,
         duration_ms: validated.duration_ms,
         cost: validated.cost,
@@ -1275,7 +1362,9 @@ app.post('/executions', async (c) => {
         type: 'template_updated',
         timestamp: new Date().toISOString(),
         data: {
-          variant_id: validated.variant_id,
+          activity_id: activityIdFromRequest,
+          // Legacy field for backward compatibility
+          variant_id: activityIdFromRequest,
           metrics: {
             success_rate: updatedMetrics.success_rate || 0,
             avg_duration_ms: updatedMetrics.avg_duration_ms || 0,
@@ -2006,8 +2095,30 @@ app.post('/recommend', async (c) => {
       });
     }
 
+    // Filter out templates without a valid ID before processing
+    const validTemplates = templates.filter((template: any) => {
+      const templateId = template.id || template.variant_id;
+      if (!templateId || typeof templateId !== 'string' || templateId.trim() === '') {
+        logger.warn('Filtering out template without valid ID', {
+          template_name: template.name || template.variant_name,
+          template_id: template.id,
+          variant_id: template.variant_id,
+        });
+        return false;
+      }
+      return true;
+    });
+
+    if (validTemplates.length < templates.length) {
+      logger.info('Templates filtered for missing IDs', {
+        before: templates.length,
+        after: validTemplates.length,
+        filtered: templates.length - validTemplates.length,
+      });
+    }
+
     // Apply Thompson Sampling with heuristic prior boosting
-    const recommendations = templates
+    const recommendations = validTemplates
       .map((template: any) => {
         // Try to get alpha/beta from v_activity_score first
         const activityId = template.id || template.variant_id;
@@ -2109,7 +2220,18 @@ app.post('/recommend', async (c) => {
       // Sort by Thompson sample (highest first)
       .sort((a: any, b: any) => b.selection_metadata.sample - a.selection_metadata.sample)
       // Take top N
-      .slice(0, limit);
+      .slice(0, limit)
+      // Final defensive filter: ensure all recommendations have valid template_id
+      .filter((rec: any) => {
+        if (!rec.template_id || typeof rec.template_id !== 'string' || rec.template_id.trim() === '') {
+          logger.error('Filtering out recommendation with invalid template_id (should not happen)', {
+            template_name: rec.template_name,
+            template_id: rec.template_id,
+          });
+          return false;
+        }
+        return true;
+      });
 
     // Generate correlation IDs for selection-to-execution linkage
     const timestamp = Date.now();
@@ -2280,15 +2402,15 @@ app.post('/create-goal-seeking', async (c) => {
       },
     });
 
-    // Insert template into database (activity_registry is the base table)
+    // Insert template into database (activity is the canonical table)
+    // Use canonical field names from GeneratedActivity interface
     const templateRecord: Record<string, any> = {
-      id: generated.variant_id,
-      activity_id: generated.activity_id,
-      name: generated.variant_name,
+      id: generated.id,
+      name: generated.name,
       description: generated.description,
-      execution_format: 'template',
+      execution_type: generated.execution_type,
       category: generated.category,
-      task_steps: generated.task_steps,
+      tasks: generated.tasks,
       scope: generated.scope,
     };
 
@@ -2301,7 +2423,7 @@ app.post('/create-goal-seeking', async (c) => {
 
     const fields = Object.keys(templateRecord).map(k => `${k}: $${k}`).join(',\n        ');
     const insertTemplateQuery = `
-      INSERT INTO activity_registry {
+      INSERT INTO activity {
         ${fields},
         created_at: time::now(),
         updated_at: time::now()
@@ -2310,20 +2432,20 @@ app.post('/create-goal-seeking', async (c) => {
 
     try {
       await surrealDB.query(insertTemplateQuery, templateRecord);
-      logger.debug('Generated template inserted into activity_registry', {
-        variant_id: generated.variant_id,
+      logger.debug('Generated template inserted into activity table', {
+        id: generated.id,
       });
     } catch (insertError: any) {
       // Check if this is a duplicate key error
       if (insertError?.message?.includes('already contains') ||
-          insertError?.message?.includes('idx_activity_registry_id')) {
+          insertError?.message?.includes('idx_activity_id')) {
         logger.info('Template already exists, returning existing template', {
-          variant_id: generated.variant_id,
+          id: generated.id,
         });
         // Return success with existing template ID
         return c.json({
           status: 'success',
-          template_id: generated.variant_id,
+          template_id: generated.id,
           existing: true,
         });
       }
@@ -2334,7 +2456,7 @@ app.post('/create-goal-seeking', async (c) => {
     // Initialize Thompson Sampling metrics
     const insertMetricsQuery = `
       INSERT INTO variant_performance_metrics {
-        variant_id: $variant_id,
+        variant_id: $activity_id,
         activity_id: $activity_id,
         total_executions: 0,
         successful_executions: 0,
@@ -2351,12 +2473,11 @@ app.post('/create-goal-seeking', async (c) => {
     `;
 
     await surrealDB.query(insertMetricsQuery, {
-      variant_id: generated.variant_id,
-      activity_id: generated.activity_id,
+      activity_id: generated.id,
     });
 
     logger.info('Created improvised activity template', {
-      variant_id: generated.variant_id,
+      id: generated.id,
       category: generated.category,
     });
 
@@ -2366,7 +2487,7 @@ app.post('/create-goal-seeking', async (c) => {
 
     return c.json({
       status: 'success',
-      template_id: generated.variant_id,
+      template_id: generated.id,
     });
   } catch (error) {
     logger.error('Failed to create goal-seeking activity', { error });

@@ -1,16 +1,23 @@
 /**
  * JWT Authentication Middleware
  *
- * Detects MiniBob JWT tokens from Authorization header and extracts claims.
- * Works alongside Redis session-based auth - JWT takes precedence when present.
+ * Supports two authentication header formats:
+ * - Authorization: Bearer <jwt>  - JWT tokens (from SurrealDB signin or identity-vessel)
+ * - Authorization: ApiKey <key>  - API keys (validated via identity-vessel HMAC)
  *
- * JWT tokens are obtained via POST /v2/auth/minibob/signin and contain:
- * - org_id: Organization the MiniBob instance belongs to
- * - project_id: Optional project scope
- * - instance_id: MiniBob instance identifier
+ * JWT tokens contain claims that are validated against SurrealDB:
+ * - org_id: Organization the caller belongs to
+ * - project_id: Optional project scope (MiniBob instances)
+ * - project_ids: Array of accessible projects (API key users)
+ * - instance_id: MiniBob instance identifier (if applicable)
  *
- * When JWT is present, routes should use queryWithAuth() to let SurrealDB
+ * When authenticated, routes should use queryWithAuth() to let SurrealDB
  * enforce RBAC via PERMISSIONS clauses using $auth.org_id.
+ *
+ * Auth Pattern Consolidation (2026-04-03):
+ * - Removed apikey_record SurrealDB ACCESS method (legacy)
+ * - API keys now validated via identity-vessel HMAC pattern
+ * - Use explicit header prefixes instead of eyJ detection heuristic
  */
 
 import { Context, Next } from 'hono';
@@ -25,22 +32,89 @@ export interface JwtAuthContext {
   // For API key users: array of accessible projects (from project_members)
   projectIds?: string[];
   instanceId?: string;
+  // Track auth type for debugging and metrics
+  authType?: 'jwt' | 'apikey' | 'minibob_token';
+}
+
+/**
+ * Validate API key via identity-vessel HMAC
+ */
+async function validateApiKeyViaIdentityVessel(apiKey: string): Promise<JwtAuthContext | null> {
+  const identityVesselUrl =
+    process.env.IDENTITY_VESSEL_URL ||
+    'http://identity-vessel.activity-system.svc.cluster.local:8080';
+
+  try {
+    const response = await fetch(`${identityVesselUrl}/v1/auth/resolve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        impulse: {
+          type: 'authentication',
+          pointer: { type: 'apiKey', apiKey },
+        },
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!response.ok) {
+      logger.warn('Identity vessel API key validation failed', { status: response.status });
+      return null;
+    }
+
+    const result = await response.json() as {
+      success: boolean;
+      data?: {
+        authenticated: boolean;
+        orgId: string;
+        userId: string;
+        keyId: string;
+        scopes: string[];
+      };
+    };
+
+    if (!result.success || !result.data?.authenticated) {
+      return null;
+    }
+
+    // For API keys, we don't have a JWT token - identity-vessel validates via HMAC
+    // We create a synthetic token for the context that includes the validated claims
+    const syntheticToken = Buffer.from(JSON.stringify({
+      type: 'apikey_validated',
+      orgId: result.data.orgId,
+      userId: result.data.userId,
+      keyId: result.data.keyId,
+      scopes: result.data.scopes,
+      validatedAt: Date.now(),
+    })).toString('base64');
+
+    return {
+      jwtToken: syntheticToken,
+      orgId: result.data.orgId,
+      authType: 'apikey',
+    };
+  } catch (error) {
+    const err = error as Error;
+    logger.error('Identity vessel API key validation error', { error: err.message });
+    return null;
+  }
 }
 
 /**
  * JWT authentication middleware
  *
- * Extracts JWT token from Authorization header and validates it against SurrealDB.
- * If valid, sets jwtAuth context with token and claims for downstream use.
+ * Extracts token from Authorization header and validates based on header prefix:
+ * - Bearer: JWT token validated against SurrealDB
+ * - ApiKey: API key validated via identity-vessel HMAC
  *
- * Allows requests without JWT to proceed (falls back to Redis session auth).
+ * Allows requests without auth header to proceed (falls back to Redis session auth).
  */
 export async function jwtAuthMiddleware(c: Context, next: Next) {
   const authHeader = c.req.header('Authorization');
-  logger.info('JWT middleware called', {
+  logger.debug('Auth middleware called', {
     path: c.req.path,
     hasAuthHeader: !!authHeader,
-    authHeaderPrefix: authHeader ? authHeader.substring(0, 30) + '...' : 'none'
+    authHeaderPrefix: authHeader ? authHeader.substring(0, 20) + '...' : 'none'
   });
 
   if (!authHeader) {
@@ -49,60 +123,72 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
     return;
   }
 
-  const match = authHeader.match(/^Bearer\s+(.+)$/i);
-  if (!match) {
+  // Check for ApiKey prefix first (API keys validated via identity-vessel)
+  const apiKeyMatch = authHeader.match(/^ApiKey\s+(.+)$/i);
+  if (apiKeyMatch) {
+    const apiKey = apiKeyMatch[1];
+    logger.debug('Processing ApiKey auth header');
+
+    const jwtAuth = await validateApiKeyViaIdentityVessel(apiKey);
+    c.set('jwtAuth', jwtAuth);
+
+    if (jwtAuth) {
+      logger.info('API key authenticated via identity-vessel', { orgId: jwtAuth.orgId });
+    } else {
+      logger.warn('API key validation failed');
+    }
+
+    await next();
+    return;
+  }
+
+  // Check for Bearer prefix (JWT tokens)
+  const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (!bearerMatch) {
+    logger.debug('Unrecognized auth header format');
     c.set('jwtAuth', null);
     await next();
     return;
   }
 
-  const token = match[1];
+  const token = bearerMatch[1];
 
-  // Detect if this is a JWT token (contains periods) vs a simple base64 token
-  // JWT format: header.payload.signature (3 parts separated by .)
-  // Simple base64: no periods (our simplified MiniBob auth)
+  // Handle simple base64 token (MiniBob simplified auth)
   if (!token.includes('.')) {
-    // Try to parse as simple base64 token (from simplified MiniBob auth)
     try {
       const decoded = JSON.parse(Buffer.from(token, 'base64').toString());
       if (decoded.instanceId && decoded.orgId && decoded.expiresAt) {
-        // Check if token is expired
         if (decoded.expiresAt < Date.now()) {
-          logger.warn('Token expired', { expiresAt: new Date(decoded.expiresAt) });
+          logger.warn('MiniBob token expired', { expiresAt: new Date(decoded.expiresAt) });
           c.set('jwtAuth', null);
           await next();
           return;
         }
 
-        // Valid simple base64 token
         const jwtAuth: JwtAuthContext = {
           jwtToken: token,
           orgId: decoded.orgId,
           projectId: decoded.projectId,
           instanceId: decoded.instanceId,
+          authType: 'minibob_token',
         };
         c.set('jwtAuth', jwtAuth);
-        logger.info('Simple base64 token authenticated', { orgId: decoded.orgId, instanceId: decoded.instanceId });
+        logger.info('MiniBob simple token authenticated', { orgId: decoded.orgId, instanceId: decoded.instanceId });
         await next();
         return;
       }
-    } catch (e) {
-      // Not a valid simple token - let Redis session auth handle it
-      c.set('jwtAuth', null);
-      await next();
-      return;
+    } catch {
+      // Not a valid MiniBob token - fall through
     }
 
-    // Not a valid token format
     c.set('jwtAuth', null);
     await next();
     return;
   }
 
-  // Count periods to verify JWT structure (should have exactly 2)
+  // Validate JWT structure (should have exactly 2 periods)
   const periodCount = (token.match(/\./g) || []).length;
   if (periodCount !== 2) {
-    // Malformed JWT - reject
     logger.warn('Malformed JWT token structure', { periodCount });
     c.set('jwtAuth', null);
     await next();
@@ -158,6 +244,7 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
         ? auth.project_ids.map((p: unknown) => String(p).replace(/^projects:/, ''))
         : undefined,
       instanceId: auth.instance_id,
+      authType: 'jwt',
     };
 
     logger.debug('JWT authentication successful', {
