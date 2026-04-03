@@ -237,6 +237,30 @@ export const ImpulsePointerSchema = z.object({
   source: z.string().optional(), // source identifier
 });
 
+/**
+ * Impulse metadata schema for impulse-driven investigation
+ * Contains: shape, rowCount, columns, sample, availableOps, producedBy, etc.
+ */
+export const ImpulseMetadataObjectSchema = z.object({
+  // Shape describes the data structure
+  shape: z.string().optional(),
+  // Count information for reasoning
+  rowCount: z.number().int().optional(),
+  // Column names for tabular data
+  columns: z.array(z.string()).optional(),
+  // Sample data for LLM context
+  sample: z.array(z.any()).optional(),
+  // Human-readable summary
+  summary: z.string().optional(),
+  // Available operations for process_impulse
+  availableOps: z.array(z.string()).optional(),
+  // Lineage tracking for investigation chains
+  producedBy: z.string().optional(),
+  // Legacy fields for backward compatibility
+  tags: z.array(z.string()).optional(),
+  content: z.string().optional(),
+}).passthrough(); // Allow additional metadata fields
+
 export const ImpulseDataSchema = z.object({
   id: z.string(),
   type: z.string(),
@@ -245,7 +269,8 @@ export const ImpulseDataSchema = z.object({
   // Accept both string ("high", "medium", "low") and number (1, 2, 3, 4)
   priority: z.union([z.number(), z.string()]).optional(),
   scope: z.string().optional(),
-  metadata: z.record(z.any()).optional(),
+  // Full metadata object for impulse-driven investigation
+  metadata: ImpulseMetadataObjectSchema.optional(),
 });
 
 export const ImpulseCreateRequestSchema = z.object({
@@ -273,6 +298,7 @@ export const ImpulseListResponseSchema = z.object({
 
 // Type exports for impulses
 export type ImpulsePointer = z.infer<typeof ImpulsePointerSchema>;
+export type ImpulseMetadataObject = z.infer<typeof ImpulseMetadataObjectSchema>;
 export type ImpulseData = z.infer<typeof ImpulseDataSchema>;
 export type ImpulseCreateRequest = z.infer<typeof ImpulseCreateRequestSchema>;
 export type ImpulseResponse = z.infer<typeof ImpulseResponseSchema>;

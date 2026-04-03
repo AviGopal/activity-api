@@ -491,25 +491,28 @@ app.post('/templates', async (c) => {
       } as CreateTemplateResponse, 409);
     }
 
-    // Build activity record using activity_registry schema
+    // Build activity record using new activity table schema
     const activityRecord: Record<string, any> = {
       id: validated.variant_id,
       name: validated.variant_name,
       description: validated.description,
-      execution_format: 'template',
+      execution_type: 'template',
       // Hierarchical tags (primary classification)
       tags,
       tag_prefixes: tagPrefixes,
       // Legacy category for backward compatibility
       category: derivedCategory,
-      scope: validated.scope || 'global',
-      public: validated.public !== undefined ? validated.public : (validated.scope === 'global'),
-      org_id: validated.org_id || orgId,
+      scope: validated.scope || 'org',
     };
 
-    // Add task_steps (schema field name)
+    // Add org_id only if provided (optional field, let schema handle default)
+    if (validated.org_id || orgId) {
+      activityRecord.org_id = validated.org_id || orgId;
+    }
+
+    // Add tasks (new schema field name, was task_steps)
     if (validated.task_steps && validated.task_steps.length > 0) {
-      activityRecord.task_steps = validated.task_steps;
+      activityRecord.tasks = validated.task_steps;
     }
 
     // Add optional fields only if provided
@@ -517,13 +520,13 @@ app.post('/templates', async (c) => {
       activityRecord.project_id = validated.project_id || projectId;
     }
     if (validated.genealogy && Object.keys(validated.genealogy).length > 0) {
-      activityRecord.genealogy = validated.genealogy;
+      activityRecord.variant_of = validated.genealogy;
     }
 
     // Build dynamic query with only provided fields
     const fields = Object.keys(activityRecord).map(k => `${k}: $${k}`).join(',\n        ');
     const insertActivityQuery = `
-      INSERT INTO activity_registry {
+      INSERT INTO activity {
         ${fields},
         created_at: time::now(),
         updated_at: time::now()
@@ -541,7 +544,8 @@ app.post('/templates', async (c) => {
 
     // Create initial performance metrics
     // org_id is optional - use session org or request value if provided
-    const metricsOrgId = validated.org_id || orgId || 'metabob_internal';
+    // Use record format for consistency with JWT $auth.org_id
+    const metricsOrgId = validated.org_id || orgId || 'organizations:metabob_internal';
     const metricsProjectId = validated.project_id || projectId;
 
     // Build metrics query with conditional project_id
