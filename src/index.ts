@@ -128,7 +128,9 @@ app.get('/health', async (c) => {
   return c.json(healthStatus, allHealthy ? 200 : 503);
 });
 
-// Authentication routes (no auth middleware - handles authentication itself)
+// Authentication routes - DEPRECATED (vessel alignment 2026-04-02)
+// MiniBob auth moved to identity-vessel: POST https://identity.metabob.local/v1/auth/minibob/signin
+// This empty router is kept for documentation and to return 404 for legacy auth calls
 app.route('/v2/auth', authRoutes);
 
 // Activity routes (GET /v2/activities/templates, etc.)
