@@ -82,7 +82,7 @@ describe('Goal Impulse Resolver', () => {
     expect(content.recommendations.length).toBeLessThanOrEqual(2);
   });
 
-  test('should handle category filter', async () => {
+  test('should apply category preference boost', async () => {
     const res = await app.request('/v2/impulses/resolve', {
       method: 'POST',
       headers: {
@@ -103,9 +103,21 @@ describe('Goal Impulse Resolver', () => {
     const data = await res.json();
     const content = JSON.parse(data.content);
 
-    // All recommendations should be in 'feature' category
+    // Category is now a soft boost, not a hard filter
+    // Verify the response includes boost information
+    expect(content.recommendations.length).toBeGreaterThan(0);
+
+    // Check that recommendations include boost breakdown
     for (const rec of content.recommendations) {
-      expect(rec.category).toBe('feature');
+      expect(rec.selection_metadata).toBeDefined();
+      expect(rec.selection_metadata.boost_breakdown).toBeDefined();
+
+      // Category match boost should be present
+      if (rec.category === 'feature') {
+        expect(rec.selection_metadata.boost_breakdown.category_match).toBe(3);
+      } else {
+        expect(rec.selection_metadata.boost_breakdown.category_match).toBe(0);
+      }
     }
   });
 

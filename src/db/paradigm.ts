@@ -533,20 +533,14 @@ export async function queryActivitiesByShapes(
     const params: Record<string, any> = { limit };
 
     // Shape matching: activity.input_shapes must be subset of availableShapes
+    // Also include activities with empty input_shapes (backward compat)
     if (availableShapes && availableShapes.length > 0) {
-      whereClauses.push(`input_shapes ALLINSIDE $available_shapes`);
+      whereClauses.push(`(input_shapes = [] OR input_shapes ALLINSIDE $available_shapes)`);
       params.available_shapes = availableShapes;
     }
 
-    // Include activities with empty input_shapes (backward compat)
-    if (availableShapes && availableShapes.length > 0) {
-      whereClauses.push(`(input_shapes = [] OR input_shapes ALLINSIDE $available_shapes)`);
-    }
-
-    if (category) {
-      whereClauses.push(`category = $category`);
-      params.category = category;
-    }
+    // NOTE: Category filtering is now a soft boost in Thompson Sampling, not a hard filter
+    // This allows exploration of activities in other categories while still preferring matches
 
     // T8: Filter by execution_type if provided
     if (executionType) {
@@ -622,10 +616,12 @@ export async function queryActivitiesByShapes(
     const whereClauses: string[] = [];
     const params: Record<string, any> = { limit };
 
-    if (category) {
-      whereClauses.push(`category = $category`);
-      params.category = category;
-    }
+    // NOTE: Category is now a soft boost in Thompson Sampling, not a hard filter
+    // Keeping legacy path consistent with paradigm path
+    // if (category) {
+    //   whereClauses.push(`category = $category`);
+    //   params.category = category;
+    // }
 
     if (orgId) {
       whereClauses.push(`(scope IS NULL OR scope = 'global' OR (scope = 'org' AND org_id = $org_id))`);
@@ -899,6 +895,213 @@ export async function getShapeConditionedScores(
     path: globalResult.path,
     latency_ms: Date.now() - startTime,
   };
+}
+
+/**
+ * Query activities using full-text search on name and description.
+ * Uses BM25 scoring from the idx_activity_name_fts and idx_activity_description_fts indexes.
+ *
+ * The search uses the @@ operator for FTS matching with score indices:
+ * - @0@@ binds to name index (search::score(0))
+ * - @1@@ binds to description index (search::score(1))
+ *
+ * Name matches are weighted 2x higher than description matches to prioritize
+ * activities where the search term appears in the title.
+ *
+ * @param searchQuery - Search query string (tokenized and stemmed by activity_analyzer)
+ * @param orgId - Organization ID for multi-tenant filtering (optional)
+ * @param executionType - Filter by execution_type (template, tool, composition, vessel_function)
+ * @param limit - Maximum number of results to return (default 50)
+ * @param jwtToken - Optional JWT token for RBAC
+ * @returns Activities matching the search query, ordered by FTS relevance score
+ *
+ * @example
+ * // Search for activities related to "typescript compilation"
+ * const result = await queryActivitiesByFTS('typescript compilation', 'metabob_internal');
+ *
+ * @example
+ * // Search for template activities only
+ * const result = await queryActivitiesByFTS('fix bug', 'metabob_internal', 'template');
+ */
+export async function queryActivitiesByFTS(
+  searchQuery: string,
+  orgId?: string | null,
+  executionType?: 'template' | 'tool' | 'composition' | 'vessel_function' | null,
+  limit: number = 50,
+  jwtToken?: string | null
+): Promise<QueryPathResult<ParadigmActivity & { fts_score: number }>> {
+  const startTime = Date.now();
+
+  // Handle empty search query gracefully
+  if (!searchQuery || searchQuery.trim() === '') {
+    logger.debug('[paradigm] queryActivitiesByFTS: empty search query, returning empty result');
+    return {
+      data: [],
+      path: 'new',
+      latency_ms: Date.now() - startTime,
+    };
+  }
+
+  const trimmedQuery = searchQuery.trim();
+
+  try {
+    // Build WHERE clause parts
+    const whereClauses: string[] = [];
+    const params: Record<string, any> = {
+      query: trimmedQuery,
+      limit,
+    };
+
+    // FTS matching on name (score index 0) OR description (score index 1)
+    // Note: We use separate score indices to allow weighted scoring
+    whereClauses.push(`(name @0@@ $query OR description @1@@ $query)`);
+
+    // Multi-tenant filtering: include global scope OR org-specific activities
+    if (orgId) {
+      whereClauses.push(`(scope = 'global' OR org_id = $org_id)`);
+      params.org_id = orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`;
+    } else if (!jwtToken) {
+      // No org_id and no JWT: only show global activities
+      whereClauses.push(`scope = 'global'`);
+    }
+    // When jwtToken is present, RBAC permissions will filter by $auth.org_id
+
+    // Filter by execution_type if provided
+    if (executionType) {
+      whereClauses.push(`execution_type = $execution_type`);
+      params.execution_type = executionType;
+    }
+
+    const whereClause = whereClauses.join(' AND ');
+
+    // Build query with BM25 score calculation
+    // Weight name matches 2x higher than description matches
+    const query = `
+      SELECT *,
+        search::score(0) * 2 + search::score(1) AS fts_score
+      FROM activity
+      WHERE ${whereClause}
+      ORDER BY fts_score DESC
+      LIMIT $limit
+    `;
+
+    logger.debug('[paradigm] queryActivitiesByFTS: executing query', {
+      searchQuery: trimmedQuery,
+      orgId,
+      executionType,
+      limit,
+      hasJwtToken: !!jwtToken,
+    });
+
+    const result = jwtToken
+      ? await queryWithAuth<ParadigmActivity & { fts_score: number }>(jwtToken, query, params)
+      : await surrealDB.query<ParadigmActivity & { fts_score: number }>(query, params);
+
+    const latencyMs = Date.now() - startTime;
+
+    logger.info('[paradigm] queryActivitiesByFTS: completed', {
+      searchQuery: trimmedQuery,
+      resultCount: result?.length || 0,
+      latency_ms: latencyMs,
+      path: 'new',
+      topScore: result && result.length > 0 ? result[0].fts_score : null,
+    });
+
+    return {
+      data: result || [],
+      path: 'new',
+      latency_ms: latencyMs,
+    };
+
+  } catch (error) {
+    const latencyMs = Date.now() - startTime;
+
+    logger.error('[paradigm] queryActivitiesByFTS: query failed', {
+      searchQuery: trimmedQuery,
+      orgId,
+      executionType,
+      error: error instanceof Error ? error.message : String(error),
+      latency_ms: latencyMs,
+    });
+
+    // Return empty result on error (FTS-only path, no legacy fallback)
+    return {
+      data: [],
+      path: 'new',
+      latency_ms: latencyMs,
+    };
+  }
+}
+
+/**
+ * Update impulse shape activity scores after an execution.
+ * Uses UPSERT pattern to create or update score for each shape/activity pair.
+ *
+ * This enables shape-conditioned Thompson Sampling by tracking how well
+ * each activity performs with specific input shapes. For example:
+ * - "debug-null-pointer" might have high success with ['error', 'source_code']
+ * - but lower success with just ['goal']
+ *
+ * The alpha/beta values follow Thompson Sampling convention:
+ * - alpha = successes + 1 (prior of 1)
+ * - beta = failures + 1 (prior of 1)
+ *
+ * @param activityId - The activity that was executed
+ * @param shapes - Input shapes used in the execution
+ * @param success - Whether the execution succeeded
+ * @param orgId - Organization ID for multi-tenant isolation
+ */
+export async function updateShapeActivityScores(
+  activityId: string,
+  shapes: string[],
+  success: boolean,
+  orgId: string
+): Promise<void> {
+  if (!shapes || shapes.length === 0) return;
+
+  const startTime = Date.now();
+
+  try {
+    // For each shape, upsert the score
+    // This allows us to track per-shape performance independently
+    for (const shape of shapes) {
+      // UPSERT pattern: create if not exists, update if exists
+      // SurrealDB UPSERT with WHERE clause for composite key matching
+      const query = `
+        UPSERT impulse_shape_activity_score
+        SET
+          shape = $shape,
+          activity_id = $activity_id,
+          org_id = $org_id,
+          success_count = IF success_count IS NONE THEN ${success ? 1 : 0} ELSE success_count + ${success ? 1 : 0} END,
+          failure_count = IF failure_count IS NONE THEN ${success ? 0 : 1} ELSE failure_count + ${success ? 0 : 1} END,
+          alpha = IF success_count IS NONE THEN ${success ? 2 : 1} ELSE success_count + ${success ? 2 : 1} END,
+          beta = IF failure_count IS NONE THEN ${success ? 1 : 2} ELSE failure_count + ${success ? 1 : 2} END,
+          updated_at = time::now()
+        WHERE org_id = $org_id AND shape = $shape AND activity_id = $activity_id
+      `;
+
+      await surrealDB.query(query, {
+        shape,
+        activity_id: activityId,
+        org_id: orgId,
+      });
+    }
+
+    logger.debug('[paradigm] Updated shape activity scores', {
+      activity_id: activityId,
+      shapes,
+      success,
+      latency_ms: Date.now() - startTime,
+    });
+  } catch (error) {
+    logger.warn('[paradigm] Failed to update shape activity scores', {
+      activity_id: activityId,
+      shapes,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    // Non-critical, don't throw - this is a learning optimization, not core functionality
+  }
 }
 
 /**

@@ -11,7 +11,7 @@ import { logger } from '../utils/logger';
 import type { SessionData } from '../models/schemas';
 import { getJwtAuthFromContext, hasJwtAuth } from '../middleware/jwtAuth';
 import { config } from '../config';
-import { insertExecution, isDualWriteEnabled, type ParadigmExecution } from '../db/paradigm';
+import { insertExecution, isDualWriteEnabled, updateShapeActivityScores, type ParadigmExecution } from '../db/paradigm';
 
 const app = new Hono();
 
@@ -1006,6 +1006,23 @@ app.post('/', async (c) => {
         });
       }
     } // end isDualWriteEnabled()
+
+    // Update impulse shape activity scores for shape-conditioned Thompson Sampling
+    // Extract input shapes from the execution trace
+    const inputShapes: string[] = body.input_impulse_shapes
+      || trace.input_impulse_shapes
+      || (trace.metadata as any)?.inputShapes
+      || (trace.metadata as any)?.input_shapes
+      || [];
+
+    if (inputShapes.length > 0 && trace.variant_id && orgId) {
+      // Fire and forget - don't block the response
+      updateShapeActivityScores(trace.variant_id, inputShapes, trace.success, orgId)
+        .catch(err => logger.warn('[paradigm] Shape score update failed (non-blocking)', {
+          execution_id: trace.execution_id,
+          error: err instanceof Error ? err.message : String(err),
+        }));
+    }
 
     // M4.2: Forward to learning service (async/non-blocking)
     // Extract modified files from execution trace

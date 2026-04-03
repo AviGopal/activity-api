@@ -13,12 +13,12 @@
  */
 const KEYWORD_TO_TAGS: Record<string, string[]> = {
   // Testing
-  'test': ['utility.code.test', 'utility'],
-  'tests': ['utility.code.test', 'utility'],
-  'testing': ['utility.code.test', 'utility'],
-  'unit test': ['utility.code.test', 'utility'],
-  'integration test': ['utility.code.test', 'utility'],
-  'e2e': ['utility.code.test', 'utility'],
+  'test': ['tool.code.test', 'tool'],
+  'tests': ['tool.code.test', 'tool'],
+  'testing': ['tool.code.test', 'tool'],
+  'unit test': ['tool.code.test', 'tool'],
+  'integration test': ['tool.code.test', 'tool'],
+  'e2e': ['tool.code.test', 'tool'],
 
   // Debugging and analysis
   'debug': ['meta.debug', 'meta'],
@@ -36,7 +36,7 @@ const KEYWORD_TO_TAGS: Record<string, string[]> = {
   // Feature development
   'implement': ['feature', 'feature.vessel'],
   'add': ['feature', 'feature.vessel'],
-  'create': ['feature', 'utility'],
+  'create': ['feature', 'tool'],
   'build': ['feature', 'feature.vessel'],
   'develop': ['feature', 'meta.develop'],
   'feature': ['feature'],
@@ -61,13 +61,13 @@ const KEYWORD_TO_TAGS: Record<string, string[]> = {
   'repair': ['bugfix', 'meta.debug'],
 
   // Code exploration
-  'explore': ['utility.exploration', 'utility'],
-  'exploration': ['utility.exploration', 'utility'],
-  'understand': ['utility.exploration', 'meta.learning'],
-  'analyze structure': ['utility.exploration', 'utility'],
-  'codebase': ['utility.exploration', 'utility'],
-  'dependencies': ['utility.exploration', 'utility'],
-  'architecture': ['utility.exploration', 'meta'],
+  'explore': ['tool.exploration', 'tool'],
+  'exploration': ['tool.exploration', 'tool'],
+  'understand': ['tool.exploration', 'meta.learning'],
+  'analyze structure': ['tool.exploration', 'tool'],
+  'codebase': ['tool.exploration', 'tool'],
+  'dependencies': ['tool.exploration', 'tool'],
+  'architecture': ['tool.exploration', 'meta'],
 
   // Meta-learning
   'extract': ['meta.learning', 'meta'],
@@ -82,17 +82,17 @@ const KEYWORD_TO_TAGS: Record<string, string[]> = {
   // Instrumentation
   'instrument': ['tool.instrumentation', 'tool'],
   'instrumentation': ['tool.instrumentation', 'tool'],
-  'trace': ['tool.instrumentation', 'utility.code.trace'],
-  'tracing': ['tool.instrumentation', 'utility.code.trace'],
+  'trace': ['tool.instrumentation', 'tool.code.trace'],
+  'tracing': ['tool.instrumentation', 'tool.code.trace'],
   'monitor': ['tool.instrumentation', 'tool'],
   'observability': ['tool.instrumentation', 'tool'],
 
   // Documentation
-  'document': ['utility.documentation', 'utility'],
-  'documentation': ['utility.documentation', 'utility'],
-  'readme': ['utility.documentation', 'utility'],
-  'docs': ['utility.documentation', 'utility'],
-  'comment': ['utility.documentation', 'utility'],
+  'document': ['tool.documentation', 'tool'],
+  'documentation': ['tool.documentation', 'tool'],
+  'readme': ['tool.documentation', 'tool'],
+  'docs': ['tool.documentation', 'tool'],
+  'comment': ['tool.documentation', 'tool'],
 
   // Infrastructure
   'deploy': ['infrastructure', 'tool.deployment'],
@@ -115,11 +115,58 @@ const KEYWORD_TO_TAGS: Record<string, string[]> = {
   'message': ['feature.vessel.state.communication', 'feature'],
 
   // Code quality
-  'lint': ['utility.code.quality', 'utility'],
-  'format': ['utility.code.quality', 'utility'],
-  'type': ['utility.code.quality', 'utility'],
-  'types': ['utility.code.quality', 'utility'],
-  'typescript': ['utility.code.quality', 'utility'],
+  'lint': ['tool.code.quality', 'tool'],
+  'format': ['tool.code.quality', 'tool'],
+  'type': ['tool.code.quality', 'tool'],
+  'types': ['tool.code.quality', 'tool'],
+  'typescript': ['tool.code.quality', 'tool'],
+
+  // Security
+  'security': ['bugfix.security', 'bugfix'],
+  'vulnerability': ['bugfix.security', 'bugfix'],
+  'cve': ['bugfix.security', 'bugfix'],
+  'auth': ['feature.security', 'feature.vessel.api'],
+  'authentication': ['feature.security', 'feature.vessel.api'],
+  'authorization': ['feature.security', 'feature.vessel.api'],
+  'injection': ['bugfix.security', 'bugfix'],
+  'xss': ['bugfix.security', 'bugfix'],
+  'csrf': ['bugfix.security', 'bugfix'],
+
+  // Performance
+  'performance': ['meta.refactor', 'tool'],
+  'slow': ['meta.refactor', 'meta.debug'],
+  'latency': ['meta.refactor', 'meta.debug'],
+  'memory': ['meta.debug', 'meta.refactor'],
+  'cpu': ['meta.debug', 'meta.refactor'],
+  'cache': ['meta.refactor', 'feature.vessel.state'],
+
+  // Migration
+  'migrate': ['infrastructure', 'meta.refactor'],
+  'migration': ['infrastructure', 'meta.refactor'],
+  'upgrade': ['infrastructure', 'meta.refactor'],
+  'schema': ['infrastructure', 'feature.vessel.state'],
+
+  // CI/CD
+  'ci': ['infrastructure', 'tool.deployment'],
+  'cd': ['infrastructure', 'tool.deployment'],
+  'pipeline': ['infrastructure', 'tool.deployment'],
+  'github': ['infrastructure', 'tool'],
+  'actions': ['infrastructure', 'tool'],
+  'workflow': ['infrastructure', 'tool'],
+
+  // Containers
+  'docker': ['infrastructure', 'tool.deployment'],
+  'kubernetes': ['infrastructure', 'tool.deployment'],
+  'k8s': ['infrastructure', 'tool.deployment'],
+  'helm': ['infrastructure', 'tool.deployment'],
+  'container': ['infrastructure', 'tool.deployment'],
+
+  // Logging/Monitoring
+  'log': ['tool.instrumentation', 'tool'],
+  'logging': ['tool.instrumentation', 'tool'],
+  'metrics': ['tool.instrumentation', 'tool'],
+  'alert': ['tool.instrumentation', 'tool'],
+  'dashboard': ['tool.instrumentation', 'tool'],
 };
 
 /**
@@ -204,13 +251,15 @@ export function calculateTagMatchQuality(
  * @returns Suggested impulse shapes to look for
  */
 export function extractImpliedShapes(taskDescription: string): string[] {
+  // NOTE: These shapes must align with the canonical schema shapes:
+  // goal, source_code, error, trace, execution_trace, activity_template,
+  // activity_metrics, test_suite, sql_schema, metrics, config_file
   const shapes = new Set<string>();
   const lowerDesc = taskDescription.toLowerCase();
 
-  // File/code patterns
+  // File/code patterns - use source_code (file is a pointer type, not a shape)
   if (lowerDesc.match(/\b\w+\.(ts|js|py|go|rs|java)\b/)) {
     shapes.add('source_code');
-    shapes.add('file');
   }
 
   // Error/failure patterns
@@ -221,17 +270,17 @@ export function extractImpliedShapes(taskDescription: string): string[] {
 
   // Execution/trace patterns
   if (lowerDesc.match(/\b(execution|trace|activity|run|running)\b/)) {
-    shapes.add('activityExecutionTrace');
+    shapes.add('execution_trace');
   }
 
   // Template/pattern patterns
   if (lowerDesc.match(/\b(template|activity|pattern|variant)\b/)) {
-    shapes.add('activityTemplate');
+    shapes.add('activity_template');
   }
 
   // Metrics/performance patterns
   if (lowerDesc.match(/\b(metric|performance|stats|success rate|failing)\b/)) {
-    shapes.add('activityMetrics');
+    shapes.add('activity_metrics');
   }
 
   // Test patterns
@@ -241,8 +290,35 @@ export function extractImpliedShapes(taskDescription: string): string[] {
   }
 
   // Goal/requirement patterns
-  if (lowerDesc.match(/\b(goal|requirement|spec|requirement)\b/)) {
-    shapes.add('goal_text');
+  if (lowerDesc.match(/\b(goal|requirement|spec)\b/)) {
+    shapes.add('goal');
+  }
+
+  // Security patterns - security issues are a type of error
+  if (lowerDesc.match(/\b(security|vulnerability|cve|auth|injection|xss|csrf)\b/)) {
+    shapes.add('error');
+    shapes.add('source_code');
+  }
+
+  // Migration patterns - migrations are sql_schema
+  if (lowerDesc.match(/\b(migrat|upgrade|schema|database)\b/)) {
+    shapes.add('sql_schema');
+  }
+
+  // Performance patterns
+  if (lowerDesc.match(/\b(performance|slow|optimize|latency|memory|cpu)\b/)) {
+    shapes.add('metrics');
+    shapes.add('trace');
+  }
+
+  // CI/CD patterns - ci configs and workflows are config_file
+  if (lowerDesc.match(/\b(ci|cd|pipeline|github|actions|workflow)\b/)) {
+    shapes.add('config_file');
+  }
+
+  // Container patterns - container and infrastructure configs are config_file
+  if (lowerDesc.match(/\b(docker|kubernetes|k8s|helm|container)\b/)) {
+    shapes.add('config_file');
   }
 
   return Array.from(shapes);
@@ -252,10 +328,9 @@ export function extractImpliedShapes(taskDescription: string): string[] {
  * Compute comprehensive semantic analysis of task description
  *
  * @param taskDescription - Natural language goal description
- * @param loadedImpulses - Currently available impulse IDs (optional)
  * @returns Analysis with tag prefixes, match quality helper, and shape suggestions
  */
-export function analyzeTaskSemantics(taskDescription: string, loadedImpulses?: string[]) {
+export function analyzeTaskSemantics(taskDescription: string) {
   const tagPrefixes = extractTagPrefixes(taskDescription);
   const impliedShapes = extractImpliedShapes(taskDescription);
 

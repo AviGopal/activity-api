@@ -1136,10 +1136,12 @@ router.post('/resolve', async (c) => {
 
         // Handle category filter - can be string or array
         const categoryValue = Array.isArray(category) ? category[0] : category;
-        if (categoryValue && categoryValue !== 'tool') {
-          whereClause = 'WHERE category = $category';
-          params.category = categoryValue;
-        }
+        // NOTE: Category is now a soft boost in Thompson Sampling, not a hard filter
+        // The /recommend endpoint handles category as a preference signal
+        // if (categoryValue && categoryValue !== 'tool') {
+        //   whereClause = 'WHERE category = $category';
+        //   params.category = categoryValue;
+        // }
 
         const templatesQuery = `
           SELECT variant_id, variant_name, description, category, task_steps, created_at
