@@ -71,6 +71,8 @@ interface ExecutionTrace {
   };
   org_id: string | null;
   project_id: string | null;
+  vessel_id?: string;
+  vessel_version?: string;
   executed_at: string;
   created_at: string;
   // Edge learning fields
@@ -985,6 +987,7 @@ app.post('/', async (c) => {
         org_id: typeof trace.org_id === 'string' ? trace.org_id : undefined,
         project_id: typeof trace.project_id === 'string' ? trace.project_id : undefined,
         vessel_id: body.vessel_id || body.pod_name,
+        vessel_version: body.vessel_version,
       };
 
       const paradigmResult = await insertExecution(paradigmExecution, jwtAuth?.jwtToken);

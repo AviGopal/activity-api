@@ -76,6 +76,11 @@ DEFINE FIELD IF NOT EXISTS created_at ON impulse TYPE datetime
 
 DEFINE FIELD IF NOT EXISTS expires_at ON impulse TYPE option<datetime>;
 
+-- Rich metadata for impulse-driven investigation
+-- Contains: rowCount, columns, sample, availableOps, producedBy, etc.
+DEFINE FIELD IF NOT EXISTS metadata ON impulse TYPE option<object> FLEXIBLE
+  COMMENT "Rich metadata: rowCount, columns, sample, availableOps, producedBy";
+
 -- Indexes
 DEFINE INDEX IF NOT EXISTS idx_impulse_id ON impulse FIELDS id UNIQUE;
 DEFINE INDEX IF NOT EXISTS idx_impulse_shape ON impulse FIELDS shape;
@@ -271,6 +276,9 @@ DEFINE FIELD IF NOT EXISTS project_id ON execution TYPE option<record<projects>>
 DEFINE FIELD IF NOT EXISTS vessel_id ON execution TYPE option<string>
   COMMENT "Vessel that executed this activity";
 
+DEFINE FIELD IF NOT EXISTS vessel_version ON execution TYPE option<string>
+  COMMENT "Vessel version in format semver-sha7 (e.g., 0.3.3-f24a329) for learning correlation";
+
 DEFINE FIELD IF NOT EXISTS created_by ON execution TYPE option<record<users> | record<minibob_instance>>
   VALUE $value OR $auth.id;
 
@@ -302,6 +310,7 @@ DEFINE INDEX IF NOT EXISTS idx_execution_parent ON execution FIELDS parent_execu
 DEFINE INDEX IF NOT EXISTS idx_execution_org ON execution FIELDS org_id;
 DEFINE INDEX IF NOT EXISTS idx_execution_org_activity ON execution FIELDS org_id, activity_id;
 DEFINE INDEX IF NOT EXISTS idx_execution_vessel ON execution FIELDS vessel_id;
+DEFINE INDEX IF NOT EXISTS idx_execution_vessel_version ON execution FIELDS vessel_version;
 DEFINE INDEX IF NOT EXISTS idx_execution_executed_at ON execution FIELDS executed_at;
 
 -- Composite index for dashboard success rate time-series queries
