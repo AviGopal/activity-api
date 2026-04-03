@@ -1110,13 +1110,11 @@ app.post('/executions', async (c) => {
     const session = (c.get as any)('session') as SessionData | undefined;
 
     // Use JWT auth claims if available, otherwise fall back to session
-    // Ensure record format (organizations:xxx) for SurrealDB schema requirements
-    const rawOrgId = jwtAuth?.orgId || session?.org_id || null;
+    // org_id is a string field (not a record), project_id is record<projects>
+    const orgId = jwtAuth?.orgId || session?.org_id || null;
     const rawProjectId = jwtAuth?.projectId || session?.project_id || null;
 
-    const orgId = rawOrgId
-      ? (rawOrgId.startsWith('organizations:') ? rawOrgId : `organizations:${rawOrgId}`)
-      : null;
+    // Only project_id needs record format (record<projects>)
     const projectId = rawProjectId
       ? (rawProjectId.startsWith('projects:') ? rawProjectId : `projects:${rawProjectId}`)
       : null;
@@ -1221,9 +1219,9 @@ app.post('/executions', async (c) => {
     }
 
     // Build dynamic query with only provided fields
-    // org_id and project_id need type::record() casting for SurrealDB
+    // org_id is string, project_id needs type::record() casting for SurrealDB
     const execFields = Object.keys(executionRecord).map(k => {
-      if (k === 'org_id' || k === 'project_id') {
+      if (k === 'project_id') {
         return `${k}: type::record($${k})`;
       }
       return `${k}: $${k}`;

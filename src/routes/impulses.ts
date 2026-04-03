@@ -228,13 +228,32 @@ router.post('/', async (c) => {
     // Use the pointer from impulse_data directly (already has proper structure)
     const pointer = impulse_data.pointer;
 
+    // Build query params dynamically to avoid sending null for optional fields
+    // SurrealDB's option<T> expects either a value or the field to be omitted, not null
+    const params: Record<string, any> = {
+      impulse_id,
+      pointer,
+      shape,
+      metadata: impulse_data.metadata || {},
+      token_estimate: impulse_data.budget || 0,
+      org_id,
+      project_id,
+      created_by,
+    };
+
+    // Only include content if it has a value (avoid null → NULL coercion issue)
+    const contentField = pointer.content ? 'content: $content,' : '';
+    if (pointer.content) {
+      params.content = pointer.content;
+    }
+
     // Create impulse record using new schema
     const createQuery = `
       CREATE impulse CONTENT {
         id: $impulse_id,
         pointer: $pointer,
         shape: $shape,
-        content: $content,
+        ${contentField}
         metadata: $metadata,
         token_estimate: $token_estimate,
         org_id: $org_id,
@@ -244,17 +263,7 @@ router.post('/', async (c) => {
       }
     `;
 
-    await executeQuery<any>(createQuery, {
-      impulse_id,
-      pointer,
-      shape,
-      content: pointer.content || null,
-      metadata: impulse_data.metadata || {},
-      token_estimate: impulse_data.budget || 0,
-      org_id,
-      project_id,
-      created_by,
-    });
+    await executeQuery<any>(createQuery, params);
 
     // Query the created record to get timestamps
     const selectQuery = `SELECT * FROM impulse WHERE id = $impulse_id LIMIT 1`;
