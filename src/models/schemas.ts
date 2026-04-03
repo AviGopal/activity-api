@@ -984,3 +984,57 @@ export const CorpusSummaryResponseSchema = z.object({
 export type ActivityScore = z.infer<typeof ActivityScoreSchema>;
 export type ActivityScoresResponse = z.infer<typeof ActivityScoresResponseSchema>;
 export type CorpusSummaryResponse = z.infer<typeof CorpusSummaryResponseSchema>;
+
+// =============================================================================
+// TOOL ARGUMENT PATTERN TRACKING SCHEMAS
+// =============================================================================
+
+/**
+ * ToolArgumentPatternRecordRequest - Request body for POST /tool-argument-patterns
+ * Records argument patterns observed during tool execution for learning
+ */
+export const ToolArgumentPatternRecordRequestSchema = z.object({
+  activity_id: z.string(),
+  tool_name: z.string(),
+  argument_shape: z.string(),
+  argument_hash: z.string(),
+  arguments: z.record(z.unknown()),
+  execution_succeeded: z.boolean(),
+  execution_ms: z.number(),
+});
+
+/**
+ * ToolArgumentRecommendationsQuery - Query params for GET /tool-argument-recommendations
+ */
+export const ToolArgumentRecommendationsQuerySchema = z.object({
+  activity_id: z.string(),
+});
+
+/**
+ * ToolArgumentPattern - Pattern record from v_argument_recommendations view
+ */
+export const ToolArgumentPatternSchema = z.object({
+  activity_id: z.string(),
+  tool_name: z.string(),
+  argument_shape: z.string(),
+  argument_hash: z.string(),
+  arguments: z.record(z.unknown()),
+  success_rate: z.number(),
+  times_used: z.number().int(),
+  avg_execution_ms: z.number().optional(),
+  last_used_at: z.union([z.string(), z.object({}).passthrough()]).optional(),
+  org_id: z.string().optional(),
+});
+
+/**
+ * ToolArgumentRecommendationsResponse - Response for GET /tool-argument-recommendations
+ */
+export const ToolArgumentRecommendationsResponseSchema = z.object({
+  patterns: z.array(ToolArgumentPatternSchema),
+});
+
+// Type exports for Tool Argument Pattern Tracking
+export type ToolArgumentPatternRecordRequest = z.infer<typeof ToolArgumentPatternRecordRequestSchema>;
+export type ToolArgumentRecommendationsQuery = z.infer<typeof ToolArgumentRecommendationsQuerySchema>;
+export type ToolArgumentPattern = z.infer<typeof ToolArgumentPatternSchema>;
+export type ToolArgumentRecommendationsResponse = z.infer<typeof ToolArgumentRecommendationsResponseSchema>;

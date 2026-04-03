@@ -56,8 +56,8 @@ const betaSample: (alpha: number, betaParam: number) => number = (() => {
 import type { SessionData } from '../models/schemas';
 import { getJwtAuthFromContext, hasJwtAuth, type JwtAuthContext } from '../middleware/jwtAuth';
 import { generateActivity } from '../services/activity-generator';
-import { 
-  ExecutionRecordSchema, 
+import {
+  ExecutionRecordSchema,
   CreateTemplateRequestSchema,
   CompositionRecordRequestSchema,
   CompositionGraphQuerySchema,
@@ -68,7 +68,9 @@ import {
   ExecutionSequenceRecordRequestSchema,
   ExecutionSequenceQuerySchema,
   StoreExecutionTraceRequestSchema,
-  type ExecutionRecord, 
+  ToolArgumentPatternRecordRequestSchema,
+  ToolArgumentRecommendationsQuerySchema,
+  type ExecutionRecord,
   type ExecutionRecordResponse,
   type CreateTemplateRequest,
   type CreateTemplateResponse,
@@ -82,6 +84,8 @@ import {
   type ExecutionSequence,
   type ExecutionSequenceResponse,
   type StoreExecutionTraceResponse,
+  type ToolArgumentPattern,
+  type ToolArgumentRecommendationsResponse,
 } from '../models/schemas';
 import { broadcaster } from '../websocket/broadcaster';
 
@@ -3816,6 +3820,237 @@ app.get('/tags/stats', async (c) => {
     logger.error('Failed to get tag stats', { error: error.message });
     return c.json({
       error: 'Failed to get tag stats',
+      message: error.message,
+    }, 500);
+  }
+});
+
+// =============================================================================
+// Tool Argument Pattern Endpoints
+// =============================================================================
+
+/**
+ * POST /tool-argument-patterns
+ *
+ * Records tool argument patterns observed during activity execution.
+ * Implements upsert logic: if a pattern with the same argument_hash exists,
+ * increments times_used and conditionally times_succeeded, updates rolling
+ * average for execution_ms.
+ *
+ * Learning metrics:
+ * - times_used: Total times this exact argument pattern was used
+ * - times_succeeded: How many of those executions succeeded
+ * - avg_execution_ms: Rolling average execution time
+ * - success_rate: Computed as times_succeeded / times_used
+ *
+ * Use cases:
+ * - Pattern deduplication: Identify repeated argument patterns
+ * - Learning: Which argument patterns lead to success
+ * - Recommendations: Suggest proven arguments for new executions
+ */
+app.post('/tool-argument-patterns', async (c) => {
+  try {
+    const body = await c.req.json();
+
+    // Validate request body
+    const validated = ToolArgumentPatternRecordRequestSchema.parse(body);
+    logger.info('Recording tool argument pattern', {
+      activity: validated.activity_id,
+      tool: validated.tool_name,
+      shape: validated.argument_shape,
+      hash: validated.argument_hash.substring(0, 16) + '...',
+      succeeded: validated.execution_succeeded,
+    });
+
+    // Check if pattern exists
+    const checkQuery = `
+      SELECT * FROM tool_argument_pattern
+      WHERE argument_hash = $hash
+      LIMIT 1
+    `;
+
+    const existing = await surrealDB.query<any[]>(checkQuery, {
+      hash: validated.argument_hash,
+    });
+
+    let pattern: any;
+
+    if (existing && existing.length > 0 && existing[0]) {
+      // Update existing pattern with rolling average for execution_ms
+      const current = existing[0];
+      // @ts-ignore - SurrealDB query typing issue
+      const currentTimesUsed = current.times_used || 0;
+      const successIncrement = validated.execution_succeeded ? 1 : 0;
+
+      const updateQuery = `
+        UPDATE tool_argument_pattern
+        SET
+          times_used = times_used + 1,
+          times_succeeded = times_succeeded + $success_increment,
+          avg_execution_ms = (avg_execution_ms * $current_times_used + $execution_ms) / ($current_times_used + 1),
+          last_used_at = time::now(),
+          updated_at = time::now()
+        WHERE argument_hash = $hash
+        RETURN AFTER
+      `;
+
+      const updateResult = await surrealDB.query<any[]>(updateQuery, {
+        hash: validated.argument_hash,
+        success_increment: successIncrement,
+        current_times_used: currentTimesUsed,
+        execution_ms: validated.execution_ms,
+      });
+
+      pattern = updateResult && updateResult.length > 0 ? updateResult[0] : current;
+
+      logger.info('Updated existing tool argument pattern', {
+        hash: validated.argument_hash.substring(0, 16) + '...',
+        times_used: pattern.times_used,
+        times_succeeded: pattern.times_succeeded,
+      });
+    } else {
+      // Create new pattern
+      const createQuery = `
+        CREATE tool_argument_pattern SET
+          activity_id = $activity_id,
+          tool_name = $tool_name,
+          argument_shape = $argument_shape,
+          argument_hash = $argument_hash,
+          arguments = $arguments,
+          times_used = 1,
+          times_succeeded = $success_increment,
+          avg_execution_ms = $execution_ms,
+          last_used_at = time::now()
+      `;
+
+      const createResult = await surrealDB.query<any[]>(createQuery, {
+        activity_id: validated.activity_id,
+        tool_name: validated.tool_name,
+        argument_shape: validated.argument_shape,
+        argument_hash: validated.argument_hash,
+        arguments: validated.arguments,
+        success_increment: validated.execution_succeeded ? 1 : 0,
+        execution_ms: validated.execution_ms,
+      });
+
+      pattern = createResult && createResult.length > 0 ? createResult[0] : {
+        activity_id: validated.activity_id,
+        tool_name: validated.tool_name,
+        argument_shape: validated.argument_shape,
+        argument_hash: validated.argument_hash,
+        times_used: 1,
+        times_succeeded: validated.execution_succeeded ? 1 : 0,
+        avg_execution_ms: validated.execution_ms,
+      };
+
+      logger.info('Created new tool argument pattern', {
+        hash: validated.argument_hash.substring(0, 16) + '...',
+        tool: validated.tool_name,
+        shape: validated.argument_shape,
+      });
+    }
+
+    return c.json({
+      success: true,
+      pattern,
+    });
+
+  } catch (error: any) {
+    logger.error('Failed to record tool argument pattern', { error: error.message });
+
+    if (error.name === 'ZodError') {
+      return c.json({
+        error: 'Validation failed',
+        message: error.message,
+        details: error.errors,
+      }, 400);
+    }
+
+    return c.json({
+      error: 'Failed to record tool argument pattern',
+      message: error.message,
+    }, 500);
+  }
+});
+
+/**
+ * GET /tool-argument-recommendations
+ *
+ * Returns recommended argument patterns for a given activity from
+ * the v_argument_recommendations view. This view filters for patterns
+ * with sufficient usage (>=3) and high success rate (>=80%).
+ *
+ * Query params:
+ *   activity_id: string (required) - The activity to get recommendations for
+ *
+ * Returns:
+ * {
+ *   patterns: [{
+ *     argument_shape: string,
+ *     argument_hash: string,
+ *     arguments: object,
+ *     success_rate: number,
+ *     times_used: number,
+ *     avg_execution_ms: number,
+ *     tool_name: string
+ *   }]
+ * }
+ *
+ * Use cases:
+ * - Pre-populate tool arguments with proven patterns
+ * - Suggest successful argument combinations
+ * - Reduce exploration when reliable patterns exist
+ */
+app.get('/tool-argument-recommendations', async (c) => {
+  try {
+    const query = c.req.query();
+
+    // Validate query params
+    const validated = ToolArgumentRecommendationsQuerySchema.parse({
+      activity_id: query.activity_id,
+    });
+
+    logger.info('GET /v2/activities/tool-argument-recommendations', { activity_id: validated.activity_id });
+
+    // Query the v_argument_recommendations view
+    const patternsQuery = `
+      SELECT * FROM v_argument_recommendations
+      WHERE activity_id = $activity_id
+        AND org_id = <string>$auth.org_id
+      ORDER BY success_rate DESC, times_used DESC
+      LIMIT 20
+    `;
+
+    const patternsResult = await surrealDB.query<ToolArgumentPattern[]>(patternsQuery, {
+      activity_id: validated.activity_id,
+    });
+
+    const patterns = patternsResult && Array.isArray(patternsResult) ? patternsResult.flat() : [];
+
+    const response: ToolArgumentRecommendationsResponse = {
+      patterns,
+    };
+
+    logger.info('Tool argument recommendations query result', {
+      activity_id: validated.activity_id,
+      patterns_found: patterns.length,
+    });
+
+    return c.json(response);
+
+  } catch (error: any) {
+    logger.error('Failed to get tool argument recommendations', { error: error.message });
+
+    if (error.name === 'ZodError') {
+      return c.json({
+        error: 'Validation failed',
+        message: error.message,
+        details: error.errors,
+      }, 400);
+    }
+
+    return c.json({
+      error: 'Failed to get tool argument recommendations',
       message: error.message,
     }, 500);
   }
