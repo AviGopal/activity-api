@@ -10,7 +10,7 @@
 ARG BUILD_SHA
 ARG BUILD_VERSION
 
-FROM oven/bun:1.1.45 as build
+FROM oven/bun:1.2 as build
 WORKDIR /app
 
 # Copy metabob-proto first (needed by package.json file: reference)
@@ -34,7 +34,7 @@ COPY metabob-proto ./repos/metabob-proto
 # Verify TypeScript compilation
 RUN bun build src/index.ts --target bun --outdir dist
 
-FROM oven/bun:1.1.45-slim
+FROM oven/bun:1.2-slim
 WORKDIR /app
 
 # Re-declare build args for this stage
