@@ -145,7 +145,6 @@ SELECT
 FROM tool_argument_pattern
 WHERE times_used >= 3
   AND (times_succeeded * 1.0 / times_used) >= 0.8
-ORDER BY success_rate DESC, times_used DESC
 PERMISSIONS
   -- SELECT: Users can only see recommendations for their org
   FOR select WHERE org_id = $auth.org_id;
