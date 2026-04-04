@@ -17,6 +17,7 @@ import { logger } from '../utils/logger';
 import { ensureTags, computeTagPrefixes, deriveCategory } from '../utils/tags';
 import { analyzeTaskSemantics } from '../utils/semantic-tags';
 import { calculateImpulseRelevancyBoosts, discoverMissingImpulses } from '../utils/impulse-relevancy';
+import { inferShapesFromTemplate, mergeShapes } from '../utils/shape-inference';
 import { captureValidationTrace } from '../utils/validation-traces';
 import {
   insertActivity,
@@ -578,21 +579,73 @@ app.post('/templates', async (c) => {
     }
 
     // Add input/output shapes for paradigm alignment
+    // Priority: 1. Explicit shapes, 2. Legacy schema conversion, 3. Inference from template
+    let inputShapesProvided = false;
+    let outputShapesProvided = false;
+
     if (validated.input_shapes?.length) {
       activityRecord.input_shapes = validated.input_shapes;
+      inputShapesProvided = true;
     } else if (validated.input_schema?.required) {
       // Convert legacy input_schema to input_shapes
       activityRecord.input_shapes = validated.input_schema.required
         .map((s: any) => typeof s === 'string' ? s : s.shape)
         .filter(Boolean);
+      inputShapesProvided = activityRecord.input_shapes.length > 0;
     }
     if (validated.output_shapes?.length) {
       activityRecord.output_shapes = validated.output_shapes;
+      outputShapesProvided = true;
     } else if (validated.output_schema?.produces) {
       // Convert legacy output_schema to output_shapes
       activityRecord.output_shapes = validated.output_schema.produces
         .map((s: any) => typeof s === 'string' ? s : s.shape)
         .filter(Boolean);
+      outputShapesProvided = activityRecord.output_shapes.length > 0;
+    }
+
+    // Infer shapes from template if not explicitly provided
+    if (!inputShapesProvided || !outputShapesProvided) {
+      try {
+        const inferredShapes = inferShapesFromTemplate({
+          tasks: activityTasks,
+          task_steps: activityTasks, // backward compat
+          description: validated.description,
+          category: derivedCategory,
+        });
+
+        if (!inputShapesProvided && inferredShapes.input_shapes.length > 0) {
+          // Merge with any existing shapes (in case partial shapes were set)
+          activityRecord.input_shapes = mergeShapes(
+            activityRecord.input_shapes,
+            inferredShapes.input_shapes
+          );
+          logger.info('Input shapes inferred from template', {
+            activityId,
+            inferredInputShapes: inferredShapes.input_shapes,
+            mergedInputShapes: activityRecord.input_shapes,
+          });
+        }
+
+        if (!outputShapesProvided && inferredShapes.output_shapes.length > 0) {
+          // Merge with any existing shapes (in case partial shapes were set)
+          activityRecord.output_shapes = mergeShapes(
+            activityRecord.output_shapes,
+            inferredShapes.output_shapes
+          );
+          logger.info('Output shapes inferred from template', {
+            activityId,
+            inferredOutputShapes: inferredShapes.output_shapes,
+            mergedOutputShapes: activityRecord.output_shapes,
+          });
+        }
+      } catch (inferenceError) {
+        // Shape inference is best-effort - don't fail template creation
+        logger.warn('Shape inference failed, continuing without inferred shapes', {
+          activityId,
+          error: inferenceError instanceof Error ? inferenceError.message : String(inferenceError),
+        });
+      }
     }
 
     // Add optional fields only if provided
@@ -3865,7 +3918,7 @@ app.post('/tool-argument-patterns', async (c) => {
     // Check if pattern exists
     const checkQuery = `
       SELECT * FROM tool_argument_pattern
-      WHERE argument_hash = $hash
+      WHERE argument_hash = $hash AND org_id = <string>$auth.org_id
       LIMIT 1
     `;
 
@@ -3890,7 +3943,7 @@ app.post('/tool-argument-patterns', async (c) => {
           avg_execution_ms = (avg_execution_ms * $current_times_used + $execution_ms) / ($current_times_used + 1),
           last_used_at = time::now(),
           updated_at = time::now()
-        WHERE argument_hash = $hash
+        WHERE argument_hash = $hash AND org_id = <string>$auth.org_id
         RETURN AFTER
       `;
 
@@ -4051,6 +4104,270 @@ app.get('/tool-argument-recommendations', async (c) => {
 
     return c.json({
       error: 'Failed to get tool argument recommendations',
+      message: error.message,
+    }, 500);
+  }
+});
+
+// =============================================================================
+// Emergent Shape Network Endpoints
+// =============================================================================
+// These endpoints expose the emergent shape statistics from v_shape_* views.
+// Shapes are discovered through usage, not predefined - these views reveal
+// the network topology that emerges from activity definitions and executions.
+// =============================================================================
+
+/**
+ * Shape network edge representing a transformation from input to output shape
+ */
+interface ShapeNetworkEdge {
+  input_shape: string;
+  output_shape: string;
+  edge_weight: number;
+  activities: string[];
+}
+
+/**
+ * Shape usage statistics by role (input or output)
+ */
+interface ShapeUsage {
+  shape: string;
+  role: 'input' | 'output';
+  activity_count: number;
+  activities: string[];
+}
+
+/**
+ * Shape suggestion for autocomplete
+ */
+interface ShapeAutocomplete {
+  shape: string;
+  total_uses: number;
+  roles: string[];
+}
+
+/**
+ * GET /shapes/network
+ *
+ * Returns the emergent shape transformation graph showing how shapes
+ * transform from inputs to outputs across activities.
+ *
+ * Query params:
+ *   input_shape?: string - Filter to edges from this input shape
+ *   output_shape?: string - Filter to edges producing this output shape
+ *   min_weight?: number - Filter to edges with weight >= this value
+ *   limit?: number - Maximum edges to return (default: 100)
+ *   offset?: number - Pagination offset (default: 0)
+ *
+ * Returns:
+ * {
+ *   edges: ShapeNetworkEdge[],
+ *   total: number
+ * }
+ */
+app.get('/shapes/network', async (c) => {
+  try {
+    const inputShape = c.req.query('input_shape');
+    const outputShape = c.req.query('output_shape');
+    const minWeight = c.req.query('min_weight') ? parseInt(c.req.query('min_weight')!, 10) : undefined;
+    const limit = parseInt(c.req.query('limit') || '100', 10);
+    const offset = parseInt(c.req.query('offset') || '0', 10);
+
+    logger.info('GET /shapes/network', { inputShape, outputShape, minWeight, limit, offset });
+
+    const whereClauses: string[] = [];
+    const params: Record<string, any> = {
+      limit,
+      offset,
+    };
+
+    if (inputShape) {
+      whereClauses.push('input_shape = $input_shape');
+      params.input_shape = inputShape;
+    }
+
+    if (outputShape) {
+      whereClauses.push('output_shape = $output_shape');
+      params.output_shape = outputShape;
+    }
+
+    if (minWeight !== undefined) {
+      whereClauses.push('edge_weight >= $min_weight');
+      params.min_weight = minWeight;
+    }
+
+    let edgesQuery = 'SELECT * FROM v_shape_network';
+    if (whereClauses.length > 0) {
+      edgesQuery += ` WHERE ${whereClauses.join(' AND ')}`;
+    }
+    edgesQuery += ' ORDER BY edge_weight DESC LIMIT $limit START $offset';
+
+    let countQuery = 'SELECT count() as total FROM v_shape_network';
+    if (whereClauses.length > 0) {
+      countQuery += ` WHERE ${whereClauses.join(' AND ')}`;
+    }
+
+    const [edgesResult, countResult] = await Promise.all([
+      surrealDB.query<ShapeNetworkEdge[]>(edgesQuery, params),
+      surrealDB.query<{ total: number }[]>(countQuery, params),
+    ]);
+
+    const edges = edgesResult && Array.isArray(edgesResult) ? edgesResult.flat() : [];
+    // @ts-ignore - SurrealDB query typing issue
+    const total = countResult && countResult.length > 0 && countResult[0] ? (countResult[0].total || 0) : 0;
+
+    logger.info('Shape network query result', { edges: edges.length, total });
+
+    return c.json({
+      edges,
+      total,
+    });
+
+  } catch (error: any) {
+    logger.error('GET /shapes/network failed', { error: error.message, stack: error.stack });
+    return c.json({
+      error: 'Failed to query shape network',
+      message: error.message,
+    }, 500);
+  }
+});
+
+/**
+ * GET /shapes/usage
+ *
+ * Returns shape frequency statistics showing how often each shape
+ * appears as an input or output across activities.
+ *
+ * Query params:
+ *   shape?: string - Filter to a specific shape
+ *   role?: 'input' | 'output' - Filter to a specific role
+ *   limit?: number - Maximum results to return (default: 100)
+ *   offset?: number - Pagination offset (default: 0)
+ *
+ * Returns:
+ * {
+ *   usage: ShapeUsage[],
+ *   total: number
+ * }
+ */
+app.get('/shapes/usage', async (c) => {
+  try {
+    const shape = c.req.query('shape');
+    const role = c.req.query('role');
+    const limit = parseInt(c.req.query('limit') || '100', 10);
+    const offset = parseInt(c.req.query('offset') || '0', 10);
+
+    logger.info('GET /shapes/usage', { shape, role, limit, offset });
+
+    const whereClauses: string[] = [];
+    const params: Record<string, any> = {
+      limit,
+      offset,
+    };
+
+    if (shape) {
+      whereClauses.push('shape = $shape');
+      params.shape = shape;
+    }
+
+    if (role && (role === 'input' || role === 'output')) {
+      whereClauses.push('role = $role');
+      params.role = role;
+    }
+
+    let usageQuery = 'SELECT * FROM v_shape_usage';
+    if (whereClauses.length > 0) {
+      usageQuery += ` WHERE ${whereClauses.join(' AND ')}`;
+    }
+    usageQuery += ' ORDER BY activity_count DESC LIMIT $limit START $offset';
+
+    let countQuery = 'SELECT count() as total FROM v_shape_usage';
+    if (whereClauses.length > 0) {
+      countQuery += ` WHERE ${whereClauses.join(' AND ')}`;
+    }
+
+    const [usageResult, countResult] = await Promise.all([
+      surrealDB.query<ShapeUsage[]>(usageQuery, params),
+      surrealDB.query<{ total: number }[]>(countQuery, params),
+    ]);
+
+    const usage = usageResult && Array.isArray(usageResult) ? usageResult.flat() : [];
+    // @ts-ignore - SurrealDB query typing issue
+    const total = countResult && countResult.length > 0 && countResult[0] ? (countResult[0].total || 0) : 0;
+
+    logger.info('Shape usage query result', { usage: usage.length, total });
+
+    return c.json({
+      usage,
+      total,
+    });
+
+  } catch (error: any) {
+    logger.error('GET /shapes/usage failed', { error: error.message, stack: error.stack });
+    return c.json({
+      error: 'Failed to query shape usage',
+      message: error.message,
+    }, 500);
+  }
+});
+
+/**
+ * GET /shapes/autocomplete
+ *
+ * Returns shape suggestions for UI autocomplete, sorted by frequency.
+ * Shapes emerge from observed usage - this is not a predefined list.
+ *
+ * Query params:
+ *   prefix?: string - Filter shapes starting with this prefix
+ *   limit?: number - Maximum suggestions to return (default: 50)
+ *
+ * Returns:
+ * {
+ *   suggestions: ShapeAutocomplete[],
+ *   total: number
+ * }
+ */
+app.get('/shapes/autocomplete', async (c) => {
+  try {
+    const prefix = c.req.query('prefix') || '';
+    const limit = parseInt(c.req.query('limit') || '50', 10);
+
+    logger.info('GET /shapes/autocomplete', { prefix, limit });
+
+    // Query the autocomplete view
+    // Note: SurrealDB views don't support LIKE, so we filter in code for prefix matching
+    const query = `
+      SELECT * FROM v_shapes_for_autocomplete
+      ORDER BY total_uses DESC
+      LIMIT 1000
+    `;
+
+    const result = await surrealDB.query<ShapeAutocomplete[]>(query);
+    const allShapes = result && Array.isArray(result) ? result.flat() : [];
+
+    // Filter by prefix if provided
+    const filtered = prefix
+      ? allShapes.filter(s => s.shape && s.shape.toLowerCase().startsWith(prefix.toLowerCase()))
+      : allShapes;
+
+    // Apply limit
+    const suggestions = filtered.slice(0, limit);
+
+    logger.info('Shape autocomplete query result', {
+      prefix: prefix || null,
+      suggestions: suggestions.length,
+      total: filtered.length,
+    });
+
+    return c.json({
+      suggestions,
+      total: filtered.length,
+    });
+
+  } catch (error: any) {
+    logger.error('GET /shapes/autocomplete failed', { error: error.message, stack: error.stack });
+    return c.json({
+      error: 'Failed to get shape suggestions',
       message: error.message,
     }, 500);
   }

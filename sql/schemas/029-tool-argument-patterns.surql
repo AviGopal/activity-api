@@ -55,7 +55,8 @@ DEFINE FIELD IF NOT EXISTS times_used ON tool_argument_pattern TYPE int
 
 DEFINE FIELD IF NOT EXISTS times_succeeded ON tool_argument_pattern TYPE int
   VALUE $value OR 0
-  COMMENT "Number of successful executions using this pattern";
+  ASSERT $value >= 0
+  COMMENT "Number of successful executions using this pattern (must be <= times_used)";
 
 DEFINE FIELD IF NOT EXISTS avg_execution_ms ON tool_argument_pattern TYPE float
   VALUE $value OR 0.0
@@ -123,6 +124,10 @@ DEFINE INDEX IF NOT EXISTS idx_tool_arg_pattern_usage
 -- Index for finding recent patterns
 DEFINE INDEX IF NOT EXISTS idx_tool_arg_pattern_last_used
   ON tool_argument_pattern FIELDS last_used_at;
+
+-- Composite index for success rate queries (times_succeeded / times_used)
+DEFINE INDEX IF NOT EXISTS idx_tool_arg_pattern_success
+  ON tool_argument_pattern FIELDS times_succeeded, times_used;
 
 -- -----------------------------------------------------------------------------
 -- v_argument_recommendations computed view
