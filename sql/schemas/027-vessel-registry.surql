@@ -28,6 +28,28 @@ DEFINE FIELD metadata ON vessel TYPE option<object> FLEXIBLE;
 DEFINE FIELD version ON vessel TYPE option<string>;
 DEFINE FIELD environment ON vessel TYPE option<string>;
 
+-- Codebase configuration for cross-vessel optimization
+-- When an activity owned by this vessel needs optimization, the optimizer
+-- can use this information to locate and (if permitted) modify the vessel's code
+--
+-- IMPORTANT: Not all vessels have editable source code:
+-- - Binary/container vessels: Source not available at runtime
+-- - External/third-party vessels: No edit permissions
+-- - Production vessels: Edit access restricted to dev environments
+--
+-- When direct modification isn't possible, optimization should:
+-- 1. Create wrapper activities or adapters
+-- 2. Generate optimization suggestions for human review
+-- 3. Route to the vessel specified in modifiable_by (if set)
+DEFINE FIELD codebase ON vessel TYPE option<object> FLEXIBLE;
+-- codebase.repo_url: Git repository URL (https or ssh) - optional
+-- codebase.path: Path within repo (e.g., "repos/identity-vessel") - optional
+-- codebase.branch: Default branch for development - optional
+-- codebase.access_level: "none" | "read-only" | "read-write" - REQUIRED
+-- codebase.access_reason: Why access is restricted (if not read-write)
+-- codebase.modifiable_by: Vessel ID that CAN modify this vessel's code
+-- codebase.entry_points: Array of key files for this vessel
+
 -- Lifecycle
 DEFINE FIELD ttl ON vessel TYPE int DEFAULT 300;
 DEFINE FIELD registered_at ON vessel TYPE datetime DEFAULT time::now();
