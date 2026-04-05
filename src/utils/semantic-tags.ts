@@ -289,8 +289,14 @@ export function extractImpliedShapes(taskDescription: string): string[] {
     shapes.add('source_code');
   }
 
-  // Goal/requirement patterns
+  // Goal/requirement patterns - explicit mentions
   if (lowerDesc.match(/\b(goal|requirement|spec)\b/)) {
+    shapes.add('goal');
+  }
+
+  // Action-oriented tasks implicitly have goals
+  // Tasks starting with action verbs like "fix", "implement", "add" are goal-directed
+  if (lowerDesc.match(/^(fix|implement|add|update|build|create|resolve|debug|refactor|optimize|improve)\b/)) {
     shapes.add('goal');
   }
 

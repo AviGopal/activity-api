@@ -1156,3 +1156,350 @@ export async function getActivityShapePatterns(
     };
   }
 }
+
+// =============================================================================
+// Variant Family Functions (variant-resolver-endpoints)
+// =============================================================================
+
+/**
+ * Variant info structure returned by getVariantFamily
+ */
+export interface VariantInfo {
+  id: string;
+  name: string;
+  variant_of: string | null;
+  created_at: string;
+  is_base: boolean;
+}
+
+/**
+ * Variant score structure with Thompson parameters
+ */
+export interface VariantScore {
+  activity_id: string;
+  alpha: number;
+  beta: number;
+  success_rate: number;
+  total_executions: number;
+  avg_duration_ms: number;
+  avg_cost_usd: number;
+}
+
+/**
+ * Variant tree node structure for genealogy
+ */
+export interface VariantTreeNode {
+  id: string;
+  name: string;
+  children: VariantTreeNode[];
+}
+
+/**
+ * Get all variants of an activity (recursive family tree).
+ * Finds all activities where variant_of matches the base ID,
+ * then recursively finds children of those variants.
+ *
+ * @param baseId - The base activity ID to find variants for
+ * @param orgId - Organization ID for multi-tenant filtering
+ * @param jwtToken - Optional JWT token for RBAC
+ * @returns Array of VariantInfo objects including the base activity
+ */
+export async function getVariantFamily(
+  baseId: string,
+  orgId: string,
+  jwtToken?: string | null
+): Promise<QueryPathResult<VariantInfo>> {
+  const startTime = Date.now();
+  const fullOrgId = orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`;
+
+  try {
+    // Recursive CTE-style query to get all descendants
+    // SurrealDB doesn't have CTEs, so we use a recursive graph traversal
+    // First, get the base activity, then find all descendants via variant_of
+    const query = `
+      LET $base = (
+        SELECT id, name, variant_of, created_at
+        FROM activity
+        WHERE id = $base_id
+          AND (org_id = $org_id OR scope = 'global')
+        LIMIT 1
+      )[0];
+
+      LET $variants = (
+        SELECT id, name, variant_of, created_at
+        FROM activity
+        WHERE variant_of = $base_id
+          AND (org_id = $org_id OR scope = 'global')
+      );
+
+      -- Get second-level variants (children of variants)
+      LET $second_level = (
+        SELECT id, name, variant_of, created_at
+        FROM activity
+        WHERE variant_of IN $variants.id
+          AND (org_id = $org_id OR scope = 'global')
+      );
+
+      -- Get third-level variants (children of second-level)
+      LET $third_level = (
+        SELECT id, name, variant_of, created_at
+        FROM activity
+        WHERE variant_of IN $second_level.id
+          AND (org_id = $org_id OR scope = 'global')
+      );
+
+      -- Combine all levels
+      RETURN array::union(
+        array::union(
+          array::union(
+            IF $base THEN [$base] ELSE [] END,
+            $variants
+          ),
+          $second_level
+        ),
+        $third_level
+      );
+    `;
+
+    const params = {
+      base_id: baseId,
+      org_id: fullOrgId,
+    };
+
+    const result = jwtToken
+      ? await queryWithAuth<any[]>(jwtToken, query, params)
+      : await surrealDB.query<any[]>(query, params);
+
+    // Flatten result (SurrealDB may wrap in arrays)
+    const activities = (result && Array.isArray(result))
+      ? result.flat().filter(a => a && a.id)
+      : [];
+
+    // Transform to VariantInfo format
+    const variants: VariantInfo[] = activities.map(a => ({
+      id: a.id,
+      name: a.name,
+      variant_of: a.variant_of || null,
+      created_at: typeof a.created_at === 'object' ? JSON.stringify(a.created_at) : a.created_at,
+      is_base: a.id === baseId,
+    }));
+
+    logger.info('[paradigm] getVariantFamily completed', {
+      baseId,
+      variantCount: variants.length,
+      latency_ms: Date.now() - startTime,
+    });
+
+    return {
+      data: variants,
+      path: 'new',
+      latency_ms: Date.now() - startTime,
+    };
+
+  } catch (error) {
+    logger.error('[paradigm] getVariantFamily failed', {
+      baseId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+
+    return {
+      data: [],
+      path: 'new',
+      latency_ms: Date.now() - startTime,
+    };
+  }
+}
+
+/**
+ * Get Thompson Sampling scores for a list of variant IDs.
+ * Returns alpha/beta parameters and aggregate metrics for each variant.
+ *
+ * @param variantIds - Array of activity IDs to get scores for
+ * @param orgId - Organization ID for multi-tenant filtering
+ * @param jwtToken - Optional JWT token for RBAC
+ * @returns Array of VariantScore objects
+ */
+export async function getVariantScores(
+  variantIds: string[],
+  orgId: string,
+  jwtToken?: string | null
+): Promise<QueryPathResult<VariantScore>> {
+  const startTime = Date.now();
+
+  if (!variantIds || variantIds.length === 0) {
+    return {
+      data: [],
+      path: 'new',
+      latency_ms: Date.now() - startTime,
+    };
+  }
+
+  const fullOrgId = orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`;
+
+  try {
+    // Query from v_activity_score view (computed from execution table)
+    const query = `
+      SELECT
+        activity_id,
+        alpha,
+        beta,
+        <float> successes / <float> total_executions AS success_rate,
+        total_executions,
+        avg_duration_ms,
+        avg_cost_usd
+      FROM v_activity_score
+      WHERE activity_id IN $variant_ids
+        AND org_id = $org_id
+    `;
+
+    const params = {
+      variant_ids: variantIds,
+      org_id: fullOrgId,
+    };
+
+    let result = jwtToken
+      ? await queryWithAuth<VariantScore>(jwtToken, query, params)
+      : await surrealDB.query<VariantScore>(query, params);
+
+    // If v_activity_score doesn't have data, fall back to variant_performance_metrics
+    if (!result || result.length === 0) {
+      logger.debug('[paradigm] getVariantScores: falling back to variant_performance_metrics');
+
+      const fallbackQuery = `
+        SELECT
+          variant_id AS activity_id,
+          thompson_alpha AS alpha,
+          thompson_beta AS beta,
+          success_rate,
+          total_executions,
+          avg_duration_ms,
+          avg_cost_usd
+        FROM variant_performance_metrics
+        WHERE variant_id IN $variant_ids
+          AND org_id = $org_id
+      `;
+
+      // Legacy table may have org_id without prefix
+      const legacyOrgId = orgId.startsWith('organizations:')
+        ? orgId.replace('organizations:', '')
+        : orgId;
+
+      result = await surrealDB.query<VariantScore>(fallbackQuery, {
+        variant_ids: variantIds,
+        org_id: legacyOrgId,
+      });
+    }
+
+    // Ensure all values are numbers (handle NaN from division by zero)
+    const scores = (result || []).map(s => ({
+      ...s,
+      success_rate: isNaN(s.success_rate) ? 0 : s.success_rate,
+      avg_duration_ms: s.avg_duration_ms || 0,
+      avg_cost_usd: s.avg_cost_usd || 0,
+    }));
+
+    logger.info('[paradigm] getVariantScores completed', {
+      requestedCount: variantIds.length,
+      foundCount: scores.length,
+      latency_ms: Date.now() - startTime,
+    });
+
+    return {
+      data: scores,
+      path: 'new',
+      latency_ms: Date.now() - startTime,
+    };
+
+  } catch (error) {
+    logger.error('[paradigm] getVariantScores failed', {
+      variantIds,
+      error: error instanceof Error ? error.message : String(error),
+    });
+
+    return {
+      data: [],
+      path: 'new',
+      latency_ms: Date.now() - startTime,
+    };
+  }
+}
+
+/**
+ * Build a tree structure showing parent-child relationships.
+ * Uses variant_of field to construct the genealogy tree.
+ *
+ * @param baseId - The root activity ID to build tree from
+ * @param orgId - Organization ID for multi-tenant filtering
+ * @param maxDepth - Maximum depth of tree (default: 5)
+ * @param jwtToken - Optional JWT token for RBAC
+ * @returns Tree structure with nested children
+ */
+export async function buildVariantTree(
+  baseId: string,
+  orgId: string,
+  maxDepth: number = 5,
+  jwtToken?: string | null
+): Promise<VariantTreeNode | null> {
+  const startTime = Date.now();
+
+  try {
+    // Fetch all activities in the family first
+    const familyResult = await getVariantFamily(baseId, orgId, jwtToken);
+    const activities = familyResult.data;
+
+    if (activities.length === 0) {
+      logger.warn('[paradigm] buildVariantTree: no activities found', { baseId });
+      return null;
+    }
+
+    // Create a map for quick lookup
+    const activityMap = new Map<string, { id: string; name: string; variant_of: string | null }>();
+    for (const a of activities) {
+      activityMap.set(a.id, { id: a.id, name: a.name, variant_of: a.variant_of });
+    }
+
+    // Build tree recursively
+    function buildNode(id: string, depth: number): VariantTreeNode | null {
+      if (depth > maxDepth) return null;
+
+      const activity = activityMap.get(id);
+      if (!activity) return null;
+
+      // Find all children (activities where variant_of = id)
+      const children: VariantTreeNode[] = [];
+      for (const [childId, childActivity] of activityMap.entries()) {
+        if (childActivity.variant_of === id) {
+          const childNode = buildNode(childId, depth + 1);
+          if (childNode) {
+            children.push(childNode);
+          }
+        }
+      }
+
+      return {
+        id: activity.id,
+        name: activity.name,
+        children,
+      };
+    }
+
+    const tree = buildNode(baseId, 0);
+
+    logger.info('[paradigm] buildVariantTree completed', {
+      baseId,
+      totalActivities: activities.length,
+      maxDepth,
+      latency_ms: Date.now() - startTime,
+    });
+
+    return tree;
+
+  } catch (error) {
+    logger.error('[paradigm] buildVariantTree failed', {
+      baseId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+
+    return null;
+  }
+}
