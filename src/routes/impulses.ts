@@ -28,6 +28,10 @@ import {
   formatCochangeAsMarkdown,
   formatImpactAsMarkdown,
   formatSearchResultsAsMarkdown,
+  formatToolRiskProfileAsMarkdown,
+  formatCompositionSuccessAsMarkdown,
+  formatImpulseRelevanceAsMarkdown,
+  formatPreValidationResultAsMarkdown,
 } from '../services/impulse-formatters';
 import { getJwtAuthFromContext, type JwtAuthContext } from '../middleware/jwtAuth';
 import activitiesRouter from './activities';
@@ -1397,6 +1401,322 @@ router.post('/resolve', async (c) => {
             error: `Failed to resolve goal impulse: ${error.message}`,
           } as ImpulseResolveResponse, 500);
         }
+      }
+
+      // =============================================================================
+      // UNIFIED LEARNING ARCHITECTURE POINTER TYPES
+      // =============================================================================
+      // These pointer types support the activity-driven learning system where backend
+      // provides shapes via impulse resolution, and MiniBob drives execution via activities.
+      // =============================================================================
+
+      case 'toolRiskProfile': {
+        // Query tool error rates and risk indicators
+        // Extended pointer fields for filtering
+        const extendedPointer = pointer as typeof pointer & {
+          toolName?: string;
+          activityId?: string;
+        };
+
+        const toolName = extendedPointer.toolName;
+        const activityId = extendedPointer.activityId;
+        const limit = pointer.limit || 50;
+
+        logger.info('Resolving toolRiskProfile', { toolName, activityId, limit });
+
+        // Build query for tool usage statistics
+        let whereClause = '';
+        const params: Record<string, any> = { limit };
+        const conditions: string[] = [];
+
+        if (toolName) {
+          conditions.push('tool_name = $tool_name');
+          params.tool_name = toolName;
+        }
+
+        if (activityId) {
+          conditions.push('activity_id = $activity_id');
+          params.activity_id = activityId;
+        }
+
+        if (conditions.length > 0) {
+          whereClause = 'WHERE ' + conditions.join(' AND ');
+        }
+
+        // Query tool_usage table for aggregated stats
+        const query = `
+          SELECT
+            tool_name,
+            activity_id,
+            math::sum(call_count) AS call_count,
+            math::sum(success_count) AS success_count,
+            math::sum(failure_count) AS failure_count,
+            math::mean(avg_duration_ms) AS avg_duration_ms
+          FROM tool_usage
+          ${whereClause}
+          GROUP BY tool_name, activity_id
+          ORDER BY failure_count DESC
+          LIMIT $limit
+        `;
+
+        const toolStats = await surrealDB.query<any>(query, params);
+
+        // Calculate error rates and format
+        const formattedStats = toolStats.map((t: any) => ({
+          tool_name: t.tool_name,
+          activity_id: t.activity_id,
+          call_count: t.call_count || 0,
+          success_count: t.success_count || 0,
+          failure_count: t.failure_count || 0,
+          avg_duration_ms: t.avg_duration_ms || 0,
+          error_rate: t.call_count > 0 ? t.failure_count / t.call_count : 0,
+        }));
+
+        content = formatToolRiskProfileAsMarkdown(formattedStats, { activityId, toolName });
+        break;
+      }
+
+      case 'compositionSuccess': {
+        // Query parent→child success rates by shapes
+        const extendedPointer = pointer as typeof pointer & {
+          parentActivityId?: string;
+          childActivityId?: string;
+        };
+
+        const parentActivityId = extendedPointer.parentActivityId;
+        const childActivityId = extendedPointer.childActivityId;
+        const limit = pointer.limit || 50;
+
+        logger.info('Resolving compositionSuccess', { parentActivityId, childActivityId, limit });
+
+        // Build query for composition graph
+        let whereClause = '';
+        const params: Record<string, any> = { limit };
+        const conditions: string[] = [];
+
+        if (parentActivityId) {
+          conditions.push('parent_activity_id = $parent_activity_id');
+          params.parent_activity_id = parentActivityId;
+        }
+
+        if (childActivityId) {
+          conditions.push('child_activity_id = $child_activity_id');
+          params.child_activity_id = childActivityId;
+        }
+
+        if (conditions.length > 0) {
+          whereClause = 'WHERE ' + conditions.join(' AND ');
+        }
+
+        const query = `
+          SELECT
+            parent_activity_id,
+            child_activity_id,
+            execution_count,
+            success_count,
+            weight,
+            goal_context,
+            created_at,
+            updated_at
+          FROM activity_composition_graph
+          ${whereClause}
+          ORDER BY weight DESC, execution_count DESC
+          LIMIT $limit
+        `;
+
+        const compositions = await surrealDB.query<any>(query, params);
+
+        content = formatCompositionSuccessAsMarkdown(compositions, { parentActivityId, childActivityId });
+        break;
+      }
+
+      case 'impulseRelevance': {
+        // Query which impulse shapes help activities succeed
+        const extendedPointer = pointer as typeof pointer & {
+          activityId?: string;
+          impulseShape?: string;
+        };
+
+        const activityId = extendedPointer.activityId;
+        const impulseShape = extendedPointer.impulseShape;
+        const limit = pointer.limit || 50;
+
+        logger.info('Resolving impulseRelevance', { activityId, impulseShape, limit });
+
+        // Build query for impulse relevance metrics
+        let whereClause = '';
+        const params: Record<string, any> = { limit };
+        const conditions: string[] = [];
+
+        if (activityId) {
+          conditions.push('activity_variant_id = $activity_id');
+          params.activity_id = activityId;
+        }
+
+        if (impulseShape) {
+          // Join with impulse table to filter by shape
+          conditions.push('impulse_id IN (SELECT id FROM impulse WHERE shape = $impulse_shape)');
+          params.impulse_shape = impulseShape;
+        }
+
+        if (conditions.length > 0) {
+          whereClause = 'WHERE ' + conditions.join(' AND ');
+        }
+
+        const query = `
+          SELECT
+            impulse_id,
+            activity_variant_id,
+            task_id,
+            times_loaded,
+            times_execution_succeeded,
+            times_execution_failed,
+            relevance_score,
+            avg_tokens,
+            created_at,
+            updated_at
+          FROM impulse_relevance_metrics
+          ${whereClause}
+          ORDER BY relevance_score DESC
+          LIMIT $limit
+        `;
+
+        const relevanceData = await surrealDB.query<any>(query, params);
+
+        // Try to enrich with shape info from impulse table
+        const impulseIds = relevanceData.map((r: any) => r.impulse_id);
+        if (impulseIds.length > 0) {
+          const shapeQuery = `
+            SELECT id, shape FROM impulse
+            WHERE id IN $impulse_ids
+          `;
+          const shapes = await surrealDB.query<any>(shapeQuery, { impulse_ids: impulseIds });
+          const shapeMap = new Map(shapes.map((s: any) => [s.id, s.shape]));
+
+          for (const item of relevanceData) {
+            item.shape = shapeMap.get(item.impulse_id);
+          }
+        }
+
+        content = formatImpulseRelevanceAsMarkdown(relevanceData, { activityId, impulseShape });
+        break;
+      }
+
+      case 'preValidationResult': {
+        // Determine if a tool call can be skipped based on historical patterns
+        const extendedPointer = pointer as typeof pointer & {
+          toolName?: string;
+          activityId?: string;
+          argumentHash?: string;
+          arguments?: Record<string, unknown>;
+          minSuccessRate?: number;
+          skipThreshold?: number;
+        };
+
+        const toolName = extendedPointer.toolName;
+        const activityId = extendedPointer.activityId;
+        const argumentHash = extendedPointer.argumentHash;
+        const args = extendedPointer.arguments;
+        const minSuccessRate = extendedPointer.minSuccessRate ?? 0.9;
+        const skipThreshold = extendedPointer.skipThreshold ?? 0.85;
+
+        // Validate required fields
+        if (!toolName || !activityId) {
+          return c.json({
+            success: false,
+            error: 'toolName and activityId required for preValidationResult pointer',
+          } as ImpulseResolveResponse, 400);
+        }
+
+        logger.info('Resolving preValidationResult', {
+          toolName,
+          activityId,
+          argumentHash: argumentHash ? argumentHash.substring(0, 12) : 'none',
+          minSuccessRate,
+          skipThreshold,
+        });
+
+        // Query matching patterns from tool_argument_pattern table
+        let whereClause = 'WHERE tool_name = $tool_name AND activity_id = $activity_id';
+        const params: Record<string, any> = {
+          tool_name: toolName,
+          activity_id: activityId,
+        };
+
+        // If argument hash provided, look for exact match
+        if (argumentHash) {
+          whereClause += ' AND argument_hash = $argument_hash';
+          params.argument_hash = argumentHash;
+        }
+
+        const query = `
+          SELECT
+            argument_hash,
+            argument_shape,
+            arguments,
+            times_used,
+            times_succeeded,
+            avg_execution_ms,
+            last_used_at,
+            (times_succeeded * 1.0 / times_used) AS success_rate
+          FROM tool_argument_pattern
+          ${whereClause}
+          AND times_used >= 3
+          ORDER BY success_rate DESC, times_used DESC
+          LIMIT 10
+        `;
+
+        const patterns = await surrealDB.query<any>(query, params);
+
+        // Determine if we can skip
+        let canSkip = false;
+        let confidence = 0;
+        let reasoning = '';
+        let matchingPatterns: any[] = [];
+
+        if (patterns.length === 0) {
+          canSkip = false;
+          confidence = 0;
+          reasoning = 'No historical patterns found for this tool/activity combination. Execute to build pattern history.';
+        } else {
+          // Check if we have a high-confidence pattern
+          const topPattern = patterns[0];
+          const successRate = topPattern.success_rate || 0;
+
+          if (successRate >= minSuccessRate && topPattern.times_used >= 5) {
+            canSkip = true;
+            confidence = Math.min(successRate, skipThreshold + (topPattern.times_used / 100));
+            reasoning = `Found high-confidence pattern with ${(successRate * 100).toFixed(1)}% success rate over ${topPattern.times_used} executions.`;
+          } else if (successRate >= 0.7 && topPattern.times_used >= 10) {
+            canSkip = false;
+            confidence = successRate;
+            reasoning = `Pattern has ${(successRate * 100).toFixed(1)}% success rate but below ${(minSuccessRate * 100).toFixed(0)}% threshold for skip. Execute with caution.`;
+          } else {
+            canSkip = false;
+            confidence = successRate;
+            reasoning = `Insufficient confidence: ${(successRate * 100).toFixed(1)}% success rate over ${topPattern.times_used} executions. Execute and monitor.`;
+          }
+
+          matchingPatterns = patterns.map((p: any) => ({
+            argument_hash: p.argument_hash,
+            success_rate: p.success_rate || 0,
+            times_used: p.times_used,
+            avg_execution_ms: p.avg_execution_ms,
+          }));
+        }
+
+        const result = {
+          canSkip,
+          confidence,
+          reasoning,
+          matchingPatterns,
+          tool_name: toolName,
+          activity_id: activityId,
+          argument_shape: patterns[0]?.argument_shape,
+        };
+
+        content = formatPreValidationResultAsMarkdown(result);
+        break;
       }
 
       default:

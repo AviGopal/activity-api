@@ -185,6 +185,8 @@ export const CreateTemplateRequestSchema = z.object({
       description: z.string().optional(),
     })).optional(),
   }).optional(),
+  // Schema confidence for template generation (goal-execution-foundation-alignment)
+  schema_confidence: z.number().min(0).max(1).optional(),
 }).refine(
   data => data.tags?.length || data.category,
   { message: 'Either tags or category must be provided' }
@@ -350,6 +352,15 @@ export const CompositionEdgeSchema = z.object({
   weight: z.number().min(0).max(1), // Computed: success_count / execution_count
   created_at: z.union([z.string(), z.object({}).passthrough()]),
   updated_at: z.union([z.string(), z.object({}).passthrough()]),
+  // Impulse flow fields (goal-execution-foundation-alignment)
+  input_impulse_shapes: z.array(z.string()).optional(),
+  output_impulse_shapes: z.array(z.string()).optional(),
+  duration_ms: z.number().optional(),
+  cost_usd: z.number().optional(),
+  tokens_input: z.number().int().optional(),
+  tokens_output: z.number().int().optional(),
+  depth: z.number().int().optional(),
+  composition_chain: z.array(z.string()).optional(),
 });
 
 export const CompositionRecordRequestSchema = z.object({
@@ -358,6 +369,18 @@ export const CompositionRecordRequestSchema = z.object({
   execution_id: z.string(),
   goal_context: z.string().optional(),
   success: z.boolean(),
+  // Impulse flow fields (goal-execution-foundation-alignment)
+  input_impulse_ids: z.array(z.string()).optional(),
+  input_impulse_shapes: z.array(z.string()).optional(),
+  output_impulse_ids: z.array(z.string()).optional(),
+  output_impulse_shapes: z.array(z.string()).optional(),
+  // Additional metrics
+  duration_ms: z.number().optional(),
+  cost_usd: z.number().optional(),
+  tokens_input: z.number().int().optional(),
+  tokens_output: z.number().int().optional(),
+  depth: z.number().int().optional(),
+  composition_chain: z.array(z.string()).optional(),
 });
 
 export const CompositionGraphQuerySchema = z.object({
@@ -762,7 +785,7 @@ export const ImpulseResolveRequestSchema = z.object({
     componentIds: z.array(z.string()).optional(), // For cochangeSuggestions pointer
     changedFiles: z.array(z.string()).optional(), // For impactAnalysis pointer
     query: z.string().optional(), // For codebaseSearch and activityTemplateRecommendation pointer
-    maxDepth: z.number().int().positive().optional(), // For impactAnalysis
+    maxDepth: z.number().int().positive().optional(), // For impactAnalysis and variantGenealogy
     format: z.enum(['full', 'summary']).optional(), // For analysisResult
     severity: z.array(z.string()).optional(), // For codebaseSearch filters
     category: z.union([z.array(z.string()), z.string()]).optional(), // For codebaseSearch/template filters (accepts string or array)
@@ -770,9 +793,27 @@ export const ImpulseResolveRequestSchema = z.object({
     // For activityExecutionTrace pointer type
     includeImpulses: z.boolean().optional(), // Include referenced impulses in response
     // For bootstrap template pointer types
-    sortBy: z.enum(['success_rate', 'total_executions', 'avg_duration_ms']).optional(), // For activityTemplatesByMetrics
+    sortBy: z.enum(['success_rate', 'total_executions', 'avg_duration_ms', 'momentum', 'executions', 'cost']).optional(), // Extended for variantFamily
     minExecutions: z.union([z.number(), z.string().transform(v => parseInt(v, 10))]).pipe(z.number().int().nonnegative()).optional(), // For activityTemplatesByMetrics
     success: z.boolean().optional(), // For executionTraces - filter by success/failure
+    // Variant-aware pointer types
+    baseActivityId: z.string().optional(), // For variantGenealogy, variantPerformance, variantFamily
+    variantId: z.string().optional(), // For variantPerformance - specific variant to query
+    includeMetrics: z.boolean().optional(), // For variantGenealogy - include performance metrics
+    includeHistory: z.boolean().optional(), // For variantPerformance - include historical data
+    timeWindow: z.string().optional(), // For variantPerformance - time range (e.g., "24h", "7d", "30d")
+    onlyActive: z.boolean().optional(), // For variantFamily - filter to active variants only
+    includeInputImpulses: z.boolean().optional(), // For failedExecutionContext - include input impulses
+    includeTrace: z.boolean().optional(), // For failedExecutionContext - include execution trace
+    // Unified Learning Architecture pointer types
+    toolName: z.string().optional(), // For toolRiskProfile - filter by tool name
+    parentActivityId: z.string().optional(), // For compositionSuccess - filter by parent
+    childActivityId: z.string().optional(), // For compositionSuccess - filter by child
+    impulseShape: z.string().optional(), // For impulseRelevance - filter by shape
+    argumentHash: z.string().optional(), // For preValidationResult - specific argument pattern
+    arguments: z.record(z.unknown()).optional(), // For preValidationResult - argument values to validate
+    minSuccessRate: z.number().min(0).max(1).optional(), // For preValidationResult - threshold for skip
+    skipThreshold: z.number().min(0).max(1).optional(), // For preValidationResult - confidence threshold
   }),
 });
 
@@ -990,8 +1031,24 @@ export type CorpusSummaryResponse = z.infer<typeof CorpusSummaryResponseSchema>;
 // =============================================================================
 
 /**
+ * Failure type enum for tool argument patterns
+ */
+export const FailureTypeSchema = z.enum([
+  'validation',
+  'execution',
+  'tool_failure',
+  'timeout',
+]);
+
+/**
  * ToolArgumentPatternRecordRequest - Request body for POST /tool-argument-patterns
  * Records argument patterns observed during tool execution for learning
+ *
+ * Extended with failure fields for goal-execution-foundation-alignment:
+ * - failure_type: Type of failure (validation, execution, tool_failure, timeout)
+ * - failure_reason: Human-readable error message
+ * - tool_succeeded: Whether the individual tool call succeeded
+ * - validation_error: Specific validation rule that failed
  */
 export const ToolArgumentPatternRecordRequestSchema = z.object({
   activity_id: z.string(),
@@ -1001,6 +1058,11 @@ export const ToolArgumentPatternRecordRequestSchema = z.object({
   arguments: z.record(z.unknown()),
   execution_succeeded: z.boolean(),
   execution_ms: z.number(),
+  // Failure pattern learning fields (optional for backward compatibility)
+  failure_type: FailureTypeSchema.optional(),
+  failure_reason: z.string().optional(),
+  tool_succeeded: z.boolean().optional(),
+  validation_error: z.string().optional(),
 });
 
 /**
@@ -1012,6 +1074,7 @@ export const ToolArgumentRecommendationsQuerySchema = z.object({
 
 /**
  * ToolArgumentPattern - Pattern record from v_argument_recommendations view
+ * Extended with failure statistics for pattern analysis
  */
 export const ToolArgumentPatternSchema = z.object({
   activity_id: z.string(),
@@ -1024,6 +1087,12 @@ export const ToolArgumentPatternSchema = z.object({
   avg_execution_ms: z.number().optional(),
   last_used_at: z.union([z.string(), z.object({}).passthrough()]).optional(),
   org_id: z.string().optional(),
+  // Failure statistics (goal-execution-foundation-alignment)
+  failure_rate: z.number().optional(),
+  times_succeeded: z.number().int().optional(),
+  times_failed: z.number().int().optional(),
+  failure_type: FailureTypeSchema.optional(),
+  failure_counts: z.record(z.number()).optional(),
 });
 
 /**
@@ -1034,7 +1103,238 @@ export const ToolArgumentRecommendationsResponseSchema = z.object({
 });
 
 // Type exports for Tool Argument Pattern Tracking
+export type FailureType = z.infer<typeof FailureTypeSchema>;
 export type ToolArgumentPatternRecordRequest = z.infer<typeof ToolArgumentPatternRecordRequestSchema>;
 export type ToolArgumentRecommendationsQuery = z.infer<typeof ToolArgumentRecommendationsQuerySchema>;
 export type ToolArgumentPattern = z.infer<typeof ToolArgumentPatternSchema>;
 export type ToolArgumentRecommendationsResponse = z.infer<typeof ToolArgumentRecommendationsResponseSchema>;
+
+// =============================================================================
+// COMPOSITION IMPULSE FLOW SCHEMAS (goal-execution-foundation-alignment)
+// =============================================================================
+
+/**
+ * CompositionImpulseFlow - Per-impulse tracking for composition edges
+ * Enables queries like "Success rate when parent X calls child Y with shape Z"
+ */
+export const CompositionImpulseFlowSchema = z.object({
+  edge_id: z.string(),
+  execution_id: z.string(),
+  impulse_id: z.string(),
+  direction: z.enum(['input', 'output']),
+  shape: z.string(),
+  execution_succeeded: z.boolean(),
+  org_id: z.string().optional(),
+  project_id: z.string().optional(),
+  created_at: z.union([z.string(), z.object({}).passthrough()]).optional(),
+});
+
+/**
+ * CompositionImpulseSuccessQuery - Query for impulse-conditioned success rates
+ */
+export const CompositionImpulseSuccessQuerySchema = z.object({
+  edge_id: z.string().optional(),
+  shape: z.string().optional(),
+  direction: z.enum(['input', 'output']).optional(),
+  min_count: z.number().int().positive().default(3),
+  limit: z.number().int().positive().default(100),
+  offset: z.number().int().nonnegative().default(0),
+});
+
+/**
+ * CompositionImpulseSuccessRate - Success rate conditioned on shape
+ */
+export const CompositionImpulseSuccessRateSchema = z.object({
+  edge_id: z.string(),
+  shape: z.string(),
+  direction: z.enum(['input', 'output']),
+  total_count: z.number().int(),
+  success_count: z.number().int(),
+  success_rate: z.number().min(0).max(1),
+});
+
+/**
+ * CompositionImpulseSuccessResponse - Response for impulse-conditioned success queries
+ */
+export const CompositionImpulseSuccessResponseSchema = z.object({
+  rates: z.array(CompositionImpulseSuccessRateSchema),
+  total: z.number().int(),
+});
+
+// Type exports for Composition Impulse Flow
+export type CompositionImpulseFlow = z.infer<typeof CompositionImpulseFlowSchema>;
+export type CompositionImpulseSuccessQuery = z.infer<typeof CompositionImpulseSuccessQuerySchema>;
+export type CompositionImpulseSuccessRate = z.infer<typeof CompositionImpulseSuccessRateSchema>;
+export type CompositionImpulseSuccessResponse = z.infer<typeof CompositionImpulseSuccessResponseSchema>;
+
+// =============================================================================
+// FAILURE PATTERN ANALYSIS SCHEMAS (goal-execution-foundation-alignment)
+// =============================================================================
+
+/**
+ * FailurePatternQuery - Query for analyzing failure patterns
+ */
+export const FailurePatternQuerySchema = z.object({
+  activity_id: z.string().optional(),
+  tool_name: z.string().optional(),
+  failure_type: FailureTypeSchema.optional(),
+  min_failures: z.number().int().positive().default(1),
+  limit: z.number().int().positive().default(100),
+  offset: z.number().int().nonnegative().default(0),
+});
+
+/**
+ * FailurePattern - Pattern record from v_failure_patterns view
+ */
+export const FailurePatternSchema = z.object({
+  activity_id: z.string(),
+  tool_name: z.string(),
+  argument_shape: z.string(),
+  argument_hash: z.string(),
+  arguments: z.record(z.unknown()),
+  success_rate: z.number(),
+  failure_rate: z.number(),
+  times_used: z.number().int(),
+  times_succeeded: z.number().int(),
+  times_failed: z.number().int(),
+  avg_execution_ms: z.number().optional(),
+  failure_type: FailureTypeSchema.optional(),
+  failure_reason: z.string().optional(),
+  validation_error: z.string().optional(),
+  failure_counts: z.record(z.number()).optional(),
+  org_id: z.string().optional(),
+});
+
+/**
+ * FailurePatternResponse - Response for failure pattern queries
+ */
+export const FailurePatternResponseSchema = z.object({
+  patterns: z.array(FailurePatternSchema),
+  total: z.number().int(),
+});
+
+// Type exports for Failure Pattern Analysis
+export type FailurePatternQuery = z.infer<typeof FailurePatternQuerySchema>;
+export type FailurePattern = z.infer<typeof FailurePatternSchema>;
+export type FailurePatternResponse = z.infer<typeof FailurePatternResponseSchema>;
+
+// =============================================================================
+// TEMPLATE SCHEMA FIELDS (goal-execution-foundation-alignment)
+// =============================================================================
+
+/**
+ * ImpulseSchemaShape - Shape definition for input/output schemas
+ */
+export const ImpulseSchemaShapeSchema = z.object({
+  shape: z.string(),
+  description: z.string().optional(),
+  collection: z.boolean().optional(),
+});
+
+/**
+ * ActivityInputSchema - Structured input schema for activity templates
+ */
+export const ActivityInputSchemaSchema = z.object({
+  required: z.array(ImpulseSchemaShapeSchema).optional(),
+  optional: z.array(ImpulseSchemaShapeSchema).optional(),
+});
+
+/**
+ * ActivityOutputSchema - Structured output schema for activity templates
+ */
+export const ActivityOutputSchemaSchema = z.object({
+  produces: z.array(ImpulseSchemaShapeSchema).optional(),
+});
+
+// Type exports for Template Schema Fields
+export type ImpulseSchemaShape = z.infer<typeof ImpulseSchemaShapeSchema>;
+export type ActivityInputSchema = z.infer<typeof ActivityInputSchemaSchema>;
+export type ActivityOutputSchema = z.infer<typeof ActivityOutputSchemaSchema>;
+
+// =============================================================================
+// VARIANT-AWARE IMPULSE POINTER SCHEMAS
+// =============================================================================
+
+/**
+ * VariantGenealogyPointer - Pointer type for variant genealogy lookup
+ * Resolves to the genealogy tree of an activity template, showing parent-child
+ * relationships and variant lineage.
+ *
+ * Use case: Understanding how a variant evolved, finding root templates,
+ * tracing inheritance of task structures.
+ */
+export const VariantGenealogyPointerSchema = z.object({
+  type: z.literal('variantGenealogy'),
+  /** Base activity ID to look up genealogy for */
+  baseActivityId: z.string(),
+  /** Maximum number of genealogy entries to return */
+  limit: z.number().int().positive().optional(),
+  /** Include performance metrics for each variant in the tree */
+  includeMetrics: z.boolean().optional(),
+  /** Maximum depth to traverse in the genealogy tree */
+  maxDepth: z.number().int().positive().optional(),
+});
+
+/**
+ * VariantPerformancePointer - Pointer type for per-variant performance scores
+ * Resolves to Thompson Sampling statistics and execution metrics for a specific
+ * variant or all variants of a base activity.
+ *
+ * Use case: Comparing variant performance, selecting best-performing variants,
+ * understanding why certain variants are chosen over others.
+ */
+export const VariantPerformancePointerSchema = z.object({
+  type: z.literal('variantPerformance'),
+  /** Base activity ID to get performance for */
+  baseActivityId: z.string(),
+  /** Specific variant ID (optional - if not provided, returns all variants) */
+  variantId: z.string().optional(),
+  /** Include historical performance data over time */
+  includeHistory: z.boolean().optional(),
+  /** Time window for metrics (e.g., "24h", "7d", "30d") */
+  timeWindow: z.string().optional(),
+});
+
+/**
+ * VariantFamilyPointer - Pointer type for variant family enumeration
+ * Resolves to a list of all variants belonging to the same activity family,
+ * with optional filtering and sorting.
+ *
+ * Use case: Discovering available variants, comparing family members,
+ * finding variants with specific characteristics.
+ */
+export const VariantFamilyPointerSchema = z.object({
+  type: z.literal('variantFamily'),
+  /** Base activity ID to enumerate family for */
+  baseActivityId: z.string(),
+  /** Only return active (non-deprecated) variants */
+  onlyActive: z.boolean().optional(),
+  /** Sort variants by specific metric */
+  sortBy: z.enum(['success_rate', 'momentum', 'executions', 'cost']).optional(),
+  /** Maximum number of variants to return */
+  limit: z.number().int().positive().optional(),
+});
+
+/**
+ * FailedExecutionContextPointer - Pointer type for failure context retrieval
+ * Resolves to comprehensive context about a failed execution, including
+ * input impulses, execution trace, and error details.
+ *
+ * Use case: Debugging failed executions, creating debug activities,
+ * understanding why a specific execution failed.
+ */
+export const FailedExecutionContextPointerSchema = z.object({
+  type: z.literal('failedExecutionContext'),
+  /** Execution ID of the failed execution */
+  executionId: z.string(),
+  /** Include input impulses that were available during execution */
+  includeInputImpulses: z.boolean().optional(),
+  /** Include full execution trace with task-level details */
+  includeTrace: z.boolean().optional(),
+});
+
+// Type exports for Variant-Aware Impulse Pointers
+export type VariantGenealogyPointer = z.infer<typeof VariantGenealogyPointerSchema>;
+export type VariantPerformancePointer = z.infer<typeof VariantPerformancePointerSchema>;
+export type VariantFamilyPointer = z.infer<typeof VariantFamilyPointerSchema>;
+export type FailedExecutionContextPointer = z.infer<typeof FailedExecutionContextPointerSchema>;
