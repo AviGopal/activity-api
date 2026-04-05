@@ -70,6 +70,8 @@ jobs:
           cd deployment
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Convert SSH URLs to HTTPS with token authentication
+          git config url."https://x-access-token:${{ secrets.AUTOMATION_PAT }}@github.com/".insteadOf "git@github.com:"
 
       - name: Update submodule pointer
         id: update
