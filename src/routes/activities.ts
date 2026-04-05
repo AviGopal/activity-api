@@ -1942,6 +1942,111 @@ app.get('/metrics/summary', async (c) => {
 });
 
 /**
+ * GET /v2/activities/metrics
+ *
+ * Returns detailed metrics for a specific activity.
+ * Used by MiniBob's model selector for progressive determinism.
+ *
+ * Query params:
+ * - activity_id: string (required) - Activity template ID to get metrics for
+ *
+ * Returns:
+ * {
+ *   activity_id: string,
+ *   total_executions: number,
+ *   successful_executions: number,
+ *   success_rate: number,
+ *   avg_duration_ms: number,
+ *   avg_cost_usd: number,
+ *   model_usage_distribution: Record<string, number>,
+ *   deterministic_task_ratio: number,
+ * }
+ */
+app.get('/metrics', async (c) => {
+  try {
+    const activityId = c.req.query('activity_id');
+
+    if (!activityId) {
+      return c.json({ error: 'Missing required parameter: activity_id' }, 400);
+    }
+
+    logger.info('GET /v2/activities/metrics', { activity_id: activityId });
+
+    // Query execution metrics for this specific activity
+    const metricsResult = await surrealDB.query(`
+      SELECT
+        count() AS total_executions,
+        count(IF success = true THEN 1 ELSE NONE END) AS successful_executions,
+        math::mean(IF success = true THEN 1.0 ELSE 0.0 END) AS success_rate,
+        math::mean(duration_ms) AS avg_duration_ms,
+        math::mean(cost_usd) AS avg_cost_usd
+      FROM execution_record
+      WHERE activity_id = $activity_id
+      GROUP ALL
+    `, { activity_id: activityId });
+
+    const stats = (metricsResult[0] as any) || {};
+
+    // Query model usage distribution
+    const modelDistResult = await surrealDB.query(`
+      SELECT model, count() AS count
+      FROM execution_record
+      WHERE activity_id = $activity_id
+      GROUP BY model
+    `, { activity_id: activityId });
+
+    const modelUsageDistribution: Record<string, number> = {};
+    for (const row of (modelDistResult as any[]) || []) {
+      if (row.model) {
+        modelUsageDistribution[row.model] = row.count || 0;
+      }
+    }
+
+    // Query deterministic task ratio (tasks that don't require LLM)
+    // Tasks are deterministic if they have tool_calls but no llm_tokens
+    const taskRatioResult = await surrealDB.query(`
+      SELECT
+        count() AS total_tasks,
+        count(IF llm_tokens = 0 OR llm_tokens = NONE THEN 1 ELSE NONE END) AS deterministic_tasks
+      FROM activity_execution_task_result
+      WHERE activity_id = $activity_id
+      GROUP ALL
+    `, { activity_id: activityId });
+
+    const taskStats = (taskRatioResult[0] as any) || {};
+    const totalTasks = taskStats.total_tasks || 0;
+    const deterministicTasks = taskStats.deterministic_tasks || 0;
+    const deterministicTaskRatio = totalTasks > 0 ? deterministicTasks / totalTasks : 0;
+
+    const metrics = {
+      activity_id: activityId,
+      total_executions: stats.total_executions || 0,
+      successful_executions: stats.successful_executions || 0,
+      success_rate: stats.success_rate || 0,
+      avg_duration_ms: Math.round(stats.avg_duration_ms || 0),
+      avg_cost_usd: stats.avg_cost_usd || 0,
+      model_usage_distribution: modelUsageDistribution,
+      deterministic_task_ratio: deterministicTaskRatio,
+    };
+
+    logger.debug('Activity metrics retrieved', { activity_id: activityId, metrics });
+
+    return c.json(metrics);
+
+  } catch (error: any) {
+    logger.error('GET /v2/activities/metrics failed', {
+      error: error.message,
+      stack: error.stack,
+    });
+
+    return c.json({
+      error: 'Failed to fetch activity metrics',
+      message: error.message,
+    }, 500);
+  }
+});
+
+/**
  * GET /scores
  *
  * Get Thompson Sampling scores for all activities in the learned corpus.
