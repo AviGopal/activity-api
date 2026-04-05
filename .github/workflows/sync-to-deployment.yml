@@ -75,6 +75,8 @@ jobs:
 
       - name: Update submodule pointer
         id: update
+        env:
+          GH_TOKEN: ${{ secrets.AUTOMATION_PAT }}
         run: |
           cd deployment
 
@@ -85,9 +87,12 @@ jobs:
             exit 1
           fi
 
+          # Set submodule URL to HTTPS with token auth (overrides SSH URL in .gitmodules)
+          git config submodule."$VESSEL_PATH".url "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
           git submodule update --init --depth=1 "$VESSEL_PATH" || true
 
           cd "$VESSEL_PATH"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
           git fetch --depth=1 origin ${{ steps.commit-info.outputs.sha }}
           git checkout ${{ steps.commit-info.outputs.sha }}
           cd ../..
