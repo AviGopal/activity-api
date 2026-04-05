@@ -1,0 +1,162 @@
+name: Sync to Deployment Repository
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '.github/**'
+      - 'docs/**'
+      - '*.md'
+      - 'LICENSE'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force sync even if no code changes'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync-deployment-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  DEPLOYMENT_REPO: MetabobProject/deployment
+  DEPLOYMENT_BRANCH: dev
+  VESSEL_NAME: ${{ github.event.repository.name }}
+
+jobs:
+  sync-submodule:
+    name: Sync Submodule to Deployment
+    runs-on: ubuntu-latest
+
+    if: |
+      !contains(github.event.head_commit.message, '[deployment-sync]') &&
+      !contains(github.event.head_commit.message, '[skip-sync]')
+
+    steps:
+      - name: Checkout vessel repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Get commit info
+        id: commit-info
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "sha_short=$(git rev-parse --short=7 HEAD)" >> $GITHUB_OUTPUT
+          echo "message=$(git log -1 --pretty=%B | head -n1 | tr -d '\n' | cut -c1-100)" >> $GITHUB_OUTPUT
+          echo "author=$(git log -1 --pretty=%an)" >> $GITHUB_OUTPUT
+
+          if [ -f "package.json" ]; then
+            VERSION=$(jq -r '.version // "0.1.0"' package.json)
+          else
+            VERSION=$(git describe --tags 2>/dev/null || echo "0.1.0")
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Checkout deployment repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DEPLOYMENT_REPO }}
+          ref: ${{ env.DEPLOYMENT_BRANCH }}
+          token: ${{ secrets.AUTOMATION_PAT }}
+          path: deployment
+          fetch-depth: 0
+          submodules: false
+
+      - name: Configure Git
+        run: |
+          cd deployment
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Update submodule pointer
+        id: update
+        run: |
+          cd deployment
+
+          VESSEL_PATH="vessels/${{ env.VESSEL_NAME }}"
+
+          if ! grep -q "path = $VESSEL_PATH" .gitmodules 2>/dev/null; then
+            echo "::error::Submodule $VESSEL_PATH not found in .gitmodules"
+            exit 1
+          fi
+
+          git submodule update --init --depth=1 "$VESSEL_PATH" || true
+
+          cd "$VESSEL_PATH"
+          git fetch --depth=1 origin ${{ steps.commit-info.outputs.sha }}
+          git checkout ${{ steps.commit-info.outputs.sha }}
+          cd ../..
+
+          if git diff --quiet "$VESSEL_PATH"; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "::notice::Submodule already at commit ${{ steps.commit-info.outputs.sha_short }}"
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "::notice::Updated submodule to commit ${{ steps.commit-info.outputs.sha_short }}"
+          fi
+
+      - name: Commit and push
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          cd deployment
+
+          VESSEL_PATH="vessels/${{ env.VESSEL_NAME }}"
+          git add "$VESSEL_PATH"
+
+          git commit -m "$(cat <<'EOF'
+          chore(${{ env.VESSEL_NAME }}): sync submodule to ${{ steps.commit-info.outputs.sha_short }}
+
+          Source: ${{ github.repository }}@${{ steps.commit-info.outputs.sha }}
+          Version: ${{ steps.commit-info.outputs.version }}
+          Original: ${{ steps.commit-info.outputs.message }}
+          Author: ${{ steps.commit-info.outputs.author }}
+
+          [sync-submodule]
+          EOF
+          )"
+
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            if git push origin ${{ env.DEPLOYMENT_BRANCH }}; then
+              echo "::notice::Successfully pushed to deployment repo"
+              exit 0
+            fi
+
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "::warning::Push failed (attempt $RETRY_COUNT/$MAX_RETRIES), rebasing..."
+
+            git fetch origin ${{ env.DEPLOYMENT_BRANCH }}
+            git rebase origin/${{ env.DEPLOYMENT_BRANCH }}
+
+            sleep $((RETRY_COUNT * 2))
+          done
+
+          echo "::error::Failed to push after $MAX_RETRIES attempts"
+          exit 1
+
+      - name: Notify on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "Failed to sync ${{ env.VESSEL_NAME }} to deployment repo",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":x: *Submodule Sync Failed*\n\n*Vessel:* ${{ env.VESSEL_NAME }}\n*Commit:* `${{ steps.commit-info.outputs.sha_short }}`\n*Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Workflow>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+        continue-on-error: true
