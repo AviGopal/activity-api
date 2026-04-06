@@ -105,8 +105,8 @@ class MigrationRunner {
     const schemaFiles = [
       // Paradigm alignment tables (schema-paradigm-alignment) - canonical activity model
       '020-paradigm-core-tables.surql',
-      // SKIPPED: 021-paradigm-computed-views.surql - incompatible with SurrealDB 3.0.0
-      '022-paradigm-compat-views.surql',  // Backward-compatibility views for migration
+      '021-paradigm-computed-views-v3.surql',  // SurrealDB 3.0 compatible computed views
+      '022-paradigm-compat-views-v3.surql',    // SurrealDB 3.0 compatible backward-compatibility views
       // Supporting tables (depend on paradigm core tables)
       '011-executions.surql',
       '012-composition.surql',
