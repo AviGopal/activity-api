@@ -1,0 +1,659 @@
+{
+  "$schema": "meta-activity-templates/1.0",
+  "description": "Meta-Activity Library for Self-Improvement (Phase 2 Task 12 - D6 Decision)",
+  "templates": [
+    {
+      "id": "debug-failed-execution",
+      "name": "Debug Failed Execution",
+      "version": 1,
+      "description": "Analyze a failed execution trace to identify root cause and propose fixes. Loads the execution trace impulse, analyzes the failure pattern, and generates actionable recommendations.",
+      "category": "infrastructure",
+      "tags": [
+        "meta.activity",
+        "meta.debug",
+        "self-improvement",
+        "failure-analysis"
+      ],
+      "scope": "system",
+      "input_shapes": ["trace", "error"],
+      "output_shapes": ["recommendation", "patch"],
+      "variables": [
+        {
+          "name": "executionId",
+          "type": "string",
+          "required": true,
+          "description": "Execution ID of the failed activity to debug"
+        },
+        {
+          "name": "outputDir",
+          "type": "string",
+          "required": false,
+          "default": "/tmp/debug-{{executionId}}",
+          "description": "Directory for analysis outputs"
+        },
+        {
+          "name": "proposeFix",
+          "type": "boolean",
+          "required": false,
+          "default": true,
+          "description": "Whether to propose template fixes based on analysis"
+        }
+      ],
+      "impulses": [
+        {
+          "id": "failedTrace",
+          "pointer": {
+            "type": "activityExecutionTrace",
+            "executionId": "{{executionId}}",
+            "includeState": true,
+            "includeToolCalls": true
+          },
+          "budget": 15000,
+          "priority": "critical",
+          "description": "Full execution trace with state transitions and tool calls"
+        },
+        {
+          "id": "templateDefinition",
+          "pointer": {
+            "type": "activityTemplate",
+            "templateId": "{{failedTrace.activity_id}}"
+          },
+          "budget": 5000,
+          "priority": "high",
+          "description": "Template definition that was executed"
+        },
+        {
+          "id": "recentFailures",
+          "pointer": {
+            "type": "executionQuery",
+            "query": "SELECT * FROM execution WHERE activity_id = $activity_id AND success = false ORDER BY executed_at DESC LIMIT 5",
+            "params": { "activity_id": "{{failedTrace.activity_id}}" }
+          },
+          "budget": 3000,
+          "priority": "medium",
+          "description": "Recent failures for the same activity (pattern detection)"
+        }
+      ],
+      "tasks": [
+        {
+          "id": "load-and-analyze",
+          "subagent": "general",
+          "description": "Load execution trace and perform failure analysis",
+          "dependencies": [],
+          "impulseReferences": ["failedTrace", "templateDefinition"],
+          "prompt": {
+            "template": "# Debug Failed Execution: {{executionId}}\n\nAnalyze the failed execution trace to identify the root cause.\n\n## Available Context (from impulses)\n\n- `failedTrace`: Full execution trace including:\n  - Task execution sequence\n  - Tool calls with arguments and results\n  - State transitions (files read/written)\n  - Error details\n\n- `templateDefinition`: The activity template that was executed\n\n## Analysis Tasks\n\n1. **Identify Failure Point**:\n   - Which task failed?\n   - What tool call triggered the failure?\n   - What was the error message?\n\n2. **Analyze State**:\n   - What files were available at failure?\n   - What variables were set?\n   - Were prerequisites met?\n\n3. **Classify Failure**:\n   - Validation failure (required pattern/file missing)\n   - Execution error (tool call failed)\n   - Timeout (task exceeded time limit)\n   - Variable error (missing or invalid input)\n   - Template defect (unclear prompt, wrong validation)\n\n4. **Root Cause Analysis**:\n   - Primary cause (what directly caused failure)\n   - Contributing factors (what made it worse)\n   - Pattern match (seen this before?)\n\n## Output\n\nCreate `{{outputDir}}/FAILURE_ANALYSIS.md` with:\n\n```markdown\n# Failure Analysis: {{executionId}}\n\n## Summary\n- **Activity**: [name]\n- **Failed Task**: [task-id]\n- **Error Type**: [classification]\n- **Duration Before Failure**: [ms]\n\n## Failure Details\n\n### Error Message\n```\n[exact error]\n```\n\n### Failed Tool Call\n- Tool: [name]\n- Arguments: [args]\n- Result: [error/failure]\n\n### State at Failure\n- Files available: [list]\n- Variables: [values]\n- Working directory: [path]\n\n## Root Cause\n\n[Clear explanation of why this failed]\n\n### Evidence\n1. [Fact from trace]\n2. [Fact from template]\n3. [Fact from state]\n\n## Classification\n\n- **Type**: [validation|execution|timeout|variable|template]\n- **Severity**: [critical|high|medium|low]\n- **Recurring**: [yes/no - based on recentFailures impulse]\n\n## Pattern Match\n\n[Is this a known failure pattern? Compare with recentFailures impulse]\n```",
+            "max_tokens": 12000
+          },
+          "validation": {
+            "required_files": ["{{outputDir}}/FAILURE_ANALYSIS.md"],
+            "required_patterns": [
+              { "pattern": "## Root Cause", "description": "Must identify root cause" },
+              { "pattern": "## Classification", "description": "Must classify failure type" }
+            ],
+            "forbidden_patterns": [
+              { "pattern": "UNKNOWN", "description": "Must determine root cause" }
+            ]
+          },
+          "tools": {
+            "required": ["write"],
+            "optional": ["read", "bash"]
+          },
+          "retry": { "maxAttempts": 2, "strategy": "exponential" }
+        },
+        {
+          "id": "propose-fix",
+          "subagent": "general",
+          "description": "Propose concrete fixes based on failure analysis",
+          "dependencies": ["load-and-analyze"],
+          "impulseReferences": ["templateDefinition"],
+          "prompt": {
+            "template": "# Propose Fix for {{executionId}}\n\nBased on the failure analysis in `{{outputDir}}/FAILURE_ANALYSIS.md`, propose fixes.\n\n## Fix Categories\n\n### 1. Template Fix (permanent improvement)\nIf the template has defects:\n- Unclear prompts → Add examples\n- Wrong validation → Adjust patterns\n- Missing defaults → Add sensible defaults\n- Token budget → Increase if truncated\n\n### 2. Input Fix (user action)\nIf inputs were wrong:\n- Missing variables → Document requirements\n- Invalid values → Add validation\n- Better defaults → Suggest values\n\n### 3. Environment Fix (infrastructure)\nIf environment caused failure:\n- Missing tool → Document dependencies\n- Permission issue → Fix access\n- Resource limit → Adjust quotas\n\n## Output\n\nCreate `{{outputDir}}/FIX_PROPOSAL.md`:\n\n```markdown\n# Fix Proposal: {{executionId}}\n\n## Recommended Fix\n\n**Type**: [template|input|environment]\n**Priority**: [high|medium|low]\n**Estimated Impact**: [% of similar failures prevented]\n\n## Implementation\n\n### For Template Fix:\n```json\n{\n  \"tasks\": [{\n    \"id\": \"[task-id]\",\n    \"prompt\": {\n      \"template\": \"[improved prompt]\"\n    },\n    \"validation\": {\n      \"required_patterns\": [\"[adjusted patterns]\"]\n    }\n  }]\n}\n```\n\n### For Input Fix:\n```bash\n# Correct invocation\nminibob --goal \"[goal]\" --var key=value\n```\n\n### For Environment Fix:\n```bash\n# Required setup\n[commands to fix environment]\n```\n\n## Testing\n\n1. Apply fix\n2. Re-run: `minibob --single \"[goal]\" --var executionId={{executionId}}`\n3. Expected: [success criteria]\n\n## Rollout\n\n{{#if proposeFix}}\n- [ ] Create template variant with fix\n- [ ] Test with 5 executions\n- [ ] Compare success rate\n- [ ] Promote if improved\n{{/if}}\n```",
+            "max_tokens": 10000
+          },
+          "validation": {
+            "required_files": ["{{outputDir}}/FIX_PROPOSAL.md"],
+            "required_patterns": [
+              { "pattern": "## Recommended Fix", "description": "Must propose fix" },
+              { "pattern": "## Implementation", "description": "Must provide implementation" }
+            ]
+          },
+          "tools": {
+            "required": ["read", "write"],
+            "optional": ["bash"]
+          },
+          "retry": { "maxAttempts": 2, "strategy": "simple" }
+        }
+      ],
+      "metadata": {
+        "meta_activity": true,
+        "self_modifying": false,
+        "teaches": [
+          "failure-analysis",
+          "trace-interpretation",
+          "fix-recommendation"
+        ],
+        "composable_with": ["optimize-slow-activity", "extract-template-from-traces"]
+      }
+    },
+    {
+      "id": "optimize-slow-activity",
+      "name": "Optimize Slow Activity",
+      "version": 1,
+      "description": "Analyze activity performance metrics to identify bottlenecks and create an optimized variant. Uses execution metrics impulses to find slow tasks and proposes improvements.",
+      "category": "infrastructure",
+      "tags": [
+        "meta.activity",
+        "meta.optimize",
+        "self-improvement",
+        "performance"
+      ],
+      "scope": "system",
+      "input_shapes": ["trace", "activity"],
+      "output_shapes": ["activity", "recommendation"],
+      "variables": [
+        {
+          "name": "activityId",
+          "type": "string",
+          "required": true,
+          "description": "Activity ID to optimize"
+        },
+        {
+          "name": "lookbackDays",
+          "type": "number",
+          "required": false,
+          "default": 30,
+          "description": "Number of days of execution history to analyze"
+        },
+        {
+          "name": "minExecutions",
+          "type": "number",
+          "required": false,
+          "default": 5,
+          "description": "Minimum executions required for meaningful analysis"
+        },
+        {
+          "name": "outputDir",
+          "type": "string",
+          "required": false,
+          "default": "/tmp/optimize-{{activityId}}",
+          "description": "Directory for analysis outputs"
+        }
+      ],
+      "impulses": [
+        {
+          "id": "activityMetrics",
+          "pointer": {
+            "type": "activityMetrics",
+            "activityId": "{{activityId}}",
+            "period": "{{lookbackDays}}d",
+            "includeTaskBreakdown": true
+          },
+          "budget": 5000,
+          "priority": "critical",
+          "description": "Performance metrics for the activity"
+        },
+        {
+          "id": "templateDefinition",
+          "pointer": {
+            "type": "activityTemplate",
+            "templateId": "{{activityId}}"
+          },
+          "budget": 5000,
+          "priority": "high",
+          "description": "Current template definition"
+        },
+        {
+          "id": "slowExecutions",
+          "pointer": {
+            "type": "executionQuery",
+            "query": "SELECT * FROM execution WHERE activity_id = $activity_id AND success = true ORDER BY duration_ms DESC LIMIT 10",
+            "params": { "activity_id": "{{activityId}}" }
+          },
+          "budget": 8000,
+          "priority": "high",
+          "description": "Slowest successful executions for analysis"
+        },
+        {
+          "id": "fastExecutions",
+          "pointer": {
+            "type": "executionQuery",
+            "query": "SELECT * FROM execution WHERE activity_id = $activity_id AND success = true ORDER BY duration_ms ASC LIMIT 5",
+            "params": { "activity_id": "{{activityId}}" }
+          },
+          "budget": 4000,
+          "priority": "medium",
+          "description": "Fastest successful executions for comparison"
+        }
+      ],
+      "tasks": [
+        {
+          "id": "analyze-performance",
+          "subagent": "general",
+          "description": "Analyze execution metrics to identify bottlenecks",
+          "dependencies": [],
+          "impulseReferences": ["activityMetrics", "slowExecutions", "fastExecutions"],
+          "prompt": {
+            "template": "# Performance Analysis: {{activityId}}\n\nAnalyze execution metrics to identify optimization opportunities.\n\n## Available Data (from impulses)\n\n- `activityMetrics`: Aggregated performance metrics\n  - Total executions\n  - Success rate\n  - Avg/p50/p95 duration\n  - Avg/p50/p95 cost\n  - Per-task breakdown\n\n- `slowExecutions`: 10 slowest successful runs\n- `fastExecutions`: 5 fastest successful runs\n\n## Analysis Tasks\n\n1. **Identify Bottleneck Tasks**:\n   - Which tasks take the longest?\n   - What % of total duration?\n   - Consistent or variable?\n\n2. **Compare Fast vs Slow**:\n   - What differs between fast and slow executions?\n   - Input differences?\n   - Tool call patterns?\n\n3. **Token Efficiency**:\n   - Are token budgets appropriate?\n   - Any truncation issues?\n   - Cost optimization opportunities?\n\n4. **Parallelization**:\n   - Can any tasks run in parallel?\n   - False dependencies?\n   - Sequential bottlenecks?\n\n5. **Model Selection**:\n   - Are complex models used for simple tasks?\n   - Could simpler models suffice?\n   - Cost vs quality tradeoff?\n\n## Output\n\nCreate `{{outputDir}}/PERFORMANCE_ANALYSIS.md`:\n\n```markdown\n# Performance Analysis: {{activityId}}\n\n## Current State\n\n| Metric | Value | Percentile |\n|--------|-------|------------|\n| Avg Duration | [ms] | - |\n| P50 Duration | [ms] | 50th |\n| P95 Duration | [ms] | 95th |\n| Avg Cost | $[amount] | - |\n| Success Rate | [%] | - |\n| Executions | [count] | - |\n\n## Task Breakdown\n\n| Task | Avg Duration | % of Total | Bottleneck? |\n|------|--------------|------------|-------------|\n| task-1 | [ms] | [%] | [yes/no] |\n| task-2 | [ms] | [%] | [yes/no] |\n\n## Bottleneck Analysis\n\n### Primary Bottleneck: [task-id]\n\n**Duration**: [ms] ([%] of total)\n\n**Cause**:\n- [reason 1]\n- [reason 2]\n\n**Evidence**:\n- Slow executions: [pattern]\n- Fast executions: [pattern]\n\n### Secondary Bottlenecks\n\n1. [task-id]: [reason]\n2. [task-id]: [reason]\n\n## Fast vs Slow Comparison\n\n| Factor | Fast Executions | Slow Executions |\n|--------|-----------------|------------------|\n| Input size | [value] | [value] |\n| Tool calls | [count] | [count] |\n| Retries | [count] | [count] |\n\n## Optimization Opportunities\n\n1. **[Opportunity 1]**\n   - Impact: [% improvement]\n   - Effort: [low/medium/high]\n   - Risk: [low/medium/high]\n\n2. **[Opportunity 2]**\n   - Impact: [% improvement]\n   - Effort: [low/medium/high]\n   - Risk: [low/medium/high]\n\n## Recommendations\n\n1. [Top recommendation]\n2. [Second recommendation]\n3. [Third recommendation]\n```",
+            "max_tokens": 14000
+          },
+          "validation": {
+            "required_files": ["{{outputDir}}/PERFORMANCE_ANALYSIS.md"],
+            "required_patterns": [
+              { "pattern": "## Bottleneck Analysis", "description": "Must identify bottlenecks" },
+              { "pattern": "## Optimization Opportunities", "description": "Must propose optimizations" }
+            ]
+          },
+          "tools": {
+            "required": ["write"],
+            "optional": ["read", "bash"]
+          },
+          "retry": { "maxAttempts": 2, "strategy": "simple" }
+        },
+        {
+          "id": "create-optimized-variant",
+          "subagent": "general",
+          "description": "Create an optimized template variant",
+          "dependencies": ["analyze-performance"],
+          "impulseReferences": ["templateDefinition"],
+          "prompt": {
+            "template": "# Create Optimized Variant: {{activityId}}\n\nBased on the performance analysis, create an optimized template variant.\n\n## Input\n\n- Read `{{outputDir}}/PERFORMANCE_ANALYSIS.md`\n- Load `templateDefinition` impulse for current template\n\n## Optimization Strategies\n\n### 1. Parallelization\nRemove false dependencies to enable parallel execution:\n```json\n{\n  \"tasks\": [{\n    \"id\": \"task-2\",\n    \"dependencies\": [\"task-1\"]  // Was: [\"task-1\", \"task-unrelated\"]\n  }]\n}\n```\n\n### 2. Token Budget Adjustment\nIncrease budgets for truncated tasks, decrease for wasteful:\n```json\n{\n  \"tasks\": [{\n    \"id\": \"task-1\",\n    \"prompt\": {\n      \"max_tokens\": 12000  // Was: 8000 (truncating)\n    }\n  }]\n}\n```\n\n### 3. Model Tiering\nUse simpler models for simple tasks:\n```json\n{\n  \"tasks\": [{\n    \"id\": \"simple-task\",\n    \"complexity\": {\n      \"tier\": \"simple\",\n      \"suggestedModels\": {\n        \"preferred\": \"anthropic/claude-haiku-4\",\n        \"fallback\": \"anthropic/claude-sonnet-4\"\n      }\n    }\n  }]\n}\n```\n\n### 4. Prompt Compression\nReduce verbose prompts while maintaining clarity:\n- Remove redundant instructions\n- Use concise examples\n- Eliminate unnecessary context\n\n## Output\n\nCreate `{{outputDir}}/{{activityId}}-optimized.json`:\n\n```json\n{\n  \"id\": \"{{activityId}}-optimized\",\n  \"name\": \"[Original Name] (Optimized)\",\n  \"version\": 1,\n  \"description\": \"[Original description]. Optimized for performance: [summary of changes].\",\n  \"variant_of\": \"{{activityId}}\",\n  \"category\": \"[same as original]\",\n  \"tags\": [\"[original tags]\", \"optimized\"],\n  \"input_shapes\": [\"[same as original]\"],\n  \"output_shapes\": [\"[same as original]\"],\n  \"tasks\": [\n    // Optimized tasks with changes applied\n  ],\n  \"metadata\": {\n    \"optimized_from\": \"{{activityId}}\",\n    \"optimization_date\": \"[timestamp]\",\n    \"expected_improvement\": {\n      \"duration_reduction\": \"[%]\",\n      \"cost_reduction\": \"[%]\"\n    },\n    \"changes_applied\": [\n      \"[change 1]\",\n      \"[change 2]\"\n    ]\n  }\n}\n```\n\nAlso create `{{outputDir}}/OPTIMIZATION_REPORT.md` documenting all changes.",
+            "max_tokens": 16000
+          },
+          "validation": {
+            "required_files": [
+              "{{outputDir}}/{{activityId}}-optimized.json",
+              "{{outputDir}}/OPTIMIZATION_REPORT.md"
+            ],
+            "required_patterns": [
+              { "pattern": "\"variant_of\"", "description": "Must link to original" },
+              { "pattern": "expected_improvement", "description": "Must estimate impact" }
+            ],
+            "commands": [
+              {
+                "command": "cat {{outputDir}}/{{activityId}}-optimized.json | jq empty",
+                "expected_exit_code": 0
+              }
+            ]
+          },
+          "tools": {
+            "required": ["read", "write", "bash"],
+            "optional": []
+          },
+          "retry": { "maxAttempts": 3, "strategy": "progressive-context" }
+        }
+      ],
+      "metadata": {
+        "meta_activity": true,
+        "self_modifying": false,
+        "teaches": [
+          "performance-analysis",
+          "bottleneck-identification",
+          "variant-creation"
+        ],
+        "composable_with": ["debug-failed-execution", "extract-template-from-traces"]
+      }
+    },
+    {
+      "id": "extract-template-from-traces",
+      "name": "Extract Template from Execution Traces",
+      "version": 1,
+      "description": "Analyze successful execution traces and mechanically extract a reusable activity template using the ribosome pattern. Converts implicit patterns into explicit templates.",
+      "category": "infrastructure",
+      "tags": [
+        "meta.activity",
+        "meta.ribosome",
+        "self-improvement",
+        "template-extraction"
+      ],
+      "scope": "system",
+      "input_shapes": ["trace"],
+      "output_shapes": ["activity"],
+      "variables": [
+        {
+          "name": "executionIds",
+          "type": "array",
+          "required": true,
+          "description": "Array of execution IDs to extract template from"
+        },
+        {
+          "name": "templateName",
+          "type": "string",
+          "required": false,
+          "description": "Name for the extracted template (auto-generated if not provided)"
+        },
+        {
+          "name": "minSuccessRate",
+          "type": "number",
+          "required": false,
+          "default": 0.7,
+          "description": "Minimum success rate across traces to proceed with extraction"
+        },
+        {
+          "name": "outputDir",
+          "type": "string",
+          "required": false,
+          "default": "/tmp/extract-template",
+          "description": "Directory for extraction outputs"
+        },
+        {
+          "name": "registerTemplate",
+          "type": "boolean",
+          "required": false,
+          "default": false,
+          "description": "Whether to register the extracted template in the backend"
+        }
+      ],
+      "impulses": [
+        {
+          "id": "executionTraces",
+          "pointer": {
+            "type": "executionTraceBatch",
+            "executionIds": "{{executionIds}}",
+            "includeState": true,
+            "includeToolCalls": true
+          },
+          "budget": 20000,
+          "priority": "critical",
+          "description": "Batch of execution traces to analyze for pattern extraction"
+        },
+        {
+          "id": "ribosomeCandidates",
+          "pointer": {
+            "type": "ribosomeCandidates",
+            "limit": 10,
+            "minTraces": 2
+          },
+          "budget": 2000,
+          "priority": "low",
+          "description": "Other candidate trace sequences for extraction (context)"
+        }
+      ],
+      "tasks": [
+        {
+          "id": "validate-traces",
+          "subagent": "general",
+          "description": "Validate that traces are suitable for extraction",
+          "dependencies": [],
+          "impulseReferences": ["executionTraces"],
+          "prompt": {
+            "template": "# Validate Traces for Extraction\n\nBefore extracting a template, validate that the traces are suitable.\n\n## Validation Criteria\n\n1. **Minimum Success Rate**:\n   - Required: {{minSuccessRate}} ({{minSuccessRate * 100}}%)\n   - At least this % of traces must be successful\n\n2. **Consistency**:\n   - Tool usage should be similar across traces\n   - Task sequence should be consistent\n   - Variables should be extractable\n\n3. **Completeness**:\n   - Traces should cover the full workflow\n   - State transitions should be captured\n   - Tool calls should have arguments\n\n## Analysis\n\nFrom `executionTraces` impulse, analyze:\n\n1. **Success Rate**:\n   ```\n   Successful: [count]\n   Failed: [count]\n   Rate: [%]\n   ```\n\n2. **Tool Consistency**:\n   - Common tools across all traces\n   - Trace-specific tools\n   - Core vs optional tools\n\n3. **Variable Extraction**:\n   - What arguments vary across traces?\n   - What arguments are constant?\n   - What can be parameterized?\n\n## Output\n\nCreate `{{outputDir}}/TRACE_VALIDATION.md`:\n\n```markdown\n# Trace Validation Report\n\n## Summary\n\n- **Traces Analyzed**: [count]\n- **Successful**: [count] ([%])\n- **Failed**: [count] ([%])\n- **Validation**: [PASSED/FAILED]\n\n## Success Rate Check\n\n- Required: {{minSuccessRate * 100}}%\n- Actual: [%]\n- Result: [PASS/FAIL]\n\n## Consistency Check\n\n### Tool Usage\n\n| Tool | Appears In | Consistent? |\n|------|------------|-------------|\n| read | [N]/[Total] | [yes/no] |\n| write | [N]/[Total] | [yes/no] |\n\n### Task Sequence\n\n- Consistent sequence: [yes/no]\n- Variations: [description]\n\n## Extractable Variables\n\n| Variable | Type | Source | Varies? |\n|----------|------|--------|--------|\n| file_path | path | read.args | yes |\n| pattern | string | grep.args | yes |\n\n## Recommendation\n\n[PROCEED/ABORT] with extraction.\n\n{{#if abort}}\n**Reason**: [why extraction should not proceed]\n{{/if}}\n```\n\n**IMPORTANT**: If validation fails (success rate < {{minSuccessRate}}), clearly indicate ABORT and do not proceed.",
+            "max_tokens": 10000
+          },
+          "validation": {
+            "required_files": ["{{outputDir}}/TRACE_VALIDATION.md"],
+            "required_patterns": [
+              { "pattern": "## Summary", "description": "Must have summary" },
+              { "pattern": "Validation", "description": "Must indicate pass/fail" }
+            ]
+          },
+          "tools": {
+            "required": ["write"],
+            "optional": ["read"]
+          },
+          "retry": { "maxAttempts": 2, "strategy": "simple" }
+        },
+        {
+          "id": "extract-template",
+          "subagent": "general",
+          "description": "Mechanically extract template from validated traces",
+          "dependencies": ["validate-traces"],
+          "impulseReferences": ["executionTraces"],
+          "prompt": {
+            "template": "# Extract Template from Traces\n\n**PREREQUISITE**: Only proceed if `{{outputDir}}/TRACE_VALIDATION.md` indicates PROCEED.\n\n## Extraction Process (Ribosome Pattern)\n\nThe ribosome mechanically converts traces into templates:\n\n### 1. Group Tool Calls into Tasks\n\n- Read operations → \"gather-context\" task\n- Write operations → \"implement\" task\n- Validation operations → \"verify\" task\n\n### 2. Extract Dependencies\n\n- If task B uses output of task A → B depends on A\n- If tasks are independent → parallel execution\n\n### 3. Extract Variables\n\n- Arguments that vary → template variables\n- Arguments that are constant → hardcode\n- Patterns → parameterize\n\n### 4. Generate Prompts\n\n- Describe what each task does\n- Include tool requirements\n- Add validation requirements\n\n### 5. Extract Impulses\n\n- File reads → file impulses\n- Grep operations → pattern impulses\n- Context needs → appropriate impulse types\n\n## Output\n\nCreate `{{outputDir}}/extracted-template.json`:\n\n```json\n{\n  \"id\": \"{{templateName || 'extracted-' + executionIds[0]}}\",\n  \"name\": \"{{templateName || 'Extracted from Traces'}}\",\n  \"version\": 1,\n  \"description\": \"Auto-extracted template from {{executionIds.length}} execution trace(s)\",\n  \"category\": \"infrastructure\",\n  \"tags\": [\"extracted\", \"ribosome\"],\n  \"input_shapes\": [\"[inferred from inputs]\"],\n  \"output_shapes\": [\"[inferred from outputs]\"],\n  \"variables\": [\n    {\n      \"name\": \"[extracted variable]\",\n      \"type\": \"[inferred type]\",\n      \"required\": true,\n      \"description\": \"[from tool call context]\",\n      \"extractedFrom\": \"[tool.args.field]\"\n    }\n  ],\n  \"impulses\": [\n    {\n      \"id\": \"[impulse-id]\",\n      \"pointer\": {\n        \"type\": \"file\",\n        \"path\": \"{{variable}}\"\n      },\n      \"budget\": 3000,\n      \"priority\": \"high\",\n      \"description\": \"[from trace context]\"\n    }\n  ],\n  \"tasks\": [\n    {\n      \"id\": \"task-1\",\n      \"subagent\": \"general\",\n      \"description\": \"[from trace task]\",\n      \"dependencies\": [],\n      \"impulseReferences\": [\"[relevant impulses]\"],\n      \"prompt\": {\n        \"template\": \"[generated from tool calls]\",\n        \"max_tokens\": 8000\n      },\n      \"validation\": {\n        \"required_files\": [\"[from output state]\"],\n        \"required_patterns\": []\n      },\n      \"tools\": {\n        \"required\": [\"[from tool calls]\"],\n        \"optional\": []\n      }\n    }\n  ],\n  \"metadata\": {\n    \"extracted\": true,\n    \"extractedFrom\": {\n      \"executionIds\": {{executionIds}},\n      \"traceCount\": {{executionIds.length}},\n      \"successRate\": \"[from validation]\"\n    },\n    \"confidence\": \"[calculated]\",\n    \"generatedAt\": \"[timestamp]\"\n  }\n}\n```\n\nAlso create `{{outputDir}}/EXTRACTION_REPORT.md` documenting the extraction process.",
+            "max_tokens": 16000
+          },
+          "validation": {
+            "required_files": [
+              "{{outputDir}}/extracted-template.json",
+              "{{outputDir}}/EXTRACTION_REPORT.md"
+            ],
+            "required_patterns": [
+              { "pattern": "\"extracted\": true", "description": "Must mark as extracted" },
+              { "pattern": "extractedFrom", "description": "Must link to source traces" }
+            ],
+            "commands": [
+              {
+                "command": "cat {{outputDir}}/extracted-template.json | jq empty",
+                "expected_exit_code": 0
+              }
+            ]
+          },
+          "tools": {
+            "required": ["read", "write", "bash"],
+            "optional": []
+          },
+          "retry": { "maxAttempts": 3, "strategy": "progressive-context" }
+        },
+        {
+          "id": "register-template",
+          "subagent": "general",
+          "description": "Register the extracted template in the backend (optional)",
+          "dependencies": ["extract-template"],
+          "impulseReferences": [],
+          "prompt": {
+            "template": "# Register Extracted Template\n\n{{#unless registerTemplate}}\n**SKIP**: Template registration not requested (registerTemplate=false).\n\nCreate `{{outputDir}}/REGISTRATION_SKIPPED.md` noting:\n- Template extracted but not registered\n- User can manually register with: POST /v2/activities/templates\n{{/unless}}\n\n{{#if registerTemplate}}\n## Registration Process\n\n1. Read extracted template from `{{outputDir}}/extracted-template.json`\n\n2. Call ribosome API to register:\n   ```bash\n   curl -X POST http://localhost:8082/v2/ribosome/extract \\\n     -H \"Content-Type: application/json\" \\\n     -d @{{outputDir}}/extracted-template.json\n   ```\n\n3. Verify registration:\n   ```bash\n   curl http://localhost:8082/v2/activities/templates/[template-id]\n   ```\n\n## Output\n\nCreate `{{outputDir}}/REGISTRATION_RESULT.md`:\n\n```markdown\n# Template Registration Result\n\n## Status: [SUCCESS/FAILED]\n\n### Template Details\n- **ID**: [id]\n- **Name**: [name]\n- **Version**: 1\n\n### API Response\n```json\n[response]\n```\n\n### Next Steps\n1. Test template: `minibob --activity [id] --var ...`\n2. Monitor success rate\n3. Iterate if needed\n```\n{{/if}}",
+            "max_tokens": 6000
+          },
+          "validation": {
+            "required_files": [
+              "{{outputDir}}/REGISTRATION_RESULT.md"
+            ],
+            "required_patterns": [
+              { "pattern": "Status:", "description": "Must report status" }
+            ]
+          },
+          "tools": {
+            "required": ["read", "write", "bash"],
+            "optional": []
+          },
+          "retry": { "maxAttempts": 2, "strategy": "simple" }
+        }
+      ],
+      "metadata": {
+        "meta_activity": true,
+        "self_modifying": false,
+        "teaches": [
+          "ribosome-pattern",
+          "template-extraction",
+          "trace-analysis"
+        ],
+        "composable_with": ["debug-failed-execution", "optimize-slow-activity"]
+      }
+    },
+    {
+      "id": "compose-activity-sequence",
+      "name": "Compose Activity Sequence",
+      "version": 1,
+      "description": "Discover frequent activity sequences from execution patterns and merge them into a composite template. Enables end-to-end Thompson Sampling on proven workflows.",
+      "category": "infrastructure",
+      "tags": [
+        "meta.activity",
+        "meta.compose",
+        "self-improvement",
+        "workflow-composition"
+      ],
+      "scope": "system",
+      "input_shapes": ["trace", "activity"],
+      "output_shapes": ["activity"],
+      "variables": [
+        {
+          "name": "patternId",
+          "type": "string",
+          "required": false,
+          "description": "Specific pattern ID to compose (if known)"
+        },
+        {
+          "name": "activitySequence",
+          "type": "array",
+          "required": false,
+          "description": "Explicit sequence of activity IDs to compose (alternative to patternId)"
+        },
+        {
+          "name": "minFrequency",
+          "type": "number",
+          "required": false,
+          "default": 10,
+          "description": "Minimum observation count for automatic pattern discovery"
+        },
+        {
+          "name": "minSuccessRate",
+          "type": "number",
+          "required": false,
+          "default": 0.8,
+          "description": "Minimum success rate for pattern to be considered"
+        },
+        {
+          "name": "maxSequenceLength",
+          "type": "number",
+          "required": false,
+          "default": 5,
+          "description": "Maximum activities in a composed sequence"
+        },
+        {
+          "name": "outputDir",
+          "type": "string",
+          "required": false,
+          "default": "/tmp/compose-sequence",
+          "description": "Directory for composition outputs"
+        },
+        {
+          "name": "registerComposite",
+          "type": "boolean",
+          "required": false,
+          "default": false,
+          "description": "Whether to register the composite template"
+        }
+      ],
+      "impulses": [
+        {
+          "id": "compositionGraph",
+          "pointer": {
+            "type": "compositionGraph",
+            "minEdgeWeight": 0.7,
+            "includeMetrics": true
+          },
+          "budget": 5000,
+          "priority": "high",
+          "description": "Activity composition graph with edge weights"
+        },
+        {
+          "id": "frequentSequences",
+          "pointer": {
+            "type": "executionQuery",
+            "query": "SELECT sequence, count() as frequency, AVG(success::int) as success_rate FROM ribosome_sequence WHERE length(sequence) <= $max_len GROUP BY sequence HAVING count() >= $min_freq AND AVG(success::int) >= $min_success ORDER BY frequency DESC LIMIT 20",
+            "params": {
+              "max_len": "{{maxSequenceLength}}",
+              "min_freq": "{{minFrequency}}",
+              "min_success": "{{minSuccessRate}}"
+            }
+          },
+          "budget": 3000,
+          "priority": "high",
+          "description": "Frequent activity sequences meeting criteria"
+        },
+        {
+          "id": "templateDefinitions",
+          "pointer": {
+            "type": "activityTemplateBatch",
+            "templateIds": "{{activitySequence || frequentSequences[0].sequence}}"
+          },
+          "budget": 10000,
+          "priority": "critical",
+          "description": "Template definitions for activities in the sequence"
+        }
+      ],
+      "tasks": [
+        {
+          "id": "discover-or-validate-pattern",
+          "subagent": "general",
+          "description": "Discover frequent patterns or validate provided sequence",
+          "dependencies": [],
+          "impulseReferences": ["compositionGraph", "frequentSequences"],
+          "prompt": {
+            "template": "# Discover or Validate Composition Pattern\n\n## Mode Selection\n\n{{#if patternId}}\n**Mode**: Compose specific pattern (patternId: {{patternId}})\n{{else if activitySequence}}\n**Mode**: Compose explicit sequence: {{activitySequence}}\n{{else}}\n**Mode**: Auto-discover best pattern from execution history\n{{/if}}\n\n## Analysis\n\n### From `frequentSequences` Impulse\n\nFind patterns meeting criteria:\n- Frequency: >= {{minFrequency}} observations\n- Success Rate: >= {{minSuccessRate * 100}}%\n- Length: <= {{maxSequenceLength}} activities\n\n### From `compositionGraph` Impulse\n\nValidate edge weights:\n- All edges in sequence should have weight >= 0.7\n- This ensures proven transitions\n\n## Output\n\nCreate `{{outputDir}}/PATTERN_ANALYSIS.md`:\n\n```markdown\n# Composition Pattern Analysis\n\n## Selected Pattern\n\n**Sequence**: [A] → [B] → [C]\n\n**Metrics**:\n- Frequency: [count] observations\n- Success Rate: [%]\n- Avg Duration: [ms]\n- Avg Cost: $[amount]\n\n## Edge Analysis\n\n| Transition | Weight | Success Rate | Count |\n|------------|--------|--------------|-------|\n| A → B | 0.85 | 92% | 45 |\n| B → C | 0.78 | 88% | 38 |\n\n## Validation\n\n- ✅ Frequency >= {{minFrequency}}\n- ✅ Success >= {{minSuccessRate * 100}}%\n- ✅ Length <= {{maxSequenceLength}}\n- ✅ All edge weights >= 0.7\n\n## Composition Recommendation\n\n[PROCEED/ABORT]\n\n{{#if abort}}\n**Reason**: [why composition should not proceed]\n**Alternative**: [suggest different pattern or approach]\n{{/if}}\n```",
+            "max_tokens": 10000
+          },
+          "validation": {
+            "required_files": ["{{outputDir}}/PATTERN_ANALYSIS.md"],
+            "required_patterns": [
+              { "pattern": "## Selected Pattern", "description": "Must select pattern" },
+              { "pattern": "## Validation", "description": "Must validate criteria" }
+            ]
+          },
+          "tools": {
+            "required": ["write"],
+            "optional": ["read"]
+          },
+          "retry": { "maxAttempts": 2, "strategy": "simple" }
+        },
+        {
+          "id": "merge-templates",
+          "subagent": "general",
+          "description": "Merge activity templates into composite",
+          "dependencies": ["discover-or-validate-pattern"],
+          "impulseReferences": ["templateDefinitions"],
+          "prompt": {
+            "template": "# Merge Templates into Composite\n\n**PREREQUISITE**: Only proceed if `{{outputDir}}/PATTERN_ANALYSIS.md` indicates PROCEED.\n\n## Merge Strategy\n\n### 1. Variable Unification\n\n- Identify shared variables across templates\n- Resolve naming conflicts (prefix with activity name)\n- Create unified variable set\n\n### 2. Impulse Consolidation\n\n- Combine impulses from all templates\n- Remove duplicates (same pointer)\n- Adjust budgets (may need to share token budget)\n\n### 3. Task Sequencing\n\n- Preserve task order within each activity\n- Add inter-activity dependencies\n- Activity B tasks depend on Activity A's final task\n\n### 4. Validation Merging\n\n- Cumulative required files\n- Combined patterns\n- Final validation checks all activities\n\n## Output\n\nCreate `{{outputDir}}/composed-template.json`:\n\n```json\n{\n  \"id\": \"composed-[A]-[B]-[C]\",\n  \"name\": \"Composed: [A Name] + [B Name] + [C Name]\",\n  \"version\": 1,\n  \"description\": \"Composite workflow combining [A], [B], and [C]. Discovered from {{frequentSequences[0].frequency}} successful executions with {{frequentSequences[0].success_rate * 100}}% success rate.\",\n  \"category\": \"composition\",\n  \"execution_type\": \"composition\",\n  \"tags\": [\"composed\", \"workflow\", \"self-improvement\"],\n  \"input_shapes\": [\"[union of inputs]\"],\n  \"output_shapes\": [\"[union of outputs]\"],\n  \"child_activities\": [\"[A]\", \"[B]\", \"[C]\"],\n  \"variables\": [\n    // Unified variables from all activities\n  ],\n  \"impulses\": [\n    // Consolidated impulses\n  ],\n  \"tasks\": [\n    // === Activity A Tasks ===\n    {\n      \"id\": \"A-task-1\",\n      \"activity_source\": \"[A]\",\n      \"dependencies\": [],\n      // ... rest of task\n    },\n    {\n      \"id\": \"A-task-2\",\n      \"activity_source\": \"[A]\",\n      \"dependencies\": [\"A-task-1\"],\n      // ... rest of task\n    },\n    // === Activity B Tasks (depend on A) ===\n    {\n      \"id\": \"B-task-1\",\n      \"activity_source\": \"[B]\",\n      \"dependencies\": [\"A-task-2\"],  // Links to A's final task\n      // ... rest of task\n    },\n    // === Activity C Tasks (depend on B) ===\n    {\n      \"id\": \"C-task-1\",\n      \"activity_source\": \"[C]\",\n      \"dependencies\": [\"B-task-N\"],  // Links to B's final task\n      // ... rest of task\n    }\n  ],\n  \"validation\": {\n    \"required_files\": [\"[all required files]\"],\n    \"success_indicators\": [\"[from all activities]\"]\n  },\n  \"metadata\": {\n    \"composed\": true,\n    \"composedFrom\": {\n      \"activities\": [\"[A]\", \"[B]\", \"[C]\"],\n      \"pattern\": \"[A] → [B] → [C]\",\n      \"frequency\": \"[count]\",\n      \"successRate\": \"[rate]\"\n    },\n    \"composedAt\": \"[timestamp]\"\n  }\n}\n```\n\nAlso create `{{outputDir}}/COMPOSITION_REPORT.md` documenting the merge process.",
+            "max_tokens": 18000
+          },
+          "validation": {
+            "required_files": [
+              "{{outputDir}}/composed-template.json",
+              "{{outputDir}}/COMPOSITION_REPORT.md"
+            ],
+            "required_patterns": [
+              { "pattern": "\"composed\": true", "description": "Must mark as composed" },
+              { "pattern": "child_activities", "description": "Must list source activities" }
+            ],
+            "commands": [
+              {
+                "command": "cat {{outputDir}}/composed-template.json | jq empty",
+                "expected_exit_code": 0
+              }
+            ]
+          },
+          "tools": {
+            "required": ["read", "write", "bash"],
+            "optional": []
+          },
+          "retry": { "maxAttempts": 3, "strategy": "progressive-context" }
+        },
+        {
+          "id": "register-composite",
+          "subagent": "general",
+          "description": "Register the composite template (optional)",
+          "dependencies": ["merge-templates"],
+          "impulseReferences": [],
+          "prompt": {
+            "template": "# Register Composite Template\n\n{{#unless registerComposite}}\n**SKIP**: Composite registration not requested.\n\nCreate `{{outputDir}}/REGISTRATION_SKIPPED.md`:\n- Composite created but not registered\n- Manual registration: POST /v2/activities/templates\n{{/unless}}\n\n{{#if registerComposite}}\n## Registration\n\n1. Read `{{outputDir}}/composed-template.json`\n2. Register with backend:\n   ```bash\n   curl -X POST http://localhost:8082/v2/activities/composition \\\n     -H \"Content-Type: application/json\" \\\n     -d @{{outputDir}}/composed-template.json\n   ```\n3. Verify:\n   ```bash\n   curl http://localhost:8082/v2/activities/templates/composed-[id]\n   ```\n\n## Output\n\nCreate `{{outputDir}}/REGISTRATION_RESULT.md`:\n\n```markdown\n# Composite Registration Result\n\n## Status: [SUCCESS/FAILED]\n\n### Composite Details\n- **ID**: composed-[id]\n- **Activities**: [count]\n- **Tasks**: [total count]\n\n### Thompson Sampling\n\nInitialized with:\n- alpha: 1 (neutral prior)\n- beta: 1 (neutral prior)\n\nWill learn from executions.\n\n### Test Command\n```bash\nminibob --activity composed-[id] --var key=value\n```\n```\n{{/if}}",
+            "max_tokens": 6000
+          },
+          "validation": {
+            "required_files": [
+              "{{outputDir}}/REGISTRATION_RESULT.md"
+            ],
+            "required_patterns": [
+              { "pattern": "Status:", "description": "Must report status" }
+            ]
+          },
+          "tools": {
+            "required": ["read", "write", "bash"],
+            "optional": []
+          },
+          "retry": { "maxAttempts": 2, "strategy": "simple" }
+        }
+      ],
+      "metadata": {
+        "meta_activity": true,
+        "self_modifying": false,
+        "teaches": [
+          "workflow-composition",
+          "pattern-discovery",
+          "template-merging"
+        ],
+        "composable_with": ["optimize-slow-activity", "extract-template-from-traces"]
+      }
+    }
+  ]
+}

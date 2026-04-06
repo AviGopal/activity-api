@@ -390,14 +390,22 @@ export async function getActivityScores(
   // P5.1: Try new v_activity_score view if paradigm read is enabled for this request
   if (useParadigm) {
     try {
-      let query = `SELECT * FROM v_activity_score WHERE org_id = $org_id`;
-      // org_id in v_activity_score is stored as record ID (e.g., "organizations:metabob_internal")
-      const fullOrgId = orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`;
-      const params: Record<string, any> = { org_id: fullOrgId };
+      // org_id format: Support both plain strings and record ID format
+      // execution table may store either "public" or "organizations:public"
+      const plainOrgId = orgId.replace(/^organizations:/, '');
+      let query = `SELECT * FROM v_activity_score WHERE (org_id = $org_id OR org_id = $plain_org_id)`;
+      const params: Record<string, any> = {
+        org_id: orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`,
+        plain_org_id: plainOrgId,
+      };
 
       if (activityIds && activityIds.length > 0) {
+        // Normalize activity IDs: strip "activity:" prefix for matching
+        // execution table stores plain IDs like "fix.bug.comprehensive"
+        // but activity table uses record IDs like "activity:fix.bug.comprehensive"
+        const normalizedIds = activityIds.map(id => id.replace(/^activity:/, '').replace(/[⟨⟩`]/g, ''));
         query += ` AND activity_id IN $activity_ids`;
-        params.activity_ids = activityIds;
+        params.activity_ids = normalizedIds;
       }
 
       const result = jwtToken

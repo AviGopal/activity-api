@@ -272,7 +272,54 @@ export function inferOutputShapesFromPrompt(prompt: string): string[] {
 }
 
 /**
+ * Get default output shape based on category
+ * Used as a fallback when no shapes can be inferred from content
+ */
+function getDefaultOutputShapeForCategory(category: string | undefined): string {
+  if (!category) {
+    return 'unknown_output';
+  }
+
+  switch (category.toLowerCase()) {
+    case 'bugfix':
+      return 'patch';
+    case 'feature':
+      return 'source_code';
+    case 'refactor':
+      return 'source_code';
+    case 'test':
+      return 'test_result';
+    case 'tool':
+      return 'tool_output';
+    case 'infrastructure':
+      return 'config_file';
+    case 'meta':
+      return 'activity_template';
+    case 'docs':
+      return 'documentation';
+    default:
+      return 'unknown_output';
+  }
+}
+
+/**
  * Infer both input and output shapes from a complete activity template
+ *
+ * IMPORTANT: This function ALWAYS returns at least one output shape.
+ * output_shapes is a required field for activity templates because it enables
+ * output-based activity selection and composition learning.
+ *
+ * If no output shapes can be inferred from the template content, a category-based
+ * fallback is used:
+ *   - bugfix → ['patch']
+ *   - feature → ['source_code']
+ *   - refactor → ['source_code']
+ *   - test → ['test_result']
+ *   - tool → ['tool_output']
+ *   - infrastructure → ['config_file']
+ *   - meta → ['activity_template']
+ *   - docs → ['documentation']
+ *   - other/unknown → ['unknown_output']
  */
 export function inferShapesFromTemplate(template: {
   tasks?: Array<{
@@ -328,14 +375,19 @@ export function inferShapesFromTemplate(template: {
     }
   }
 
-  // Analyze template description
+  // Analyze template description for output indicators
   if (template.description) {
+    // Infer inputs from description
     for (const shape of inferInputShapesFromPrompt(template.description)) {
       inputShapes.add(shape);
     }
+    // Also check description for output shapes
+    for (const shape of inferOutputShapesFromPrompt(template.description)) {
+      outputShapes.add(shape);
+    }
   }
 
-  // Category-based defaults
+  // Category-based defaults (add to output shapes, enrich input shapes)
   if (template.category) {
     switch (template.category.toLowerCase()) {
       case 'bugfix':
@@ -350,12 +402,28 @@ export function inferShapesFromTemplate(template: {
         outputShapes.add('patch');
         break;
       case 'test':
-        outputShapes.add('test_suite');
+        outputShapes.add('test_result');
         break;
       case 'docs':
         outputShapes.add('documentation');
         break;
+      case 'tool':
+        outputShapes.add('tool_output');
+        break;
+      case 'infrastructure':
+        outputShapes.add('config_file');
+        break;
+      case 'meta':
+        outputShapes.add('activity_template');
+        break;
     }
+  }
+
+  // CRITICAL: Ensure at least one output shape is present
+  // output_shapes is a required field for activity templates
+  if (outputShapes.size === 0) {
+    const fallbackShape = getDefaultOutputShapeForCategory(template.category);
+    outputShapes.add(fallbackShape);
   }
 
   return {

@@ -733,11 +733,13 @@ app.post('/', async (c) => {
 
     // Map MiniBob's field names to database schema
     // MiniBob sends: template_id, we store as: variant_id + activity_id
+    const success = body.status === 'completed' || body.success === true;
     const trace = {
       execution_id: body.execution_id,
       variant_id: body.template_id, // MiniBob's template_id maps to variant_id
       activity_id: body.activity_id || body.template_id, // Default to template_id
-      success: body.status === 'completed' || body.success === true,
+      success,
+      status: success ? 'success' : 'failure', // Derived status for backward compatibility
       duration_ms: body.duration_ms || 0,
       cost_usd: body.cost_usd || body.cost || 0,
       // Token counts (separate fields, not nested object)
@@ -901,6 +903,7 @@ app.post('/', async (c) => {
         variant_id: $variant_id,
         activity_id: $activity_id,
         success: $success,
+        status: $status,
         duration_ms: $duration_ms,
         cost_usd: $cost_usd,
         tokens_input: $tokens_input,
@@ -1073,6 +1076,441 @@ app.post('/', async (c) => {
 
     return c.json({
       error: 'Failed to store execution trace',
+      message: error instanceof Error ? error.message : 'Unknown error',
+    }, 500);
+  }
+});
+
+/**
+ * GET /v2/activities/execution-traces/selection-outcomes
+ *
+ * Query selection-to-execution correlation data (Task 15)
+ * Joins thompson_selection_log with activity_execution_traces via correlation_id
+ *
+ * Query params:
+ * - activity_id: Filter by activity ID
+ * - attribution_type: Filter by attribution type ('exact' | 'pending')
+ * - success: Filter by execution success (true/false)
+ * - limit: Max records to return (default: 50, max: 500)
+ * - offset: Pagination offset (default: 0)
+ * - start_date: Filter selections after this ISO timestamp
+ * - end_date: Filter selections before this ISO timestamp
+ */
+app.get('/selection-outcomes', async (c) => {
+  try {
+    const jwtAuth = getJwtAuthFromContext(c);
+    const useJwtAuth = hasJwtAuth(c);
+
+    // Parse query params
+    const activityId = c.req.query('activity_id');
+    const attributionType = c.req.query('attribution_type');
+    const successParam = c.req.query('success');
+    const limitParam = parseInt(c.req.query('limit') || '50', 10);
+    const offsetParam = parseInt(c.req.query('offset') || '0', 10);
+    const startDate = c.req.query('start_date');
+    const endDate = c.req.query('end_date');
+
+    const limit = Math.min(Math.max(limitParam, 1), 500);
+    const offset = Math.max(offsetParam, 0);
+
+    // Build selection query conditions
+    const selectionConditions: string[] = [];
+    const params: Record<string, any> = { limit, offset };
+
+    if (activityId) {
+      selectionConditions.push('sel.activity_id = $activity_id');
+      params.activity_id = activityId;
+    }
+
+    if (startDate) {
+      selectionConditions.push('sel.selected_at >= $start_date');
+      params.start_date = startDate;
+    }
+
+    if (endDate) {
+      selectionConditions.push('sel.selected_at <= $end_date');
+      params.end_date = endDate;
+    }
+
+    const selectionWhereClause = selectionConditions.length > 0
+      ? `WHERE ${selectionConditions.join(' AND ')}`
+      : '';
+
+    // Step 1: Get selections from thompson_selection_log
+    const selectionsQuery = `
+      SELECT
+        correlation_id,
+        activity_id,
+        thompson_sample AS selection_probability,
+        alpha AS alpha_at_selection,
+        beta AS beta_at_selection,
+        selection_method,
+        candidates_count,
+        selected_at,
+        org_id,
+        <float> alpha / (<float> alpha + <float> beta) AS expected_success_rate
+      FROM thompson_selection_log AS sel
+      ${selectionWhereClause}
+      ORDER BY sel.selected_at DESC
+      LIMIT $limit
+      START $offset
+    `;
+
+    logger.info('Fetching selection outcomes', { selectionWhereClause, params });
+
+    let selections: any[];
+    if (useJwtAuth && jwtAuth?.jwtToken) {
+      selections = await queryWithAuth(jwtAuth.jwtToken, selectionsQuery, params);
+    } else {
+      selections = await surrealDB.query(selectionsQuery, params);
+    }
+
+    // Step 2: Fetch execution data for correlation_ids
+    const correlationIds = (selections || [])
+      .filter((s: any) => s.correlation_id)
+      .map((s: any) => s.correlation_id);
+
+    let executionsByCorrelation = new Map<string, any>();
+
+    if (correlationIds.length > 0) {
+      const executionsQuery = `
+        SELECT
+          correlation_id,
+          execution_id,
+          success,
+          duration_ms,
+          cost_usd,
+          tokens_input,
+          tokens_output,
+          error_type,
+          executed_at
+        FROM activity_execution_traces
+        WHERE correlation_id IN $correlation_ids
+      `;
+
+      let executions: any[];
+      if (useJwtAuth && jwtAuth?.jwtToken) {
+        executions = await queryWithAuth(jwtAuth.jwtToken, executionsQuery, { correlation_ids: correlationIds });
+      } else {
+        executions = await surrealDB.query(executionsQuery, { correlation_ids: correlationIds });
+      }
+
+      for (const exec of executions || []) {
+        executionsByCorrelation.set(exec.correlation_id, exec);
+      }
+    }
+
+    // Step 3: Merge selection and execution data
+    let outcomes = (selections || []).map((sel: any) => {
+      const exec = executionsByCorrelation.get(sel.correlation_id);
+      const hasExecution = exec !== undefined;
+
+      return {
+        // Selection data
+        correlation_id: sel.correlation_id,
+        activity_id: sel.activity_id,
+        selection_probability: sel.selection_probability,
+        alpha_at_selection: sel.alpha_at_selection,
+        beta_at_selection: sel.beta_at_selection,
+        selection_method: sel.selection_method,
+        candidates_count: sel.candidates_count,
+        selected_at: sel.selected_at,
+        org_id: sel.org_id,
+        expected_success_rate: sel.expected_success_rate,
+
+        // Execution data (may be null if not yet executed)
+        execution_id: exec?.execution_id || null,
+        execution_success: exec?.success ?? null,
+        execution_duration_ms: exec?.duration_ms || null,
+        execution_cost_usd: exec?.cost_usd || null,
+        execution_tokens_in: exec?.tokens_input || null,
+        execution_tokens_out: exec?.tokens_output || null,
+        execution_error_type: exec?.error_type || null,
+        executed_at: exec?.executed_at || null,
+
+        // Computed fields
+        attribution_type: hasExecution ? 'exact' : 'pending',
+        selection_to_execution_delay: hasExecution && exec.executed_at && sel.selected_at
+          ? new Date(exec.executed_at).getTime() - new Date(sel.selected_at).getTime()
+          : null,
+      };
+    });
+
+    // Step 4: Apply post-filters (attribution_type, success)
+    if (attributionType) {
+      outcomes = outcomes.filter((o: any) => o.attribution_type === attributionType);
+    }
+
+    if (successParam !== undefined) {
+      const success = successParam === 'true';
+      outcomes = outcomes.filter((o: any) => o.execution_success === success);
+    }
+
+    // Get total count for pagination
+    const countQuery = `
+      SELECT count() as total FROM thompson_selection_log AS sel
+      ${selectionWhereClause}
+      GROUP ALL
+    `;
+
+    let countResult: { total: number }[];
+    if (useJwtAuth && jwtAuth?.jwtToken) {
+      countResult = await queryWithAuth(jwtAuth.jwtToken, countQuery, params);
+    } else {
+      countResult = await surrealDB.query(countQuery, params);
+    }
+
+    const total = countResult?.[0]?.total || 0;
+
+    logger.info('Selection outcomes fetched', {
+      count: outcomes?.length || 0,
+      total,
+      withExecutions: executionsByCorrelation.size,
+    });
+
+    return c.json({
+      outcomes: outcomes || [],
+      total,
+      limit,
+      offset,
+    });
+
+  } catch (error) {
+    logger.error('Failed to fetch selection outcomes', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+
+    return c.json({
+      error: 'Failed to fetch selection outcomes',
+      message: error instanceof Error ? error.message : 'Unknown error',
+    }, 500);
+  }
+});
+
+/**
+ * GET /v2/activities/execution-traces/selection-calibration
+ *
+ * Get Thompson Sampling calibration metrics per activity (Task 15)
+ * Computes calibration error: |predicted_success_rate - actual_success_rate|
+ *
+ * Query params:
+ * - activity_id: Filter by activity ID
+ * - min_executions: Filter activities with at least N executions (default: 1)
+ * - limit: Max records to return (default: 50, max: 500)
+ * - offset: Pagination offset (default: 0)
+ */
+app.get('/selection-calibration', async (c) => {
+  try {
+    const jwtAuth = getJwtAuthFromContext(c);
+    const useJwtAuth = hasJwtAuth(c);
+
+    // Parse query params
+    const activityId = c.req.query('activity_id');
+    const minExecutions = parseInt(c.req.query('min_executions') || '1', 10);
+    const limitParam = parseInt(c.req.query('limit') || '50', 10);
+    const offsetParam = parseInt(c.req.query('offset') || '0', 10);
+
+    const limit = Math.min(Math.max(limitParam, 1), 500);
+    const offset = Math.max(offsetParam, 0);
+
+    // Build activity filter
+    const activityFilter = activityId ? 'AND sel.activity_id = $activity_id' : '';
+    const params: Record<string, any> = { limit, offset, min_executions: minExecutions };
+    if (activityId) {
+      params.activity_id = activityId;
+    }
+
+    // Query: Aggregate selection+execution data per activity
+    // This computes calibration metrics at query time
+    const query = `
+      SELECT
+        sel.activity_id AS activity_id,
+        sel.org_id AS org_id,
+        count(sel.correlation_id) AS total_selections,
+        count(exec.execution_id) AS executed_selections,
+        count(sel.correlation_id) - count(exec.execution_id) AS pending_selections,
+        count(IF exec.success = true THEN 1 ELSE NONE END) AS successful_executions,
+        count(IF exec.success = false THEN 1 ELSE NONE END) AS failed_executions,
+        math::mean(<float> sel.alpha / (<float> sel.alpha + <float> sel.beta)) AS avg_predicted_success,
+        IF count(exec.execution_id) > 0
+          THEN <float> count(IF exec.success = true THEN 1 ELSE NONE END) / <float> count(exec.execution_id)
+          ELSE NONE
+        END AS actual_success_rate,
+        math::mean(sel.thompson_sample) AS avg_thompson_sample,
+        math::mean(<float> exec.duration_ms) AS avg_duration_ms,
+        math::mean(<float> exec.cost_usd) AS avg_cost_usd,
+        time::min(sel.selected_at) AS first_selection_at,
+        time::max(sel.selected_at) AS last_selection_at,
+        time::max(exec.executed_at) AS last_execution_at
+      FROM thompson_selection_log AS sel
+      LEFT JOIN activity_execution_traces AS exec ON sel.correlation_id = exec.correlation_id
+      WHERE 1=1 ${activityFilter}
+      GROUP BY sel.activity_id, sel.org_id
+      HAVING count(exec.execution_id) >= $min_executions
+      ORDER BY count(exec.execution_id) DESC
+      LIMIT $limit
+      START $offset
+    `;
+
+    logger.info('Fetching selection calibration', { activityId, minExecutions, limit, offset });
+
+    let calibrationRaw: any[];
+
+    if (useJwtAuth && jwtAuth?.jwtToken) {
+      calibrationRaw = await queryWithAuth(jwtAuth.jwtToken, query, params);
+    } else {
+      calibrationRaw = await surrealDB.query(query, params);
+    }
+
+    // Compute calibration error for each activity
+    const calibration = (calibrationRaw || []).map((row: any) => {
+      const predicted = row.avg_predicted_success || 0;
+      const actual = row.actual_success_rate;
+      const calibrationError = actual !== null && actual !== undefined
+        ? Math.abs(predicted - actual)
+        : null;
+
+      return {
+        ...row,
+        calibration_error: calibrationError,
+      };
+    });
+
+    // Sort by calibration error (worst first)
+    calibration.sort((a: any, b: any) => {
+      if (a.calibration_error === null) return 1;
+      if (b.calibration_error === null) return -1;
+      return b.calibration_error - a.calibration_error;
+    });
+
+    // Get total count
+    const countQuery = `
+      SELECT count() AS total FROM (
+        SELECT sel.activity_id
+        FROM thompson_selection_log AS sel
+        LEFT JOIN activity_execution_traces AS exec ON sel.correlation_id = exec.correlation_id
+        WHERE 1=1 ${activityFilter}
+        GROUP BY sel.activity_id
+        HAVING count(exec.execution_id) >= $min_executions
+      )
+      GROUP ALL
+    `;
+
+    let countResult: { total: number }[];
+    if (useJwtAuth && jwtAuth?.jwtToken) {
+      countResult = await queryWithAuth(jwtAuth.jwtToken, countQuery, params);
+    } else {
+      countResult = await surrealDB.query(countQuery, params);
+    }
+
+    const total = countResult?.[0]?.total || 0;
+
+    logger.info('Selection calibration fetched', {
+      count: calibration?.length || 0,
+      total,
+    });
+
+    return c.json({
+      calibration: calibration || [],
+      total,
+      limit,
+      offset,
+    });
+
+  } catch (error) {
+    logger.error('Failed to fetch selection calibration', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+
+    return c.json({
+      error: 'Failed to fetch selection calibration',
+      message: error instanceof Error ? error.message : 'Unknown error',
+    }, 500);
+  }
+});
+
+/**
+ * GET /v2/activities/execution-traces/calibration-summary
+ *
+ * Get org-level Thompson Sampling calibration health summary (Task 15)
+ * Aggregates calibration metrics across all activities
+ */
+app.get('/calibration-summary', async (c) => {
+  try {
+    const jwtAuth = getJwtAuthFromContext(c);
+    const useJwtAuth = hasJwtAuth(c);
+
+    // Query: Org-level aggregate of selection + execution correlation
+    const query = `
+      SELECT
+        sel.org_id AS org_id,
+        count(DISTINCT sel.activity_id) AS total_activities,
+        count(sel.correlation_id) AS total_selections,
+        count(exec.execution_id) AS total_executions,
+        count(IF exec.success = true THEN 1 ELSE NONE END) AS total_successes,
+        count(IF exec.success = false THEN 1 ELSE NONE END) AS total_failures,
+        IF count(exec.execution_id) > 0
+          THEN <float> count(IF exec.success = true THEN 1 ELSE NONE END) / <float> count(exec.execution_id)
+          ELSE NONE
+        END AS org_success_rate,
+        math::mean(<float> sel.alpha / (<float> sel.alpha + <float> sel.beta)) AS avg_predicted_success,
+        math::sum(<float> exec.cost_usd) AS total_cost_usd,
+        time::min(sel.selected_at) AS first_selection_at,
+        time::max(sel.selected_at) AS last_selection_at
+      FROM thompson_selection_log AS sel
+      LEFT JOIN activity_execution_traces AS exec ON sel.correlation_id = exec.correlation_id
+      GROUP BY sel.org_id
+      LIMIT 1
+    `;
+
+    logger.info('Fetching calibration summary');
+
+    let summaryRaw: any[];
+
+    if (useJwtAuth && jwtAuth?.jwtToken) {
+      summaryRaw = await queryWithAuth(jwtAuth.jwtToken, query, {});
+    } else {
+      summaryRaw = await surrealDB.query(query, {});
+    }
+
+    if (!summaryRaw || summaryRaw.length === 0) {
+      return c.json({
+        summary: null,
+        message: 'No calibration data available yet',
+      });
+    }
+
+    const row = summaryRaw[0];
+    const predicted = row.avg_predicted_success || 0;
+    const actual = row.org_success_rate;
+    const avgCalibrationError = actual !== null && actual !== undefined
+      ? Math.abs(predicted - actual)
+      : null;
+
+    const summary = {
+      ...row,
+      avg_calibration_error: avgCalibrationError,
+      // Pending selections (not yet executed)
+      pending_selections: (row.total_selections || 0) - (row.total_executions || 0),
+      // Execution rate
+      execution_rate: row.total_selections > 0
+        ? row.total_executions / row.total_selections
+        : null,
+    };
+
+    logger.info('Calibration summary fetched', { summary });
+
+    return c.json({
+      summary,
+    });
+
+  } catch (error) {
+    logger.error('Failed to fetch calibration summary', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+
+    return c.json({
+      error: 'Failed to fetch calibration summary',
       message: error instanceof Error ? error.message : 'Unknown error',
     }, 500);
   }

@@ -1266,10 +1266,11 @@ router.post('/resolve', async (c) => {
       case 'goal': {
         // Goal impulse resolver: Returns activity recommendations via Thompson Sampling
         // Used by MiniBob to get recommendations based on goal description + impulse context
-        // NOTE: impulseRefs and excludeActivities are extended pointer fields not in base schema
+        // NOTE: impulseRefs, excludeActivities, and expectedOutputShapes are extended pointer fields not in base schema
         const extendedPointer = pointer as typeof pointer & {
           impulseRefs?: string[];
           excludeActivities?: string[];
+          expectedOutputShapes?: string[];  // Expected output shapes from goal enrichment
         };
 
         const goalDescription = pointer.content;
@@ -1277,6 +1278,7 @@ router.post('/resolve', async (c) => {
         const impulseRefs = extendedPointer.impulseRefs || [];
         const limit = pointer.limit || 3;
         const excludeActivities = extendedPointer.excludeActivities || [];
+        const expectedOutputShapes = extendedPointer.expectedOutputShapes || [];
 
         // Validate required fields
         if (!goalDescription) {
@@ -1290,6 +1292,7 @@ router.post('/resolve', async (c) => {
           goal: goalDescription.substring(0, 100),
           category,
           impulseRefsCount: impulseRefs.length,
+          expectedOutputShapes,
           limit,
         });
 
@@ -1339,6 +1342,7 @@ router.post('/resolve', async (c) => {
               category,
               loaded_impulses: impulseRefs,
               impulse_shapes: impulseShapes,
+              expected_output_shapes: expectedOutputShapes,  // Pass expected output shapes for activity matching
               limit,
               exclude_activities: excludeActivities,
             }),
