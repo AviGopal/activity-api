@@ -315,14 +315,164 @@ export async function validateApiKeyViaIdentityVessel(
 }
 
 // =============================================================================
-// LEGACY FUNCTION REMOVED: authenticateApiKeyViaSurrealDB (2026-04-03)
+// Direct API Key Validation (Fallback)
 // =============================================================================
-// The SurrealDB apikey_record ACCESS method has been removed in favor of
-// HMAC-based API key validation via identity-vessel.
+// When identity-vessel is unavailable, validate API keys directly via SurrealDB.
+// Uses SHA-256 hash for fast O(1) lookup (no Argon2, which is slow by design).
 //
-// Use validateApiKeyViaIdentityVessel() instead for API key authentication.
-// Benefits:
-// - Faster (~2ms vs ~50ms for Argon2 hash comparison)
-// - Stateless (no database lookup required for validation)
-// - Centralized (identity-vessel is the single source of truth for auth)
+// This is a FALLBACK mechanism. Primary auth should go through identity-vessel.
 // =============================================================================
+
+/**
+ * Compute SHA-256 hash of an API key for direct validation.
+ * Uses Web Crypto API (available in Bun).
+ */
+export async function hashApiKey(apiKey: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(apiKey);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Validate API key directly via SurrealDB lookup.
+ * This is a fallback when identity-vessel is unavailable.
+ *
+ * @param apiKey - Raw API key from Authorization header
+ * @returns AuthContext with validation result
+ */
+export async function validateApiKeyDirect(apiKey: string): Promise<AuthContext> {
+  try {
+    logger.debug('[auth] Validating API key directly via SurrealDB');
+
+    // Hash the API key for lookup
+    const keyHash = await hashApiKey(apiKey);
+
+    // Import surrealDB here to avoid circular dependency
+    const { surrealDB } = await import('../db/surreal');
+
+    // Query api_key table with hash lookup
+    // Check is_active and expiration in the query
+    const result = await surrealDB.query<{
+      id: string;
+      org_id: string;
+      user_id?: string;
+      scopes: string[];
+      expires_at?: string;
+      is_active: boolean;
+    }>(
+      `SELECT id, org_id, user_id, scopes, expires_at, is_active
+       FROM api_key
+       WHERE key_hash = $key_hash
+         AND is_active = true
+         AND (expires_at IS NONE OR expires_at > time::now())
+       LIMIT 1`,
+      { key_hash: keyHash }
+    );
+
+    if (!result || result.length === 0) {
+      logger.debug('[auth] API key not found or inactive');
+      return {
+        authenticated: false,
+        reason: 'API key not found or inactive',
+      };
+    }
+
+    const keyRecord = result[0];
+
+    // Update last_used_at asynchronously (don't await to avoid blocking)
+    surrealDB
+      .query(
+        `UPDATE api_key SET last_used_at = time::now() WHERE id = $id`,
+        { id: keyRecord.id }
+      )
+      .catch(err => {
+        logger.warn('[auth] Failed to update api_key last_used_at', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+
+    logger.info('[auth] API key validated directly via SurrealDB', {
+      keyId: keyRecord.id,
+      orgId: keyRecord.org_id,
+    });
+
+    return {
+      authenticated: true,
+      orgId: keyRecord.org_id,
+      userId: keyRecord.user_id,
+      keyId: String(keyRecord.id),
+      scopes: keyRecord.scopes || ['read', 'write'],
+    };
+  } catch (error) {
+    logger.error('[auth] Direct API key validation error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      authenticated: false,
+      reason: error instanceof Error ? error.message : 'Validation failed',
+    };
+  }
+}
+
+/**
+ * Validate API key with fallback strategy:
+ * 1. Try identity-vessel first (primary)
+ * 2. Fall back to direct SurrealDB lookup if identity-vessel fails
+ *
+ * @param apiKey - Raw API key from Authorization header
+ * @returns AuthContext with validation result and method used
+ */
+export async function validateApiKeyWithFallback(
+  apiKey: string
+): Promise<AuthContext & { authMethod?: 'identity-vessel' | 'direct' }> {
+  // Try identity-vessel first
+  const identityResult = await validateApiKeyViaIdentityVessel(apiKey);
+
+  if (identityResult.authenticated) {
+    logger.info('[auth] API key validated via identity-vessel');
+    return {
+      ...identityResult,
+      authMethod: 'identity-vessel',
+    };
+  }
+
+  // Check if identity-vessel returned a specific error (vs network failure)
+  // Network failures have reasons like "Network error" or timeout messages
+  const isNetworkError =
+    identityResult.reason?.includes('Network error') ||
+    identityResult.reason?.includes('fetch') ||
+    identityResult.reason?.includes('timeout') ||
+    identityResult.reason?.includes('ECONNREFUSED') ||
+    identityResult.reason?.includes('returned 5');
+
+  if (isNetworkError) {
+    logger.info('[auth] Identity-vessel unavailable, trying direct validation', {
+      reason: identityResult.reason,
+    });
+
+    // Fall back to direct validation
+    const directResult = await validateApiKeyDirect(apiKey);
+
+    if (directResult.authenticated) {
+      return {
+        ...directResult,
+        authMethod: 'direct',
+      };
+    }
+
+    // Both methods failed
+    return {
+      authenticated: false,
+      reason: `Identity-vessel unavailable and direct validation failed: ${directResult.reason}`,
+    };
+  }
+
+  // Identity-vessel returned a definitive "invalid key" response
+  // Don't fall back in this case - the key is genuinely invalid
+  return {
+    authenticated: false,
+    reason: identityResult.reason || 'API key validation failed',
+  };
+}

@@ -3,7 +3,7 @@
  *
  * Supports two authentication header formats:
  * - Authorization: Bearer <jwt>  - JWT tokens (from SurrealDB signin or identity-vessel)
- * - Authorization: ApiKey <key>  - API keys (validated via identity-vessel HMAC)
+ * - Authorization: ApiKey <key>  - API keys (validated via identity-vessel or direct SurrealDB)
  *
  * JWT tokens contain claims that are validated against SurrealDB:
  * - org_id: Organization the caller belongs to
@@ -18,10 +18,16 @@
  * - Removed apikey_record SurrealDB ACCESS method (legacy)
  * - API keys now validated via identity-vessel HMAC pattern
  * - Use explicit header prefixes instead of eyJ detection heuristic
+ *
+ * Direct Auth Fallback (2026-04-06):
+ * - Added direct SurrealDB validation as fallback when identity-vessel unavailable
+ * - Uses SHA-256 hash lookup for fast O(1) validation
+ * - Logs which auth method was used for debugging
  */
 
 import { Context, Next } from 'hono';
 import { createAuthenticatedClient } from '../db/surreal';
+import { validateApiKeyWithFallback, generateJwtToken } from '../services/auth';
 import { logger } from '../utils/logger';
 
 export interface JwtAuthContext {
@@ -37,65 +43,63 @@ export interface JwtAuthContext {
 }
 
 /**
- * Validate API key via identity-vessel HMAC
+ * Validate API key with fallback to direct SurrealDB validation
+ * Returns JwtAuthContext on success, null on failure
  */
-async function validateApiKeyViaIdentityVessel(apiKey: string): Promise<JwtAuthContext | null> {
-  const identityVesselUrl =
-    process.env.IDENTITY_VESSEL_URL ||
-    'http://identity-vessel.activity-system.svc.cluster.local:8080';
-
+async function validateApiKey(apiKey: string): Promise<JwtAuthContext | null> {
   try {
-    const response = await fetch(`${identityVesselUrl}/v1/auth/resolve`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        impulse: {
-          type: 'authentication',
-          pointer: { type: 'apiKey', apiKey },
-        },
-      }),
-      signal: AbortSignal.timeout(5000),
+    const result = await validateApiKeyWithFallback(apiKey);
+
+    if (!result.authenticated) {
+      logger.warn('API key validation failed', { reason: result.reason });
+      return null;
+    }
+
+    // Log which method was used
+    logger.info('API key authenticated', {
+      method: result.authMethod || 'unknown',
+      orgId: result.orgId,
     });
 
-    if (!response.ok) {
-      logger.warn('Identity vessel API key validation failed', { status: response.status });
-      return null;
-    }
+    // Generate a real JWT token for downstream use
+    // This enables queryWithAuth() to work with RBAC permissions
+    const jwtToken = await generateJwtToken({
+      orgId: result.orgId!,
+      userId: result.userId || 'apikey-user',
+      keyId: result.keyId || 'unknown',
+      scopes: result.scopes || ['read', 'write'],
+      expirySeconds: 900, // 15 minutes
+    });
 
-    const result = await response.json() as {
-      success: boolean;
-      data?: {
-        authenticated: boolean;
-        orgId: string;
-        userId: string;
-        keyId: string;
-        scopes: string[];
+    if (!jwtToken) {
+      // Fall back to synthetic token if JWT generation fails
+      const syntheticToken = Buffer.from(
+        JSON.stringify({
+          type: 'apikey_validated',
+          orgId: result.orgId,
+          userId: result.userId,
+          keyId: result.keyId,
+          scopes: result.scopes,
+          authMethod: result.authMethod,
+          validatedAt: Date.now(),
+        })
+      ).toString('base64');
+
+      return {
+        jwtToken: syntheticToken,
+        orgId: result.orgId!,
+        authType: 'apikey',
       };
-    };
-
-    if (!result.success || !result.data?.authenticated) {
-      return null;
     }
-
-    // For API keys, we don't have a JWT token - identity-vessel validates via HMAC
-    // We create a synthetic token for the context that includes the validated claims
-    const syntheticToken = Buffer.from(JSON.stringify({
-      type: 'apikey_validated',
-      orgId: result.data.orgId,
-      userId: result.data.userId,
-      keyId: result.data.keyId,
-      scopes: result.data.scopes,
-      validatedAt: Date.now(),
-    })).toString('base64');
 
     return {
-      jwtToken: syntheticToken,
-      orgId: result.data.orgId,
+      jwtToken,
+      orgId: result.orgId!,
       authType: 'apikey',
     };
   } catch (error) {
     const err = error as Error;
-    logger.error('Identity vessel API key validation error', { error: err.message });
+    logger.error('API key validation error', { error: err.message });
     return null;
   }
 }
@@ -123,17 +127,17 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
     return;
   }
 
-  // Check for ApiKey prefix first (API keys validated via identity-vessel)
+  // Check for ApiKey prefix first (API keys validated via identity-vessel with direct fallback)
   const apiKeyMatch = authHeader.match(/^ApiKey\s+(.+)$/i);
   if (apiKeyMatch) {
     const apiKey = apiKeyMatch[1];
     logger.debug('Processing ApiKey auth header');
 
-    const jwtAuth = await validateApiKeyViaIdentityVessel(apiKey);
+    const jwtAuth = await validateApiKey(apiKey);
     c.set('jwtAuth', jwtAuth);
 
     if (jwtAuth) {
-      logger.info('API key authenticated via identity-vessel', { orgId: jwtAuth.orgId });
+      logger.info('API key authenticated', { orgId: jwtAuth.orgId, authType: jwtAuth.authType });
     } else {
       logger.warn('API key validation failed');
     }
