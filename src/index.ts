@@ -26,6 +26,7 @@ import connectionsRoutes from './routes/connections';
 import ribosomeRoutes from './routes/ribosome';
 import { broadcaster } from './websocket/broadcaster';
 import type { ServerWebSocket } from 'bun';
+import packageJson from '../package.json';
 
 // Define app-wide environment type with jwtAuth context variable
 type AppEnv = {
@@ -72,7 +73,7 @@ app.use('/v2/*', async (c, next) => {
 app.get('/health', async (c) => {
   const healthStatus: any = {
     service: 'metabob-activity-api',
-    version: '1.0.0',
+    version: packageJson.version,
     timestamp: new Date().toISOString(),
     checks: {
       redis: { status: 'unknown', latency_ms: 0 },
