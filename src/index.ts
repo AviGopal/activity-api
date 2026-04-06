@@ -243,28 +243,62 @@ const server = Bun.serve<WebSocketData>({
 
         // Handle authentication
         if (data.type === 'authenticate' && data.token) {
-          // CRITICAL: Validate JWT token before marking as authenticated
-          const { validateJwtToken } = await import('./services/auth');
-          const validation = await validateJwtToken(data.token);
+          const { validateJwtToken, validateApiKeyViaIdentityVessel } = await import('./services/auth');
 
-          if (!validation.valid || !validation.payload) {
-            logger.warn('[WebSocket] Authentication failed', {
-              error: validation.error || 'Invalid token',
-            });
+          let orgId: string | undefined;
+          let authMethod: string;
 
-            ws.send(JSON.stringify({
-              type: 'auth_error',
-              error: 'Authentication failed',
-              message: validation.error || 'Invalid or expired token',
-              timestamp: new Date().toISOString(),
-            }));
+          // Determine if token is JWT (contains two dots) or API key
+          const isJwt = data.token.split('.').length === 3;
 
-            ws.close(1008, 'Authentication failed');
-            return;
+          if (isJwt) {
+            // Validate as JWT token
+            authMethod = 'jwt';
+            const validation = await validateJwtToken(data.token);
+
+            if (!validation.valid || !validation.payload) {
+              logger.warn('[WebSocket] JWT authentication failed', {
+                error: validation.error || 'Invalid token',
+              });
+
+              ws.send(JSON.stringify({
+                type: 'auth_error',
+                error: 'Authentication failed',
+                message: validation.error || 'Invalid or expired token',
+                timestamp: new Date().toISOString(),
+              }));
+
+              ws.close(1008, 'Authentication failed');
+              return;
+            }
+
+            // Extract org_id from validated JWT payload
+            orgId = validation.payload.org_id?.toString().replace('organizations:', '') || '';
+          } else {
+            // Validate as API key via identity-vessel
+            authMethod = 'apikey';
+            logger.debug('[WebSocket] Validating API key via identity-vessel');
+
+            const authContext = await validateApiKeyViaIdentityVessel(data.token);
+
+            if (!authContext.authenticated) {
+              logger.warn('[WebSocket] API key authentication failed', {
+                reason: authContext.reason,
+              });
+
+              ws.send(JSON.stringify({
+                type: 'auth_error',
+                error: 'Authentication failed',
+                message: authContext.reason || 'Invalid API key',
+                timestamp: new Date().toISOString(),
+              }));
+
+              ws.close(1008, 'Authentication failed');
+              return;
+            }
+
+            orgId = authContext.orgId;
           }
-
-          // Extract org_id from validated JWT payload
-          const orgId = validation.payload.org_id?.toString().replace('organizations:', '') || '';
 
           if (!orgId) {
             logger.warn('[WebSocket] Token missing org_id claim');
@@ -286,6 +320,7 @@ const server = Bun.serve<WebSocketData>({
           logger.info('[WebSocket] Client authenticated', {
             sessionId: ws.data.sessionId,
             orgId: ws.data.orgId,
+            method: authMethod,
           });
 
           // Send auth confirmation
