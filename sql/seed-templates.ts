@@ -41,6 +41,7 @@ const TEMPLATE_DIRS = [
   { name: 'bootstrap', path: join(PROTO_PATH, 'activities/bootstrap') },
   { name: 'reliability', path: join(PROTO_PATH, 'activities/reliability') },
   { name: 'hypothesis', path: join(PROTO_PATH, 'activities/hypothesis') },
+  { name: 'infrastructure', path: join(PROTO_PATH, 'activities/infrastructure') },
 ];
 
 interface BootstrapTemplate {

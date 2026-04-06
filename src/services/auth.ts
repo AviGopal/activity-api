@@ -3,9 +3,13 @@
  *
  * Provides JWT token validation, generation, and authentication utilities.
  * Handles both MiniBob RECORD access and API key authentication.
+ *
+ * Note: Uses 'jose' library for JWT operations since SurrealDB 3.x removed
+ * the crypto::jwt::encode/decode functions.
  */
 
 import { Surreal } from 'surrealdb';
+import * as jose from 'jose';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 
@@ -39,67 +43,56 @@ export interface ValidatedToken {
 
 /**
  * Validate JWT token without making database calls
- * Uses SurrealDB's crypto::jwt::decode to verify signature and expiry
+ * Uses jose library for JWT verification (SurrealDB 3.x compatible)
  */
 export async function validateJwtToken(token: string): Promise<ValidatedToken> {
   try {
-    // Create temporary connection for validation
-    const db = new Surreal();
-    await db.connect(config.surrealdb.url);
-    await db.use({
-      namespace: config.surrealdb.namespace,
-      database: config.surrealdb.database,
+    // Encode the secret key for jose
+    const secretKey = new TextEncoder().encode(config.auth.jwtSecret);
+
+    // Verify and decode the token
+    const { payload } = await jose.jwtVerify(token, secretKey, {
+      algorithms: ['HS256', 'HS384', 'HS512'],
     });
 
-    // Sign in with root to validate token
-    await db.signin({
-      username: config.surrealdb.username,
-      password: config.surrealdb.password,
-    });
+    // Map jose payload to our JwtPayload format
+    const jwtPayload: JwtPayload = {
+      NS: (payload.NS as string) || config.surrealdb.namespace,
+      DB: (payload.DB as string) || config.surrealdb.database,
+      AC: (payload.AC as string) || '',
+      exp: payload.exp || 0,
+      iat: payload.iat || 0,
+      nbf: payload.nbf || 0,
+      id: (payload.id as string) || '',
+      org_id: (payload.org_id as string) || '',
+      user_id: payload.user_id as string | undefined,
+      scopes: payload.scopes as string[] | undefined,
+    };
 
-    // Validate token signature and expiry
-    const result = await db.query<[JwtPayload | null]>(
-      `RETURN crypto::jwt::decode($token, $jwt_secret)`,
-      {
-        token,
-        jwt_secret: config.auth.jwtSecret,
-      }
-    );
+    return {
+      valid: true,
+      payload: jwtPayload,
+    };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
 
-    await db.close();
-
-    const payload = result[0];
-    if (!payload) {
-      return {
-        valid: false,
-        error: 'Invalid token signature or format',
-      };
-    }
-
-    // Check expiry
-    const now = Math.floor(Date.now() / 1000);
-    if (payload.exp && payload.exp < now) {
+    // Handle specific jose errors
+    if (errorMessage.includes('expired')) {
       return {
         valid: false,
         error: 'Token expired',
       };
     }
 
-    // Check not-before
-    if (payload.nbf && payload.nbf > now) {
+    if (errorMessage.includes('not yet valid') || errorMessage.includes('nbf')) {
       return {
         valid: false,
         error: 'Token not yet valid',
       };
     }
 
-    return {
-      valid: true,
-      payload,
-    };
-  } catch (error) {
     logger.error('[auth] JWT validation error', {
-      error: error instanceof Error ? error.message : String(error),
+      error: errorMessage,
     });
 
     return {
@@ -111,7 +104,7 @@ export async function validateJwtToken(token: string): Promise<ValidatedToken> {
 
 /**
  * Generate JWT token for authenticated context
- * Used after validating credentials via identity-vessel or SurrealDB
+ * Uses jose library for JWT creation (SurrealDB 3.x compatible)
  */
 export async function generateJwtToken(context: {
   orgId: string;
@@ -121,57 +114,26 @@ export async function generateJwtToken(context: {
   expirySeconds?: number;
 }): Promise<string | null> {
   try {
-    const db = new Surreal();
-    await db.connect(config.surrealdb.url);
-    await db.use({
-      namespace: config.surrealdb.namespace,
-      database: config.surrealdb.database,
-    });
-
-    // Sign in with root to generate token
-    await db.signin({
-      username: config.surrealdb.username,
-      password: config.surrealdb.password,
-    });
-
+    const secretKey = new TextEncoder().encode(config.auth.jwtSecret);
     const expirySeconds = context.expirySeconds || 900; // Default 15 minutes
 
+    const now = Math.floor(Date.now() / 1000);
+
     // Generate JWT token with custom claims
-    const tokenQuery = await db.query<[string]>(
-      `RETURN crypto::jwt::encode(
-        {
-          NS: $namespace,
-          DB: $database,
-          AC: "apikey_token",
-          exp: time::unix() + $expiry,
-          iat: time::unix(),
-          nbf: time::unix(),
-          id: $key_id,
-          org_id: $org_id,
-          user_id: $user_id,
-          scopes: $scopes
-        },
-        $jwt_secret
-      )`,
-      {
-        namespace: config.surrealdb.namespace,
-        database: config.surrealdb.database,
-        expiry: expirySeconds,
-        key_id: context.keyId,
-        org_id: `organizations:${context.orgId}`,
-        user_id: `users:${context.userId}`,
-        scopes: context.scopes,
-        jwt_secret: config.auth.jwtSecret,
-      }
-    );
-
-    await db.close();
-
-    const token = tokenQuery[0];
-    if (!token) {
-      logger.error('[auth] Failed to generate JWT token');
-      return null;
-    }
+    const token = await new jose.SignJWT({
+      NS: config.surrealdb.namespace,
+      DB: config.surrealdb.database,
+      AC: 'apikey_token',
+      id: context.keyId,
+      org_id: `organizations:${context.orgId}`,
+      user_id: `users:${context.userId}`,
+      scopes: context.scopes,
+    })
+      .setProtectedHeader({ alg: 'HS512' })
+      .setIssuedAt(now)
+      .setNotBefore(now)
+      .setExpirationTime(now + expirySeconds)
+      .sign(secretKey);
 
     return token;
   } catch (error) {
