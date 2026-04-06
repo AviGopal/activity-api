@@ -62,6 +62,9 @@ DEFINE FIELD IF NOT EXISTS avg_execution_ms ON tool_argument_pattern TYPE float
   VALUE $value OR 0.0
   COMMENT "Rolling average execution time in milliseconds";
 
+DEFINE FIELD IF NOT EXISTS failure_counts ON tool_argument_pattern TYPE option<object> FLEXIBLE
+  COMMENT "Map of validation failure types to counts for learning which failures are common";
+
 DEFINE FIELD IF NOT EXISTS last_used_at ON tool_argument_pattern TYPE option<datetime>
   COMMENT "Timestamp of last usage";
 
@@ -76,9 +79,9 @@ DEFINE FIELD IF NOT EXISTS project_id ON tool_argument_pattern TYPE option<recor
   COMMENT "Project ID (optional, inherited from auth context)";
 
 -- created_by can be either a user (dashboard) or a minibob_instance (autonomous vessel)
-DEFINE FIELD IF NOT EXISTS created_by ON tool_argument_pattern TYPE option<record<users> | record<minibob_instance>>
+DEFINE FIELD IF NOT EXISTS created_by ON tool_argument_pattern TYPE option<string | record<users> | record<minibob_instance>>
   VALUE $value OR $auth.id
-  COMMENT "User or MiniBob instance who created this pattern";
+  COMMENT "User, MiniBob instance, or instance ID string who created this pattern";
 
 -- Timestamps
 DEFINE FIELD IF NOT EXISTS created_at ON tool_argument_pattern TYPE datetime

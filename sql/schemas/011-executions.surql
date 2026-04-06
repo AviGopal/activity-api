@@ -98,9 +98,9 @@ DEFINE FIELD IF NOT EXISTS project_id ON activity_execution_traces TYPE option<r
   COMMENT "Project ID (optional, inherited from auth context)";
 
 -- created_by can be either a user (dashboard) or a minibob_instance (autonomous vessel)
-DEFINE FIELD IF NOT EXISTS created_by ON activity_execution_traces TYPE option<record<users> | record<minibob_instance>>
+DEFINE FIELD IF NOT EXISTS created_by ON activity_execution_traces TYPE option<string | record<users> | record<minibob_instance>>
   VALUE $value OR $auth.id
-  COMMENT "User or MiniBob instance who created this execution";
+  COMMENT "User, MiniBob instance, or instance ID string who created this execution";
 
 -- Execution results
 DEFINE FIELD IF NOT EXISTS success ON activity_execution_traces TYPE bool
@@ -158,6 +158,10 @@ DEFINE FIELD IF NOT EXISTS state_snapshot ON activity_execution_traces TYPE opti
 
 DEFINE FIELD IF NOT EXISTS tasks ON activity_execution_traces TYPE option<array<object>> FLEXIBLE
   COMMENT "Array of task execution details with any nested structure";
+
+-- Nested field definition for tasks array elements (FLEXIBLE required for arbitrary nested task objects)
+DEFINE FIELD IF NOT EXISTS tasks.* ON activity_execution_traces TYPE object FLEXIBLE
+  COMMENT "Individual task execution detail with arbitrary fields (task_id, description, status, duration_ms, tool_calls, etc.)";
 
 DEFINE FIELD IF NOT EXISTS parent_execution_id ON activity_execution_traces TYPE option<string>
   COMMENT "Parent execution ID (for composition tracking)";
