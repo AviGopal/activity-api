@@ -110,8 +110,11 @@ export const ActivityTemplateSchema = z.object({
   org_id: z.string().nullable(),
   project_id: z.string().nullable(),
   // Input/output shapes for paradigm alignment
+  // input_shapes: Optional - activities can work with any input
   input_shapes: z.array(z.string()).optional(),
-  output_shapes: z.array(z.string()).optional(),
+  // output_shapes: REQUIRED - must declare what the activity produces
+  // This enables output-based activity selection and composition learning
+  output_shapes: z.array(z.string()).min(1, 'output_shapes must have at least one shape'),
   execution_type: z.string().optional(),
   variant_of: z.record(z.any()).optional(),
   created_at: z.union([z.string(), z.object({}).passthrough()]),
@@ -164,7 +167,10 @@ export const CreateTemplateRequestSchema = z.object({
   // Template-level impulse definitions
   impulses: z.array(TemplateImpulseSchema).optional(),
   // Input/output shapes for paradigm alignment
+  // input_shapes: Optional - activities can work with any input
   input_shapes: z.array(z.string()).optional(),
+  // output_shapes: Optional in request (will be inferred if not provided)
+  // but required in stored template after shape inference
   output_shapes: z.array(z.string()).optional(),
   // Legacy input/output schemas (converted to shapes internally)
   input_schema: z.object({
@@ -1338,3 +1344,61 @@ export type VariantGenealogyPointer = z.infer<typeof VariantGenealogyPointerSche
 export type VariantPerformancePointer = z.infer<typeof VariantPerformancePointerSchema>;
 export type VariantFamilyPointer = z.infer<typeof VariantFamilyPointerSchema>;
 export type FailedExecutionContextPointer = z.infer<typeof FailedExecutionContextPointerSchema>;
+
+// =============================================================================
+// IMPULSE SHAPE ACTIVITY SCORING SCHEMAS
+// =============================================================================
+// Persistent Thompson Sampling parameters for shape-based activity selection.
+// Unlike computed views, this allows incremental updates and custom priors.
+// =============================================================================
+
+/**
+ * ShapeScoreUpdateRequest - Request body for POST /v2/activities/shape-scores
+ * Records execution outcome for shape-based Thompson Sampling.
+ *
+ * The endpoint performs atomic UPSERT operations:
+ * - If row exists: increment success_count or failure_count
+ * - If row doesn't exist: create with initial counts
+ * - Always: recompute alpha = success_count + 1, beta = failure_count + 1
+ */
+export const ShapeScoreUpdateRequestSchema = z.object({
+  /** Activity ID that was executed */
+  activity_id: z.string(),
+  /** Input impulse shapes observed during execution */
+  shapes: z.array(z.string()).min(1),
+  /** Whether the execution succeeded */
+  success: z.boolean(),
+  /** Organization ID (optional, inferred from auth context if not provided) */
+  org_id: z.string().optional(),
+});
+
+/**
+ * ShapeScoreUpdateResponse - Response for POST /v2/activities/shape-scores
+ */
+export const ShapeScoreUpdateResponseSchema = z.object({
+  success: z.boolean(),
+  /** Number of shape scores updated */
+  updated_count: z.number().int(),
+  /** Message describing the operation */
+  message: z.string().optional(),
+});
+
+/**
+ * ImpulseShapeActivityScore - Shape-based Thompson Sampling score record
+ * Matches the impulse_shape_activity_score table schema.
+ */
+export const ImpulseShapeActivityScoreSchema = z.object({
+  shape: z.string(),
+  activity_id: z.string(),
+  org_id: z.string(),
+  success_count: z.number().int(),
+  failure_count: z.number().int(),
+  alpha: z.number().int(), // success_count + 1
+  beta: z.number().int(),  // failure_count + 1
+  updated_at: z.union([z.string(), z.object({}).passthrough()]),
+});
+
+// Type exports for Impulse Shape Activity Scoring
+export type ShapeScoreUpdateRequest = z.infer<typeof ShapeScoreUpdateRequestSchema>;
+export type ShapeScoreUpdateResponse = z.infer<typeof ShapeScoreUpdateResponseSchema>;
+export type ImpulseShapeActivityScore = z.infer<typeof ImpulseShapeActivityScoreSchema>;
