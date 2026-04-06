@@ -137,6 +137,13 @@ DEFINE FIELD IF NOT EXISTS execution_type ON activity TYPE string
 -- Category (backward compat with activity_registry)
 DEFINE FIELD IF NOT EXISTS category ON activity TYPE option<string>;
 
+-- Hierarchical tags for classification
+DEFINE FIELD IF NOT EXISTS tags ON activity TYPE option<array<string>>
+  COMMENT "Hierarchical tags using dot-notation (e.g., 'feature.ui', 'bugfix.auth')";
+
+DEFINE FIELD IF NOT EXISTS tag_prefixes ON activity TYPE option<array<string>>
+  COMMENT "All prefixes of tags for efficient prefix matching";
+
 -- Template-specific: Task steps for LLM execution
 -- Both tasks and tasks.* must be FLEXIBLE to allow arbitrary nested task objects
 DEFINE FIELD IF NOT EXISTS tasks ON activity TYPE option<array<object>> FLEXIBLE
