@@ -172,12 +172,20 @@ router.post('/', async (c) => {
     if (jwtAuth) {
       // JWT auth from MiniBob instances or users
       org_id = jwtAuth.orgId;
-      created_by = jwtAuth.instanceId || jwtAuth.orgId || 'unknown';
-      logger.debug('Using JWT auth', { orgId: jwtAuth.orgId, projectId: jwtAuth.projectId });
+      // Convert instanceId to proper SurrealDB record format
+      // Schema expects: option<string | record<users> | record<minibob_instance>>
+      if (jwtAuth.instanceId) {
+        created_by = `minibob_instance:${jwtAuth.instanceId}`;
+      } else {
+        // For non-MiniBob auth (API keys, JWT users), leave as empty to use NONE
+        created_by = '';
+      }
+      logger.debug('Using JWT auth', { orgId: jwtAuth.orgId, projectId: jwtAuth.projectId, createdBy: created_by || 'NONE' });
     } else if (internalApiKey) {
       // Use record format for consistency with JWT $auth.org_id
       org_id = 'organizations:metabob_internal'; // Default for internal services
-      created_by = 'internal-service';
+      // Internal services don't have a user/instance, leave as NONE (omit field)
+      created_by = '';
       logger.debug('Using internal service api_key', { key: internalApiKey.substring(0, 8) + '...' });
     } else {
       logger.warn('POST /v2/impulses: no auth', { hasJwtAuth: !!jwtAuth, hasInternalKey: !!internalApiKey });
@@ -242,13 +250,18 @@ router.post('/', async (c) => {
       token_estimate: impulse_data.budget || 0,
       org_id,
       project_id,
-      created_by,
     };
 
     // Only include content if it has a value (avoid null → NULL coercion issue)
     const contentField = pointer.content ? 'content: $content,' : '';
     if (pointer.content) {
       params.content = pointer.content;
+    }
+
+    // Only include created_by if it has a value (empty string means internal service)
+    const createdByField = created_by ? 'created_by: $created_by,' : '';
+    if (created_by) {
+      params.created_by = created_by;
     }
 
     // Create impulse record using new schema
@@ -262,7 +275,7 @@ router.post('/', async (c) => {
         token_estimate: $token_estimate,
         org_id: $org_id,
         project_id: $project_id,
-        created_by: $created_by,
+        ${createdByField}
         created_at: time::now()
       }
     `;
