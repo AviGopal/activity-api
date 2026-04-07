@@ -343,20 +343,60 @@ async function enrichTemplatesWithMetrics(
         activity_ids: normalizedIds
       });
     } catch (error: any) {
-      // Fallback to activity table if view doesn't exist yet
-      logger.warn('Failed to query v_activity_score, falling back to activity table', {
+      // Fallback to variant_performance_metrics if view doesn't exist or fails
+      logger.warn('Failed to query v_activity_score, falling back to variant_performance_metrics', {
         error: error.message
       });
       const fallbackQuery = `
-        SELECT id as activity_id, name, total_executions,
+        SELECT activity_id, variant_id,
+               total_executions, successful_executions, failed_executions,
                thompson_alpha, thompson_beta, success_rate,
-               avg_duration_ms, avg_cost_usd
-        FROM activity
-        WHERE id IN $activity_ids
+               avg_duration_ms, avg_cost_usd, total_selections
+        FROM variant_performance_metrics
+        WHERE activity_id IN $activity_ids
       `;
       metricsResult = await surrealDB.query<any>(fallbackQuery, {
         activity_ids: activityIds
       });
+    }
+
+    // For templates not found in v_activity_score (no executions yet),
+    // try to get initial metrics from variant_performance_metrics
+    if (metricsResult.length < activityIds.length) {
+      const foundIds = new Set(metricsResult.map((m: any) => m.activity_id || m.variant_id));
+      const missingIds = activityIds.filter(id => !foundIds.has(id) && !foundIds.has(id.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '')));
+
+      if (missingIds.length > 0) {
+        logger.debug('Fetching initial metrics for templates without executions', {
+          missingCount: missingIds.length,
+          sampleMissing: missingIds.slice(0, 3)
+        });
+
+        try {
+          const initialMetricsQuery = `
+            SELECT activity_id, variant_id,
+                   total_executions, successful_executions, failed_executions,
+                   thompson_alpha, thompson_beta, success_rate,
+                   avg_duration_ms, avg_cost_usd, total_selections
+            FROM variant_performance_metrics
+            WHERE activity_id IN $missing_ids
+          `;
+          const initialMetrics = await surrealDB.query<any>(initialMetricsQuery, {
+            missing_ids: missingIds
+          });
+
+          if (initialMetrics.length > 0) {
+            logger.info('Found initial metrics for new templates', {
+              count: initialMetrics.length
+            });
+            metricsResult = [...metricsResult, ...initialMetrics];
+          }
+        } catch (initialError: any) {
+          logger.debug('Failed to fetch initial metrics from variant_performance_metrics', {
+            error: initialError.message
+          });
+        }
+      }
     }
 
     logger.info('Metrics query result', {
@@ -3192,27 +3232,17 @@ app.post('/composition', async (c) => {
       const newSuccessCount = (current.success_count || 0) + (validated.success ? 1 : 0);
       const newWeight = newSuccessCount / newExecutionCount;
 
-      const updateQuery = `
-        UPDATE activity_composition_graph
-        SET
-          execution_count = $execution_count,
-          success_count = $success_count,
-          weight = $weight,
-          updated_at = time::now(),
-          input_impulse_shapes = $input_impulse_shapes,
-          output_impulse_shapes = $output_impulse_shapes,
-          duration_ms = $duration_ms,
-          cost_usd = $cost_usd,
-          tokens_input = $tokens_input,
-          tokens_output = $tokens_output,
-          depth = $depth,
-          composition_chain = $composition_chain
-        WHERE parent_activity_id = $parent_activity_id
-          AND child_activity_id = $child_activity_id
-        RETURN AFTER
-      `;
+      // Build SET clauses dynamically to avoid SCHEMAFULL field errors
+      const setClauses: string[] = [
+        'execution_count = $execution_count',
+        'success_count = $success_count',
+        'weight = $weight',
+        'updated_at = time::now()',
+        'input_impulse_shapes = $input_impulse_shapes',
+        'output_impulse_shapes = $output_impulse_shapes',
+      ];
 
-      const updated = await surrealDB.query<CompositionEdge[]>(updateQuery, {
+      const updateParams: Record<string, any> = {
         parent_activity_id: validated.parent_activity_id,
         child_activity_id: validated.child_activity_id,
         execution_count: newExecutionCount,
@@ -3220,13 +3250,43 @@ app.post('/composition', async (c) => {
         weight: newWeight,
         input_impulse_shapes: validated.input_impulse_shapes || [],
         output_impulse_shapes: validated.output_impulse_shapes || [],
-        duration_ms: validated.duration_ms ?? null,
-        cost_usd: validated.cost_usd ?? null,
-        tokens_input: validated.tokens_input ?? null,
-        tokens_output: validated.tokens_output ?? null,
-        depth: validated.depth ?? null,
-        composition_chain: validated.composition_chain || null,
-      });
+      };
+
+      // Add optional fields only if they have values
+      if (validated.duration_ms !== undefined && validated.duration_ms !== null) {
+        setClauses.push('duration_ms = $duration_ms');
+        updateParams.duration_ms = validated.duration_ms;
+      }
+      if (validated.cost_usd !== undefined && validated.cost_usd !== null) {
+        setClauses.push('cost_usd = $cost_usd');
+        updateParams.cost_usd = validated.cost_usd;
+      }
+      if (validated.tokens_input !== undefined && validated.tokens_input !== null) {
+        setClauses.push('tokens_input = $tokens_input');
+        updateParams.tokens_input = validated.tokens_input;
+      }
+      if (validated.tokens_output !== undefined && validated.tokens_output !== null) {
+        setClauses.push('tokens_output = $tokens_output');
+        updateParams.tokens_output = validated.tokens_output;
+      }
+      if (validated.depth !== undefined && validated.depth !== null) {
+        setClauses.push('depth = $depth');
+        updateParams.depth = validated.depth;
+      }
+      if (validated.composition_chain && validated.composition_chain.length > 0) {
+        setClauses.push('composition_chain = $composition_chain');
+        updateParams.composition_chain = validated.composition_chain;
+      }
+
+      const updateQuery = `
+        UPDATE activity_composition_graph
+        SET ${setClauses.join(',\n          ')}
+        WHERE parent_activity_id = $parent_activity_id
+          AND child_activity_id = $child_activity_id
+        RETURN AFTER
+      `;
+
+      const updated = await surrealDB.query<CompositionEdge[]>(updateQuery, updateParams);
 
       // @ts-ignore - SurrealDB query typing issue
       edge = updated && updated.length > 0 ? updated[0] : current;
@@ -3238,30 +3298,8 @@ app.post('/composition', async (c) => {
       });
     } else {
       // Create new edge with impulse flow fields
-      const createQuery = `
-        CREATE activity_composition_graph CONTENT {
-          parent_activity_id: $parent_activity_id,
-          child_activity_id: $child_activity_id,
-          execution_id: $execution_id,
-          goal_context: $goal_context,
-          success: $success,
-          execution_count: 1,
-          success_count: $success_count,
-          weight: $weight,
-          input_impulse_shapes: $input_impulse_shapes,
-          output_impulse_shapes: $output_impulse_shapes,
-          duration_ms: $duration_ms,
-          cost_usd: $cost_usd,
-          tokens_input: $tokens_input,
-          tokens_output: $tokens_output,
-          depth: $depth,
-          composition_chain: $composition_chain,
-          created_at: time::now(),
-          updated_at: time::now()
-        }
-      `;
-
-      const created = await surrealDB.query<CompositionEdge[]>(createQuery, {
+      // Build params object dynamically to avoid SCHEMAFULL field errors
+      const params: Record<string, any> = {
         parent_activity_id: validated.parent_activity_id,
         child_activity_id: validated.child_activity_id,
         execution_id: validated.execution_id,
@@ -3271,13 +3309,43 @@ app.post('/composition', async (c) => {
         weight: validated.success ? 1.0 : 0.0,
         input_impulse_shapes: validated.input_impulse_shapes || [],
         output_impulse_shapes: validated.output_impulse_shapes || [],
-        duration_ms: validated.duration_ms ?? null,
-        cost_usd: validated.cost_usd ?? null,
-        tokens_input: validated.tokens_input ?? null,
-        tokens_output: validated.tokens_output ?? null,
-        depth: validated.depth ?? null,
-        composition_chain: validated.composition_chain || null,
-      });
+      };
+
+      // Add optional fields only if they have values
+      // This prevents SCHEMAFULL errors when fields aren't in the schema yet
+      if (validated.duration_ms !== undefined && validated.duration_ms !== null) {
+        params.duration_ms = validated.duration_ms;
+      }
+      if (validated.cost_usd !== undefined && validated.cost_usd !== null) {
+        params.cost_usd = validated.cost_usd;
+      }
+      if (validated.tokens_input !== undefined && validated.tokens_input !== null) {
+        params.tokens_input = validated.tokens_input;
+      }
+      if (validated.tokens_output !== undefined && validated.tokens_output !== null) {
+        params.tokens_output = validated.tokens_output;
+      }
+      if (validated.depth !== undefined && validated.depth !== null) {
+        params.depth = validated.depth;
+      }
+      if (validated.composition_chain && validated.composition_chain.length > 0) {
+        params.composition_chain = validated.composition_chain;
+      }
+
+      // Build field list dynamically from params
+      const fieldEntries = Object.keys(params).map(k => `${k}: $${k}`);
+      const fieldsStr = fieldEntries.join(',\n          ');
+
+      const createQuery = `
+        CREATE activity_composition_graph CONTENT {
+          ${fieldsStr},
+          execution_count: 1,
+          created_at: time::now(),
+          updated_at: time::now()
+        }
+      `;
+
+      const created = await surrealDB.query<CompositionEdge[]>(createQuery, params);
 
       // @ts-ignore - SurrealDB query typing issue
       edge = created && created.length > 0 ? created[0] : {
