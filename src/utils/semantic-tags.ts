@@ -380,3 +380,4 @@ export function analyzeTaskSemantics(taskDescription: string) {
     allIntents: [...new Set(tagPrefixes.map(t => t.split('.')[0]))],
   };
 }
+// Trigger rebuild Tue Apr  7 11:46:17 AM PDT 2026
