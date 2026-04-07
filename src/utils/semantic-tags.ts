@@ -13,12 +13,13 @@
  */
 const KEYWORD_TO_TAGS: Record<string, string[]> = {
   // Testing
-  'test': ['tool.code.test', 'tool'],
-  'tests': ['tool.code.test', 'tool'],
-  'testing': ['tool.code.test', 'tool'],
-  'unit test': ['tool.code.test', 'tool'],
-  'integration test': ['tool.code.test', 'tool'],
-  'e2e': ['tool.code.test', 'tool'],
+  'test': ['development.testing', 'development.quality', 'tool.code.test', 'tool'],
+  'tests': ['development.testing', 'development.quality', 'tool.code.test', 'tool'],
+  'testing': ['development.testing', 'development.quality', 'tool.code.test', 'tool'],
+  'unit test': ['development.testing', 'tool.code.test', 'tool'],
+  'integration test': ['development.testing', 'tool.code.test', 'tool'],
+  'e2e': ['development.testing', 'tool.code.test', 'tool'],
+  'quality': ['development.quality', 'tool.code.quality', 'tool'],
 
   // Debugging and analysis
   'debug': ['meta.debug', 'meta'],
@@ -34,12 +35,15 @@ const KEYWORD_TO_TAGS: Record<string, string[]> = {
   'failing': ['meta.debug', 'meta'],
 
   // Feature development
-  'implement': ['feature', 'feature.vessel'],
-  'add': ['feature', 'feature.vessel'],
-  'create': ['feature', 'tool'],
-  'build': ['feature', 'feature.vessel'],
-  'develop': ['feature', 'meta.develop'],
-  'feature': ['feature'],
+  'implement': ['development.feature', 'feature', 'feature.vessel'],
+  'add': ['development.feature', 'development.enhancement', 'feature', 'feature.vessel'],
+  'create': ['development.scaffold', 'development', 'feature', 'tool'],
+  'build': ['development.scaffold', 'development', 'feature', 'feature.vessel'],
+  'develop': ['development', 'development.feature', 'feature', 'meta.develop'],
+  'feature': ['development.feature', 'development.enhancement', 'feature'],
+  'enhance': ['development.enhancement', 'development.feature', 'feature'],
+  'enhancement': ['development.enhancement', 'development.feature', 'feature'],
+  'extend': ['development.enhancement', 'development.feature', 'feature'],
   'endpoint': ['feature.vessel.api', 'feature'],
   'api': ['feature.vessel.api', 'feature'],
   'route': ['feature.vessel.api', 'feature'],
@@ -61,13 +65,14 @@ const KEYWORD_TO_TAGS: Record<string, string[]> = {
   'repair': ['bugfix', 'meta.debug'],
 
   // Code exploration
-  'explore': ['tool.exploration', 'tool'],
-  'exploration': ['tool.exploration', 'tool'],
-  'understand': ['tool.exploration', 'meta.learning'],
-  'analyze structure': ['tool.exploration', 'tool'],
-  'codebase': ['tool.exploration', 'tool'],
-  'dependencies': ['tool.exploration', 'tool'],
-  'architecture': ['tool.exploration', 'meta'],
+  'explore': ['development.exploration', 'tool.exploration', 'tool'],
+  'exploration': ['development.exploration', 'tool.exploration', 'tool'],
+  'understand': ['development.exploration', 'tool.exploration', 'meta.learning'],
+  'analyze structure': ['development.exploration', 'tool.exploration', 'tool'],
+  'codebase': ['development.exploration', 'tool.exploration', 'tool'],
+  'dependencies': ['development.exploration', 'tool.exploration', 'tool'],
+  'architecture': ['development.exploration', 'tool.exploration', 'meta'],
+  'investigate codebase': ['development.exploration', 'development.documentation', 'tool.exploration'],
 
   // Meta-learning
   'extract': ['meta.learning', 'meta'],
@@ -88,11 +93,11 @@ const KEYWORD_TO_TAGS: Record<string, string[]> = {
   'observability': ['tool.instrumentation', 'tool'],
 
   // Documentation
-  'document': ['tool.documentation', 'tool'],
-  'documentation': ['tool.documentation', 'tool'],
-  'readme': ['tool.documentation', 'tool'],
-  'docs': ['tool.documentation', 'tool'],
-  'comment': ['tool.documentation', 'tool'],
+  'document': ['development.documentation', 'tool.documentation', 'tool'],
+  'documentation': ['development.documentation', 'tool.documentation', 'tool'],
+  'readme': ['development.documentation', 'tool.documentation', 'tool'],
+  'docs': ['development.documentation', 'tool.documentation', 'tool'],
+  'comment': ['development.documentation', 'tool.documentation', 'tool'],
 
   // Infrastructure
   'deploy': ['infrastructure', 'tool.deployment'],
@@ -119,7 +124,21 @@ const KEYWORD_TO_TAGS: Record<string, string[]> = {
   'format': ['tool.code.quality', 'tool'],
   'type': ['tool.code.quality', 'tool'],
   'types': ['tool.code.quality', 'tool'],
-  'typescript': ['tool.code.quality', 'tool'],
+  'typescript': ['development.typescript', 'tool.code.quality', 'tool'],
+
+  // Development / Scaffolding
+  'module': ['development.scaffold', 'development', 'feature'],
+  'scaffold': ['development.scaffold', 'development'],
+  'boilerplate': ['development.scaffold', 'development'],
+  'starter': ['development.scaffold', 'development'],
+  'skeleton': ['development.scaffold', 'development'],
+  'development': ['development', 'feature'],
+  'component': ['development.scaffold', 'development', 'feature'],
+  'service': ['development.scaffold', 'development', 'feature'],
+  'class': ['development.scaffold', 'development', 'feature'],
+  'function': ['development.scaffold', 'development', 'feature'],
+  'utility': ['development.scaffold', 'development', 'tool'],
+  'helper': ['development.scaffold', 'development', 'tool'],
 
   // Security
   'security': ['bugfix.security', 'bugfix'],
