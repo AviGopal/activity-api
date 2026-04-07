@@ -107,6 +107,8 @@ export const ActivityTemplateSchema = z.object({
   // Canonical: 'tasks' instead of 'task_steps'
   tasks: z.array(TemplateTaskSchema).optional(),
   scope: z.string().nullable(),
+  // Public templates are discoverable by all orgs (ribosome-generated templates)
+  public: z.boolean().default(false),
   org_id: z.string().nullable(),
   project_id: z.string().nullable(),
   // Input/output shapes for paradigm alignment
@@ -159,6 +161,8 @@ export const CreateTemplateRequestSchema = z.object({
   tasks: z.array(TemplateTaskSchema).optional(),
   task_steps: z.array(TemplateTaskSchema).optional(),
   scope: z.enum(['global', 'org', 'project']).default('global'),
+  // Public templates are discoverable by all orgs (ribosome-generated templates)
+  public: z.boolean().default(false),
   org_id: z.string().nullable().optional(),
   project_id: z.string().nullable().optional(),
   // Canonical field: 'variant_of' (also accept legacy 'genealogy')

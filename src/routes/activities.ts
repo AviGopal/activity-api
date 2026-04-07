@@ -673,6 +673,8 @@ app.post('/templates', async (c) => {
       // Legacy category for backward compatibility
       category: derivedCategory,
       scope: validated.scope || 'org',
+      // Public templates are discoverable by all orgs (ribosome-generated templates)
+      public: validated.public ?? false,
     };
 
     // Add org_id only if provided (optional field, let schema handle default)
