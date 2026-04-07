@@ -356,15 +356,16 @@ async function enrichTemplatesWithMetrics(
         WHERE activity_id IN $activity_ids
       `;
       metricsResult = await surrealDB.query<any>(fallbackQuery, {
-        activity_ids: activityIds
+        activity_ids: normalizedIds  // Use normalized IDs to match stored activity_id format
       });
     }
 
     // For templates not found in v_activity_score (no executions yet),
     // try to get initial metrics from variant_performance_metrics
-    if (metricsResult.length < activityIds.length) {
+    if (metricsResult.length < normalizedIds.length) {
       const foundIds = new Set(metricsResult.map((m: any) => m.activity_id || m.variant_id));
-      const missingIds = activityIds.filter(id => !foundIds.has(id) && !foundIds.has(id.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '')));
+      // Use normalized IDs for comparison since variant_performance_metrics stores plain IDs
+      const missingIds = normalizedIds.filter(id => !foundIds.has(id));
 
       if (missingIds.length > 0) {
         logger.debug('Fetching initial metrics for templates without executions', {
