@@ -145,95 +145,15 @@ export async function generateJwtToken(context: {
 }
 
 /**
- * Authenticate MiniBob instance using RECORD access
+ * DEPRECATED: authenticateMiniBob
+ *
+ * MiniBob instances now authenticate using standard API keys via:
+ * - validateApiKeyWithFallback() (primary method)
+ * - Identity service validation with SurrealDB fallback
+ *
+ * This function is kept for reference but should not be used.
+ * Remove after confirming all clients use API key authentication.
  */
-export async function authenticateMiniBob(
-  instanceId: string,
-  apiKey: string
-): Promise<AuthContext> {
-  try {
-    const db = new Surreal();
-    await db.connect(config.surrealdb.url);
-    await db.use({
-      namespace: config.surrealdb.namespace,
-      database: config.surrealdb.database,
-    });
-
-    // Authenticate using RECORD access
-    const authResult = await db.signin({
-      access: 'minibob_record',
-      variables: {
-        instance_id: instanceId,
-        api_key: apiKey,
-      },
-    });
-
-    if (!authResult) {
-      await db.close();
-      return {
-        authenticated: false,
-        reason: 'Invalid instance_id or api_key',
-      };
-    }
-
-    // Extract JWT string from SDK response
-    const jwtToken =
-      typeof authResult === 'string'
-        ? authResult
-        : (authResult as { access: string }).access;
-
-    // Query $auth to get org_id and project_id
-    const authQuery = await db.query<
-      [
-        {
-          org_id: string;
-          project_id?: string;
-        }
-      ]
-    >(`RETURN {
-      org_id: $auth.org_id,
-      project_id: $auth.project_id
-    }`);
-
-    await db.close();
-
-    const instance = authQuery[0];
-    if (!instance || !instance.org_id) {
-      return {
-        authenticated: false,
-        reason: 'Instance authenticated but $auth not populated',
-      };
-    }
-
-    return {
-      authenticated: true,
-      orgId: instance.org_id,
-      keyId: instanceId,
-    };
-  } catch (error) {
-    logger.error('[auth] MiniBob authentication error', {
-      error: error instanceof Error ? error.message : String(error),
-    });
-
-    const errorMessage = error instanceof Error ? error.message : String(error);
-
-    if (
-      errorMessage.includes('No access method found') ||
-      errorMessage.includes('Signin failed') ||
-      errorMessage.includes('Invalid credentials')
-    ) {
-      return {
-        authenticated: false,
-        reason: 'Invalid instance_id or api_key',
-      };
-    }
-
-    return {
-      authenticated: false,
-      reason: 'Authentication failed',
-    };
-  }
-}
 
 /**
  * Validate API key via identity-vessel

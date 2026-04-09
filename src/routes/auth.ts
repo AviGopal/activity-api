@@ -217,4 +217,33 @@ auth.get('/me', async (c) => {
     }
 })
 
+/**
+ * POST /v2/auth/minibob/signin - DEPRECATED
+ *
+ * This endpoint was removed on 2026-04-08.
+ * MiniBob instances now use API key authentication.
+ */
+auth.post('/minibob/signin', async (c) => {
+  logger.warn('[auth] Deprecated endpoint called', {
+    endpoint: '/v2/auth/minibob/signin',
+    ip: c.req.header('x-forwarded-for') || 'unknown'
+  })
+
+  return c.json({
+    error: {
+      code: 'ENDPOINT_DEPRECATED',
+      message: 'MiniBob instance authentication has been deprecated',
+      details: {
+        deprecated_since: '2026-04-08',
+        removal_date: '2026-04-08',
+        old_method: 'POST /v2/auth/minibob/signin with instance_id + api_key',
+        new_method: 'Use API key authentication with Authorization: ApiKey <key> header',
+        migration_guide: 'All endpoints now accept API key authentication directly. No signin required.',
+        example: 'curl -H "Authorization: ApiKey <your-key>" https://activity.metabob.com/v2/activities/templates'
+      },
+      documentation: 'See README.md Authentication section for details'
+    }
+  }, 410)
+})
+
 export default auth

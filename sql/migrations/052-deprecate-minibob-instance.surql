@@ -1,29 +1,30 @@
 -- =============================================================================
--- Authentication and Authorization Schema
+-- Migration 052: Deprecate minibob_instance Table
 -- =============================================================================
--- Activity-API owns: minibob_instance table
--- Identity-vessel owns: organizations, users, api_keys tables
--- =============================================================================
-
--- =============================================================================
--- Table: minibob_instance (Activity-specific) - DEPRECATED
--- =============================================================================
--- DEPRECATED: Use API key authentication instead
--- Migration 052 makes this table read-only and removes minibob_record ACCESS
+-- Purpose: Transition to API-key-only authentication
 --
--- MiniBob instances now authenticate using standard API keys:
---   Authorization: ApiKey <key>
--- Identity service validates and returns org_id, user_id, key_id, scopes
+-- MiniBob instances now authenticate using standard API keys managed by
+-- identity-vessel. The instance_id requirement is removed.
+--
+-- Authentication flow:
+--   1. MiniBob sends: Authorization: ApiKey <key>
+--   2. Activity-API validates via identity service
+--   3. Identity service returns: org_id, user_id, key_id, scopes
+--   4. Activity-API uses key_id for audit trails
+--
+-- This migration makes the minibob_instance table read-only to prevent
+-- new writes while preserving historical data.
 -- =============================================================================
 
--- OVERWRITE ensures PERMISSIONS are always applied (critical for $auth.org_id access)
+-- Make minibob_instance read-only (admin only)
 DEFINE TABLE OVERWRITE minibob_instance SCHEMAFULL
   PERMISSIONS
-    -- MiniBob can read its own record (needed for org_id access)
-    FOR select WHERE id = $auth
-    -- Only root can create/update/delete (managed via init-data)
+    -- Read-only for admins (data export/audit purposes)
+    FOR select WHERE $auth.role = 'admin'
+    -- No new writes
     FOR create, update, delete NONE;
 
+-- Keep existing fields for historical data
 DEFINE FIELD IF NOT EXISTS instance_id ON minibob_instance TYPE string
   ASSERT $value != NONE;
 
@@ -50,28 +51,18 @@ DEFINE FIELD IF NOT EXISTS created_at ON minibob_instance TYPE datetime
 DEFINE FIELD IF NOT EXISTS last_active_at ON minibob_instance TYPE datetime
   VALUE $value OR time::now();
 
--- Unique constraint on instance_id
+-- Keep index for historical queries
 DEFINE INDEX IF NOT EXISTS idx_minibob_instance_id
   ON minibob_instance FIELDS instance_id UNIQUE;
 
 -- =============================================================================
--- ACCESS METHOD: minibob_record - DEPRECATED (removed in migration 052)
+-- ACCESS METHOD: minibob_record (DEPRECATED)
 -- =============================================================================
--- DEPRECATED: MiniBob instances now use standard API key authentication
---
--- Old flow (removed):
---   POST /v2/auth/minibob/signin { instance_id, api_key }
---   Returns JWT via minibob_record ACCESS
---
--- New flow (use this):
---   Authorization: ApiKey <key>
---   Validated via identity service
---   Returns org_id, user_id, key_id, scopes
+-- This ACCESS method is commented out to prevent new authentication attempts.
+-- Existing tokens remain valid until expiry (24h).
+-- Uncomment for rollback if needed.
 -- =============================================================================
 
--- REMOVED: Migration 052 removes this ACCESS method
--- Uncomment for rollback if needed:
---
 -- DEFINE ACCESS IF NOT EXISTS minibob_record ON DATABASE TYPE RECORD
 --   SIGNIN (
 --     SELECT * FROM minibob_instance
@@ -80,3 +71,6 @@ DEFINE INDEX IF NOT EXISTS idx_minibob_instance_id
 --   )
 --   DURATION FOR TOKEN 24h
 --   DURATION FOR SESSION 7d;
+
+-- Remove the ACCESS method completely (prevents new authentications)
+REMOVE ACCESS IF EXISTS minibob_record ON DATABASE;
