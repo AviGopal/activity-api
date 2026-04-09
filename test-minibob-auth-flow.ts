@@ -1,19 +1,20 @@
 #!/usr/bin/env bun
 /**
- * Test script: MiniBob Instance Authentication Flow
+ * Test script: MiniBob API Key Authentication Flow
  *
  * Validates the complete flow:
- * 1. MiniBob instance signs in with instance_id + api_key
- * 2. Receives JWT with org_id and project_id
- * 3. Fetches templates (scoped to org/project)
- * 4. Creates execution trace (scoped to org/project)
- * 5. Verifies isolation from other projects
+ * 1. MiniBob authenticates with API key (Authorization: ApiKey <key>)
+ * 2. API key validated via identity service (with direct SurrealDB fallback)
+ * 3. Fetches templates (scoped to org)
+ * 4. Creates execution trace (scoped to org)
+ * 5. Verifies audit trail uses key_id
  *
- * This demonstrates: minibob → metabob-activity-api → SurrealDB
+ * This demonstrates: minibob → metabob-activity-api → identity-vessel/SurrealDB
  *
  * Prerequisites:
  * - SurrealDB running with schemas deployed
  * - activity-api running on localhost:8080
+ * - identity-vessel running (or direct SurrealDB fallback active)
  *
  * Usage: bun run test-minibob-auth-flow.ts
  */
@@ -81,22 +82,22 @@ async function setupTestData() {
   `);
   console.log('Created projects:', project1Id, project2Id);
 
-  // Create MiniBob instance for backend project
-  const instanceId = 'mb-test-backend-001';
-  const instanceApiKey = 'mb_test_key_' + Date.now();
+  // Create API key for MiniBob authentication
+  const apiKey = 'mb_test_key_' + Date.now();
+  const keyId = `api_key:test_minibob_key_${Date.now()}`;
 
   await db.query(`
-    DELETE minibob_instance WHERE instance_id = $instance_id;
-    CREATE minibob_instance SET
-      instance_id = $instance_id,
+    DELETE api_key WHERE id = $key_id;
+    CREATE $key_id SET
       org_id = ${orgId},
-      project_id = ${project1Id},
-      api_key_hash = crypto::argon2::generate($api_key),
-      vessel_id = 'minibob:v2',
+      user_id = NONE,
+      key_hash = crypto::sha256::hash($api_key),
+      scopes = ['read', 'write'],
       is_active = true,
-      created_at = time::now()
-  `, { instance_id: instanceId, api_key: instanceApiKey });
-  console.log('Created MiniBob instance:', instanceId);
+      created_at = time::now(),
+      expires_at = NONE
+  `, { key_id: keyId, api_key: apiKey });
+  console.log('Created API key:', keyId);
 
   // Create templates with different scopes
   await db.query(`
@@ -153,63 +154,45 @@ async function setupTestData() {
 
   await db.close();
 
-  return { instanceId, instanceApiKey, orgId, project1Id, project2Id };
+  return { apiKey, keyId, orgId, project1Id, project2Id };
 }
 
-async function testMiniBobSignin(instanceId: string, apiKey: string): Promise<string | null> {
-  console.log('\n=== Test: MiniBob Instance Signin ===\n');
-  console.log(`Instance ID: ${instanceId}`);
+async function testMiniBobApiKeyAuth(apiKey: string): Promise<boolean> {
+  console.log('\n=== Test: MiniBob API Key Authentication ===\n');
+  console.log(`API Key: ${apiKey.substring(0, 10)}...`);
 
   try {
-    const response = await fetch(`${API_URL}/v2/auth/minibob/signin`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        instance_id: instanceId,
-        api_key: apiKey,
-      }),
+    // Test direct template fetch with API key (no signin needed)
+    const response = await fetch(`${API_URL}/v2/activities/templates`, {
+      headers: { 'Authorization': `ApiKey ${apiKey}` },
     });
 
     if (!response.ok) {
       const error = await response.text();
-      test('MiniBob signin returns 200', false, `Got ${response.status}: ${error}`);
-      return null;
+      test('API key authentication returns 200', false, `Got ${response.status}: ${error}`);
+      return false;
     }
 
-    test('MiniBob signin returns 200', true);
+    test('API key authentication returns 200', true);
 
-    const data = await response.json() as { token?: string; org_id?: string; project_id?: string };
+    const data = await response.json() as { templates?: Array<{ name: string }> };
+    test('Response contains templates array', Array.isArray(data.templates));
 
-    test('Response contains JWT token', !!data.token);
-    test('Response contains org_id', !!data.org_id);
-    test('Response contains project_id', !!data.project_id);
+    console.log(`Received ${data.templates?.length || 0} templates`);
 
-    if (data.token) {
-      // Decode JWT to verify claims
-      const parts = data.token.split('.');
-      if (parts.length === 3) {
-        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
-        console.log('\nJWT payload:', JSON.stringify(payload, null, 2));
-
-        test('JWT contains org_id', !!payload.org_id || !!payload.ID);
-        test('JWT contains project_id', !!payload.project_id);
-        test('JWT contains instance_id', !!payload.instance_id);
-      }
-    }
-
-    return data.token || null;
+    return true;
   } catch (error) {
-    test('MiniBob signin', false, String(error));
-    return null;
+    test('MiniBob API key auth', false, String(error));
+    return false;
   }
 }
 
-async function testTemplateVisibility(jwt: string) {
-  console.log('\n=== Test: Template Visibility (Project Scoping) ===\n');
+async function testTemplateVisibility(apiKey: string) {
+  console.log('\n=== Test: Template Visibility (Org Scoping) ===\n');
 
   try {
     const response = await fetch(`${API_URL}/v2/activities/templates`, {
-      headers: { 'Authorization': `Bearer ${jwt}` },
+      headers: { 'Authorization': `ApiKey ${apiKey}` },
     });
 
     if (!response.ok) {
@@ -225,8 +208,8 @@ async function testTemplateVisibility(jwt: string) {
 
     console.log('Returned templates:', templateNames);
 
-    // Should see: global, org-shared, backend-deploy
-    // Should NOT see: frontend-build (different project)
+    // Should see: global, org-shared, backend-deploy, frontend-build
+    // All are org-scoped with API key auth (no project filtering)
 
     test('Global template is visible',
       templateNames.includes('test-minibob-global'));
@@ -237,17 +220,16 @@ async function testTemplateVisibility(jwt: string) {
     test('Backend project template is visible',
       templateNames.includes('test-minibob-backend-deploy'));
 
-    test('Frontend project template is NOT visible',
-      !templateNames.includes('test-minibob-frontend-build'),
-      templateNames.includes('test-minibob-frontend-build') ? 'Should be hidden!' : undefined);
+    test('Frontend project template is visible',
+      templateNames.includes('test-minibob-frontend-build'));
 
   } catch (error) {
     test('Template visibility', false, String(error));
   }
 }
 
-async function testExecutionTraceWithProjectScope(jwt: string) {
-  console.log('\n=== Test: Execution Trace Creation (Project Scoped) ===\n');
+async function testExecutionTraceWithOrgScope(apiKey: string, keyId: string) {
+  console.log('\n=== Test: Execution Trace Creation (Org Scoped) ===\n');
 
   try {
     const executionId = `test_minibob_exec_${Date.now()}`;
@@ -265,7 +247,7 @@ async function testExecutionTraceWithProjectScope(jwt: string) {
     const response = await fetch(`${API_URL}/v2/activities/execution-traces`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${jwt}`,
+        'Authorization': `ApiKey ${apiKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(trace),
@@ -283,15 +265,20 @@ async function testExecutionTraceWithProjectScope(jwt: string) {
     console.log('Created trace:', JSON.stringify(data.trace, null, 2));
 
     test('Trace has org_id', !!data.trace?.org_id);
-    test('Trace has project_id', !!data.trace?.project_id);
+
+    // Verify audit trail uses key_id
+    const createdBy = data.trace?.created_by as string;
+    test('Trace created_by uses key_id format',
+      createdBy?.startsWith('api_key:'),
+      createdBy ? `Expected api_key:*, got: ${createdBy}` : 'No created_by field');
 
   } catch (error) {
     test('Execution trace creation', false, String(error));
   }
 }
 
-async function testInactiveInstanceRejected() {
-  console.log('\n=== Test: Inactive Instance Rejected ===\n');
+async function testInactiveApiKeyRejected() {
+  console.log('\n=== Test: Inactive API Key Rejected ===\n');
 
   const db = new Surreal();
   await db.connect(SURREALDB_URL);
@@ -301,38 +288,33 @@ async function testInactiveInstanceRejected() {
   });
   await db.use({ namespace: 'activity-system', database: 'learning_loop' });
 
-  // Create inactive instance
-  const inactiveId = 'mb-test-inactive';
+  // Create inactive API key
   const inactiveKey = 'inactive_key_' + Date.now();
+  const inactiveKeyId = `api_key:test_inactive_${Date.now()}`;
 
   await db.query(`
-    DELETE minibob_instance WHERE instance_id = $instance_id;
-    CREATE minibob_instance SET
-      instance_id = $instance_id,
+    DELETE $key_id;
+    CREATE $key_id SET
       org_id = organizations:test_minibob_org,
-      project_id = projects:test_minibob_backend,
-      api_key_hash = crypto::argon2::generate($api_key),
-      vessel_id = 'minibob:v2',
+      user_id = NONE,
+      key_hash = crypto::sha256::hash($api_key),
+      scopes = ['read', 'write'],
       is_active = false,
-      created_at = time::now()
-  `, { instance_id: inactiveId, api_key: inactiveKey });
+      created_at = time::now(),
+      expires_at = NONE
+  `, { key_id: inactiveKeyId, api_key: inactiveKey });
 
   await db.close();
 
   try {
-    const response = await fetch(`${API_URL}/v2/auth/minibob/signin`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        instance_id: inactiveId,
-        api_key: inactiveKey,
-      }),
+    const response = await fetch(`${API_URL}/v2/activities/templates`, {
+      headers: { 'Authorization': `ApiKey ${inactiveKey}` },
     });
 
-    test('Inactive instance signin returns 401', response.status === 401);
+    test('Inactive API key returns 401 or 403', response.status === 401 || response.status === 403);
 
   } catch (error) {
-    test('Inactive instance test', false, String(error));
+    test('Inactive API key test', false, String(error));
   }
 }
 
@@ -350,7 +332,7 @@ async function cleanup() {
   await db.query(`
     DELETE activity_registry WHERE name CONTAINS 'test-minibob-';
     DELETE activity_execution_traces WHERE execution_id CONTAINS 'test_minibob_';
-    DELETE minibob_instance WHERE instance_id CONTAINS 'mb-test-';
+    DELETE api_key WHERE id CONTAINS 'test_minibob_key_' OR id CONTAINS 'test_inactive_';
     DELETE projects WHERE org_id = organizations:test_minibob_org;
     DELETE organizations:test_minibob_org;
   `);
@@ -361,34 +343,34 @@ async function cleanup() {
 
 async function main() {
   console.log('╔════════════════════════════════════════════════════════════╗');
-  console.log('║      MiniBob Instance Authentication Flow Test             ║');
+  console.log('║      MiniBob API Key Authentication Flow Test              ║');
   console.log('╠════════════════════════════════════════════════════════════╣');
-  console.log('║  Validates: minibob → activity-api → SurrealDB             ║');
+  console.log('║  Validates: minibob → activity-api → identity/SurrealDB    ║');
   console.log('║                                                            ║');
   console.log('║  Data Flow:                                                ║');
-  console.log('║  1. MiniBob signs in with instance_id + api_key            ║');
-  console.log('║  2. Receives JWT with org_id + project_id (singular)       ║');
-  console.log('║  3. Fetches templates (filtered by project scope)          ║');
-  console.log('║  4. Creates execution trace (scoped to project)            ║');
+  console.log('║  1. MiniBob authenticates with API key header              ║');
+  console.log('║  2. Validated via identity service (or direct fallback)    ║');
+  console.log('║  3. Fetches templates (filtered by org scope)              ║');
+  console.log('║  4. Creates execution trace (scoped to org, uses key_id)   ║');
   console.log('╚════════════════════════════════════════════════════════════╝');
 
   try {
     // Setup
-    const { instanceId, instanceApiKey } = await setupTestData();
+    const { apiKey, keyId } = await setupTestData();
 
-    // Test MiniBob signin
-    const jwt = await testMiniBobSignin(instanceId, instanceApiKey);
+    // Test MiniBob API key authentication
+    const authSuccess = await testMiniBobApiKeyAuth(apiKey);
 
-    if (jwt) {
-      // Test template visibility with project scoping
-      await testTemplateVisibility(jwt);
+    if (authSuccess) {
+      // Test template visibility with org scoping
+      await testTemplateVisibility(apiKey);
 
       // Test execution trace creation
-      await testExecutionTraceWithProjectScope(jwt);
+      await testExecutionTraceWithOrgScope(apiKey, keyId);
     }
 
-    // Test inactive instance rejection
-    await testInactiveInstanceRejected();
+    // Test inactive API key rejection
+    await testInactiveApiKeyRejected();
 
     // Cleanup
     await cleanup();

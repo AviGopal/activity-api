@@ -1,5 +1,23 @@
 #!/usr/bin/env bun
 /**
+ * DEPRECATED: SurrealDB minibob_record ACCESS Method
+ *
+ * This test validates the DEPRECATED minibob_record ACCESS method:
+ *   SIGNIN minibob_record { instance_id, api_key }
+ *
+ * As of 2026-04-08, MiniBob uses API key-only authentication via identity-vessel.
+ * The minibob_record ACCESS method has been removed (migration 052).
+ *
+ * This test is RETAINED for:
+ * - Emergency rollback validation
+ * - Schema migration verification
+ * - Historical reference
+ *
+ * Do NOT use this authentication pattern for new development.
+ * See: test/api-key-auth.test.ts for current auth tests.
+ *
+ * ============================================================================
+ *
  * Test SurrealDB RECORD authentication directly
  *
  * Validates that the minibob_record ACCESS method works correctly.

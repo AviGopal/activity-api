@@ -9,11 +9,12 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 
 const API_URL = process.env.ACTIVITY_API_URL || 'http://activity.metabob.local';
 const TEST_ORG_ID = 'metabob_internal';
+const TEST_API_KEY = process.env.TEST_API_KEY || 'test-api-key-123';
 
-// Test JWT token (will be populated during setup)
-let jwtToken: string;
+// Connection tracking
 let connectionId: string;
 let sessionToken: string;
+let jwtToken: string; // JWT obtained from connection acquisition
 
 // Helper to make authenticated requests
 async function apiRequest(
@@ -27,8 +28,11 @@ async function apiRequest(
     ...headers,
   };
 
+  // Use JWT from connection acquisition if available, otherwise use API key
   if (jwtToken) {
     requestHeaders['Authorization'] = `Bearer ${jwtToken}`;
+  } else {
+    requestHeaders['Authorization'] = `ApiKey ${TEST_API_KEY}`;
   }
 
   if (connectionId) {
@@ -44,24 +48,9 @@ async function apiRequest(
 
 describe('Connection Slots Integration Tests', () => {
   beforeAll(async () => {
-    // Authenticate to get a JWT token
-    // First try to use an existing MiniBob instance
-    const authResponse = await fetch(`${API_URL}/v2/auth/minibob/signin`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        instance_id: 'minibob-local-001',
-        api_key: 'test-api-key-123',
-      }),
-    });
-
-    if (authResponse.ok) {
-      const authData = await authResponse.json() as { token: string };
-      jwtToken = authData.token;
-      console.log('Authenticated with existing MiniBob instance');
-    } else {
-      console.log('MiniBob auth failed, tests may be limited:', await authResponse.text());
-    }
+    // Connection slots use API key authentication
+    // The API key is set in TEST_API_KEY environment variable or defaults to 'test-api-key-123'
+    console.log('Using API key authentication for connection slot tests');
   });
 
   // Note: Connection slots use API key authentication, not JWT.
@@ -74,7 +63,7 @@ describe('Connection Slots Integration Tests', () => {
 
   afterAll(async () => {
     // Clean up: release connection if acquired
-    if (connectionId && jwtToken) {
+    if (connectionId) {
       try {
         await apiRequest('POST', '/v2/connections/release', {
           connection_id: connectionId,
@@ -88,16 +77,8 @@ describe('Connection Slots Integration Tests', () => {
 
   describe('P2.1: Connection Acquisition', () => {
     test('should acquire a connection slot (requires API key)', async () => {
-      // Connection slots require API key authentication, not JWT
+      // Connection slots require API key authentication
       // The api_key must be created in api_keys table with proper key_hash
-      const TEST_API_KEY = process.env.TEST_API_KEY;
-
-      if (!TEST_API_KEY) {
-        console.log('Skipping: No TEST_API_KEY environment variable set');
-        console.log('To test connection slots, create an API key and set TEST_API_KEY');
-        return;
-      }
-
       const response = await fetch(`${API_URL}/v2/connections/acquire`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -226,31 +207,13 @@ describe('Connection Slots Integration Tests', () => {
 
 describe('Tiered Resolver Integration Tests', () => {
   beforeAll(async () => {
-    // Re-authenticate if needed
-    if (!jwtToken) {
-      const authResponse = await fetch(`${API_URL}/v2/auth/minibob/signin`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          instance_id: 'minibob-local-001',
-          api_key: 'test-api-key-123',
-        }),
-      });
-
-      if (authResponse.ok) {
-        const authData = await authResponse.json() as { token: string };
-        jwtToken = authData.token;
-      }
-    }
+    // Use API key authentication for resolver tests
+    // JWT token will be used if we have one from connection acquisition
+    console.log('Using API key authentication for tiered resolver tests');
   });
 
   describe('P3.4: Resolution Endpoint', () => {
     test('should resolve impulse through tiered system', async () => {
-      if (!jwtToken) {
-        console.log('Skipping: No JWT token available');
-        return;
-      }
-
       const response = await apiRequest('POST', '/v2/resolve', {
         impulse: {
           pointer: {
@@ -301,11 +264,6 @@ describe('Tiered Resolver Integration Tests', () => {
     });
 
     test('should handle direct LLM messages', async () => {
-      if (!jwtToken) {
-        console.log('Skipping: No JWT token available');
-        return;
-      }
-
       const response = await apiRequest('POST', '/v2/resolve', {
         impulse: {
           pointer: { type: 'memo' },

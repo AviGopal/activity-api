@@ -13,33 +13,24 @@ echo "Testing org_id VALUE clause fix"
 echo "==================================================================="
 echo ""
 
-# Step 1: Authenticate as MiniBob
-echo "Step 1: Authenticating as MiniBob..."
-AUTH_RESPONSE=$(curl -s -X POST "${MINIBOB_API}/v2/auth/minibob/signin" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "instance_id": "minibob-local-001",
-    "api_key": "test-api-key-123"
-  }')
+# Step 1: Set up API key authentication
+echo "Step 1: Setting up API key authentication..."
+API_KEY="${METABOB_API_KEY:-test-api-key-123}"
+AUTH_HEADER="Authorization: ApiKey ${API_KEY}"
 
-TOKEN=$(echo "$AUTH_RESPONSE" | jq -r '.token')
-ORG_ID=$(echo "$AUTH_RESPONSE" | jq -r '.org_id')
+# For testing purposes, we'll use the default MiniBob org_id
+# In production, the API key would determine the org_id
+ORG_ID="minibob"
 
-if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
-  echo "❌ FAILED: Could not authenticate"
-  echo "$AUTH_RESPONSE" | jq .
-  exit 1
-fi
-
-echo "✅ Authenticated successfully"
+echo "✅ API key authentication configured"
+echo "   Using API Key: ${API_KEY:0:20}..."
 echo "   Org ID: $ORG_ID"
-echo "   Token: ${TOKEN:0:20}..."
 echo ""
 
 # Step 2: Create an impulse (this would fail before the fix)
 echo "Step 2: Creating impulse..."
 IMPULSE_RESPONSE=$(curl -s -X POST "${MINIBOB_API}/v2/impulses" \
-  -H "Authorization: Bearer $TOKEN" \
+  -H "${AUTH_HEADER}" \
   -H "Content-Type: application/json" \
   -d '{
     "impulse_id": "test-org-id-fix",
