@@ -1,5 +1,24 @@
 #!/usr/bin/env bun
 
+/**
+ * ⚠️  DEPRECATED: MiniBob Instance Creation Script ⚠️
+ *
+ * This script creates records in the DEPRECATED minibob_instance table.
+ * As of 2026-04-08, MiniBob uses API key authentication via identity-vessel.
+ *
+ * ⛔ DO NOT USE for new instances.
+ *
+ * This script is retained ONLY for:
+ * - Backward compatibility testing
+ * - Emergency rollback scenarios
+ * - Historical data migration
+ *
+ * For new MiniBob instances, create API keys via identity-vessel instead.
+ * Migration 052 made the minibob_instance table read-only.
+ *
+ * See: repos/identity-vessel/CLAUDE.md for current authentication
+ */
+
 import { Surreal } from 'surrealdb';
 
 const SURREAL_URL = process.env.SURREALDB_URL || 'http://surrealdb.activity-system.svc.cluster.local:8000';
