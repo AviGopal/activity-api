@@ -145,12 +145,12 @@ DEFINE FIELD IF NOT EXISTS tags ON activity TYPE option<array<string>>
 DEFINE FIELD IF NOT EXISTS tag_prefixes ON activity TYPE option<array<string>>
   COMMENT "All prefixes of tags for efficient prefix matching";
 
--- Template-specific: Task steps for LLM execution
--- Both tasks and tasks.* must be FLEXIBLE to allow arbitrary nested task objects
-DEFINE FIELD IF NOT EXISTS tasks ON activity TYPE option<array<object>> FLEXIBLE
-  COMMENT "Task steps array for template execution";
-DEFINE FIELD IF NOT EXISTS tasks.* ON activity TYPE object FLEXIBLE
-  COMMENT "Individual task objects with arbitrary nested fields (dependencies, prompt, etc.)";
+-- Template-specific: Task steps for any resolver type
+-- FLEXIBLE without object type specification allows truly arbitrary nested structures
+-- Supports: LLM resolvers (prompt/variables), deterministic resolvers (resolver/config),
+--           tool invocations, compositions, and any future resolver patterns
+DEFINE FIELD IF NOT EXISTS tasks ON activity TYPE option<array> FLEXIBLE
+  COMMENT "Task steps array - supports any resolver type (LLM, deterministic, tool, etc.)";
 
 -- Tool-specific: Tool name for tool invocation
 DEFINE FIELD IF NOT EXISTS tool_name ON activity TYPE option<string>;
