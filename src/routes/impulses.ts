@@ -172,12 +172,14 @@ router.post('/', async (c) => {
     if (jwtAuth) {
       // JWT auth from MiniBob instances or users
       org_id = jwtAuth.orgId;
-      // Convert instanceId to proper SurrealDB record format
-      // Schema expects: option<string | record<users> | record<minibob_instance>>
-      if (jwtAuth.instanceId) {
-        created_by = `minibob_instance:${jwtAuth.instanceId}`;
+      // Use keyId or userId for audit trail
+      // Schema expects: option<string | record<users> | record<api_key>>
+      if (jwtAuth.keyId) {
+        created_by = `api_key:${jwtAuth.keyId}`;
+      } else if (jwtAuth.userId) {
+        created_by = `users:${jwtAuth.userId}`;
       } else {
-        // For non-MiniBob auth (API keys, JWT users), leave as empty to use NONE
+        // For legacy auth without keyId/userId, leave as empty to use NONE
         created_by = '';
       }
       logger.debug('Using JWT auth', { orgId: jwtAuth.orgId, projectId: jwtAuth.projectId, createdBy: created_by || 'NONE' });

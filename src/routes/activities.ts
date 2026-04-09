@@ -983,7 +983,7 @@ app.post('/templates', async (c) => {
         error.errors,
         body,
         {
-          callerId: jwtAuth?.instanceId,
+          callerId: jwtAuth?.keyId || jwtAuth?.userId,
           orgId: orgId || undefined,
           projectId: projectId || undefined,
         }
