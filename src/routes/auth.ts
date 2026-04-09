@@ -218,9 +218,10 @@ auth.get('/me', async (c) => {
 })
 
 /**
- * POST /v2/auth/minibob/signin - DEPRECATED
+ * POST /v2/auth/minibob/signin
  *
- * This endpoint was removed on 2026-04-08.
+ * Returns 410 Gone. This endpoint was removed on 2026-04-08.
+ * Kept for API compatibility to guide clients to new authentication method.
  * MiniBob instances now use API key authentication.
  */
 auth.post('/minibob/signin', async (c) => {
