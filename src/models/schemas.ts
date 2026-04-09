@@ -1406,3 +1406,46 @@ export const ImpulseShapeActivityScoreSchema = z.object({
 export type ShapeScoreUpdateRequest = z.infer<typeof ShapeScoreUpdateRequestSchema>;
 export type ShapeScoreUpdateResponse = z.infer<typeof ShapeScoreUpdateResponseSchema>;
 export type ImpulseShapeActivityScore = z.infer<typeof ImpulseShapeActivityScoreSchema>;
+
+// =============================================================================
+// MANUAL FEEDBACK SCHEMAS
+// =============================================================================
+
+/**
+ * ActivityFeedbackRequest - Manual feedback from /teach and /warn commands
+ * Request body for POST /v2/activities/feedback
+ */
+export const ActivityFeedbackRequestSchema = z.object({
+  activity_id: z.string()
+    .describe('Activity ID to provide feedback on'),
+  direction: z.enum(['positive', 'negative'])
+    .describe('Feedback type: positive (teach) or negative (warn)'),
+  intensity: z.number().int().min(0).max(3).default(0)
+    .describe('Feedback strength: 0=1.5x, 1=2x, 2=2.5x, 3=3x'),
+  include_adjacent: z.boolean().optional()
+    .describe('Whether to apply feedback to adjacent activities (composition graph)'),
+  session_id: z.string().optional()
+    .describe('Session ID for finding adjacent activities'),
+  reason: z.string().optional()
+    .describe('Optional reason for feedback (logged for learning)'),
+});
+
+/**
+ * ActivityFeedbackResponse - Response from feedback endpoint
+ * Returns updated Thompson Sampling parameters
+ */
+export const ActivityFeedbackResponseSchema = z.object({
+  success: z.boolean()
+    .describe('Whether feedback was successfully recorded'),
+  affected_activities: z.array(z.string())
+    .describe('Activity IDs that received feedback updates'),
+  multiplier: z.number()
+    .describe('Applied multiplier based on intensity'),
+  direction: z.string()
+    .describe('Feedback direction that was applied'),
+  message: z.string().optional()
+    .describe('Optional status message'),
+});
+
+export type ActivityFeedbackRequest = z.infer<typeof ActivityFeedbackRequestSchema>;
+export type ActivityFeedbackResponse = z.infer<typeof ActivityFeedbackResponseSchema>;

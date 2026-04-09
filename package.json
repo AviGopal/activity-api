@@ -9,7 +9,7 @@
     "start": "bun run src/index.ts",
     "build": "bun build src/index.ts --outdir dist --target bun",
     "init-db": "bun run scripts/init-database.ts",
-    "init-data": "bun run sql/init-test-data.ts",
+    "init-data": "echo 'DEPRECATED: MiniBob instance creation removed (migration 052). Creates organization only.' && bun run sql/init-test-data.ts",
     "seed-templates": "bun run sql/seed-templates.ts",
     "extract-variants": "bun run sql/extract-best-variants.ts",
     "test": "bun test",
