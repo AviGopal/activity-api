@@ -16,6 +16,7 @@
 
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
+import { redis } from '../db/redis';
 
 // =============================================================================
 // TYPES
@@ -138,7 +139,7 @@ export class CircuitBreakerService {
     const shouldResetWindow = windowAge > current.failure_window_seconds;
 
     let transitioned = false;
-    let newState = current.state;
+    let newState: CircuitState = current.state;
 
     // Half-open → Closed on success
     if (current.state === 'half_open') {
@@ -151,6 +152,18 @@ export class CircuitBreakerService {
         previous_state: 'half_open',
         probe_succeeded: true,
       });
+
+      // Release probe lock since probe succeeded
+      const lockKey = `circuit_breaker:probe_lock:${vesselId}`;
+      try {
+        await redis.releaseLock(lockKey);
+        logger.debug('Released probe lock after successful probe', { vesselId });
+      } catch (error) {
+        logger.error('Failed to release probe lock', {
+          vesselId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
 
       logger.info('Circuit breaker closed after successful probe', { vesselId });
     }
@@ -220,7 +233,7 @@ export class CircuitBreakerService {
       failureRate >= current.failure_rate_threshold;
 
     let transitioned = false;
-    let newState = current.state;
+    let newState: CircuitState = current.state;
     let triggerType: 'consecutive_failures' | 'failure_rate_threshold' | undefined;
 
     if (shouldOpen && current.state === 'closed') {
@@ -263,6 +276,18 @@ export class CircuitBreakerService {
         probe_error_code: errorCode,
         cooldown_period_ms: newCooldown,
       });
+
+      // Release probe lock since probe failed
+      const lockKey = `circuit_breaker:probe_lock:${vesselId}`;
+      try {
+        await redis.releaseLock(lockKey);
+        logger.debug('Released probe lock after failed probe', { vesselId });
+      } catch (error) {
+        logger.error('Failed to release probe lock', {
+          vesselId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
 
       logger.warn('Circuit breaker reopened after failed probe', {
         vesselId,
@@ -363,6 +388,7 @@ export class CircuitBreakerService {
 
   /**
    * Check if a request should be allowed through the circuit breaker
+   * Uses Redis distributed lock to ensure only ONE probe request in half-open state
    */
   static async shouldAllowRequest(vesselId: string, orgId: string): Promise<boolean> {
     const current = await this.getState(vesselId, orgId);
@@ -377,8 +403,31 @@ export class CircuitBreakerService {
       return state.state === 'half_open';
     }
 
-    // Half-open: allow single probe request (caller must handle locking)
-    return true;
+    // Half-open: allow single probe request using distributed lock
+    // Lock prevents multiple concurrent requests from all becoming probes
+    const lockKey = `circuit_breaker:probe_lock:${vesselId}`;
+    const lockTTL = 5; // 5 seconds - long enough for probe to complete
+
+    try {
+      const lockAcquired = await redis.acquireLock(lockKey, lockTTL);
+
+      if (lockAcquired) {
+        // This request gets to be the probe
+        logger.debug('Half-open probe lock acquired', { vesselId });
+        return true;
+      } else {
+        // Another request is already probing - reject this one
+        logger.debug('Half-open probe lock held by another request', { vesselId });
+        return false;
+      }
+    } catch (error) {
+      // If Redis fails, fall back to allowing the request to prevent cascade failures
+      logger.error('Failed to acquire probe lock, allowing request', {
+        vesselId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return true;
+    }
   }
 
   /**

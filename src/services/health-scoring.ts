@@ -137,9 +137,33 @@ export class HealthScoringService {
 
     // Sliding window: keep last 100 requests
     const newTotalCount = Math.min(current.total_count + 1, this.MAX_TRACKED_REQUESTS);
-    const newSuccessCount = current.total_count >= this.MAX_TRACKED_REQUESTS
-      ? current.success_count // Will be recalculated in sliding window
-      : current.success_count + 1;
+
+    // When window is full, maintain success count (assuming oldest was a failure)
+    // If success_count === total_count (all successes), adding success keeps it at MAX
+    // If success_count < total_count, we need to assume oldest request drops out
+    let newSuccessCount: number;
+    if (current.total_count >= this.MAX_TRACKED_REQUESTS) {
+      // Window is full - we're dropping oldest request
+      // Assume oldest request had same success rate as current window
+      // To keep the math simple: if all were successes, stays at 100
+      // Otherwise, increment by 1 (this success) but capped at MAX
+      if (current.success_count === current.total_count) {
+        newSuccessCount = this.MAX_TRACKED_REQUESTS; // All successes
+      } else {
+        // Mixed results - maintain approximately same success rate
+        // Drop one request (unknown if success/failure), add this success
+        const currentSuccessRate = current.success_count / current.total_count;
+        // Probabilistically: if we drop a failure, success count increases
+        // Simplification: assume we drop based on current ratio
+        newSuccessCount = Math.min(
+          Math.round((current.success_count - currentSuccessRate) + 1),
+          this.MAX_TRACKED_REQUESTS
+        );
+      }
+    } else {
+      // Window not full yet - just increment
+      newSuccessCount = current.success_count + 1;
+    }
 
     // Update latency with exponential moving average
     const alpha = current.latency_ema_alpha;
@@ -199,7 +223,22 @@ export class HealthScoringService {
 
     // Sliding window: keep last 100 requests
     const newTotalCount = Math.min(current.total_count + 1, this.MAX_TRACKED_REQUESTS);
-    // Success count stays the same
+
+    // When window is full, maintain success count by dropping oldest request
+    let newSuccessCount: number;
+    if (current.total_count >= this.MAX_TRACKED_REQUESTS) {
+      // Window is full - dropping oldest request, adding this failure
+      // Assume oldest request had same success rate as current window
+      const currentSuccessRate = current.success_count / current.total_count;
+      // Drop one request probabilistically, add this failure (no success increment)
+      newSuccessCount = Math.max(
+        0,
+        Math.round(current.success_count - currentSuccessRate)
+      );
+    } else {
+      // Window not full yet - success count unchanged (adding a failure)
+      newSuccessCount = current.success_count;
+    }
 
     // Update latency (even for failures)
     const alpha = current.latency_ema_alpha;
@@ -209,8 +248,8 @@ export class HealthScoringService {
 
     const newP95Latency = Math.max(newAvgLatency * 1.5, current.p95_latency_ms * 0.9);
 
-    // Calculate success rate
-    const newSuccessRate = newTotalCount > 0 ? current.success_count / newTotalCount : 0.0;
+    // Calculate success rate with new success count
+    const newSuccessRate = newTotalCount > 0 ? newSuccessCount / newTotalCount : 0.0;
 
     // Compute health score
     const score = this.computeHealthScore(

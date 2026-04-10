@@ -100,6 +100,7 @@ import {
   type ShapeScoreUpdateResponse,
   type ActivityFeedbackRequest,
   type ActivityFeedbackResponse,
+  type ImpulseShapeActivityScore,
 } from '../models/schemas';
 import { broadcaster } from '../websocket/broadcaster';
 
