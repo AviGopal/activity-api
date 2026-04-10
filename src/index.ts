@@ -43,7 +43,11 @@ const app = new Hono<AppEnv>();
 
 // CORS configuration for cross-origin requests
 app.use('/*', cors({
-  origin: '*', // Allow all origins for development
+  origin: process.env.CORS_ORIGINS?.split(',') || [
+    'https://activity.metabob.com',
+    'https://internal.metabob.com',
+    'https://app.metabob.com',
+  ],
   credentials: true,
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization', 'X-Internal-Api-Key'],
