@@ -738,150 +738,185 @@ router.post('/resolve', async (c) => {
         break;
       }
 
-      case 'recentExecutions': {
-        // Query recent executions with optional filters
-        // Supports: filter (failed|successful|all), limit, activityId, templateId, since
-        const filter = pointer.filter || 'all';
-        const limit = pointer.limit || 10;
-        const activityId = pointer.activityId;
-        const templateId = pointer.templateId;
-        const since = pointer.since; // ISO date string
+      case 'executionTraceList': {
+        // Metadata-first impulse type: returns trace pointers with rich metadata
+        // Replaces: recentExecutions (clean removal)
+        const filters = pointer.filters || {};
+        const status = filters.status || 'all';
+        const activityId = filters.activityId;
+        const templateId = filters.templateId;
+        const since = filters.since;
+        const limit = filters.limit || 50;
 
-        let whereClause = '';
+        // Build WHERE clause dynamically
+        const conditions: string[] = [];
         const params: Record<string, any> = { limit };
 
-        // Build WHERE clause based on filters
-        const conditions: string[] = [];
-
-        if (filter === 'failed') {
-          conditions.push('status = "failed"');
-        } else if (filter === 'successful') {
-          conditions.push('status = "completed"');
+        if (status === 'success') {
+          conditions.push('success = true');
+        } else if (status === 'failure') {
+          conditions.push('success = false');
         }
 
         if (activityId) {
-          conditions.push('activity_id = $activity_id');
-          params.activity_id = activityId;
+          conditions.push('activity_id = $activityId');
+          params.activityId = activityId;
         }
 
         if (templateId) {
-          conditions.push('template_id = $template_id');
-          params.template_id = templateId;
+          conditions.push('activity_id = $templateId');
+          params.templateId = templateId;
         }
 
         if (since) {
-          conditions.push('created_at >= $since');
+          conditions.push('executed_at >= type::datetime($since)');
           params.since = since;
         }
 
-        if (conditions.length > 0) {
-          whereClause = 'WHERE ' + conditions.join(' AND ');
-        }
+        const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
 
-        const query = `
-          SELECT * FROM activity_execution_traces
-          ${whereClause}
-          ORDER BY created_at DESC
-          LIMIT $limit
-        `;
-
-        const result = await surrealDB.query<any>(query, params);
-
-        if (result.length === 0) {
-          content = `# Recent Executions\n\nNo executions found matching filter: ${filter}`;
-        } else {
-          // Format as summary markdown with links to individual traces
-          content = formatRecentExecutionsAsMarkdown(result, filter);
-        }
-        break;
-      }
-
-      case 'failurePatterns': {
-        // Analyze failure patterns across recent executions
-        // Groups failures by error type, template, and suggests improvements
-        const limit = pointer.limit || 50;
-        const since = pointer.since || new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-
+        // Query execution table
         const query = `
           SELECT
-            variant_id as template_id,
-            status,
-            execution_trace.tasks.*.result.error as errors,
-            execution_trace.tasks.*.toolCalls.*.result.error as tool_errors,
-            created_at
-          FROM activity_execution_traces
-          WHERE status = "failure" AND created_at >= $since
-          ORDER BY created_at DESC
-          LIMIT $limit
-        `;
-
-        const result = await surrealDB.query<any>(query, { limit, since });
-
-        if (result.length === 0) {
-          content = `# Failure Patterns\n\nNo failures found in the last 7 days. System is healthy!`;
-        } else {
-          content = formatFailurePatternsAsMarkdown(result);
-        }
-        break;
-      }
-
-      case 'successPatterns': {
-        // Analyze success patterns to identify what works well
-        const limit = pointer.limit || 50;
-        const since = pointer.since || new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-
-        const query = `
-          SELECT
-            variant_id as template_id,
+            id,
+            activity_id,
+            success,
             duration_ms,
             cost_usd,
-            execution_trace.tasks.*.toolCalls as tool_usage,
-            created_at
-          FROM activity_execution_traces
-          WHERE status = "success" AND created_at >= $since
-          ORDER BY duration_ms ASC
+            executed_at
+          FROM execution
+          ${whereClause}
+          ORDER BY executed_at DESC
           LIMIT $limit
         `;
 
-        const result = await surrealDB.query<any>(query, { limit, since });
+        const traces = await surrealDB.query<any>(query, params);
 
-        if (result.length === 0) {
-          content = `# Success Patterns\n\nNo successful executions found in the last 7 days.`;
-        } else {
-          content = formatSuccessPatternsAsMarkdown(result);
-        }
+        // Compute metadata
+        const successCount = traces.filter(t => t.success === true).length;
+        const failureCount = traces.filter(t => t.success === false).length;
+        const totalDuration = traces.reduce((sum, t) => sum + (t.duration_ms || 0), 0);
+        const totalCost = traces.reduce((sum, t) => sum + (t.cost_usd || 0), 0);
+
+        // Get unique templates and activities
+        const uniqueTemplates = [...new Set(traces.map(t => t.activity_id))];
+        const uniqueActivities = [...new Set(traces.map(t => t.activity_id))];
+
+        // Format metadata-first response
+        const metadata = {
+          rowCount: traces.length,
+          dateRange: {
+            start: traces[traces.length - 1]?.executed_at || null,
+            end: traces[0]?.executed_at || null
+          },
+          availableOps: ['filter', 'expand', 'group'],
+          filterParams: {
+            status: ['success', 'failure'],
+            availableTemplates: uniqueTemplates,
+            availableActivities: uniqueActivities
+          },
+          summary: {
+            successCount,
+            failureCount,
+            totalDuration,
+            totalCost
+          }
+        };
+
+        // Add pointers to full traces
+        const tracesWithPointers = traces.map(t => ({
+          id: t.id,
+          templateId: t.activity_id,
+          activityId: t.activity_id,
+          status: t.success ? 'success' : 'failure',
+          duration_ms: t.duration_ms,
+          cost_usd: t.cost_usd,
+          created_at: t.executed_at,
+          pointer: { type: 'activityExecutionTrace', executionId: t.id }
+        }));
+
+        content = JSON.stringify({
+          loaded: false,
+          metadata,
+          content: { traces: tracesWithPointers }
+        }, null, 2);
         break;
       }
 
-      case 'templateComparison': {
-        // Compare performance between template variants
+      case 'variantMetricsSummary': {
+        // Metadata-first impulse type: returns pre-computed metrics per variant
+        // Replaces: templateComparison (clean removal)
         if (!pointer.activityId) {
           return c.json({
             success: false,
-            error: 'activityId required for templateComparison pointer',
+            error: 'variantMetricsSummary requires activityId',
           } as ImpulseResolveResponse, 400);
         }
 
+        // Query execution table directly and compute per-variant metrics
+        // Note: v_activity_score groups by activity_id only, not variant_id
         const query = `
           SELECT
-            variant_id as template_id,
-            count() as executions,
-            math::mean(duration_ms) as avg_duration,
-            math::mean(cost_usd) as avg_cost,
-            count(success = true) / count() as success_rate
-          FROM activity_execution_traces
-          WHERE activity_id = $activity_id
-          GROUP BY variant_id
+            activity_id,
+            count() AS total_executions,
+            count(success = true) AS successful_executions,
+            count(success = false) AS failed_executions,
+            count(success = true) + 1 AS thompson_alpha,
+            count(success = false) + 1 AS thompson_beta,
+            <float> count(success = true) / <float> count() AS success_rate,
+            math::mean(<float> duration_ms) AS avg_duration_ms,
+            math::mean(<float> cost_usd) AS avg_cost_usd
+          FROM execution
+          WHERE activity_id CONTAINS $activityId
+          GROUP BY activity_id
           ORDER BY success_rate DESC
         `;
 
-        const result = await surrealDB.query<any>(query, { activity_id: pointer.activityId });
+        const variants = await surrealDB.query<any>(query, { activityId: pointer.activityId });
 
-        if (result.length === 0) {
-          content = `# Template Comparison\n\nNo executions found for activity: ${pointer.activityId}`;
-        } else {
-          content = formatTemplateComparisonAsMarkdown(result, pointer.activityId);
+        if (variants.length === 0) {
+          content = JSON.stringify({
+            loaded: false,
+            metadata: { rowCount: 0, baseActivityId: pointer.activityId, variantCount: 0 },
+            content: { variants: [] }
+          }, null, 2);
+          break;
         }
+
+        // Compute metadata
+        const bestVariant = variants[0];
+        const worstVariant = variants[variants.length - 1];
+        const avgSuccessRate = variants.reduce((sum, v) => sum + v.success_rate, 0) / variants.length;
+
+        const metadata = {
+          rowCount: variants.length,
+          baseActivityId: pointer.activityId,
+          variantCount: variants.length,
+          availableOps: ['filter', 'compare', 'resolve'],
+          summary: {
+            bestVariant: { id: bestVariant.activity_id, successRate: bestVariant.success_rate },
+            worstVariant: { id: worstVariant.activity_id, successRate: worstVariant.success_rate },
+            avgSuccessRate
+          }
+        };
+
+        // Add pointers to full templates
+        const variantsWithPointers = variants.map(v => ({
+          variantId: v.activity_id,
+          successRate: v.success_rate,
+          executionCount: v.successful_executions + v.failed_executions,
+          avgDuration: v.avg_duration_ms,
+          avgCost: v.avg_cost_usd,
+          thompsonAlpha: v.thompson_alpha,
+          thompsonBeta: v.thompson_beta,
+          pointer: { type: 'activityTemplate', templateId: v.activity_id }
+        }));
+
+        content = JSON.stringify({
+          loaded: false,
+          metadata,
+          content: { variants: variantsWithPointers }
+        }, null, 2);
         break;
       }
 
