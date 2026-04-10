@@ -119,6 +119,14 @@ export async function generateJwtToken(context: {
 
     const now = Math.floor(Date.now() / 1000);
 
+    logger.debug('[auth] Generating JWT token', {
+      orgId: context.orgId,
+      userId: context.userId,
+      keyId: context.keyId,
+      expirySeconds,
+      secretLength: config.auth.jwtSecret.length,
+    });
+
     // Generate JWT token with custom claims
     const token = await new jose.SignJWT({
       NS: config.surrealdb.namespace,
@@ -135,10 +143,13 @@ export async function generateJwtToken(context: {
       .setExpirationTime(now + expirySeconds)
       .sign(secretKey);
 
+    logger.debug('[auth] JWT token generated successfully', { tokenLength: token.length });
     return token;
   } catch (error) {
     logger.error('[auth] JWT generation error', {
       error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      context,
     });
     return null;
   }

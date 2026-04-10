@@ -72,24 +72,13 @@ async function validateApiKey(apiKey: string): Promise<JwtAuthContext | null> {
     });
 
     if (!jwtToken) {
-      // Fall back to synthetic token if JWT generation fails
-      const syntheticToken = Buffer.from(
-        JSON.stringify({
-          type: 'apikey_validated',
-          orgId: result.orgId,
-          userId: result.userId,
-          keyId: result.keyId,
-          scopes: result.scopes,
-          authMethod: result.authMethod,
-          validatedAt: Date.now(),
-        })
-      ).toString('base64');
-
-      return {
-        jwtToken: syntheticToken,
-        orgId: result.orgId!,
-        authType: 'apikey',
-      };
+      // JWT generation failed - log error and reject authentication
+      // We can't use synthetic tokens because SurrealDB can't authenticate them
+      logger.error('JWT generation failed for API key', {
+        orgId: result.orgId,
+        keyId: result.keyId,
+      });
+      return null;
     }
 
     return {
