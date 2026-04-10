@@ -1329,7 +1329,7 @@ app.get('/templates/:variantId', async (c) => {
     const variantQuery = `
       SELECT * FROM activity
       WHERE (meta::id(id) = $variant_id OR meta::id(id) = $normalized_id)
-        AND execution_type = 'template'
+        AND (execution_type = 'template' OR execution_type IS NONE OR execution_type IS NULL)
       LIMIT 1
     `;
     result = await surrealDB.query<ActivityTemplate>(variantQuery, {
@@ -1343,7 +1343,7 @@ app.get('/templates/:variantId', async (c) => {
         const recordQuery = `
           SELECT * FROM activity
           WHERE id = type::record($variant_id)
-            AND execution_type = 'template'
+            AND (execution_type = 'template' OR execution_type IS NONE OR execution_type IS NULL)
         `;
         result = await surrealDB.query<ActivityTemplate>(recordQuery, { variant_id: variantId });
       } catch (recordError) {
