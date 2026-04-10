@@ -12,6 +12,7 @@
     "init-data": "echo 'DEPRECATED: MiniBob instance creation removed (migration 052). Creates organization only.' && bun run sql/init-test-data.ts",
     "seed-templates": "bun run sql/seed-templates.ts",
     "extract-variants": "bun run sql/extract-best-variants.ts",
+    "bootstrap-shapes": "bun run sql/bootstrap-shapes.ts",
     "test": "bun test",
     "lint": "eslint src --ext .ts",
     "format": "prettier --write 'src/**/*.ts'"
@@ -19,6 +20,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.36.3",
     "@stdlib/random-base-beta": "^0.2.1",
+    "ajv": "^8.12.0",
     "argon2": "^0.41.1",
     "hono": "^4.0.0",
     "ioredis": "^5.3.2",

@@ -24,6 +24,7 @@ import vesselsRoutes from './routes/vessels';
 import vesselRegistryRoutes from './routes/vessel-registry';
 import connectionsRoutes from './routes/connections';
 import ribosomeRoutes from './routes/ribosome';
+import shapesRoutes from './routes/shapes';
 import { broadcaster } from './websocket/broadcaster';
 import type { ServerWebSocket } from 'bun';
 import packageJson from '../package.json';
@@ -144,6 +145,9 @@ app.route('/v2/activities/goal-paths', goalPathsRoutes);
 
 // Impulse routes (POST /v2/impulses, GET /v2/impulses/:id, GET /v2/impulses)
 app.route('/v2/impulses', impulsesRoutes);
+
+// Shape registry routes (POST /v2/shapes, GET /v2/shapes, GET /v2/shapes/:name, etc.)
+app.route('/v2/shapes', shapesRoutes);
 
 // Boredom queue routes (GET /boredom-tasks, POST /v2/activities/boredom/enqueue, POST /v2/vessels/register)
 app.route('/', boredomRoutes);
