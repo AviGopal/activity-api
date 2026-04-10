@@ -1318,14 +1318,24 @@ app.get('/templates/:variantId', async (c) => {
     let result: ActivityTemplate[] = [];
 
     // Query from activity table (the canonical table for templates)
-    // Use meta::id() to extract just the ID part (without table prefix) and compare
+    // Try multiple ID formats to handle SurrealDB's auto-wrapping of string IDs in angle brackets
+    // 1. Simple name (e.g., "report-metrics")
+    // 2. Angle-bracket wrapped (e.g., "⟨report-metrics⟩") - SurrealDB auto-format
+    // 3. Full record ID (e.g., "activity:report-metrics")
+    const normalizedId = variantId.includes('⟨') || variantId.includes('⟩')
+      ? variantId
+      : `⟨${variantId}⟩`;
+
     const variantQuery = `
       SELECT * FROM activity
-      WHERE meta::id(id) = $variant_id
+      WHERE (meta::id(id) = $variant_id OR meta::id(id) = $normalized_id)
         AND execution_type = 'template'
       LIMIT 1
     `;
-    result = await surrealDB.query<ActivityTemplate>(variantQuery, { variant_id: variantId });
+    result = await surrealDB.query<ActivityTemplate>(variantQuery, {
+      variant_id: variantId,
+      normalized_id: normalizedId,
+    });
 
     // If not found, try treating variant_id as a full record ID (for activity:xyz format)
     if (result.length === 0 && variantId.includes(':')) {
