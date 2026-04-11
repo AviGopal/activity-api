@@ -6,10 +6,28 @@
  */
 
 import { Hono } from 'hono';
+import type { Context, Next } from 'hono';
 import { logger } from '../utils/logger';
 import { surrealDB } from '../db/surreal';
+import { discoveryClient } from '../services/discovery-client';
+import { config } from '../config';
 
 const app = new Hono();
+
+/**
+ * Deprecation middleware for legacy vessel endpoints
+ * Adds deprecation headers to responses
+ */
+async function deprecationMiddleware(c: Context, next: Next) {
+  // Add deprecation headers
+  c.header('X-API-Deprecated', 'true');
+  c.header('X-API-Deprecation-Date', '2026-05-01');
+  c.header('X-API-Sunset-Date', '2026-07-01');
+  c.header('X-API-Replacement', 'discovery-vessel');
+  c.header('X-API-Migration-Guide', 'https://docs.metabob.com/discovery-vessel-migration');
+
+  await next();
+}
 
 interface VesselStatus {
   pod_name: string;
@@ -121,6 +139,8 @@ async function getVesselStatusFromK8s(): Promise<VesselStatus[]> {
 /**
  * GET /v2/vessels/status
  *
+ * DEPRECATED: Use discovery-vessel instead
+ *
  * List all MiniBob vessel instances with current status
  *
  * Returns:
@@ -129,7 +149,7 @@ async function getVesselStatusFromK8s(): Promise<VesselStatus[]> {
  * - Resource usage metrics
  * - Execution statistics
  */
-app.get('/status', async (c) => {
+app.get('/status', deprecationMiddleware, async (c) => {
   try {
     // Get vessel status (tries K8s API first, falls back to DB)
     const vessels = await getVesselStatusFromK8s();
@@ -163,8 +183,12 @@ app.get('/status', async (c) => {
 /**
  * POST /v2/vessels/heartbeat
  *
+ * DEPRECATED: Use discovery-vessel instead
+ *
  * MiniBob vessels send heartbeats to report their status
  * This allows dashboard to show real-time vessel state even without K8s API access
+ *
+ * PROXY MODE: Dual-writes to both discovery-vessel and SurrealDB for backward compatibility
  *
  * Request body:
  * {
@@ -175,7 +199,7 @@ app.get('/status', async (c) => {
  *   metrics?: { executions_completed, total_cost_usd, uptime_seconds }
  * }
  */
-app.post('/heartbeat', async (c) => {
+app.post('/heartbeat', deprecationMiddleware, async (c) => {
   try {
     const body = await c.req.json();
 
@@ -211,11 +235,51 @@ app.post('/heartbeat', async (c) => {
 
     await surrealDB.query(query, heartbeat);
 
-    logger.info('Vessel heartbeat recorded', {
+    logger.info('Vessel heartbeat recorded (legacy DB)', {
       pod_name: body.pod_name,
       namespace: body.namespace,
       status: body.status,
     });
+
+    // PROXY MODE: Also forward to discovery-vessel if enabled
+    if (discoveryClient.isEnabled() && config.discovery.enabled) {
+      try {
+        // Transform legacy heartbeat to discovery format
+        const discoveryHeartbeat = {
+          vesselId: body.pod_name, // Use pod_name as vessel ID
+          metrics: body.metrics ? {
+            executionsCompleted: body.metrics.executions_completed,
+            avgLatencyMs: 0, // Not tracked in legacy format
+            errorRate: 0, // Not tracked in legacy format
+          } : undefined,
+        };
+
+        // Send to discovery-vessel (non-blocking)
+        const discoveryEndpoint = config.discovery.endpoint;
+        fetch(`${discoveryEndpoint}/heartbeat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(discoveryHeartbeat),
+        })
+          .then((res) => {
+            if (res.ok) {
+              logger.debug('[Proxy] Heartbeat forwarded to discovery-vessel', {
+                vesselId: body.pod_name,
+              });
+            }
+          })
+          .catch((error) => {
+            logger.warn('[Proxy] Failed to forward heartbeat to discovery-vessel', {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+      } catch (error) {
+        // Non-blocking: log error but don't fail request
+        logger.warn('[Proxy] Error forwarding heartbeat', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
 
     return c.json({
       success: true,
@@ -238,9 +302,11 @@ app.post('/heartbeat', async (c) => {
 /**
  * GET /v2/vessels/:podName/status
  *
+ * DEPRECATED: Use discovery-vessel instead
+ *
  * Get status of a specific vessel by pod name
  */
-app.get('/:podName/status', async (c) => {
+app.get('/:podName/status', deprecationMiddleware, async (c) => {
   try {
     const podName = c.req.param('podName');
 
@@ -286,8 +352,12 @@ app.get('/:podName/status', async (c) => {
 /**
  * POST /v2/vessels/register
  *
+ * DEPRECATED: Use discovery-vessel directly instead
+ *
  * Register a vessel's capabilities for discovery
  * Vessels announce what impulse shapes they can resolve
+ *
+ * PROXY MODE: Dual-writes to both discovery-vessel and SurrealDB for backward compatibility
  *
  * Request body:
  * {
@@ -298,7 +368,7 @@ app.get('/:podName/status', async (c) => {
  *   metadata?: object
  * }
  */
-app.post('/register', async (c) => {
+app.post('/register', deprecationMiddleware, async (c) => {
   try {
     const body = await c.req.json();
 
@@ -341,18 +411,57 @@ app.post('/register', async (c) => {
 
     await surrealDB.query(query, registration);
 
-    logger.info('Vessel registered', {
+    logger.info('Vessel registered (legacy DB)', {
       vesselId: body.vesselId,
       vesselName: body.vesselName,
       endpoint: body.endpoint,
       shapes: body.shapes,
     });
 
+    // PROXY MODE: Also forward to discovery-vessel if enabled
+    if (discoveryClient.isEnabled() && config.discovery.enabled) {
+      try {
+        const discoveryEndpoint = config.discovery.endpoint;
+        const discoveryRegistration = {
+          vesselId: body.vesselId,
+          vesselName: body.vesselName,
+          version: body.metadata?.version || 'unknown',
+          endpoint: body.endpoint,
+          shapes: body.shapes,
+          metadata: body.metadata,
+        };
+
+        // Send to discovery-vessel (non-blocking)
+        fetch(`${discoveryEndpoint}/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(discoveryRegistration),
+        })
+          .then((res) => {
+            if (res.ok) {
+              logger.info('[Proxy] Registration forwarded to discovery-vessel', {
+                vesselId: body.vesselId,
+              });
+            }
+          })
+          .catch((error) => {
+            logger.warn('[Proxy] Failed to forward registration to discovery-vessel', {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+      } catch (error) {
+        // Non-blocking: log error but don't fail request
+        logger.warn('[Proxy] Error forwarding registration', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
     return c.json({
       success: true,
       vesselId: body.vesselId,
       timestamp: registration.registered_at,
-      message: 'Vessel registered successfully',
+      message: 'Vessel registered successfully (legacy endpoint - please migrate to discovery-vessel)',
     });
 
   } catch (error) {
@@ -370,6 +479,8 @@ app.post('/register', async (c) => {
 /**
  * GET /v2/vessels/discover?shape=<shape>
  *
+ * DEPRECATED: Use discovery-vessel directly instead
+ *
  * Discover vessels that can resolve a specific impulse shape
  *
  * Query params:
@@ -382,7 +493,7 @@ app.post('/register', async (c) => {
  *   found: boolean
  * }
  */
-app.get('/discover', async (c) => {
+app.get('/discover', deprecationMiddleware, async (c) => {
   try {
     const shape = c.req.query('shape');
 
@@ -459,9 +570,11 @@ app.get('/discover', async (c) => {
 /**
  * GET /v2/vessels/capabilities
  *
+ * DEPRECATED: Use discovery-vessel directly instead
+ *
  * List all registered vessel capabilities
  */
-app.get('/capabilities', async (c) => {
+app.get('/capabilities', deprecationMiddleware, async (c) => {
   try {
     // Get all vessel capabilities registered in last hour
     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();

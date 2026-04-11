@@ -24,10 +24,6 @@ import {
 } from '../models/schemas';
 import { config } from '../config';
 import {
-  formatAnalysisResultAsMarkdown,
-  formatCochangeAsMarkdown,
-  formatImpactAsMarkdown,
-  formatSearchResultsAsMarkdown,
   formatToolRiskProfileAsMarkdown,
   formatCompositionSuccessAsMarkdown,
   formatImpulseRelevanceAsMarkdown,
@@ -37,102 +33,6 @@ import { getJwtAuthFromContext, type JwtAuthContext } from '../middleware/jwtAut
 import activitiesRouter from './activities';
 
 const router = new Hono();
-
-/**
- * Proxy request to Analysis API [DEPRECATED - ARCHITECTURE DRIFT]
- *
- * TODO: This violates "Resolvers live WHERE THE DATA IS" principle.
- *
- * PROBLEM: The activity-api backend is proxying Analysis API data through
- * impulse resolution. This makes the backend act as a universal resolver
- * instead of letting vessels access the Analysis API directly.
- *
- * SOLUTION: Analysis API should provide its own /v2/impulses/resolve endpoint
- * - Vessels can call Analysis API directly for their impulse types
- * - Analysis API resolves impulses like 'analysisResult', 'cochangeSuggestions', etc.
- * - Activity-api backend only stores traces, doesn't proxy data
- *
- * This function is retained for reference but analysis types now return
- * an error directing vessels to use the Analysis API directly.
- *
- * Original: Proxy request to Analysis API with retry and timeout
- * Returns null on failure (graceful degradation)
- */
-async function proxyToAnalysisApi<T>(
-  endpoint: string,
-  options: {
-    method?: 'GET' | 'POST';
-    body?: unknown;
-    sessionId?: string;
-    params?: Record<string, string | number>;
-  } = {}
-): Promise<T | null> {
-  const { method = 'GET', body, sessionId, params } = options;
-  const baseUrl = config.analysisApi.url;
-
-  // Build URL with query params
-  let url = `${baseUrl}${endpoint}`;
-  if (params && Object.keys(params).length > 0) {
-    const searchParams = new URLSearchParams();
-    for (const [key, value] of Object.entries(params)) {
-      searchParams.append(key, String(value));
-    }
-    url += `?${searchParams.toString()}`;
-  }
-
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    // Internal service key for service-to-service calls
-    'X-Internal-Api-Key': process.env.INTERNAL_API_KEY || 'metabob-internal-service-key-dev',
-  };
-  if (sessionId) {
-    headers['X-Session-ID'] = sessionId;
-  }
-
-  for (let attempt = 0; attempt < config.analysisApi.retryAttempts; attempt++) {
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), config.analysisApi.timeout);
-
-      const response = await fetch(url, {
-        method,
-        headers,
-        body: body ? JSON.stringify(body) : undefined,
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        logger.warn('Analysis API error', {
-          endpoint,
-          status: response.status,
-          attempt: attempt + 1,
-        });
-
-        if (response.status >= 500 && attempt < config.analysisApi.retryAttempts - 1) {
-          await new Promise(r => setTimeout(r, config.analysisApi.retryDelay * (attempt + 1)));
-          continue;
-        }
-        return null;
-      }
-
-      return await response.json() as T;
-    } catch (error) {
-      logger.warn('Analysis API request failed', {
-        endpoint,
-        error: error instanceof Error ? error.message : 'Unknown error',
-        attempt: attempt + 1,
-      });
-
-      if (attempt < config.analysisApi.retryAttempts - 1) {
-        await new Promise(r => setTimeout(r, config.analysisApi.retryDelay * (attempt + 1)));
-      }
-    }
-  }
-
-  return null;
-}
 
 /**
  * POST /v2/impulses
@@ -944,229 +844,19 @@ router.post('/resolve', async (c) => {
         } as ImpulseResolveResponse, 410); // 410 Gone - permanent deprecation
       }
 
-      /* ORIGINAL IMPLEMENTATION - COMMENTED OUT FOR REFERENCE
-      case 'analysisResult': {
-        // Load a single analysis problem/issue
-        if (!pointer.resultId) {
-          return c.json({
-            success: false,
-            error: 'resultId required for analysisResult pointer',
-          } as ImpulseResolveResponse, 400);
-        }
-
-        const sessionId = c.req.header('X-Session-ID');
-        const analysisResult = await proxyToAnalysisApi<{ problem: any }>(
-          `/v2/analysis/problems/${pointer.resultId}`,
-          { method: 'GET', sessionId: sessionId || undefined }
-        );
-
-        if (!analysisResult || !analysisResult.problem) {
-          content = `# Analysis Result\n\nProblem not found: ${pointer.resultId}\n\n*The analysis API may be unavailable or the problem does not exist.*`;
-        } else {
-          content = formatAnalysisResultAsMarkdown(
-            analysisResult.problem,
-            pointer.format || 'full'
-          );
-        }
-        break;
-      }
-
-      case 'cochangeSuggestions': {
-        // Get co-change suggestions for components
-        if (!pointer.componentIds || pointer.componentIds.length === 0) {
-          return c.json({
-            success: false,
-            error: 'componentIds required for cochangeSuggestions pointer',
-          } as ImpulseResolveResponse, 400);
-        }
-
-        const sessionId = c.req.header('X-Session-ID');
-
-        // Extract file paths from component IDs
-        const changedFiles = [...new Set(
-          pointer.componentIds.map(id => id.split('::')[0])
-        )];
-
-        const cochangeResult = await proxyToAnalysisApi<{ suggestions: any[] }>(
-          '/v2/analysis/cochange/suggest',
-          {
-            method: 'POST',
-            sessionId: sessionId || undefined,
-            body: {
-              changed_files: changedFiles,
-              limit: pointer.limit || 5,
-              confidence_threshold: 0.3,
-            },
-          }
-        );
-
-        if (!cochangeResult || !cochangeResult.suggestions) {
-          content = `# Co-Change Suggestions\n\nUnable to get co-change suggestions.\n\n*The analysis API may be unavailable or the codebase is not indexed.*`;
-        } else {
-          content = formatCochangeAsMarkdown(cochangeResult.suggestions);
-        }
-        break;
-      }
-
-      case 'impactAnalysis': {
-        // Get impact analysis for changed files
-        if (!pointer.changedFiles || pointer.changedFiles.length === 0) {
-          return c.json({
-            success: false,
-            error: 'changedFiles required for impactAnalysis pointer',
-          } as ImpulseResolveResponse, 400);
-        }
-
-        const sessionId = c.req.header('X-Session-ID');
-        const impactResult = await proxyToAnalysisApi<any>(
-          '/v2/analysis/impact',
-          {
-            method: 'POST',
-            sessionId: sessionId || undefined,
-            body: {
-              changed_files: pointer.changedFiles,
-              max_depth: pointer.maxDepth || 2,
-              include_tests: true,
-            },
-          }
-        );
-
-        if (!impactResult) {
-          content = `# Impact Analysis\n\nUnable to perform impact analysis.\n\n*The analysis API may be unavailable or the codebase is not indexed.*`;
-        } else {
-          content = formatImpactAsMarkdown(impactResult);
-        }
-        break;
-      }
-
-      case 'codebaseSearch': {
-        // Search the indexed codebase
-        if (!pointer.query) {
-          return c.json({
-            success: false,
-            error: 'query required for codebaseSearch pointer',
-          } as ImpulseResolveResponse, 400);
-        }
-
-        const sessionId = c.req.header('X-Session-ID');
-        const searchResult = await proxyToAnalysisApi<{ results: any[] }>(
-          '/v2/analysis/search',
-          {
-            method: 'POST',
-            sessionId: sessionId || undefined,
-            body: {
-              query: pointer.query,
-              limit: pointer.limit || 10,
-              filters: {
-                severity: pointer.severity,
-                category: pointer.category,
-              },
-            },
-          }
-        );
-
-        if (!searchResult || !searchResult.results) {
-          content = `# Codebase Search: "${pointer.query}"\n\nUnable to search codebase.\n\n*The analysis API may be unavailable or the codebase is not indexed.*`;
-        } else {
-          content = formatSearchResultsAsMarkdown(searchResult.results, pointer.query);
-        }
-        break;
-      }
-      END COMMENTED OUT ORIGINAL IMPLEMENTATION */
-
       case 'problemCluster': {
-        // Impulse-driven problem investigation - returns METADATA not content
-        // This enables LLM to reason about problem shape before loading full data
-        const sessionId = c.req.header('X-Session-ID');
-        if (!sessionId) {
-          return c.json({
-            success: false,
-            error: 'X-Session-ID header required for problemCluster pointer',
-          } as ImpulseResolveResponse, 400);
-        }
-
-        // Call analysis-api impulse endpoint with filter params from pointer
-        const impulseResult = await proxyToAnalysisApi<{
-          success: boolean;
-          loaded: boolean;
-          metadata: {
-            shape: string;
-            rowCount: number;
-            summary: string;
-            bySeverity: Record<string, number>;
-            byCategory: Record<string, number>;
-            topIssue?: {
-              category: string;
-              brief: string;
-              impactScore?: number;
-              severity: string;
-            };
-            availableOps: string[];
-            filterParams: {
-              severity?: string[];
-              category?: string[];
-              status?: string;
-              sessionId: string;
-            };
-          };
-          pointer: {
-            type: string;
-            sessionId: string;
-            severity?: string[];
-            category?: string[];
-            status?: string;
-          };
-          query_time_ms: number;
-        }>(
-          '/v2/analysis/problems/impulse',
-          {
-            method: 'POST',
-            sessionId,
-            body: {
-              severity: pointer.severity ? (Array.isArray(pointer.severity) ? pointer.severity : [pointer.severity]) : undefined,
-              category: pointer.category ? (Array.isArray(pointer.category) ? pointer.category : [pointer.category]) : undefined,
-              status: pointer.status,
-            },
-          }
-        );
-
-        if (!impulseResult || !impulseResult.success) {
-          return c.json({
-            success: false,
-            error: 'Unable to get problem cluster metadata from analysis API',
-          } as ImpulseResolveResponse, 500);
-        }
-
-        // Return metadata response directly - NOT markdown content
-        // This is the impulse-driven pattern: metadata first, drill down via process_impulse
-        logger.info('problemCluster impulse resolved with metadata', {
-          rowCount: impulseResult.metadata?.rowCount,
-          summary: impulseResult.metadata?.summary,
-          filterParams: impulseResult.metadata?.filterParams,
-          pointer: impulseResult.pointer,
-        });
-
+        // Return helpful error directing vessels to Analysis API
         return c.json({
-          success: true,
-          loaded: false, // Metadata only, not full content
-          metadata: {
-            shape: impulseResult.metadata?.shape,
-            rowCount: impulseResult.metadata?.rowCount,
-            summary: impulseResult.metadata?.summary,
-            bySeverity: impulseResult.metadata?.bySeverity,
-            byCategory: impulseResult.metadata?.byCategory,
-            topIssue: impulseResult.metadata?.topIssue,
-            availableOps: impulseResult.metadata?.availableOps || ['filter', 'expand', 'group', 'resolve'],
-            // Lineage tracking for investigation chains
-            producedBy: 'problemCluster',
-            producedAt: new Date().toISOString(),
-          },
-          // Include pointer for process_impulse operations
-          content: JSON.stringify({
-            pointer: impulseResult.pointer,
-            filterParams: impulseResult.metadata?.filterParams,
-          }),
-        } as ImpulseResolveResponse, 200);
+          success: false,
+          error: 'resolver_moved',
+          message: `Analysis API impulse types (${pointer.type}) should be resolved by calling ` +
+                   `the Analysis API directly, not through activity-api. ` +
+                   `This follows the "Resolvers live WHERE THE DATA IS" principle.`,
+          todo: 'Analysis API should implement /v2/impulses/resolve endpoint',
+          analysis_api_url: config.analysisApi.url,
+          pointer_type: pointer.type,
+          suggested_approach: 'Vessels should include Analysis API client code to resolve these impulse types locally'
+        } as ImpulseResolveResponse, 410); // 410 Gone - permanent deprecation
       }
 
       // =============================================================================
@@ -1772,11 +1462,22 @@ router.post('/resolve', async (c) => {
         break;
       }
 
-      default:
+      default: {
+        // Unknown shape - delegate to vessel discovery
+        // This follows the "Resolvers live WHERE THE DATA IS" principle
+        logger.info('Unknown impulse shape - routing to vessel discovery', {
+          shape: pointer.type,
+        });
+
         return c.json({
           success: false,
-          error: `Unknown pointer type: ${pointer.type}`,
-        } as ImpulseResolveResponse, 400);
+          error: 'use_vessel_discovery',
+          message: `Unknown impulse shape "${pointer.type}" - use vessel discovery to find capable resolver`,
+          shape: pointer.type,
+          suggested_approach: 'Query GET /v2/vessels/discover?shape=' + pointer.type + ' to find vessels capable of resolving this impulse',
+          hint: 'Vessels register their capabilities via POST /v2/vessels/register. The backend only resolves shapes it directly stores (execution traces, templates, metrics).'
+        } as ImpulseResolveResponse, 404);
+      }
     }
 
     logger.info('Impulse resolved successfully', {
