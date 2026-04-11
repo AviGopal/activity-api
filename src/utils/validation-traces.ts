@@ -192,12 +192,21 @@ export async function detectValidationPatterns(
       ORDER BY frequency DESC
     `;
 
-    const results = await surrealDB.query<any[]>(query);
+    type ValidationPatternResult = {
+      field_path: string;
+      error_code: string;
+      frequency: number;
+      first_seen: string;
+      last_seen: string;
+    };
+
+    const queryResults = await surrealDB.query<ValidationPatternResult[]>(query);
+    const results = queryResults[0] || [];
 
     // Filter by minimum frequency (since SurrealDB doesn't support HAVING)
-    return (results || [])
-      .filter(r => r.frequency >= minFrequency)
-      .map(r => ({
+    return (Array.isArray(results) ? results : [])
+      .filter((r: ValidationPatternResult) => r.frequency >= minFrequency)
+      .map((r: ValidationPatternResult) => ({
         ...r,
         likely_cause: inferCause(r.field_path, r.error_code),
       }));

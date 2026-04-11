@@ -22,7 +22,8 @@ export async function cleanupExpiredVessels(): Promise<void> {
       RETURN id;
     `;
 
-    const deleted = await surrealDB.query<{ id: string }[]>(query);
+    const result = await surrealDB.query<{ id: string }[]>(query);
+    const deleted = result[0] || [];
 
     if (deleted.length > 0) {
       logger.info('Cleaned up expired vessels', {

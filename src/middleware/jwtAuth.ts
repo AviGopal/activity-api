@@ -40,6 +40,9 @@ export interface JwtAuthContext {
   instanceId?: string;
   // Track auth type for debugging and metrics
   authType?: 'jwt' | 'apikey' | 'minibob_token';
+  // For audit trail - API key ID or user ID
+  keyId?: string;
+  userId?: string;
 }
 
 /**

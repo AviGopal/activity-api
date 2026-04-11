@@ -670,6 +670,14 @@ app.post('/templates', async (c) => {
     const activityTasks = validated.tasks || validated.task_steps;
     const activityVariantOf = validated.variant_of || validated.genealogy;
 
+    // Validate required fields
+    if (!activityId) {
+      return c.json({ error: 'Missing required field: id or variant_id' }, 400);
+    }
+    if (!activityName) {
+      return c.json({ error: 'Missing required field: name or variant_name' }, 400);
+    }
+
     // Convert category to tags if needed (backward compatibility)
     const tags = ensureTags({ tags: validated.tags, category: validated.category });
     const tagPrefixes = computeTagPrefixes(tags);
@@ -2613,7 +2621,8 @@ app.post('/feedback', async (c) => {
 
     // Invalidate Redis cache for template recommendations
     try {
-      const redis = await RedisClient.getInstance();
+      const redisWrapper = RedisClient.getInstance();
+      const redis = redisWrapper.getClient();
       if (redis) {
         // Invalidate all cached recommendations since scores changed
         const keys = await redis.keys(`${CACHE_KEY_PREFIX}*`);

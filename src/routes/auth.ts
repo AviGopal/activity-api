@@ -14,11 +14,19 @@
  */
 
 import { Hono } from 'hono'
-import { surrealDB } from '../db/surreal'
+import { surrealDB, queryWithAuth } from '../db/surreal'
 import { generateJwtToken } from '../services/auth'
 import { logger } from '../utils/logger'
+import type { JwtAuthContext } from '../middleware/jwtAuth'
 
-const auth = new Hono()
+// Define app-wide environment type
+type AppEnv = {
+  Variables: {
+    jwtAuth: JwtAuthContext | null;
+  };
+};
+
+const auth = new Hono<AppEnv>()
 
 /**
  * POST /v2/auth/login
@@ -164,18 +172,16 @@ auth.get('/me', async (c) => {
 
   try {
     // Extract user ID from JWT (format: users:xyz)
-    const result = await surrealDB.query<{
+    const result = await queryWithAuth<{
       id: string
-      email: string
-      name: string
-      is_active: boolean
+      user_id?: string
     }>(
+      jwtAuth.jwtToken,
       `RETURN {
         id: $auth.id,
         user_id: $auth.user_id
       }`,
-      {},
-      jwtAuth.jwtToken
+      {}
     )
 
     const auth = result[0]

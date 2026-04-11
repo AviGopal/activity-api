@@ -741,20 +741,19 @@ router.post('/resolve', async (c) => {
       case 'executionTraceList': {
         // Metadata-first impulse type: returns trace pointers with rich metadata
         // Replaces: recentExecutions (clean removal)
-        const filters = pointer.filters || {};
-        const status = filters.status || 'all';
-        const activityId = filters.activityId;
-        const templateId = filters.templateId;
-        const since = filters.since;
-        const limit = filters.limit || 50;
+        const filter = pointer.filter || 'all';
+        const activityId = pointer.activityId;
+        const templateId = pointer.templateId;
+        const since = pointer.since;
+        const limit = pointer.limit || 50;
 
         // Build WHERE clause dynamically
         const conditions: string[] = [];
         const params: Record<string, any> = { limit };
 
-        if (status === 'success') {
+        if (filter === 'successful') {
           conditions.push('success = true');
-        } else if (status === 'failure') {
+        } else if (filter === 'failed') {
           conditions.push('success = false');
         }
 

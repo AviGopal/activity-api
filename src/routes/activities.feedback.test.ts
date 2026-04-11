@@ -135,7 +135,12 @@ describe('POST /v2/activities/feedback', () => {
 
     expect(response.status).toBe(200);
 
-    const data = await response.json();
+    const data = await response.json() as {
+      success: boolean;
+      direction: string;
+      multiplier: number;
+      affected_activities: string[];
+    };
     expect(data.success).toBe(true);
     expect(data.direction).toBe('positive');
     expect(data.multiplier).toBe(1.5);
@@ -186,7 +191,10 @@ describe('POST /v2/activities/feedback', () => {
 
     expect(response.status).toBe(200);
 
-    const data = await response.json();
+    const data = await response.json() as {
+      success: boolean;
+      multiplier: number;
+    };
     expect(data.success).toBe(true);
     expect(data.multiplier).toBe(3.0); // 1.5 + (3 * 0.5)
 
@@ -233,7 +241,11 @@ describe('POST /v2/activities/feedback', () => {
 
     expect(response.status).toBe(200);
 
-    const data = await response.json();
+    const data = await response.json() as {
+      success: boolean;
+      direction: string;
+      multiplier: number;
+    };
     expect(data.success).toBe(true);
     expect(data.direction).toBe('negative');
     expect(data.multiplier).toBe(2.0); // 1.5 + (1 * 0.5)
@@ -269,7 +281,7 @@ describe('POST /v2/activities/feedback', () => {
 
     expect(response.status).toBe(404);
 
-    const data = await response.json();
+    const data = await response.json() as { error: string };
     expect(data.error).toBe('Activity not found');
   });
 
@@ -288,7 +300,7 @@ describe('POST /v2/activities/feedback', () => {
 
     expect(response.status).toBe(400);
 
-    const data = await response.json();
+    const data = await response.json() as { error: string };
     expect(data.error).toBe('Validation error');
   });
 
@@ -307,7 +319,7 @@ describe('POST /v2/activities/feedback', () => {
 
     expect(response.status).toBe(400);
 
-    const data = await response.json();
+    const data = await response.json() as { error: string };
     expect(data.error).toBe('Validation error');
   });
 

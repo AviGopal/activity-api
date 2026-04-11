@@ -141,15 +141,25 @@ async function queryFrequentSequences(
   logger.debug('Querying frequent sequences', { query });
 
   try {
-    const results = await surrealDB.query<any[]>(query);
+    type SequenceQueryResult = {
+      activity_ids: string[];
+      frequency: number;
+      success_count: number;
+      avg_duration_ms: number;
+      avg_cost_usd: number;
+      source_execution_ids: string[];
+    };
 
-    if (!results || results.length === 0) {
+    const queryResults = await surrealDB.query<SequenceQueryResult[]>(query);
+    const results = queryResults[0] || [];
+
+    if (!results || !Array.isArray(results) || results.length === 0) {
       logger.info('No frequent sequences found');
       return [];
     }
 
     // Filter in application code since SurrealDB HAVING clause is limited
-    const filtered = results.filter(row => {
+    const filtered = results.filter((row: SequenceQueryResult) => {
       const frequency = row.frequency || 0;
       const successCount = row.success_count || 0;
       const successRate = frequency > 0 ? successCount / frequency : 0;
@@ -158,7 +168,7 @@ async function queryFrequentSequences(
     });
 
     // Transform to SequencePattern format
-    const patterns: SequencePattern[] = filtered.map(row => ({
+    const patterns: SequencePattern[] = filtered.map((row: SequenceQueryResult) => ({
       activityIds: row.activity_ids || [],
       frequency: row.frequency || 0,
       successCount: row.success_count || 0,
@@ -247,12 +257,19 @@ async function getCompositionEdgeWeight(
   `;
 
   try {
-    const results = await surrealDB.query<any[]>(query, {
+    type CompositionEdgeResult = {
+      weight: number;
+      success_count: number;
+      execution_count: number;
+    };
+
+    const queryResults = await surrealDB.query<CompositionEdgeResult[]>(query, {
       parent: parentActivityId,
       child: childActivityId
     });
+    const results = queryResults[0] || [];
 
-    if (!results || results.length === 0) {
+    if (!results || !Array.isArray(results) || results.length === 0) {
       // Edge doesn't exist in composition graph
       // This can happen if activities ran in sequence but weren't composed
       logger.debug('No composition edge found', {
