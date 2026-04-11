@@ -132,4 +132,111 @@ describe('CircuitBreakerService', () => {
     expect(updatedState.failed_requests).toBe(1);
     expect(updatedState.last_error_code).toBe('TEST_ERROR');
   });
+
+  test('should use distributed lock to prevent multiple half-open probe requests', async () => {
+    const vesselId = 'test-vessel-probe-lock';
+
+    // Open the circuit
+    for (let i = 0; i < 5; i++) {
+      await CircuitBreakerService.recordFailure(
+        vesselId,
+        testOrgId,
+        'TEST_ERROR',
+        'Test error'
+      );
+    }
+
+    // Manually transition to half-open for testing
+    // In production, this happens after cooldown period
+    const recordId = `vessel_circuit_breaker:${vesselId}`;
+    await CircuitBreakerService['checkHalfOpenTransition'](vesselId, testOrgId);
+
+    // Simulate concurrent requests
+    const request1 = CircuitBreakerService.shouldAllowRequest(vesselId, testOrgId);
+    const request2 = CircuitBreakerService.shouldAllowRequest(vesselId, testOrgId);
+    const request3 = CircuitBreakerService.shouldAllowRequest(vesselId, testOrgId);
+
+    const results = await Promise.all([request1, request2, request3]);
+
+    // Only ONE request should be allowed (get the lock)
+    const allowedCount = results.filter((r) => r === true).length;
+    expect(allowedCount).toBe(1);
+
+    // Other requests should be rejected
+    const rejectedCount = results.filter((r) => r === false).length;
+    expect(rejectedCount).toBe(2);
+  });
+
+  test('should release probe lock after successful probe', async () => {
+    const vesselId = 'test-vessel-probe-success';
+    const { redis } = await import('../db/redis');
+
+    // Open circuit
+    for (let i = 0; i < 5; i++) {
+      await CircuitBreakerService.recordFailure(
+        vesselId,
+        testOrgId,
+        'TEST_ERROR',
+        'Test error'
+      );
+    }
+
+    // Transition to half-open
+    await CircuitBreakerService['checkHalfOpenTransition'](vesselId, testOrgId);
+
+    // Acquire probe lock
+    const allowed = await CircuitBreakerService.shouldAllowRequest(vesselId, testOrgId);
+    expect(allowed).toBe(true);
+
+    // Check lock exists
+    const lockKey = `circuit_breaker:probe_lock:${vesselId}`;
+    const lockExists = await redis.get(lockKey);
+    expect(lockExists).toBeTruthy();
+
+    // Record successful probe
+    await CircuitBreakerService.recordSuccess(vesselId, testOrgId, 100);
+
+    // Lock should be released
+    const lockAfter = await redis.get(lockKey);
+    expect(lockAfter).toBeNull();
+  });
+
+  test('should release probe lock after failed probe', async () => {
+    const vesselId = 'test-vessel-probe-failure';
+    const { redis } = await import('../db/redis');
+
+    // Open circuit
+    for (let i = 0; i < 5; i++) {
+      await CircuitBreakerService.recordFailure(
+        vesselId,
+        testOrgId,
+        'TEST_ERROR',
+        'Test error'
+      );
+    }
+
+    // Transition to half-open
+    await CircuitBreakerService['checkHalfOpenTransition'](vesselId, testOrgId);
+
+    // Acquire probe lock
+    const allowed = await CircuitBreakerService.shouldAllowRequest(vesselId, testOrgId);
+    expect(allowed).toBe(true);
+
+    // Check lock exists
+    const lockKey = `circuit_breaker:probe_lock:${vesselId}`;
+    const lockExists = await redis.get(lockKey);
+    expect(lockExists).toBeTruthy();
+
+    // Record failed probe
+    await CircuitBreakerService.recordFailure(
+      vesselId,
+      testOrgId,
+      'PROBE_ERROR',
+      'Probe failed'
+    );
+
+    // Lock should be released
+    const lockAfter = await redis.get(lockKey);
+    expect(lockAfter).toBeNull();
+  });
 });

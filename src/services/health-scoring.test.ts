@@ -65,6 +65,63 @@ describe('HealthScoringService', () => {
 
     // Should cap at 100 requests
     expect(metrics.total_count).toBe(100);
+    // All successes, so success count should be 100
+    expect(metrics.success_count).toBe(100);
+    expect(metrics.success_rate).toBe(1.0);
+  });
+
+  test('should properly handle sliding window with mixed success/failure', async () => {
+    const vesselId = 'test-vessel-sliding-window';
+
+    // Record 50 successes and 50 failures (100 total)
+    for (let i = 0; i < 50; i++) {
+      await HealthScoringService.recordSuccess(vesselId, testOrgId, 100);
+    }
+    for (let i = 0; i < 50; i++) {
+      await HealthScoringService.recordFailure(vesselId, testOrgId, 500);
+    }
+
+    let metrics = await HealthScoringService.getMetrics(vesselId, testOrgId);
+    expect(metrics.total_count).toBe(100);
+    expect(metrics.success_count).toBe(50);
+    expect(metrics.success_rate).toBe(0.5);
+
+    // Add one more success - should drop oldest request
+    await HealthScoringService.recordSuccess(vesselId, testOrgId, 100);
+
+    metrics = await HealthScoringService.getMetrics(vesselId, testOrgId);
+    expect(metrics.total_count).toBe(100); // Still capped at 100
+
+    // Success count should be approximately 50-51 (depending on probabilistic drop)
+    expect(metrics.success_count).toBeGreaterThanOrEqual(50);
+    expect(metrics.success_count).toBeLessThanOrEqual(51);
+  });
+
+  test('should properly handle sliding window when adding failures to full window', async () => {
+    const vesselId = 'test-vessel-sliding-failures';
+
+    // Fill window with 100 successes
+    for (let i = 0; i < 100; i++) {
+      await HealthScoringService.recordSuccess(vesselId, testOrgId, 100);
+    }
+
+    let metrics = await HealthScoringService.getMetrics(vesselId, testOrgId);
+    expect(metrics.total_count).toBe(100);
+    expect(metrics.success_count).toBe(100);
+    expect(metrics.success_rate).toBe(1.0);
+
+    // Add 10 failures - should drop oldest successes
+    for (let i = 0; i < 10; i++) {
+      await HealthScoringService.recordFailure(vesselId, testOrgId, 500);
+    }
+
+    metrics = await HealthScoringService.getMetrics(vesselId, testOrgId);
+    expect(metrics.total_count).toBe(100);
+
+    // Success count should decrease (dropped 10 successes, added 10 failures)
+    expect(metrics.success_count).toBeLessThan(100);
+    expect(metrics.success_count).toBeGreaterThanOrEqual(89); // Approximate due to probabilistic drop
+    expect(metrics.success_rate).toBeLessThan(1.0);
   });
 
   test('should update availability on heartbeat', async () => {
