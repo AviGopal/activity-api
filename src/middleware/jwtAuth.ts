@@ -2,8 +2,8 @@
  * JWT Authentication Middleware
  *
  * Supports two authentication header formats:
- * - Authorization: Bearer <jwt>  - JWT tokens (from SurrealDB signin or identity-vessel)
- * - Authorization: ApiKey <key>  - API keys (validated via identity-vessel or direct SurrealDB)
+ * - Authorization: Bearer <jwt>  - JWT tokens (validated against SurrealDB)
+ * - Authorization: ApiKey <key>  - API keys (validated via identity-vessel)
  *
  * JWT tokens contain claims that are validated against SurrealDB:
  * - org_id: Organization the caller belongs to
@@ -14,15 +14,16 @@
  * When authenticated, routes should use queryWithAuth() to let SurrealDB
  * enforce RBAC via PERMISSIONS clauses using $auth.org_id.
  *
- * Auth Pattern Consolidation (2026-04-03):
- * - Removed apikey_record SurrealDB ACCESS method (legacy)
- * - API keys now validated via identity-vessel HMAC pattern
- * - Use explicit header prefixes instead of eyJ detection heuristic
+ * VESSEL PATTERN (2026-04-12):
+ * - API key validation is delegated to identity-vessel via impulse pattern
+ * - Identity-vessel is the single source of truth for API key operations
+ * - If identity-vessel is unavailable, discovery-vessel finds another resolver
+ * - NO direct SurrealDB queries for API key validation (violates vessel idiom)
  *
- * Direct Auth Fallback (2026-04-06):
- * - Added direct SurrealDB validation as fallback when identity-vessel unavailable
- * - Uses SHA-256 hash lookup for fast O(1) validation
- * - Logs which auth method was used for debugging
+ * Auth Pattern History:
+ * - 2026-04-03: Removed apikey_record SurrealDB ACCESS method
+ * - 2026-04-06: Added direct SurrealDB fallback (now removed)
+ * - 2026-04-12: Migrated to vessel pattern, removed direct fallback
  */
 
 import { Context, Next } from 'hono';
@@ -46,8 +47,12 @@ export interface JwtAuthContext {
 }
 
 /**
- * Validate API key with fallback to direct SurrealDB validation
- * Returns JwtAuthContext on success, null on failure
+ * Validate API key via identity-vessel (vessel pattern)
+ *
+ * Sends AuthenticationImpulse to identity-vessel for validation.
+ * If identity-vessel is unavailable, uses discovery-vessel to find another resolver.
+ *
+ * Returns JwtAuthContext on success, null on failure.
  */
 async function validateApiKey(apiKey: string): Promise<JwtAuthContext | null> {
   try {
@@ -58,10 +63,21 @@ async function validateApiKey(apiKey: string): Promise<JwtAuthContext | null> {
       return null;
     }
 
+    // Validate that keyId is present for API key auth
+    // This is required for audit trails using `api_key:${jwtAuth.keyId}`
+    if (!result.keyId) {
+      logger.error('API key validation succeeded but keyId is missing', {
+        method: result.authMethod || 'unknown',
+        orgId: result.orgId,
+      });
+      return null;
+    }
+
     // Log which method was used
     logger.info('API key authenticated', {
       method: result.authMethod || 'unknown',
       orgId: result.orgId,
+      keyId: result.keyId,
     });
 
     // Generate a real JWT token for downstream use
@@ -87,6 +103,8 @@ async function validateApiKey(apiKey: string): Promise<JwtAuthContext | null> {
     return {
       jwtToken,
       orgId: result.orgId!,
+      keyId: result.keyId,
+      userId: result.userId,
       authType: 'apikey',
     };
   } catch (error) {
@@ -119,7 +137,7 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
     return;
   }
 
-  // Check for ApiKey prefix first (API keys validated via identity-vessel with direct fallback)
+  // Check for ApiKey prefix first (API keys validated via identity-vessel impulse pattern)
   const apiKeyMatch = authHeader.match(/^ApiKey\s+(.+)$/i);
   if (apiKeyMatch) {
     const apiKey = apiKeyMatch[1];
@@ -230,6 +248,7 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
 
     // Extract claims, handling SurrealDB record ID format (organizations:xyz -> xyz)
     // MiniBob instances have project_id (singular), API key users have project_ids (array)
+    // The 'id' claim contains the keyId for API key-generated JWTs
     const jwtAuth: JwtAuthContext = {
       jwtToken: token,
       orgId: String(auth.org_id || '').replace(/^organizations:/, ''),
@@ -240,6 +259,10 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
         ? auth.project_ids.map((p: unknown) => String(p).replace(/^projects:/, ''))
         : undefined,
       instanceId: auth.instance_id,
+      // For API key-generated JWTs, 'id' contains the keyId
+      keyId: auth.id ? String(auth.id) : undefined,
+      // Extract user_id if present
+      userId: auth.user_id ? String(auth.user_id).replace(/^users:/, '') : undefined,
       authType: 'jwt',
     };
 
