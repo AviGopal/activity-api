@@ -2,7 +2,7 @@
 replicaCount: 2
 
 image:
-  repository: metabob-activity-api
+  repository: metabobapp/metabob-activity-api
   pullPolicy: IfNotPresent
   tag: "latest"
 
