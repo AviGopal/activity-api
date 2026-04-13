@@ -1010,6 +1010,95 @@ app.post('/', async (c) => {
       }
     } // end isDualWriteEnabled()
 
+    // ========================================================================
+    // FIX 2: Update Thompson Sampling scores in activity table
+    // Enables real-time learning loop: execute → update scores → recommend
+    // ========================================================================
+    try {
+      // Increment Thompson Sampling parameters based on execution outcome
+      const scoreUpdate = trace.success
+        ? { thompson_alpha: 1, successful_executions: 1 }
+        : { thompson_beta: 1, failed_executions: 1 };
+
+      const updateQuery = `
+        UPDATE activity
+        SET
+          thompson_alpha = thompson_alpha + $alpha_delta,
+          thompson_beta = thompson_beta + $beta_delta,
+          total_executions = total_executions + 1,
+          successful_executions = successful_executions + $success_delta,
+          failed_executions = failed_executions + $failure_delta,
+          last_executed_at = time::now()
+        WHERE id = $activity_id
+        RETURN {
+          id,
+          thompson_alpha,
+          thompson_beta,
+          total_executions
+        }
+      `;
+
+      const updateParams = {
+        activity_id: trace.variant_id, // variant_id is the activity ID
+        alpha_delta: trace.success ? 1 : 0,
+        beta_delta: trace.success ? 0 : 1,
+        success_delta: trace.success ? 1 : 0,
+        failure_delta: trace.success ? 0 : 1,
+      };
+
+      // Use JWT auth if available for RBAC enforcement
+      const updateResult = jwtAuth?.jwtToken
+        ? await queryWithAuth(jwtAuth.jwtToken, updateQuery, updateParams)
+        : await surrealDB.query(updateQuery, updateParams);
+
+      if (updateResult && updateResult.length > 0) {
+        logger.info('[learning] Thompson Sampling scores updated', {
+          execution_id: trace.execution_id,
+          activity_id: trace.variant_id,
+          success: trace.success,
+          new_alpha: updateResult[0].thompson_alpha,
+          new_beta: updateResult[0].thompson_beta,
+          total_executions: updateResult[0].total_executions,
+        });
+
+        // FIX 3: Invalidate Redis cache to ensure fresh scores in next recommendation
+        try {
+          const { RedisClient } = await import('../db/redis');
+          const redis = RedisClient.getInstance();
+
+          // Invalidate both the specific template cache and the template list cache
+          const CACHE_KEY_PREFIX = 'activity:template:';
+          const CACHE_LIST_KEY = 'activity:templates:list';
+
+          await redis.del(`${CACHE_KEY_PREFIX}${trace.variant_id}`);
+          await redis.del(CACHE_LIST_KEY);
+
+          logger.debug('[learning] Redis cache invalidated after score update', {
+            activity_id: trace.variant_id,
+          });
+        } catch (cacheError) {
+          // Non-critical - scores will eventually propagate when cache expires
+          logger.warn('[learning] Failed to invalidate Redis cache (non-blocking)', {
+            execution_id: trace.execution_id,
+            error: cacheError instanceof Error ? cacheError.message : String(cacheError),
+          });
+        }
+      } else {
+        logger.warn('[learning] Thompson Sampling score update returned no results', {
+          execution_id: trace.execution_id,
+          activity_id: trace.variant_id,
+          query_params: updateParams,
+        });
+      }
+    } catch (scoreUpdateError) {
+      // Don't fail the request if score update fails - trace is already stored
+      logger.error('[learning] Failed to update Thompson Sampling scores (non-blocking)', {
+        execution_id: trace.execution_id,
+        activity_id: trace.variant_id,
+        error: scoreUpdateError instanceof Error ? scoreUpdateError.message : String(scoreUpdateError),
+      });
+    }
+
     // Update impulse shape activity scores for shape-conditioned Thompson Sampling
     // Extract input shapes from the execution trace
     const inputShapes: string[] = body.input_impulse_shapes
