@@ -46,23 +46,40 @@ export const SessionPostResponseSchema = z.object({
 });
 
 // Activity Template schemas
+// Task prompt schema for LLM-based tasks
+const TaskPromptSchema = z.object({
+  template: z.string(),
+  maxTokens: z.number().optional(),
+  compressionStrategy: z.string().optional(),
+  variables: z.array(z.any()).optional(),
+});
+
+// Task config schema for deterministic (resolver-based) tasks
+const TaskConfigSchema = z.record(z.any());
+
+// Validation schema for deterministic tasks
+const DeterministicValidationSchema = z.object({
+  exitCode: z.number().optional(),
+  outputContains: z.string().optional(),
+  outputMatches: z.string().optional(),
+  requiredFiles: z.array(z.string()).optional(),
+  requiredPatterns: z.array(z.any()).optional(),
+  forbiddenPatterns: z.array(z.any()).optional(),
+  commands: z.array(z.any()).optional(),
+});
+
 export const TemplateTaskSchema = z.object({
   id: z.string(),
   subagent: z.string().optional(),
   description: z.string(),
   dependencies: z.array(z.string()).optional(),
-  prompt: z.object({
-    template: z.string(),
-    maxTokens: z.number().optional(),
-    compressionStrategy: z.string().optional(),
-    variables: z.array(z.any()).optional(),
-  }),
-  validation: z.object({
-    requiredFiles: z.array(z.string()).optional(),
-    requiredPatterns: z.array(z.any()).optional(),
-    forbiddenPatterns: z.array(z.any()).optional(),
-    commands: z.array(z.any()).optional(),
-  }).optional(),
+  // LLM-based task: uses prompt
+  prompt: TaskPromptSchema.optional(),
+  // Deterministic task: uses resolver + config (no LLM cost)
+  resolver: z.string().optional(), // e.g., "bash", "http", "file"
+  config: TaskConfigSchema.optional(), // resolver-specific config (e.g., {command: "gh pr list"})
+  // Validation for task output
+  validation: DeterministicValidationSchema.optional(),
   retry: z.object({
     // Accept both snake_case (from MiniBob MCP) and camelCase (from ribosome)
     max_attempts: z.number().optional(),
@@ -72,7 +89,11 @@ export const TemplateTaskSchema = z.object({
     (data) => data.max_attempts !== undefined || data.maxAttempts !== undefined,
     { message: "Either max_attempts or maxAttempts is required" }
   ).optional(),
-});
+}).refine(
+  // Either prompt (LLM-based) OR resolver+config (deterministic) must be provided
+  (data) => data.prompt !== undefined || data.resolver !== undefined,
+  { message: "Either 'prompt' (for LLM tasks) or 'resolver' (for deterministic tasks) is required" }
+);
 
 export const TemplateMetricsSchema = z.object({
   // Canonical: use 'id' as the primary identifier
