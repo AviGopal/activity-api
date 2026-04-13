@@ -54,11 +54,11 @@ const TaskPromptSchema = z.object({
   variables: z.array(z.any()).optional(),
 });
 
-// Task config schema for deterministic (resolver-based) tasks
+// Task config schema for resolver-based tasks
 const TaskConfigSchema = z.record(z.any());
 
-// Validation schema for deterministic tasks
-const DeterministicValidationSchema = z.object({
+// Validation schema for task output
+const TaskValidationSchema = z.object({
   exitCode: z.number().optional(),
   outputContains: z.string().optional(),
   outputMatches: z.string().optional(),
@@ -73,13 +73,12 @@ export const TemplateTaskSchema = z.object({
   subagent: z.string().optional(),
   description: z.string(),
   dependencies: z.array(z.string()).optional(),
-  // LLM-based task: uses prompt
+  // Task execution: either prompt-based or resolver-based
   prompt: TaskPromptSchema.optional(),
-  // Deterministic task: uses resolver + config (no LLM cost)
-  resolver: z.string().optional(), // e.g., "bash", "http", "file"
-  config: TaskConfigSchema.optional(), // resolver-specific config (e.g., {command: "gh pr list"})
+  resolver: z.string().optional(), // e.g., "bash", "llm", "http", "file"
+  config: TaskConfigSchema.optional(), // resolver-specific config
   // Validation for task output
-  validation: DeterministicValidationSchema.optional(),
+  validation: TaskValidationSchema.optional(),
   retry: z.object({
     // Accept both snake_case (from MiniBob MCP) and camelCase (from ribosome)
     max_attempts: z.number().optional(),
@@ -90,9 +89,9 @@ export const TemplateTaskSchema = z.object({
     { message: "Either max_attempts or maxAttempts is required" }
   ).optional(),
 }).refine(
-  // Either prompt (LLM-based) OR resolver+config (deterministic) must be provided
+  // Either prompt OR resolver must be provided
   (data) => data.prompt !== undefined || data.resolver !== undefined,
-  { message: "Either 'prompt' (for LLM tasks) or 'resolver' (for deterministic tasks) is required" }
+  { message: "Either 'prompt' or 'resolver' is required" }
 );
 
 export const TemplateMetricsSchema = z.object({
