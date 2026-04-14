@@ -714,11 +714,6 @@ app.post('/', async (c) => {
     // Session may be undefined for internal/unauthenticated calls
     const session = ((c.get as any)('session') as SessionData | undefined) || { session_id: 'internal', org_id: null, project_id: null, api_key: null, latest_job_id: null };
 
-    // Use JWT auth claims if available, otherwise fall back to session
-    // Default to 'public' for unauthenticated/improvised executions (schema requires non-null string)
-    const orgId = jwtAuth?.orgId || session?.org_id || 'public';
-    const projectId = jwtAuth?.projectId || session?.project_id || null;
-
     const body = await c.req.json();
 
     // Validate required fields
@@ -730,6 +725,18 @@ app.post('/', async (c) => {
         received: Object.keys(body),
       }, 400);
     }
+
+    // FIX: Use org_id from request body if provided, otherwise fall back to JWT/session
+    // This allows MiniBob to explicitly set org_id when sending traces
+    const traceOrgId = body.org_id || jwtAuth?.orgId || session?.org_id || 'public';
+    const traceProjectId = body.project_id || jwtAuth?.projectId || session?.project_id || null;
+
+    logger.debug('[TRACE DEBUG] Determining org_id for trace', {
+      body_org_id: body.org_id,
+      jwt_org_id: jwtAuth?.orgId,
+      session_org_id: session?.org_id,
+      final_org_id: traceOrgId,
+    });
 
     // Map MiniBob's field names to database schema
     // MiniBob sends: template_id, we store as: variant_id + activity_id
@@ -774,13 +781,14 @@ app.post('/', async (c) => {
           }
         : null,
 
-      // Multi-tenancy (prefer JWT claims over session)
-      org_id: orgId,
-      project_id: projectId,
+      // Multi-tenancy (use org_id from request body if provided)
+      org_id: traceOrgId,
+      project_id: traceProjectId,
 
       // Timestamps (SurrealDB datetime type)
       executed_at: new Date(),
       created_at: new Date(),
+      stored_at: new Date(),
 
       // Edge learning fields (from improvisation traces)
       ...(body.improvisation ? { improvisation: body.improvisation } : {}),
@@ -911,7 +919,8 @@ app.post('/', async (c) => {
         tokens_cache: $tokens_cache,
         org_id: $org_id,
         executed_at: $executed_at,
-        created_at: $created_at${optionalFieldsStr}
+        created_at: $created_at,
+        stored_at: $stored_at${optionalFieldsStr}
       }
     `;
 
@@ -1107,9 +1116,9 @@ app.post('/', async (c) => {
       || (trace.metadata as any)?.input_shapes
       || [];
 
-    if (inputShapes.length > 0 && trace.variant_id && orgId) {
+    if (inputShapes.length > 0 && trace.variant_id && traceOrgId) {
       // Fire and forget - don't block the response
-      updateShapeActivityScores(trace.variant_id, inputShapes, trace.success, orgId, jwtAuth?.jwtToken)
+      updateShapeActivityScores(trace.variant_id, inputShapes, trace.success, traceOrgId)
         .catch(err => logger.warn('[paradigm] Shape score update failed (non-blocking)', {
           execution_id: trace.execution_id,
           error: err instanceof Error ? err.message : String(err),
@@ -1147,7 +1156,7 @@ app.post('/', async (c) => {
     // Forward to learning (non-blocking, don't await)
     if (uniqueFiles.length >= 2) {
       const sessionId = c.req.header('X-Session-ID') || session.session_id || 'unknown';
-      forwardToLearning(sessionId, uniqueFiles, projectId);
+      forwardToLearning(sessionId, uniqueFiles, traceProjectId);
     }
 
     return c.json({
