@@ -108,10 +108,19 @@ router.post('/', async (c) => {
     });
 
     // Helper to execute queries with proper auth context
-    // Use authenticated query when JWT is present (for RBAC), otherwise root
+    // For API key auth, use root credentials (JWT token is self-signed, not valid for SurrealDB)
+    // For real JWT auth (from SurrealDB ACCESS), use queryWithAuth for RBAC
     const executeQuery = async <T>(sql: string, params: Record<string, any>): Promise<T[]> => {
+      // API key auth generates self-signed JWTs that SurrealDB can't validate
+      // Use root credentials instead, filtering is done via query params
+      if (jwtAuth?.authType === 'apikey') {
+        logger.debug('Using root query for API key auth (self-signed JWT)', { orgId: jwtAuth.orgId });
+        return surrealDB.query<T>(sql, params);
+      }
+      // Real JWT auth (from SurrealDB ACCESS method) can use queryWithAuth for RBAC
+      // Note: After the apikey check above, authType is narrowed to 'jwt' | 'minibob_token' | undefined
       if (jwtAuth?.jwtToken) {
-        logger.debug('Using authenticated query with JWT', { hasToken: true });
+        logger.debug('Using authenticated query with JWT', { hasToken: true, authType: jwtAuth.authType });
         return queryWithAuth<T>(jwtAuth.jwtToken, sql, params);
       }
       return surrealDB.query<T>(sql, params);

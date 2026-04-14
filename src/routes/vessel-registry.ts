@@ -189,12 +189,24 @@ app.post('/register', async (c) => {
  *
  * Find vessels that can resolve a specific impulse shape.
  * Integrates with shape registry for version compatibility checking.
+ *
+ * Accepts both JWT and API key authentication.
+ * API key auth is validated via identity-vessel and provides orgId for filtering.
  */
 app.get('/discover', async (c) => {
   const auth = getJwtAuthFromContext(c);
-  if (!auth) {
-    return c.json({ error: 'JWT authentication required' }, 401);
+  if (!auth || !auth.orgId) {
+    logger.warn('GET /v2/vessels/discover: no auth or missing orgId', {
+      hasAuth: !!auth,
+      authType: auth?.authType,
+    });
+    return c.json({ error: 'Authentication required (JWT or API key)' }, 401);
   }
+
+  logger.debug('GET /v2/vessels/discover: authenticated', {
+    authType: auth.authType,
+    orgId: auth.orgId,
+  });
 
   const shape = c.req.query('shape');
   const version = c.req.query('version');
