@@ -75,7 +75,7 @@ router.post('/', async (c) => {
       // Use keyId or userId for audit trail
       // Schema expects: option<string | record<users> | record<api_key>>
       if (jwtAuth.keyId) {
-        created_by = `api_key:${jwtAuth.keyId}`;
+        created_by = jwtAuth.keyId;
       } else if (jwtAuth.userId) {
         created_by = `users:${jwtAuth.userId}`;
       } else {

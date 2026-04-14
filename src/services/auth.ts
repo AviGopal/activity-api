@@ -145,7 +145,7 @@ export async function generateJwtToken(context: {
       NS: config.surrealdb.namespace,
       DB: config.surrealdb.database,
       AC: 'apikey_token',
-      id: context.keyId,
+      id: `api_key:${context.keyId}`,
       org_id: `organizations:${context.orgId}`,
       user_id: `users:${context.userId}`,
       scopes: context.scopes,
