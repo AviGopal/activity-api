@@ -181,16 +181,66 @@ export async function generateJwtToken(context: {
 
 /**
  * Validate API key via identity-vessel
+ *
+ * Tries the configured URL first, then falls back to external URL if internal fails.
  */
 export async function validateApiKeyViaIdentityVessel(
   apiKey: string
 ): Promise<AuthContext> {
-  const identityVesselUrl =
+  // Try primary (internal) URL first
+  const primaryUrl =
     process.env.IDENTITY_VESSEL_URL ||
     'http://identity-vessel.activity-system.svc.cluster.local:8080';
 
+  // External fallback URL (public endpoint)
+  const fallbackUrl =
+    process.env.IDENTITY_VESSEL_EXTERNAL_URL ||
+    'https://identity.metabob.com';
+
+  // Try primary URL
+  const primaryResult = await tryIdentityVesselValidation(apiKey, primaryUrl);
+  if (primaryResult.authenticated) {
+    return primaryResult;
+  }
+
+  // If primary failed due to network error, try external fallback
+  const isNetworkError =
+    primaryResult.reason?.includes('Network error') ||
+    primaryResult.reason?.includes('fetch') ||
+    primaryResult.reason?.includes('timeout') ||
+    primaryResult.reason?.includes('ECONNREFUSED') ||
+    primaryResult.reason?.includes('returned 5') ||
+    primaryResult.reason?.includes('getaddrinfo');
+
+  if (isNetworkError && primaryUrl !== fallbackUrl) {
+    logger.info('[auth] Primary identity-vessel unavailable, trying external URL', {
+      primaryUrl,
+      fallbackUrl,
+      reason: primaryResult.reason,
+    });
+
+    const fallbackResult = await tryIdentityVesselValidation(apiKey, fallbackUrl);
+    if (fallbackResult.authenticated) {
+      return fallbackResult;
+    }
+
+    // Both failed - return the fallback error (more likely to be meaningful)
+    return fallbackResult;
+  }
+
+  // Primary returned a definitive error (not network), return as-is
+  return primaryResult;
+}
+
+/**
+ * Try to validate API key against a specific identity-vessel URL
+ */
+async function tryIdentityVesselValidation(
+  apiKey: string,
+  identityVesselUrl: string
+): Promise<AuthContext> {
   try {
-    logger.debug('[auth] Validating API key via identity-vessel');
+    logger.debug('[auth] Validating API key via identity-vessel', { url: identityVesselUrl });
 
     const response = await fetch(`${identityVesselUrl}/v1/auth/resolve`, {
       method: 'POST',
@@ -209,6 +259,7 @@ export async function validateApiKeyViaIdentityVessel(
 
     if (!response.ok) {
       logger.warn('[auth] Identity vessel validation failed', {
+        url: identityVesselUrl,
         status: response.status,
       });
       return {
@@ -237,6 +288,7 @@ export async function validateApiKeyViaIdentityVessel(
     }
 
     logger.info('[auth] Identity vessel validated key', {
+      url: identityVesselUrl,
       userId: result.data.userId,
     });
 
@@ -249,6 +301,7 @@ export async function validateApiKeyViaIdentityVessel(
     };
   } catch (error) {
     logger.error('[auth] Identity vessel validation error', {
+      url: identityVesselUrl,
       error: error instanceof Error ? error.message : String(error),
     });
     return {
