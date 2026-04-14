@@ -3,7 +3,7 @@ replicaCount: 2
 
 image:
   repository: metabobapp/metabob-activity-api
-  pullPolicy: IfNotPresent
+  pullPolicy: Always
   tag: "latest"
 
 imagePullSecrets:
