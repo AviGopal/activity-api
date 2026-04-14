@@ -1063,7 +1063,8 @@ export async function updateShapeActivityScores(
   activityId: string,
   shapes: string[],
   success: boolean,
-  orgId: string
+  orgId: string,
+  jwtToken?: string | null
 ): Promise<void> {
   if (!shapes || shapes.length === 0) return;
 
@@ -1089,11 +1090,18 @@ export async function updateShapeActivityScores(
         WHERE org_id = $org_id AND shape = $shape AND activity_id = $activity_id
       `;
 
-      await surrealDB.query(query, {
+      const params = {
         shape,
         activity_id: activityId,
         org_id: orgId,
-      });
+      };
+
+      // Use authenticated connection if JWT token provided, otherwise use root connection
+      if (jwtToken) {
+        await queryWithAuth(jwtToken, query, params);
+      } else {
+        await surrealDB.query(query, params);
+      }
     }
 
     logger.debug('[paradigm] Updated shape activity scores', {

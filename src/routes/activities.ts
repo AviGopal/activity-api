@@ -1599,7 +1599,8 @@ app.post('/executions', async (c) => {
         activityIdFromRequest,
         validated.input_impulse_shapes,
         validated.success,
-        orgId
+        orgId,
+        jwtAuth?.jwtToken
       ).catch((error) => {
         logger.warn('Shape score update failed (non-blocking)', {
           activity_id: activityIdFromRequest,
@@ -5751,7 +5752,8 @@ async function updateShapeScoresFromExecution(
   activityId: string,
   shapes: string[],
   success: boolean,
-  orgId: string
+  orgId: string,
+  jwtToken?: string | null
 ): Promise<void> {
   if (!shapes || shapes.length === 0) {
     return; // No shapes to update
@@ -5785,13 +5787,20 @@ async function updateShapeScoresFromExecution(
           };
         `;
 
-        await surrealDB.query(upsertQuery, {
+        const params = {
           shape,
           activity_id: activityId,
           org_id: orgId,
           success_increment: successIncrement,
           failure_increment: failureIncrement,
-        });
+        };
+
+        // Use authenticated connection if JWT token provided, otherwise use root connection
+        if (jwtToken) {
+          await queryWithAuth(jwtToken, upsertQuery, params);
+        } else {
+          await surrealDB.query(upsertQuery, params);
+        }
       } catch (shapeError: any) {
         logger.warn('Failed to update shape score in execution flow', {
           shape,
