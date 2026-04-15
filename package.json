@@ -21,7 +21,8 @@
     "format:check": "prettier --check 'src/**/*.ts'",
     "preflight": "bun run typecheck && bun run lint && bun run format:check && bun test",
     "clean:artifacts": "find . -name '*.log' -o -name 'test-*' -o -name '*.tmp' | grep -v node_modules | xargs rm -f 2>/dev/null || true",
-    "version:check": "node -e \"const pkg = require('./package.json'); const tag = require('child_process').execSync('git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0').toString().trim().replace('v',''); if (tag !== pkg.version) { console.log('Version mismatch: package.json=' + pkg.version + ', latest tag=v' + tag); process.exit(1); }\""
+    "version:check": "node -e \"const pkg = require('./package.json'); const tag = require('child_process').execSync('git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0').toString().trim().replace('v',''); if (tag !== pkg.version) { console.log('Version mismatch: package.json=' + pkg.version + ', latest tag=v' + tag); process.exit(1); }\"",
+    "validate-thompson-sampling": "bun run validate-thompson-learning.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.36.3",
