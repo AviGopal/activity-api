@@ -755,6 +755,16 @@ export const ExecutedTaskSchema = z.object({
     environment: z.record(z.string()),
     impulses: z.array(z.string()),
     variables: z.record(z.any()),
+    git: z.object({
+      branch: z.string(),
+      commit: z.string(),
+      dirty: z.boolean(),
+      changedFiles: z.array(z.string()),
+      stagedFiles: z.array(z.string()),
+      unstagedFiles: z.array(z.string()),
+      ahead: z.number().optional(),
+      behind: z.number().optional(),
+    }).optional(),
   }).optional(),
   outputState: z.object({
     filesModified: z.array(z.string()),
@@ -778,6 +788,17 @@ export const ExecutionTraceDataSchema = z.object({
     goal: z.string(),
     intent: z.string(),
     context: z.record(z.any()),
+  }).optional(),
+  // Session context for within-session composition learning (Task #26)
+  session_context: z.object({
+    session_id: z.string(),
+    previous_activities: z.array(z.object({
+      activity_id: z.string(),
+      shapes_produced: z.array(z.string()),
+      success: z.boolean(),
+    })),
+    accumulated_shapes: z.array(z.string()),
+    goal_chain: z.array(z.string()),
   }).optional(),
 });
 

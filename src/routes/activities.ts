@@ -103,6 +103,7 @@ import {
   type ImpulseShapeActivityScore,
 } from '../models/schemas';
 import { broadcaster } from '../websocket/broadcaster';
+import { autoCreateVariantIfNeeded, checkAndRetireTemplate } from '../services/variant-creator';
 
 const app = new Hono();
 
@@ -504,6 +505,7 @@ async function listAllTemplatesFromDB(
     query = `
       SELECT * FROM activity
       WHERE execution_type = $execution_type
+      AND (retired = false OR retired IS NONE)
       ${whereClause ? 'AND ' + whereClause.replace('WHERE ', '') : ''}
       ORDER BY created_at DESC
       LIMIT $limit
@@ -541,6 +543,7 @@ async function listAllTemplatesFromDB(
       query = `
         SELECT * FROM activity
         WHERE execution_type = $execution_type
+        AND (retired = false OR retired IS NONE)
         AND (
           (scope = 'global' AND public = true)
           OR (scope = 'org' AND org_id = $org_id)
@@ -554,7 +557,9 @@ async function listAllTemplatesFromDB(
       // User has org_id but no project_id: return global + org activities
       query = `
         SELECT * FROM activity
-        WHERE execution_type = $execution_type AND (
+        WHERE execution_type = $execution_type
+        AND (retired = false OR retired IS NONE)
+        AND (
           scope IS NULL
           OR scope = 'global'
           OR (scope = 'org' AND org_id = $org_id)
@@ -568,7 +573,9 @@ async function listAllTemplatesFromDB(
     // No org_id: return only global activities
     query = `
       SELECT * FROM activity
-      WHERE execution_type = $execution_type AND (
+      WHERE execution_type = $execution_type
+      AND (retired = false OR retired IS NONE)
+      AND (
         scope IS NULL
         OR scope = 'global'
       ) ${scopeClause}
@@ -1698,6 +1705,72 @@ app.post('/executions', async (c) => {
       });
     }
 
+    // Step 4: Auto-create variant if needed (after consecutive failures)
+    // Non-blocking: don't await, fire and forget
+    if (orgId) {
+      autoCreateVariantIfNeeded(activityIdFromRequest, orgId, validated.success)
+        .then((variantResult) => {
+          if (variantResult) {
+            logger.info('Auto-created variant from consecutive failures', {
+              parentTemplateId: activityIdFromRequest,
+              variantId: variantResult.variantId,
+              variantGeneration: variantResult.variantGeneration,
+              modifications: variantResult.modifications.length,
+            });
+
+            // Emit variant_created event via WebSocket
+            broadcaster.emit({
+              type: 'variant_created',
+              timestamp: new Date().toISOString(),
+              data: {
+                parent_activity_id: activityIdFromRequest,
+                variant_id: variantResult.variantId,
+                variant_generation: variantResult.variantGeneration,
+                reason: variantResult.reason,
+                modifications: variantResult.modifications,
+              },
+            });
+          }
+        })
+        .catch((error) => {
+          logger.warn('Auto-variant creation failed (non-blocking)', {
+            activity_id: activityIdFromRequest,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+
+      // Step 5: Check and retire template if needed (after enough executions)
+      // Non-blocking: don't await, fire and forget
+      checkAndRetireTemplate(activityIdFromRequest, orgId)
+        .then((wasRetired) => {
+          if (wasRetired) {
+            logger.info('Template retired due to poor performance', {
+              activity_id: activityIdFromRequest,
+            });
+
+            // Emit template_retired event via WebSocket
+            broadcaster.emit({
+              type: 'template_retired',
+              timestamp: new Date().toISOString(),
+              data: {
+                activity_id: activityIdFromRequest,
+                reason: 'poor_performance',
+              },
+            });
+
+            // Invalidate cache for retired template
+            redis.del(`${CACHE_KEY_PREFIX}${activityIdFromRequest}`);
+            redis.srem(CACHE_LIST_KEY, activityIdFromRequest);
+          }
+        })
+        .catch((error) => {
+          logger.warn('Template retirement check failed (non-blocking)', {
+            activity_id: activityIdFromRequest,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+    }
+
     // Return response with updated metrics
     const response: ExecutionRecordResponse = {
       success: true,
@@ -2298,6 +2371,115 @@ app.get('/:id/variants', async (c) => {
 
     return c.json({
       error: 'Failed to fetch activity variants',
+      message: error.message,
+    }, 500);
+  }
+});
+
+/**
+ * POST /v2/activities/:id/variants
+ * Manually trigger variant creation for a template.
+ *
+ * This endpoint allows users to explicitly request variant creation
+ * without waiting for automatic creation from consecutive failures.
+ *
+ * Request body:
+ * - reason: Optional reason for creating the variant (default: 'manual_improvement')
+ *
+ * Returns:
+ * - variant_id: ID of the created variant
+ * - variant_generation: Generation number
+ * - modifications: Array of modifications made
+ * - reason: Reason for variant creation
+ */
+app.post('/:id/variants', async (c) => {
+  try {
+    const activityId = c.req.param('id');
+    const jwtAuth = getJwtAuthFromContext(c);
+    const session = (c.get as any)('session') as SessionData | undefined;
+    const orgId = jwtAuth?.orgId || session?.org_id || null;
+
+    if (!orgId) {
+      return c.json({ error: 'Organization ID required' }, 401);
+    }
+
+    // Parse optional request body
+    let reason = 'manual_improvement';
+    try {
+      const body = await c.req.json();
+      if (body.reason) {
+        reason = body.reason;
+      }
+    } catch {
+      // No body or invalid JSON, use default
+    }
+
+    logger.info('POST /v2/activities/:id/variants', {
+      activityId,
+      orgId,
+      reason,
+      authMethod: jwtAuth ? 'jwt' : 'session',
+    });
+
+    // Import the createVariant function from variant-creator
+    const { createVariant, shouldCreateVariant } = await import('../services/variant-creator');
+
+    // Check current failure pattern to provide context
+    const failurePattern = await shouldCreateVariant(activityId, orgId);
+
+    // Create variant even if no failure pattern (manual improvement)
+    const defaultFailurePattern = failurePattern || {
+      templateId: activityId,
+      consecutiveFailures: 0,
+      totalExecutions: 0,
+      successRate: 1.0,
+      commonErrors: [],
+      failedTasks: [],
+    };
+
+    const variantResult = await createVariant(
+      activityId,
+      defaultFailurePattern,
+      orgId,
+      reason
+    );
+
+    if (!variantResult) {
+      return c.json({
+        error: 'Failed to create variant',
+        message: 'Variant creation returned null. Template may not exist or maximum variants reached.',
+      }, 500);
+    }
+
+    // Emit variant_created event via WebSocket
+    broadcaster.emit({
+      type: 'variant_created',
+      timestamp: new Date().toISOString(),
+      data: {
+        parent_activity_id: activityId,
+        variant_id: variantResult.variantId,
+        variant_generation: variantResult.variantGeneration,
+        reason: variantResult.reason,
+        modifications: variantResult.modifications,
+      },
+    });
+
+    return c.json({
+      success: true,
+      variant_id: variantResult.variantId,
+      variant_generation: variantResult.variantGeneration,
+      modifications: variantResult.modifications,
+      reason: variantResult.reason,
+    }, 201);
+
+  } catch (error: any) {
+    logger.error('POST /v2/activities/:id/variants failed', {
+      error: error.message,
+      stack: error.stack,
+    });
+
+    return c.json({
+      error: 'Failed to create variant',
       message: error.message,
     }, 500);
   }
@@ -3056,7 +3238,7 @@ app.post('/recommend', async (c) => {
       });
     }
 
-    // Filter out templates without a valid ID before processing
+    // Filter out templates without a valid ID or that are retired before processing
     // Note: Use normalizeRecordId to handle SurrealDB RecordId objects
     const validTemplates = templates.filter((template: any) => {
       const templateId = normalizeRecordId(template.id || template.variant_id);
@@ -3068,6 +3250,17 @@ app.post('/recommend', async (c) => {
         });
         return false;
       }
+
+      // Filter out retired templates
+      if (template.retired === true) {
+        logger.debug('Filtering out retired template', {
+          template_id: templateId,
+          template_name: template.name || template.variant_name,
+          retired_reason: template.retired_reason,
+        });
+        return false;
+      }
+
       return true;
     });
 
@@ -3231,6 +3424,16 @@ app.post('/recommend', async (c) => {
       count: recommendations.length,
       top: recommendations[0]?.template_id,
       correlationIds: recommendations.map((r: any) => r.correlation_id),
+      scoreMethod,
+      fallbackTier,
+      // Log selection details for top recommendation
+      topRecommendation: recommendations[0] ? {
+        template_id: recommendations[0].template_id,
+        thompson_sample: recommendations[0].selection_metadata.sample,
+        alpha: recommendations[0].selection_metadata.alpha,
+        beta: recommendations[0].selection_metadata.beta,
+        output_shapes: recommendations[0].output_shapes,
+      } : null,
     });
 
     // Log Thompson Sampling selections for explainability (non-blocking)
@@ -3827,6 +4030,86 @@ app.get('/composition/graph', async (c) => {
 });
 
 /**
+ * GET /v2/activities/composition/successors
+ * Query composition successors for an activity
+ *
+ * Returns activities that have historically followed the given activity
+ * with their success rates, costs, and durations. Used for post-execution
+ * recommendations.
+ *
+ * Query parameters:
+ * - activity_id: Activity to get successors for (required)
+ * - min_weight: Minimum edge weight (default: 0.5 = 50% success rate)
+ * - limit: Max results (default: 10)
+ *
+ * Returns array of successor activities sorted by weight (success rate)
+ */
+app.get('/composition/successors', async (c) => {
+  try {
+    const query = c.req.query();
+    const activityId = query.activity_id;
+    const minWeight = query.min_weight ? parseFloat(query.min_weight) : 0.5;
+    const limit = query.limit ? parseInt(query.limit) : 10;
+
+    if (!activityId) {
+      return c.json({
+        error: 'Validation failed',
+        message: 'activity_id is required',
+      }, 400);
+    }
+
+    logger.info('GET /v2/activities/composition/successors', {
+      activityId,
+      minWeight,
+      limit,
+    });
+
+    // Query composition graph for edges where this activity is parent
+    const successorsQuery = `
+      SELECT
+        child_activity_id,
+        weight,
+        avg_duration_ms,
+        avg_cost_usd,
+        success_count,
+        total_count
+      FROM activity_composition_graph
+      WHERE parent_activity_id = $activity_id
+        AND weight >= $min_weight
+      ORDER BY weight DESC
+      LIMIT $limit
+    `;
+
+    const result = await surrealDB.query(successorsQuery, {
+      activity_id: activityId,
+      min_weight: minWeight,
+      limit,
+    });
+
+    const successors = (result && Array.isArray(result) ? result.flat() : []);
+
+    logger.info('Composition successors query result', {
+      activityId,
+      successorCount: successors.length,
+    });
+
+    return c.json({
+      successors,
+    });
+  } catch (error: any) {
+    logger.error('GET /v2/activities/composition/successors failed', {
+      error: error.message,
+      stack: error.stack,
+    });
+
+    return c.json({
+      error: 'Failed to query composition successors',
+      message: error.message,
+    }, 500);
+  }
+});
+
+/**
  * GET /v2/activities/composition/impulse-success
  * Query impulse-conditioned success rates from composition data
  *
@@ -3953,18 +4236,196 @@ app.get('/composition/impulse-success', async (c) => {
 });
 
 /**
+ * POST /v2/activities/similar-state
+ * Query executions with similar available shapes (Task #29)
+ *
+ * Finds past executions that had similar impulse state (available shapes)
+ * to the current state. Uses Jaccard similarity on shape sets.
+ *
+ * Request body:
+ * - state_signature: State signature hash
+ * - available_shapes: Array of shapes currently available
+ * - min_similarity: Minimum similarity threshold (0.0-1.0, default: 0.5)
+ * - limit: Maximum results (default: 10)
+ *
+ * Returns executions sorted by similarity score descending.
+ */
+app.post('/similar-state', async (c) => {
+  try {
+    const body = await c.req.json();
+    const {
+      state_signature,
+      available_shapes,
+      min_similarity = 0.5,
+      limit = 10,
+    } = body;
+
+    logger.info('POST /v2/activities/similar-state', {
+      state_signature,
+      shapes_count: available_shapes?.length || 0,
+      min_similarity,
+      limit,
+    });
+
+    if (!available_shapes || !Array.isArray(available_shapes)) {
+      return c.json({
+        error: 'available_shapes is required and must be an array',
+      }, 400);
+    }
+
+    // Fast path: Check for exact state_signature match using indexed field
+    // This enables instant retrieval of executions with identical state
+    if (state_signature) {
+      logger.debug('Attempting fast path: exact state_signature match', { state_signature });
+
+      const exactQuery = `
+        SELECT
+          id,
+          activity_id,
+          success,
+          duration_ms,
+          cost_usd,
+          input_impulses,
+          output_impulses
+        FROM execution
+        WHERE state_signature = $state_signature
+        ORDER BY created_at DESC
+        LIMIT $limit
+      `;
+
+      const exactResults = await surrealDB.query<any[]>(exactQuery, {
+        state_signature,
+        limit,
+      });
+
+      const exactMatches = exactResults && Array.isArray(exactResults) ? exactResults.flat() : [];
+
+      if (exactMatches.length > 0) {
+        logger.info('Fast path hit: exact state_signature matches found', {
+          count: exactMatches.length,
+          state_signature,
+        });
+
+        // Return exact matches with similarity score of 1.0
+        const formatted = exactMatches.map((exec: any) => ({
+          execution_id: exec.id,
+          activity_id: exec.activity_id,
+          similarity: 1.0,
+          success: exec.success || false,
+          duration_ms: exec.duration_ms || 0,
+          cost_usd: exec.cost_usd || 0,
+          input_shapes: exec.input_impulses || [],
+          output_shapes: exec.output_impulses || [],
+        }));
+
+        return c.json({
+          executions: formatted,
+          total: formatted.length,
+          fast_path: true,
+        });
+      }
+
+      logger.debug('Fast path miss: no exact state_signature matches, falling back to similarity', {
+        state_signature,
+      });
+    }
+
+    // Fallback path: Jaccard similarity on shapes
+    // Query executions that have input shapes overlapping with available shapes
+    // Use CONTAINSANY to find executions with at least one matching shape
+    const similarityQuery = `
+      SELECT
+        id,
+        activity_id,
+        success,
+        duration_ms,
+        cost_usd,
+        input_impulses,
+        output_impulses
+      FROM execution
+      WHERE input_impulses CONTAINSANY $available_shapes
+      ORDER BY created_at DESC
+      LIMIT 100
+    `;
+
+    const results = await surrealDB.query<any[]>(similarityQuery, {
+      available_shapes,
+    });
+
+    const executions = results && Array.isArray(results) ? results.flat() : [];
+
+    // Calculate Jaccard similarity for each execution
+    const availableSet = new Set(available_shapes);
+    const withSimilarity = executions.map((exec: any) => {
+      const execShapes = exec.input_impulses || [];
+      const execSet = new Set(execShapes);
+
+      // Calculate intersection
+      const intersection = new Set(
+        [...execSet].filter(shape => availableSet.has(shape))
+      );
+
+      // Calculate union
+      const union = new Set([...execSet, ...availableSet]);
+
+      // Jaccard similarity
+      const similarity = union.size > 0 ? intersection.size / union.size : 0;
+
+      return {
+        execution_id: exec.id,
+        activity_id: exec.activity_id,
+        similarity,
+        success: exec.success || false,
+        duration_ms: exec.duration_ms || 0,
+        cost_usd: exec.cost_usd || 0,
+        input_shapes: execShapes,
+        output_shapes: exec.output_impulses || [],
+      };
+    });
+
+    // Filter by minimum similarity and sort by similarity descending
+    const filtered = withSimilarity
+      .filter(exec => exec.similarity >= min_similarity)
+      .sort((a, b) => b.similarity - a.similarity)
+      .slice(0, limit);
+
+    logger.info('Similarity fallback query result', {
+      total_executions: executions.length,
+      filtered_count: filtered.length,
+      top_similarity: filtered[0]?.similarity,
+    });
+
+    return c.json({
+      executions: filtered,
+      total: filtered.length,
+      fast_path: false,
+    });
+  } catch (error: any) {
+    logger.error('POST /v2/activities/similar-state failed', {
+      error: error.message,
+      stack: error.stack,
+    });
+
+    return c.json({
+      error: 'Failed to query similar executions',
+      message: error.message,
+    }, 500);
+  }
+});
+
+/**
  * POST /v2/activities/impulse-relevance
  * Record impulse usage and outcome for relevance learning
- * 
+ *
  * This endpoint implements Bayesian learning for impulse relevance:
  * - Track: was impulse loaded? did execution succeed?
  * - Learn: P(success | impulse present) vs P(success | impulse absent)
  * - Optimize: Skip loading irrelevant impulses (save tokens)
- * 
+ *
  * Bayesian calculation:
  * relevance_score = P(success | loaded) = times_execution_succeeded / times_loaded
  * irrelevance_score = P(success | not loaded) = times_not_loaded_succeeded / times_not_loaded
- * 
+ *
  * Decision rule:
  * - If relevance_score >> irrelevance_score → impulse is critical
  * - If relevance_score ≈ irrelevance_score → impulse is irrelevant

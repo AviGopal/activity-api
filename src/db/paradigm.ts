@@ -562,6 +562,9 @@ export async function queryActivitiesByShapes(
       params.org_id = orgId;
     }
 
+    // Filter out retired templates
+    whereClauses.push(`(retired = false OR retired IS NONE)`);
+
     const whereClause = whereClauses.length > 0
       ? `WHERE ${whereClauses.join(' AND ')}`
       : '';

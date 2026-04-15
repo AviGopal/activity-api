@@ -12,6 +12,12 @@ import type { SessionData } from '../models/schemas';
 import { getJwtAuthFromContext, hasJwtAuth } from '../middleware/jwtAuth';
 import { config } from '../config';
 import { insertExecution, isDualWriteEnabled, updateShapeActivityScores, type ParadigmExecution } from '../db/paradigm';
+import {
+  extractOutputShapes,
+  validateOutputShapes,
+  computeThompsonSamplingUpdates,
+  type ShapeMatchMetadata,
+} from '../services/thompson-sampling';
 
 const app = new Hono();
 
@@ -1021,13 +1027,63 @@ app.post('/', async (c) => {
 
     // ========================================================================
     // FIX 2: Update Thompson Sampling scores in activity table
+    // Enhanced with shape match scoring for quality-aware learning
     // Enables real-time learning loop: execute → update scores → recommend
     // ========================================================================
     try {
-      // Increment Thompson Sampling parameters based on execution outcome
-      const scoreUpdate = trace.success
-        ? { thompson_alpha: 1, successful_executions: 1 }
-        : { thompson_beta: 1, failed_executions: 1 };
+      // Fetch activity template to get declared output_shapes
+      const activityQuery = `
+        SELECT output_shapes FROM activity
+        WHERE id = $activity_id
+        LIMIT 1
+      `;
+      const activityResult = await surrealDB.query(activityQuery, {
+        activity_id: trace.variant_id,
+      });
+
+      // Extract actual output shapes from execution
+      const actualShapes = extractOutputShapes({
+        output_impulses: trace.output_impulses,
+        output_impulse_shapes: trace.output_impulse_shapes,
+      });
+
+      // Compute shape match score and weighted success
+      let shapeMatchMetadata: ShapeMatchMetadata | null = null;
+      let alphaDelta = trace.success ? 1 : 0;
+      let betaDelta = trace.success ? 0 : 1;
+
+      if (activityResult && activityResult.length > 0 && activityResult[0]?.output_shapes) {
+        const declaredShapes: string[] = activityResult[0].output_shapes;
+
+        // Validate shapes and compute match score
+        shapeMatchMetadata = validateOutputShapes(declaredShapes, actualShapes, trace.success);
+
+        // Compute Thompson Sampling updates with shape match weighting
+        const tsUpdates = computeThompsonSamplingUpdates(trace.success, shapeMatchMetadata.shapeMatchScore);
+        alphaDelta = tsUpdates.alphaDelta;
+        betaDelta = tsUpdates.betaDelta;
+
+        logger.info('[Thompson Sampling] Using shape-weighted updates', {
+          execution_id: trace.execution_id,
+          activity_id: trace.variant_id,
+          executionSuccess: trace.success,
+          shapeMatchScore: shapeMatchMetadata.shapeMatchScore,
+          weightedScore: tsUpdates.weightedScore,
+          alphaDelta,
+          betaDelta,
+        });
+
+        // Store shape match metadata in trace for analysis
+        if (!trace.metadata) {
+          trace.metadata = {};
+        }
+        (trace.metadata as any).shape_match = shapeMatchMetadata;
+      } else {
+        logger.debug('[Thompson Sampling] No output_shapes in template, using binary success', {
+          execution_id: trace.execution_id,
+          activity_id: trace.variant_id,
+        });
+      }
 
       const updateQuery = `
         UPDATE activity
@@ -1049,8 +1105,8 @@ app.post('/', async (c) => {
 
       const updateParams = {
         activity_id: trace.variant_id, // variant_id is the activity ID
-        alpha_delta: trace.success ? 1 : 0,
-        beta_delta: trace.success ? 0 : 1,
+        alpha_delta: alphaDelta,
+        beta_delta: betaDelta,
         success_delta: trace.success ? 1 : 0,
         failure_delta: trace.success ? 0 : 1,
       };
