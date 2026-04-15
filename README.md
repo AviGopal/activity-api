@@ -16,15 +16,15 @@ This is a TypeScript rewrite of the `repos/metabob-rpc-api` activity system with
 
 ```
 ┌─────────────────┐
-│ metabob-cli     │  (MCP Server)
-│  (activity_     │
-│   manager.py)   │
+│ MiniBob         │  (Primary client - autonomous vessel)
+│ OpenCode        │  (IDE integration - vessel)
+│ Other Vessels   │
 └────────┬────────┘
-         │ HTTP/REST
+         │ HTTP/REST + MCP
          ▼
 ┌─────────────────┐
-│ metabob-        │  (This server - TypeScript/Bun)
-│ activity-api    │  Deployed at {host}/v2/*
+│ metabob-        │  (Learning backend - TypeScript/Bun)
+│ activity-api    │  Deployed at activity.metabob.com
 │  /v2/* routes   │
 └────────┬────────┘
          │
@@ -33,7 +33,7 @@ This is a TypeScript rewrite of the `repos/metabob-rpc-api` activity system with
     ▼         ▼
 ┌────────┐ ┌────────┐
 │SurrealDB│ │ Redis  │
-│(primary)│ │(cache) │
+│(traces) │ │(cache) │
 └────────┘ └────────┘
 ```
 
@@ -144,18 +144,7 @@ curl -X GET https://activity.metabob.com/v2/activities/templates \
 - Audit trails track operations by key_id
 - Fallback ensures high availability
 
-### Deprecated: MiniBob Instance Authentication
-
-**Prior to 2026-04-08**, MiniBob instances authenticated using:
-```bash
-POST /v2/auth/minibob/signin
-{
-  "instance_id": "minibob-local-001",
-  "api_key": "test-api-key-123"
-}
-```
-
-This approach has been **deprecated** and replaced with API key authentication. The `/v2/auth/minibob/signin` endpoint and `minibob_instance` table are read-only and will be removed after migration period.
+**Note**: Prior to 2026-04-08, MiniBob instances used a separate authentication mechanism via `/v2/auth/minibob/signin`. This has been fully migrated to standard API key authentication.
 
 ## API Endpoints
 
