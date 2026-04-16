@@ -80,3 +80,39 @@ DEFINE INDEX IF NOT EXISTS idx_minibob_instance_id
 --   )
 --   DURATION FOR TOKEN 24h
 --   DURATION FOR SESSION 7d;
+
+-- =============================================================================
+-- ACCESS METHOD: apikey_token (Added in migration 064)
+-- =============================================================================
+-- JWT ACCESS method for API key-derived authentication tokens.
+--
+-- Flow:
+-- 1. Client sends: Authorization: ApiKey <key>
+-- 2. Activity-API validates key via identity-vessel
+-- 3. Activity-API generates JWT with AC: 'apikey_token' using jose library
+-- 4. JWT is used with createAuthenticatedClient() for SurrealDB queries
+-- 5. SurrealDB validates JWT against this ACCESS method
+-- 6. $auth is populated from JWT claims for PERMISSIONS enforcement
+--
+-- JWT Claims (set by generateJwtToken in src/services/auth.ts):
+-- {
+--   "NS": "activity-system",
+--   "DB": "learning_loop",
+--   "AC": "apikey_token",
+--   "id": "api_key:<keyId>",
+--   "org_id": "organizations:<orgId>",
+--   "user_id": "users:<userId>",
+--   "scopes": ["read", "write"],
+--   "iat": <timestamp>,
+--   "nbf": <timestamp>,
+--   "exp": <timestamp>
+-- }
+--
+-- IMPORTANT: The KEY must match JWT_SECRET environment variable in Activity-API
+-- Default for dev: 'dev-secret-change-in-production'
+-- =============================================================================
+
+DEFINE ACCESS IF NOT EXISTS apikey_token ON DATABASE TYPE JWT
+  ALGORITHM HS512
+  KEY 'dev-secret-change-in-production'
+  DURATION FOR TOKEN 15m, FOR SESSION 1h;

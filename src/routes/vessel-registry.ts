@@ -6,7 +6,7 @@
  */
 
 import { Hono } from 'hono';
-import { surrealDB } from '../db/surreal';
+import { surrealDB, queryWithAuth } from '../db/surreal';
 import { logger } from '../utils/logger';
 import { getJwtAuthFromContext } from '../middleware/jwtAuth';
 import { computeVesselHealthScore, getOrganizationVesselHealth } from '../services/vessel-health';
@@ -84,7 +84,7 @@ interface VesselRecord {
  */
 app.post('/register', async (c) => {
   const auth = getJwtAuthFromContext(c);
-  if (!auth) {
+  if (!auth || !auth.jwtToken) {
     return c.json({ error: 'JWT authentication required' }, 401);
   }
 
@@ -115,11 +115,16 @@ app.post('/register', async (c) => {
 
   try {
     // First try to get existing vessel to preserve registered_at
+    // Use queryWithAuth so PERMISSIONS on vessel table are respected
     const existingQuery = `SELECT registered_at FROM ${recordId}`;
-    const existing = await surrealDB.query<{ registered_at?: string }[]>(existingQuery);
-    const existingRegisteredAt = existing?.[0]?.[0]?.registered_at;
+    const existing = await queryWithAuth<{ registered_at?: string }>(
+      auth.jwtToken,
+      existingQuery
+    );
+    const existingRegisteredAt = existing?.[0]?.registered_at;
 
     // Upsert vessel record using CONTENT (creates or replaces)
+    // Use queryWithAuth so PERMISSIONS on vessel table are respected
     const now = new Date().toISOString();
     const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
 
@@ -142,22 +147,26 @@ app.post('/register', async (c) => {
       RETURN id, expires_at;
     `;
 
-    const results = await surrealDB.query<{ id: string; expires_at: string }[]>(query, {
-      vesselId: body.vesselId,
-      vesselName: body.vesselName,
-      endpoint: body.endpoint,
-      shapes: body.shapes,
-      capabilities: body.capabilities || [],
-      metadata: body.metadata || {},
-      version: body.metadata?.version,
-      environment: body.metadata?.environment,
-      ttl,
-      expiresAt,
-      orgId: auth.orgId,
-      registeredAt: existingRegisteredAt || now,
-    });
+    const results = await queryWithAuth<{ id: string; expires_at: string }>(
+      auth.jwtToken,
+      query,
+      {
+        vesselId: body.vesselId,
+        vesselName: body.vesselName,
+        endpoint: body.endpoint,
+        shapes: body.shapes,
+        capabilities: body.capabilities || [],
+        metadata: body.metadata || {},
+        version: body.metadata?.version,
+        environment: body.metadata?.environment,
+        ttl,
+        expiresAt,
+        orgId: auth.orgId,
+        registeredAt: existingRegisteredAt || now,
+      }
+    );
 
-    const result = results[0]?.[0];
+    const result = results?.[0];
     if (!result) {
       throw new Error('Failed to register vessel');
     }
@@ -217,6 +226,7 @@ app.get('/discover', async (c) => {
 
   try {
     // Lookup shape in registry to validate it exists
+    // Use queryWithAuth so PERMISSIONS on shape_definition are respected
     const shapeQuery = `
       SELECT name, version, description
       FROM shape_definition
@@ -226,12 +236,13 @@ app.get('/discover', async (c) => {
       LIMIT 1;
     `;
 
-    const shapeResults = await surrealDB.query<{ name: string; version: string; description: string }[]>(
+    const shapeResults = await queryWithAuth<{ name: string; version: string; description: string }>(
+      auth.jwtToken,
       shapeQuery,
       { shape, orgId: auth.orgId }
     );
 
-    const shapeDefinition = shapeResults[0]?.[0];
+    const shapeDefinition = shapeResults?.[0];
     if (!shapeDefinition) {
       return c.json({
         error: 'Shape not found in registry',
@@ -241,6 +252,7 @@ app.get('/discover', async (c) => {
     }
 
     // Find vessels advertising this shape
+    // Use queryWithAuth so PERMISSIONS on vessel are respected
     const vesselQuery = `
       SELECT * FROM vessel
       WHERE $shape IN shapes
@@ -249,12 +261,13 @@ app.get('/discover', async (c) => {
       ORDER BY last_heartbeat DESC;
     `;
 
-    const vessels = await surrealDB.query<VesselRecord[]>(vesselQuery, {
-      shape,
-      orgId: auth.orgId,
-    });
+    const vessels = await queryWithAuth<VesselRecord>(
+      auth.jwtToken,
+      vesselQuery,
+      { shape, orgId: auth.orgId }
+    );
 
-    if (vessels[0]?.length === 0) {
+    if (!vessels || vessels.length === 0) {
       return c.json({
         error: `No vessels found for shape: ${shape}`,
         shape,
@@ -263,6 +276,8 @@ app.get('/discover', async (c) => {
     }
 
     // Record routing trace
+    // Use queryWithAuth so PERMISSIONS on routing_trace are respected
+    // (routing_trace requires org_id = $auth.org_id for CREATE)
     const traceQuery = `
       CREATE routing_trace CONTENT {
         shape: $shape,
@@ -278,27 +293,31 @@ app.get('/discover', async (c) => {
       };
     `;
 
-    await surrealDB.query(traceQuery, {
-      shape,
-      version: version || shapeDefinition.version,
-      selectedVesselId: vessels[0][0]?.id || null,
-      candidates: vessels[0].map((v: VesselRecord) => ({
-        vessel_id: v.id,
-        endpoint: v.endpoint,
-        last_heartbeat: v.last_heartbeat,
-      })),
-      orgId: auth.orgId,
-    });
+    await queryWithAuth(
+      auth.jwtToken,
+      traceQuery,
+      {
+        shape,
+        version: version || shapeDefinition.version,
+        selectedVesselId: vessels[0]?.id || null,
+        candidates: vessels.map((v: VesselRecord) => ({
+          vessel_id: v.id,
+          endpoint: v.endpoint,
+          last_heartbeat: v.last_heartbeat,
+        })),
+        orgId: auth.orgId,
+      }
+    );
 
     logger.info('Vessel discovery', {
       shape,
       version: version || shapeDefinition.version,
       orgId: auth.orgId,
-      found: vessels[0].length,
+      found: vessels.length,
     });
 
     return c.json({
-      vessels: vessels[0],
+      vessels: vessels,
       shape_info: {
         name: shapeDefinition.name,
         version: shapeDefinition.version,
@@ -322,7 +341,7 @@ app.get('/discover', async (c) => {
  */
 app.get('/', async (c) => {
   const auth = getJwtAuthFromContext(c);
-  if (!auth) {
+  if (!auth || !auth.jwtToken) {
     return c.json({ error: 'JWT authentication required' }, 401);
   }
 
@@ -340,11 +359,14 @@ app.get('/', async (c) => {
 
     query += ' ORDER BY last_heartbeat DESC;';
 
-    const vessels = await surrealDB.query<VesselRecord[]>(query, {
-      orgId: auth.orgId,
-    });
+    // Use queryWithAuth so PERMISSIONS on vessel table are respected
+    const vessels = await queryWithAuth<VesselRecord>(
+      auth.jwtToken,
+      query,
+      { orgId: auth.orgId }
+    );
 
-    const vesselList = vessels[0] || [];
+    const vesselList = vessels || [];
     const now = new Date();
     const active = vesselList.filter((v) => new Date(v.expires_at) > now);
     const expired = vesselList.filter((v) => new Date(v.expires_at) <= now);
@@ -369,7 +391,7 @@ app.get('/', async (c) => {
  */
 app.get('/:vesselId', async (c) => {
   const auth = getJwtAuthFromContext(c);
-  if (!auth) {
+  if (!auth || !auth.jwtToken) {
     return c.json({ error: 'JWT authentication required' }, 401);
   }
 
@@ -383,16 +405,18 @@ app.get('/:vesselId', async (c) => {
       LIMIT 1;
     `;
 
-    const vessels = await surrealDB.query<VesselRecord[]>(query, {
-      vesselId,
-      orgId: auth.orgId,
-    });
+    // Use queryWithAuth so PERMISSIONS on vessel table are respected
+    const vessels = await queryWithAuth<VesselRecord>(
+      auth.jwtToken,
+      query,
+      { vesselId, orgId: auth.orgId }
+    );
 
-    if (vessels[0]?.length === 0) {
+    if (!vessels || vessels.length === 0) {
       return c.json({ error: 'Vessel not found' }, 404);
     }
 
-    const vessel = vessels[0][0];
+    const vessel = vessels[0];
     const now = new Date();
     const expiresAt = new Date(vessel.expires_at);
     const isHealthy = expiresAt > now;
@@ -424,7 +448,7 @@ app.get('/:vesselId', async (c) => {
  */
 app.delete('/:vesselId', async (c) => {
   const auth = getJwtAuthFromContext(c);
-  if (!auth) {
+  if (!auth || !auth.jwtToken) {
     return c.json({ error: 'JWT authentication required' }, 401);
   }
 
@@ -437,10 +461,12 @@ app.delete('/:vesselId', async (c) => {
         AND org_id = $orgId;
     `;
 
-    await surrealDB.query(query, {
-      vesselId,
-      orgId: auth.orgId,
-    });
+    // Use queryWithAuth so PERMISSIONS on vessel table are respected
+    await queryWithAuth(
+      auth.jwtToken,
+      query,
+      { vesselId, orgId: auth.orgId }
+    );
 
     logger.info('Vessel unregistered', {
       vesselId,
@@ -466,7 +492,7 @@ app.delete('/:vesselId', async (c) => {
  */
 app.get('/:vesselId/health', async (c) => {
   const auth = getJwtAuthFromContext(c);
-  if (!auth) {
+  if (!auth || !auth.jwtToken) {
     return c.json({ error: 'JWT authentication required' }, 401);
   }
 
@@ -491,12 +517,14 @@ app.get('/:vesselId/health', async (c) => {
         WHERE id = $vesselId AND org_id = $orgId
         LIMIT 1;
       `;
-      const vesselResults = await surrealDB.query<{ endpoint: string }[]>(vesselQuery, {
-        vesselId,
-        orgId: auth.orgId,
-      });
+      // Use queryWithAuth so PERMISSIONS on vessel table are respected
+      const vesselResults = await queryWithAuth<{ endpoint: string }>(
+        auth.jwtToken,
+        vesselQuery,
+        { vesselId, orgId: auth.orgId }
+      );
 
-      const vessel = vesselResults[0]?.[0];
+      const vessel = vesselResults?.[0];
       if (vessel) {
         try {
           const startTime = Date.now();
