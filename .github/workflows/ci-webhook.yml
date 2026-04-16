@@ -98,6 +98,22 @@ jobs:
           echo "lint_errors=${LINT_ERRORS}" >> $GITHUB_OUTPUT
           echo "lint_warnings=${LINT_WARNINGS}" >> $GITHUB_OUTPUT
 
+      - name: Format check
+        id: format
+        continue-on-error: true
+        run: |
+          echo "format_start=$(date +%s%3N)" >> $GITHUB_OUTPUT
+          bun run format:check 2>&1 | tee format.log || echo "format_failed=true" >> $GITHUB_OUTPUT
+          echo "format_end=$(date +%s%3N)" >> $GITHUB_OUTPUT
+
+      - name: Secret scanning
+        id: secrets
+        continue-on-error: true
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+
       - name: Build Docker image (on success)
         id: docker
         if: steps.build.outcome == 'success' && steps.typecheck.outcome == 'success' && steps.test.outcome == 'success'
@@ -147,7 +163,9 @@ jobs:
           # Check if all critical stages passed
           if [ "${{ steps.build.outcome }}" == "success" ] && \
              [ "${{ steps.typecheck.outcome }}" == "success" ] && \
-             [ "${{ steps.test.outcome }}" == "success" ]; then
+             [ "${{ steps.test.outcome }}" == "success" ] && \
+             [ "${{ steps.lint.outcome }}" == "success" ] && \
+             [ "${{ steps.format.outcome }}" == "success" ]; then
             echo "success=true" >> $GITHUB_OUTPUT
           else
             echo "success=false" >> $GITHUB_OUTPUT

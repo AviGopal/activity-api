@@ -2,13 +2,17 @@
  * Centralized Authentication Service
  *
  * Provides JWT token validation, generation, and authentication utilities.
- * Handles both MiniBob RECORD access and API key authentication.
+ *
+ * VESSEL PATTERN (2026-04-12):
+ * - API key validation is delegated to identity-vessel via impulse pattern
+ * - Identity-vessel owns the api_key table and validation logic
+ * - This service does NOT directly query SurrealDB for API key validation
+ * - JWT tokens for SurrealDB access are validated via createAuthenticatedClient()
  *
  * Note: Uses 'jose' library for JWT operations since SurrealDB 3.x removed
  * the crypto::jwt::encode/decode functions.
  */
 
-import { Surreal } from 'surrealdb';
 import * as jose from 'jose';
 import { config } from '../config';
 import { logger } from '../utils/logger';
@@ -26,13 +30,22 @@ export interface JwtPayload {
   scopes?: string[];
 }
 
+/**
+ * Authentication result from identity-vessel impulse resolution.
+ *
+ * IMPORTANT: keyId is REQUIRED for API key authentication.
+ * All audit trails depend on having a valid keyId.
+ */
 export interface AuthContext {
   authenticated: boolean;
   orgId?: string;
   userId?: string;
+  /** API key ID - REQUIRED for api_key authType, used for audit trails */
   keyId?: string;
   scopes?: string[];
   reason?: string;
+  /** Which method resolved the authentication */
+  authMethod?: 'identity-vessel' | 'discovery';
 }
 
 export interface ValidatedToken {
@@ -132,7 +145,7 @@ export async function generateJwtToken(context: {
       NS: config.surrealdb.namespace,
       DB: config.surrealdb.database,
       AC: 'apikey_token',
-      id: context.keyId,
+      id: `api_key:${context.keyId}`,
       org_id: `organizations:${context.orgId}`,
       user_id: `users:${context.userId}`,
       scopes: context.scopes,
@@ -168,16 +181,66 @@ export async function generateJwtToken(context: {
 
 /**
  * Validate API key via identity-vessel
+ *
+ * Tries the configured URL first, then falls back to external URL if internal fails.
  */
 export async function validateApiKeyViaIdentityVessel(
   apiKey: string
 ): Promise<AuthContext> {
-  const identityVesselUrl =
+  // Try primary (internal) URL first
+  const primaryUrl =
     process.env.IDENTITY_VESSEL_URL ||
     'http://identity-vessel.activity-system.svc.cluster.local:8080';
 
+  // External fallback URL (public endpoint)
+  const fallbackUrl =
+    process.env.IDENTITY_VESSEL_EXTERNAL_URL ||
+    'https://identity.metabob.com';
+
+  // Try primary URL
+  const primaryResult = await tryIdentityVesselValidation(apiKey, primaryUrl);
+  if (primaryResult.authenticated) {
+    return primaryResult;
+  }
+
+  // If primary failed due to network error, try external fallback
+  const isNetworkError =
+    primaryResult.reason?.includes('Network error') ||
+    primaryResult.reason?.includes('fetch') ||
+    primaryResult.reason?.includes('timeout') ||
+    primaryResult.reason?.includes('ECONNREFUSED') ||
+    primaryResult.reason?.includes('returned 5') ||
+    primaryResult.reason?.includes('getaddrinfo');
+
+  if (isNetworkError && primaryUrl !== fallbackUrl) {
+    logger.info('[auth] Primary identity-vessel unavailable, trying external URL', {
+      primaryUrl,
+      fallbackUrl,
+      reason: primaryResult.reason,
+    });
+
+    const fallbackResult = await tryIdentityVesselValidation(apiKey, fallbackUrl);
+    if (fallbackResult.authenticated) {
+      return fallbackResult;
+    }
+
+    // Both failed - return the fallback error (more likely to be meaningful)
+    return fallbackResult;
+  }
+
+  // Primary returned a definitive error (not network), return as-is
+  return primaryResult;
+}
+
+/**
+ * Try to validate API key against a specific identity-vessel URL
+ */
+async function tryIdentityVesselValidation(
+  apiKey: string,
+  identityVesselUrl: string
+): Promise<AuthContext> {
   try {
-    logger.debug('[auth] Validating API key via identity-vessel');
+    logger.debug('[auth] Validating API key via identity-vessel', { url: identityVesselUrl });
 
     const response = await fetch(`${identityVesselUrl}/v1/auth/resolve`, {
       method: 'POST',
@@ -196,6 +259,7 @@ export async function validateApiKeyViaIdentityVessel(
 
     if (!response.ok) {
       logger.warn('[auth] Identity vessel validation failed', {
+        url: identityVesselUrl,
         status: response.status,
       });
       return {
@@ -224,6 +288,7 @@ export async function validateApiKeyViaIdentityVessel(
     }
 
     logger.info('[auth] Identity vessel validated key', {
+      url: identityVesselUrl,
       userId: result.data.userId,
     });
 
@@ -236,6 +301,7 @@ export async function validateApiKeyViaIdentityVessel(
     };
   } catch (error) {
     logger.error('[auth] Identity vessel validation error', {
+      url: identityVesselUrl,
       error: error instanceof Error ? error.message : String(error),
     });
     return {
@@ -246,119 +312,40 @@ export async function validateApiKeyViaIdentityVessel(
 }
 
 // =============================================================================
-// Direct API Key Validation (Fallback)
+// Direct API Key Validation - REMOVED (Vessel Pattern)
 // =============================================================================
-// When identity-vessel is unavailable, validate API keys directly via SurrealDB.
-// Uses SHA-256 hash for fast O(1) lookup (no Argon2, which is slow by design).
 //
-// This is a FALLBACK mechanism. Primary auth should go through identity-vessel.
+// REMOVED 2026-04-12: Direct SurrealDB validation violates the vessel idiom.
+//
+// The foundation principle states: "Resolvers live where data lives"
+// - Identity-vessel owns the api_key table
+// - Identity-vessel resolves authentication impulses
+// - Other vessels should NOT duplicate validation logic
+//
+// If identity-vessel is unavailable:
+// - Use discovery-vessel to find another identity resolver
+// - Or fail the authentication (fail-safe behavior)
+//
+// DO NOT add direct SurrealDB queries here. If you need to change auth logic,
+// update identity-vessel's resolvers/auth.ts instead.
 // =============================================================================
 
 /**
- * Compute SHA-256 hash of an API key for direct validation.
- * Uses Web Crypto API (available in Bun).
- */
-export async function hashApiKey(apiKey: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const data = encoder.encode(apiKey);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-/**
- * Validate API key directly via SurrealDB lookup.
- * This is a fallback when identity-vessel is unavailable.
+ * Validate API key via identity-vessel (vessel pattern)
+ *
+ * VESSEL PATTERN (2026-04-12):
+ * - Identity-vessel is the single source of truth for API key validation
+ * - This function sends an AuthenticationImpulse to identity-vessel
+ * - If identity-vessel is unavailable, use discovery-vessel to find it
+ * - Do NOT fall back to direct SurrealDB queries (violates vessel idiom)
  *
  * @param apiKey - Raw API key from Authorization header
  * @returns AuthContext with validation result
  */
-export async function validateApiKeyDirect(apiKey: string): Promise<AuthContext> {
-  try {
-    logger.debug('[auth] Validating API key directly via SurrealDB');
-
-    // Hash the API key for lookup
-    const keyHash = await hashApiKey(apiKey);
-
-    // Import surrealDB here to avoid circular dependency
-    const { surrealDB } = await import('../db/surreal');
-
-    // Query api_key table with hash lookup
-    // Check is_active and expiration in the query
-    const result = await surrealDB.query<{
-      id: string;
-      org_id: string;
-      user_id?: string;
-      scopes: string[];
-      expires_at?: string;
-      is_active: boolean;
-    }>(
-      `SELECT id, org_id, user_id, scopes, expires_at, is_active
-       FROM api_key
-       WHERE key_hash = $key_hash
-         AND is_active = true
-         AND (expires_at IS NONE OR expires_at > time::now())
-       LIMIT 1`,
-      { key_hash: keyHash }
-    );
-
-    if (!result || result.length === 0) {
-      logger.debug('[auth] API key not found or inactive');
-      return {
-        authenticated: false,
-        reason: 'API key not found or inactive',
-      };
-    }
-
-    const keyRecord = result[0];
-
-    // Update last_used_at asynchronously (don't await to avoid blocking)
-    surrealDB
-      .query(
-        `UPDATE api_key SET last_used_at = time::now() WHERE id = $id`,
-        { id: keyRecord.id }
-      )
-      .catch(err => {
-        logger.warn('[auth] Failed to update api_key last_used_at', {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      });
-
-    logger.info('[auth] API key validated directly via SurrealDB', {
-      keyId: keyRecord.id,
-      orgId: keyRecord.org_id,
-    });
-
-    return {
-      authenticated: true,
-      orgId: keyRecord.org_id,
-      userId: keyRecord.user_id,
-      keyId: String(keyRecord.id),
-      scopes: keyRecord.scopes || ['read', 'write'],
-    };
-  } catch (error) {
-    logger.error('[auth] Direct API key validation error', {
-      error: error instanceof Error ? error.message : String(error),
-    });
-    return {
-      authenticated: false,
-      reason: error instanceof Error ? error.message : 'Validation failed',
-    };
-  }
-}
-
-/**
- * Validate API key with fallback strategy:
- * 1. Try identity-vessel first (primary)
- * 2. Fall back to direct SurrealDB lookup if identity-vessel fails
- *
- * @param apiKey - Raw API key from Authorization header
- * @returns AuthContext with validation result and method used
- */
 export async function validateApiKeyWithFallback(
   apiKey: string
-): Promise<AuthContext & { authMethod?: 'identity-vessel' | 'direct' }> {
-  // Try identity-vessel first
+): Promise<AuthContext> {
+  // Try configured identity-vessel first
   const identityResult = await validateApiKeyViaIdentityVessel(apiKey);
 
   if (identityResult.authenticated) {
@@ -370,7 +357,6 @@ export async function validateApiKeyWithFallback(
   }
 
   // Check if identity-vessel returned a specific error (vs network failure)
-  // Network failures have reasons like "Network error" or timeout messages
   const isNetworkError =
     identityResult.reason?.includes('Network error') ||
     identityResult.reason?.includes('fetch') ||
@@ -379,31 +365,138 @@ export async function validateApiKeyWithFallback(
     identityResult.reason?.includes('returned 5');
 
   if (isNetworkError) {
-    logger.info('[auth] Identity-vessel unavailable, trying direct validation', {
+    // Try discovery-vessel to find identity-vessel
+    logger.info('[auth] Identity-vessel unavailable, trying discovery', {
       reason: identityResult.reason,
     });
 
-    // Fall back to direct validation
-    const directResult = await validateApiKeyDirect(apiKey);
-
-    if (directResult.authenticated) {
-      return {
-        ...directResult,
-        authMethod: 'direct',
-      };
+    const discoveryResult = await validateApiKeyViaDiscovery(apiKey);
+    if (discoveryResult.authenticated) {
+      return discoveryResult;
     }
 
-    // Both methods failed
+    // Discovery also failed - fail the authentication
+    // This is fail-safe: if we can't validate, we don't authenticate
+    logger.warn('[auth] Both identity-vessel and discovery unavailable', {
+      identityReason: identityResult.reason,
+      discoveryReason: discoveryResult.reason,
+    });
+
     return {
       authenticated: false,
-      reason: `Identity-vessel unavailable and direct validation failed: ${directResult.reason}`,
+      reason: 'Authentication service unavailable',
     };
   }
 
   // Identity-vessel returned a definitive "invalid key" response
-  // Don't fall back in this case - the key is genuinely invalid
+  // Don't retry - the key is genuinely invalid
   return {
     authenticated: false,
     reason: identityResult.reason || 'API key validation failed',
   };
+}
+
+/**
+ * Try to find identity-vessel via discovery and validate API key
+ */
+async function validateApiKeyViaDiscovery(apiKey: string): Promise<AuthContext> {
+  const discoveryUrl =
+    process.env.DISCOVERY_VESSEL_ENDPOINT ||
+    'http://discovery-vessel.activity-system.svc.cluster.local:8080';
+
+  try {
+    logger.debug('[auth] Discovering identity-vessel via discovery-vessel');
+
+    // Query discovery-vessel for vessels that resolve 'authentication' shape
+    const discoverResponse = await fetch(`${discoveryUrl}/v1/discover`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        shape: 'authentication',
+        capabilities: ['api_key_validation'],
+      }),
+      signal: AbortSignal.timeout(3000),
+    });
+
+    if (!discoverResponse.ok) {
+      return {
+        authenticated: false,
+        reason: `Discovery failed: ${discoverResponse.status}`,
+      };
+    }
+
+    const discovered = (await discoverResponse.json()) as {
+      vessels?: Array<{ endpoint: string; vesselId: string }>;
+    };
+
+    if (!discovered.vessels || discovered.vessels.length === 0) {
+      return {
+        authenticated: false,
+        reason: 'No identity vessels discovered',
+      };
+    }
+
+    // Try first discovered vessel
+    const vessel = discovered.vessels[0];
+    logger.info('[auth] Found identity-vessel via discovery', {
+      vesselId: vessel.vesselId,
+      endpoint: vessel.endpoint,
+    });
+
+    // Send authentication impulse to discovered vessel
+    const authResponse = await fetch(`${vessel.endpoint}/v1/auth/resolve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        impulse: {
+          type: 'authentication',
+          pointer: { type: 'apiKey', apiKey },
+        },
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!authResponse.ok) {
+      return {
+        authenticated: false,
+        reason: `Discovered vessel returned ${authResponse.status}`,
+      };
+    }
+
+    const result = (await authResponse.json()) as {
+      success: boolean;
+      data?: {
+        authenticated: boolean;
+        orgId: string;
+        userId: string;
+        keyId: string;
+        scopes: string[];
+        reason?: string;
+      };
+    };
+
+    if (!result.success || !result.data?.authenticated) {
+      return {
+        authenticated: false,
+        reason: result.data?.reason || 'Validation failed',
+      };
+    }
+
+    return {
+      authenticated: true,
+      orgId: result.data.orgId,
+      userId: result.data.userId,
+      keyId: result.data.keyId,
+      scopes: result.data.scopes,
+      authMethod: 'discovery',
+    };
+  } catch (error) {
+    logger.warn('[auth] Discovery-based validation failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      authenticated: false,
+      reason: error instanceof Error ? error.message : 'Discovery failed',
+    };
+  }
 }

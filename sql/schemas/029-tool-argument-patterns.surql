@@ -65,6 +65,19 @@ DEFINE FIELD IF NOT EXISTS avg_execution_ms ON tool_argument_pattern TYPE float
 DEFINE FIELD IF NOT EXISTS failure_counts ON tool_argument_pattern TYPE option<object> FLEXIBLE
   COMMENT "Map of validation failure types to counts for learning which failures are common";
 
+-- Per-invocation failure details (added in migration 060)
+DEFINE FIELD IF NOT EXISTS failure_type ON tool_argument_pattern TYPE option<string>
+  COMMENT "Type of failure if tool execution failed (validation_error, execution_error, timeout)";
+
+DEFINE FIELD IF NOT EXISTS failure_reason ON tool_argument_pattern TYPE option<string>
+  COMMENT "Detailed failure reason/error message if tool execution failed";
+
+DEFINE FIELD IF NOT EXISTS tool_succeeded ON tool_argument_pattern TYPE option<bool>
+  COMMENT "Whether the tool execution succeeded (true/false/null for unknown)";
+
+DEFINE FIELD IF NOT EXISTS execution_ms ON tool_argument_pattern TYPE option<float>
+  COMMENT "Execution time in milliseconds for this specific invocation";
+
 DEFINE FIELD IF NOT EXISTS last_used_at ON tool_argument_pattern TYPE option<datetime>
   COMMENT "Timestamp of last usage";
 

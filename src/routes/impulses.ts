@@ -24,10 +24,6 @@ import {
 } from '../models/schemas';
 import { config } from '../config';
 import {
-  formatAnalysisResultAsMarkdown,
-  formatCochangeAsMarkdown,
-  formatImpactAsMarkdown,
-  formatSearchResultsAsMarkdown,
   formatToolRiskProfileAsMarkdown,
   formatCompositionSuccessAsMarkdown,
   formatImpulseRelevanceAsMarkdown,
@@ -37,102 +33,6 @@ import { getJwtAuthFromContext, type JwtAuthContext } from '../middleware/jwtAut
 import activitiesRouter from './activities';
 
 const router = new Hono();
-
-/**
- * Proxy request to Analysis API [DEPRECATED - ARCHITECTURE DRIFT]
- *
- * TODO: This violates "Resolvers live WHERE THE DATA IS" principle.
- *
- * PROBLEM: The activity-api backend is proxying Analysis API data through
- * impulse resolution. This makes the backend act as a universal resolver
- * instead of letting vessels access the Analysis API directly.
- *
- * SOLUTION: Analysis API should provide its own /v2/impulses/resolve endpoint
- * - Vessels can call Analysis API directly for their impulse types
- * - Analysis API resolves impulses like 'analysisResult', 'cochangeSuggestions', etc.
- * - Activity-api backend only stores traces, doesn't proxy data
- *
- * This function is retained for reference but analysis types now return
- * an error directing vessels to use the Analysis API directly.
- *
- * Original: Proxy request to Analysis API with retry and timeout
- * Returns null on failure (graceful degradation)
- */
-async function proxyToAnalysisApi<T>(
-  endpoint: string,
-  options: {
-    method?: 'GET' | 'POST';
-    body?: unknown;
-    sessionId?: string;
-    params?: Record<string, string | number>;
-  } = {}
-): Promise<T | null> {
-  const { method = 'GET', body, sessionId, params } = options;
-  const baseUrl = config.analysisApi.url;
-
-  // Build URL with query params
-  let url = `${baseUrl}${endpoint}`;
-  if (params && Object.keys(params).length > 0) {
-    const searchParams = new URLSearchParams();
-    for (const [key, value] of Object.entries(params)) {
-      searchParams.append(key, String(value));
-    }
-    url += `?${searchParams.toString()}`;
-  }
-
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    // Internal service key for service-to-service calls
-    'X-Internal-Api-Key': process.env.INTERNAL_API_KEY || 'metabob-internal-service-key-dev',
-  };
-  if (sessionId) {
-    headers['X-Session-ID'] = sessionId;
-  }
-
-  for (let attempt = 0; attempt < config.analysisApi.retryAttempts; attempt++) {
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), config.analysisApi.timeout);
-
-      const response = await fetch(url, {
-        method,
-        headers,
-        body: body ? JSON.stringify(body) : undefined,
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        logger.warn('Analysis API error', {
-          endpoint,
-          status: response.status,
-          attempt: attempt + 1,
-        });
-
-        if (response.status >= 500 && attempt < config.analysisApi.retryAttempts - 1) {
-          await new Promise(r => setTimeout(r, config.analysisApi.retryDelay * (attempt + 1)));
-          continue;
-        }
-        return null;
-      }
-
-      return await response.json() as T;
-    } catch (error) {
-      logger.warn('Analysis API request failed', {
-        endpoint,
-        error: error instanceof Error ? error.message : 'Unknown error',
-        attempt: attempt + 1,
-      });
-
-      if (attempt < config.analysisApi.retryAttempts - 1) {
-        await new Promise(r => setTimeout(r, config.analysisApi.retryDelay * (attempt + 1)));
-      }
-    }
-  }
-
-  return null;
-}
 
 /**
  * POST /v2/impulses
@@ -175,7 +75,7 @@ router.post('/', async (c) => {
       // Use keyId or userId for audit trail
       // Schema expects: option<string | record<users> | record<api_key>>
       if (jwtAuth.keyId) {
-        created_by = `api_key:${jwtAuth.keyId}`;
+        created_by = jwtAuth.keyId;
       } else if (jwtAuth.userId) {
         created_by = `users:${jwtAuth.userId}`;
       } else {
@@ -208,34 +108,23 @@ router.post('/', async (c) => {
     });
 
     // Helper to execute queries with proper auth context
-    // Use authenticated query when JWT is present (for RBAC), otherwise root
+    // For API key auth, use root credentials (JWT token is self-signed, not valid for SurrealDB)
+    // For real JWT auth (from SurrealDB ACCESS), use queryWithAuth for RBAC
     const executeQuery = async <T>(sql: string, params: Record<string, any>): Promise<T[]> => {
+      // API key auth generates self-signed JWTs that SurrealDB can't validate
+      // Use root credentials instead, filtering is done via query params
+      if (jwtAuth?.authType === 'apikey') {
+        logger.debug('Using root query for API key auth (self-signed JWT)', { orgId: jwtAuth.orgId });
+        return surrealDB.query<T>(sql, params);
+      }
+      // Real JWT auth (from SurrealDB ACCESS method) can use queryWithAuth for RBAC
+      // Note: After the apikey check above, authType is narrowed to 'jwt' | 'minibob_token' | undefined
       if (jwtAuth?.jwtToken) {
-        logger.debug('Using authenticated query with JWT', { hasToken: true });
+        logger.debug('Using authenticated query with JWT', { hasToken: true, authType: jwtAuth.authType });
         return queryWithAuth<T>(jwtAuth.jwtToken, sql, params);
       }
       return surrealDB.query<T>(sql, params);
     };
-
-    // Check if impulse already exists (by id, RBAC handles org_id filtering)
-    const existsQuery = `
-      SELECT id FROM impulse
-      WHERE id = $impulse_id
-      LIMIT 1
-    `;
-
-    const existing = await executeQuery<any>(existsQuery, {
-      impulse_id,
-    });
-
-    if (existing.length > 0) {
-      logger.warn('Impulse already exists', { impulse_id, project_id });
-      return c.json({
-        error: 'Impulse already exists',
-        impulse_id,
-        project_id,
-      }, 400);
-    }
 
     // Derive shape from impulse_data.type, use pointer directly from impulse_data
     const shape = impulse_data.type || 'unknown';
@@ -244,6 +133,7 @@ router.post('/', async (c) => {
 
     // Build query params dynamically to avoid sending null for optional fields
     // SurrealDB's option<T> expects either a value or the field to be omitted, not null
+    // Note: SurrealDB 3.x requires Date objects for datetime fields, not ISO strings
     const params: Record<string, any> = {
       impulse_id,
       pointer,
@@ -252,6 +142,7 @@ router.post('/', async (c) => {
       token_estimate: impulse_data.budget || 0,
       org_id,
       project_id,
+      created_at: new Date(), // Pass Date object for SurrealDB datetime field
     };
 
     // Only include content if it has a value (avoid null → NULL coercion issue)
@@ -266,9 +157,12 @@ router.post('/', async (c) => {
       params.created_by = created_by;
     }
 
-    // Create impulse record using new schema
-    const createQuery = `
-      CREATE impulse CONTENT {
+    // Use UPSERT for idempotency (creates if not exists, updates if exists)
+    // SurrealDB 3.x UPDATE only modifies existing records; UPSERT creates if missing
+    // Use backtick escaping for IDs with hyphens (e.g., `impulse:\`goal-123\``)
+    // Note: type::thing() and type::record() don't work in UPSERT context
+    const createOrUpdateQuery = `
+      UPSERT impulse:\`${impulse_id}\` CONTENT {
         id: $impulse_id,
         pointer: $pointer,
         shape: $shape,
@@ -278,24 +172,18 @@ router.post('/', async (c) => {
         org_id: $org_id,
         project_id: $project_id,
         ${createdByField}
-        created_at: time::now()
+        created_at: $created_at
       }
     `;
 
-    await executeQuery<any>(createQuery, params);
+    const [result] = await executeQuery<any>(createOrUpdateQuery, params);
 
-    // Query the created record to get timestamps
-    const selectQuery = `SELECT * FROM impulse WHERE id = $impulse_id LIMIT 1`;
-    const selectResult = await executeQuery<any>(selectQuery, {
-      impulse_id,
-    });
-
-    if (!selectResult || selectResult.length === 0) {
-      logger.error('Failed to retrieve created impulse', { impulse_id });
+    if (!result) {
+      logger.error('Failed to create/update impulse - no record returned', { impulse_id });
       throw new Error('Failed to create impulse in SurrealDB');
     }
 
-    const created = selectResult[0];
+    const created = result;
 
     logger.info('Impulse created', {
       impulse_id,
@@ -738,150 +626,184 @@ router.post('/resolve', async (c) => {
         break;
       }
 
-      case 'recentExecutions': {
-        // Query recent executions with optional filters
-        // Supports: filter (failed|successful|all), limit, activityId, templateId, since
+      case 'executionTraceList': {
+        // Metadata-first impulse type: returns trace pointers with rich metadata
+        // Replaces: recentExecutions (clean removal)
         const filter = pointer.filter || 'all';
-        const limit = pointer.limit || 10;
         const activityId = pointer.activityId;
         const templateId = pointer.templateId;
-        const since = pointer.since; // ISO date string
+        const since = pointer.since;
+        const limit = pointer.limit || 50;
 
-        let whereClause = '';
+        // Build WHERE clause dynamically
+        const conditions: string[] = [];
         const params: Record<string, any> = { limit };
 
-        // Build WHERE clause based on filters
-        const conditions: string[] = [];
-
-        if (filter === 'failed') {
-          conditions.push('status = "failed"');
-        } else if (filter === 'successful') {
-          conditions.push('status = "completed"');
+        if (filter === 'successful') {
+          conditions.push('success = true');
+        } else if (filter === 'failed') {
+          conditions.push('success = false');
         }
 
         if (activityId) {
-          conditions.push('activity_id = $activity_id');
-          params.activity_id = activityId;
+          conditions.push('activity_id = $activityId');
+          params.activityId = activityId;
         }
 
         if (templateId) {
-          conditions.push('template_id = $template_id');
-          params.template_id = templateId;
+          conditions.push('activity_id = $templateId');
+          params.templateId = templateId;
         }
 
         if (since) {
-          conditions.push('created_at >= $since');
+          conditions.push('executed_at >= type::datetime($since)');
           params.since = since;
         }
 
-        if (conditions.length > 0) {
-          whereClause = 'WHERE ' + conditions.join(' AND ');
-        }
+        const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
 
-        const query = `
-          SELECT * FROM activity_execution_traces
-          ${whereClause}
-          ORDER BY created_at DESC
-          LIMIT $limit
-        `;
-
-        const result = await surrealDB.query<any>(query, params);
-
-        if (result.length === 0) {
-          content = `# Recent Executions\n\nNo executions found matching filter: ${filter}`;
-        } else {
-          // Format as summary markdown with links to individual traces
-          content = formatRecentExecutionsAsMarkdown(result, filter);
-        }
-        break;
-      }
-
-      case 'failurePatterns': {
-        // Analyze failure patterns across recent executions
-        // Groups failures by error type, template, and suggests improvements
-        const limit = pointer.limit || 50;
-        const since = pointer.since || new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-
+        // Query execution table
         const query = `
           SELECT
-            variant_id as template_id,
-            status,
-            execution_trace.tasks.*.result.error as errors,
-            execution_trace.tasks.*.toolCalls.*.result.error as tool_errors,
-            created_at
-          FROM activity_execution_traces
-          WHERE status = "failure" AND created_at >= $since
-          ORDER BY created_at DESC
-          LIMIT $limit
-        `;
-
-        const result = await surrealDB.query<any>(query, { limit, since });
-
-        if (result.length === 0) {
-          content = `# Failure Patterns\n\nNo failures found in the last 7 days. System is healthy!`;
-        } else {
-          content = formatFailurePatternsAsMarkdown(result);
-        }
-        break;
-      }
-
-      case 'successPatterns': {
-        // Analyze success patterns to identify what works well
-        const limit = pointer.limit || 50;
-        const since = pointer.since || new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-
-        const query = `
-          SELECT
-            variant_id as template_id,
+            id,
+            activity_id,
+            success,
             duration_ms,
             cost_usd,
-            execution_trace.tasks.*.toolCalls as tool_usage,
-            created_at
-          FROM activity_execution_traces
-          WHERE status = "success" AND created_at >= $since
-          ORDER BY duration_ms ASC
+            executed_at
+          FROM execution
+          ${whereClause}
+          ORDER BY executed_at DESC
           LIMIT $limit
         `;
 
-        const result = await surrealDB.query<any>(query, { limit, since });
+        const traces = await surrealDB.query<any>(query, params);
 
-        if (result.length === 0) {
-          content = `# Success Patterns\n\nNo successful executions found in the last 7 days.`;
-        } else {
-          content = formatSuccessPatternsAsMarkdown(result);
-        }
+        // Compute metadata
+        const successCount = traces.filter(t => t.success === true).length;
+        const failureCount = traces.filter(t => t.success === false).length;
+        const totalDuration = traces.reduce((sum, t) => sum + (t.duration_ms || 0), 0);
+        const totalCost = traces.reduce((sum, t) => sum + (t.cost_usd || 0), 0);
+
+        // Get unique templates and activities
+        const uniqueTemplates = [...new Set(traces.map(t => t.activity_id))];
+        const uniqueActivities = [...new Set(traces.map(t => t.activity_id))];
+
+        // Format metadata-first response
+        const metadata = {
+          rowCount: traces.length,
+          dateRange: {
+            start: traces[traces.length - 1]?.executed_at || null,
+            end: traces[0]?.executed_at || null
+          },
+          availableOps: ['filter', 'expand', 'group'],
+          filterParams: {
+            status: ['success', 'failure'],
+            availableTemplates: uniqueTemplates,
+            availableActivities: uniqueActivities
+          },
+          summary: {
+            successCount,
+            failureCount,
+            totalDuration,
+            totalCost
+          }
+        };
+
+        // Add pointers to full traces
+        const tracesWithPointers = traces.map(t => ({
+          id: t.id,
+          templateId: t.activity_id,
+          activityId: t.activity_id,
+          status: t.success ? 'success' : 'failure',
+          duration_ms: t.duration_ms,
+          cost_usd: t.cost_usd,
+          created_at: t.executed_at,
+          pointer: { type: 'activityExecutionTrace', executionId: t.id }
+        }));
+
+        content = JSON.stringify({
+          loaded: false,
+          metadata,
+          content: { traces: tracesWithPointers }
+        }, null, 2);
         break;
       }
 
-      case 'templateComparison': {
-        // Compare performance between template variants
+      case 'variantMetricsSummary': {
+        // Metadata-first impulse type: returns pre-computed metrics per variant
+        // Replaces: templateComparison (clean removal)
         if (!pointer.activityId) {
           return c.json({
             success: false,
-            error: 'activityId required for templateComparison pointer',
+            error: 'variantMetricsSummary requires activityId',
           } as ImpulseResolveResponse, 400);
         }
 
+        // Query execution table directly and compute per-variant metrics
+        // Note: v_activity_score groups by activity_id only, not variant_id
         const query = `
           SELECT
-            variant_id as template_id,
-            count() as executions,
-            math::mean(duration_ms) as avg_duration,
-            math::mean(cost_usd) as avg_cost,
-            count(success = true) / count() as success_rate
-          FROM activity_execution_traces
-          WHERE activity_id = $activity_id
-          GROUP BY variant_id
+            activity_id,
+            count() AS total_executions,
+            count(success = true) AS successful_executions,
+            count(success = false) AS failed_executions,
+            count(success = true) + 1 AS thompson_alpha,
+            count(success = false) + 1 AS thompson_beta,
+            <float> count(success = true) / <float> count() AS success_rate,
+            math::mean(<float> duration_ms) AS avg_duration_ms,
+            math::mean(<float> cost_usd) AS avg_cost_usd
+          FROM execution
+          WHERE activity_id CONTAINS $activityId
+          GROUP BY activity_id
           ORDER BY success_rate DESC
         `;
 
-        const result = await surrealDB.query<any>(query, { activity_id: pointer.activityId });
+        const variants = await surrealDB.query<any>(query, { activityId: pointer.activityId });
 
-        if (result.length === 0) {
-          content = `# Template Comparison\n\nNo executions found for activity: ${pointer.activityId}`;
-        } else {
-          content = formatTemplateComparisonAsMarkdown(result, pointer.activityId);
+        if (variants.length === 0) {
+          content = JSON.stringify({
+            loaded: false,
+            metadata: { rowCount: 0, baseActivityId: pointer.activityId, variantCount: 0 },
+            content: { variants: [] }
+          }, null, 2);
+          break;
         }
+
+        // Compute metadata
+        const bestVariant = variants[0];
+        const worstVariant = variants[variants.length - 1];
+        const avgSuccessRate = variants.reduce((sum, v) => sum + v.success_rate, 0) / variants.length;
+
+        const metadata = {
+          rowCount: variants.length,
+          baseActivityId: pointer.activityId,
+          variantCount: variants.length,
+          availableOps: ['filter', 'compare', 'resolve'],
+          summary: {
+            bestVariant: { id: bestVariant.activity_id, successRate: bestVariant.success_rate },
+            worstVariant: { id: worstVariant.activity_id, successRate: worstVariant.success_rate },
+            avgSuccessRate
+          }
+        };
+
+        // Add pointers to full templates
+        const variantsWithPointers = variants.map(v => ({
+          variantId: v.activity_id,
+          successRate: v.success_rate,
+          executionCount: v.successful_executions + v.failed_executions,
+          avgDuration: v.avg_duration_ms,
+          avgCost: v.avg_cost_usd,
+          thompsonAlpha: v.thompson_alpha,
+          thompsonBeta: v.thompson_beta,
+          pointer: { type: 'activityTemplate', templateId: v.activity_id }
+        }));
+
+        content = JSON.stringify({
+          loaded: false,
+          metadata,
+          content: { variants: variantsWithPointers }
+        }, null, 2);
         break;
       }
 
@@ -910,229 +832,19 @@ router.post('/resolve', async (c) => {
         } as ImpulseResolveResponse, 410); // 410 Gone - permanent deprecation
       }
 
-      /* ORIGINAL IMPLEMENTATION - COMMENTED OUT FOR REFERENCE
-      case 'analysisResult': {
-        // Load a single analysis problem/issue
-        if (!pointer.resultId) {
-          return c.json({
-            success: false,
-            error: 'resultId required for analysisResult pointer',
-          } as ImpulseResolveResponse, 400);
-        }
-
-        const sessionId = c.req.header('X-Session-ID');
-        const analysisResult = await proxyToAnalysisApi<{ problem: any }>(
-          `/v2/analysis/problems/${pointer.resultId}`,
-          { method: 'GET', sessionId: sessionId || undefined }
-        );
-
-        if (!analysisResult || !analysisResult.problem) {
-          content = `# Analysis Result\n\nProblem not found: ${pointer.resultId}\n\n*The analysis API may be unavailable or the problem does not exist.*`;
-        } else {
-          content = formatAnalysisResultAsMarkdown(
-            analysisResult.problem,
-            pointer.format || 'full'
-          );
-        }
-        break;
-      }
-
-      case 'cochangeSuggestions': {
-        // Get co-change suggestions for components
-        if (!pointer.componentIds || pointer.componentIds.length === 0) {
-          return c.json({
-            success: false,
-            error: 'componentIds required for cochangeSuggestions pointer',
-          } as ImpulseResolveResponse, 400);
-        }
-
-        const sessionId = c.req.header('X-Session-ID');
-
-        // Extract file paths from component IDs
-        const changedFiles = [...new Set(
-          pointer.componentIds.map(id => id.split('::')[0])
-        )];
-
-        const cochangeResult = await proxyToAnalysisApi<{ suggestions: any[] }>(
-          '/v2/analysis/cochange/suggest',
-          {
-            method: 'POST',
-            sessionId: sessionId || undefined,
-            body: {
-              changed_files: changedFiles,
-              limit: pointer.limit || 5,
-              confidence_threshold: 0.3,
-            },
-          }
-        );
-
-        if (!cochangeResult || !cochangeResult.suggestions) {
-          content = `# Co-Change Suggestions\n\nUnable to get co-change suggestions.\n\n*The analysis API may be unavailable or the codebase is not indexed.*`;
-        } else {
-          content = formatCochangeAsMarkdown(cochangeResult.suggestions);
-        }
-        break;
-      }
-
-      case 'impactAnalysis': {
-        // Get impact analysis for changed files
-        if (!pointer.changedFiles || pointer.changedFiles.length === 0) {
-          return c.json({
-            success: false,
-            error: 'changedFiles required for impactAnalysis pointer',
-          } as ImpulseResolveResponse, 400);
-        }
-
-        const sessionId = c.req.header('X-Session-ID');
-        const impactResult = await proxyToAnalysisApi<any>(
-          '/v2/analysis/impact',
-          {
-            method: 'POST',
-            sessionId: sessionId || undefined,
-            body: {
-              changed_files: pointer.changedFiles,
-              max_depth: pointer.maxDepth || 2,
-              include_tests: true,
-            },
-          }
-        );
-
-        if (!impactResult) {
-          content = `# Impact Analysis\n\nUnable to perform impact analysis.\n\n*The analysis API may be unavailable or the codebase is not indexed.*`;
-        } else {
-          content = formatImpactAsMarkdown(impactResult);
-        }
-        break;
-      }
-
-      case 'codebaseSearch': {
-        // Search the indexed codebase
-        if (!pointer.query) {
-          return c.json({
-            success: false,
-            error: 'query required for codebaseSearch pointer',
-          } as ImpulseResolveResponse, 400);
-        }
-
-        const sessionId = c.req.header('X-Session-ID');
-        const searchResult = await proxyToAnalysisApi<{ results: any[] }>(
-          '/v2/analysis/search',
-          {
-            method: 'POST',
-            sessionId: sessionId || undefined,
-            body: {
-              query: pointer.query,
-              limit: pointer.limit || 10,
-              filters: {
-                severity: pointer.severity,
-                category: pointer.category,
-              },
-            },
-          }
-        );
-
-        if (!searchResult || !searchResult.results) {
-          content = `# Codebase Search: "${pointer.query}"\n\nUnable to search codebase.\n\n*The analysis API may be unavailable or the codebase is not indexed.*`;
-        } else {
-          content = formatSearchResultsAsMarkdown(searchResult.results, pointer.query);
-        }
-        break;
-      }
-      END COMMENTED OUT ORIGINAL IMPLEMENTATION */
-
       case 'problemCluster': {
-        // Impulse-driven problem investigation - returns METADATA not content
-        // This enables LLM to reason about problem shape before loading full data
-        const sessionId = c.req.header('X-Session-ID');
-        if (!sessionId) {
-          return c.json({
-            success: false,
-            error: 'X-Session-ID header required for problemCluster pointer',
-          } as ImpulseResolveResponse, 400);
-        }
-
-        // Call analysis-api impulse endpoint with filter params from pointer
-        const impulseResult = await proxyToAnalysisApi<{
-          success: boolean;
-          loaded: boolean;
-          metadata: {
-            shape: string;
-            rowCount: number;
-            summary: string;
-            bySeverity: Record<string, number>;
-            byCategory: Record<string, number>;
-            topIssue?: {
-              category: string;
-              brief: string;
-              impactScore?: number;
-              severity: string;
-            };
-            availableOps: string[];
-            filterParams: {
-              severity?: string[];
-              category?: string[];
-              status?: string;
-              sessionId: string;
-            };
-          };
-          pointer: {
-            type: string;
-            sessionId: string;
-            severity?: string[];
-            category?: string[];
-            status?: string;
-          };
-          query_time_ms: number;
-        }>(
-          '/v2/analysis/problems/impulse',
-          {
-            method: 'POST',
-            sessionId,
-            body: {
-              severity: pointer.severity ? (Array.isArray(pointer.severity) ? pointer.severity : [pointer.severity]) : undefined,
-              category: pointer.category ? (Array.isArray(pointer.category) ? pointer.category : [pointer.category]) : undefined,
-              status: pointer.status,
-            },
-          }
-        );
-
-        if (!impulseResult || !impulseResult.success) {
-          return c.json({
-            success: false,
-            error: 'Unable to get problem cluster metadata from analysis API',
-          } as ImpulseResolveResponse, 500);
-        }
-
-        // Return metadata response directly - NOT markdown content
-        // This is the impulse-driven pattern: metadata first, drill down via process_impulse
-        logger.info('problemCluster impulse resolved with metadata', {
-          rowCount: impulseResult.metadata?.rowCount,
-          summary: impulseResult.metadata?.summary,
-          filterParams: impulseResult.metadata?.filterParams,
-          pointer: impulseResult.pointer,
-        });
-
+        // Return helpful error directing vessels to Analysis API
         return c.json({
-          success: true,
-          loaded: false, // Metadata only, not full content
-          metadata: {
-            shape: impulseResult.metadata?.shape,
-            rowCount: impulseResult.metadata?.rowCount,
-            summary: impulseResult.metadata?.summary,
-            bySeverity: impulseResult.metadata?.bySeverity,
-            byCategory: impulseResult.metadata?.byCategory,
-            topIssue: impulseResult.metadata?.topIssue,
-            availableOps: impulseResult.metadata?.availableOps || ['filter', 'expand', 'group', 'resolve'],
-            // Lineage tracking for investigation chains
-            producedBy: 'problemCluster',
-            producedAt: new Date().toISOString(),
-          },
-          // Include pointer for process_impulse operations
-          content: JSON.stringify({
-            pointer: impulseResult.pointer,
-            filterParams: impulseResult.metadata?.filterParams,
-          }),
-        } as ImpulseResolveResponse, 200);
+          success: false,
+          error: 'resolver_moved',
+          message: `Analysis API impulse types (${pointer.type}) should be resolved by calling ` +
+                   `the Analysis API directly, not through activity-api. ` +
+                   `This follows the "Resolvers live WHERE THE DATA IS" principle.`,
+          todo: 'Analysis API should implement /v2/impulses/resolve endpoint',
+          analysis_api_url: config.analysisApi.url,
+          pointer_type: pointer.type,
+          suggested_approach: 'Vessels should include Analysis API client code to resolve these impulse types locally'
+        } as ImpulseResolveResponse, 410); // 410 Gone - permanent deprecation
       }
 
       // =============================================================================
@@ -1738,11 +1450,22 @@ router.post('/resolve', async (c) => {
         break;
       }
 
-      default:
+      default: {
+        // Unknown shape - delegate to vessel discovery
+        // This follows the "Resolvers live WHERE THE DATA IS" principle
+        logger.info('Unknown impulse shape - routing to vessel discovery', {
+          shape: pointer.type,
+        });
+
         return c.json({
           success: false,
-          error: `Unknown pointer type: ${pointer.type}`,
-        } as ImpulseResolveResponse, 400);
+          error: 'use_vessel_discovery',
+          message: `Unknown impulse shape "${pointer.type}" - use vessel discovery to find capable resolver`,
+          shape: pointer.type,
+          suggested_approach: 'Query GET /v2/vessels/discover?shape=' + pointer.type + ' to find vessels capable of resolving this impulse',
+          hint: 'Vessels register their capabilities via POST /v2/vessels/register. The backend only resolves shapes it directly stores (execution traces, templates, metrics).'
+        } as ImpulseResolveResponse, 404);
+      }
     }
 
     logger.info('Impulse resolved successfully', {

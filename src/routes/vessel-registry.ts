@@ -9,6 +9,7 @@ import { Hono } from 'hono';
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
 import { getJwtAuthFromContext } from '../middleware/jwtAuth';
+import { computeVesselHealthScore, getOrganizationVesselHealth } from '../services/vessel-health';
 
 const app = new Hono();
 
@@ -16,6 +17,22 @@ const app = new Hono();
 // TYPES
 // =============================================================================
 
+// VesselCapabilityV2 format with shape versioning
+interface VesselCapabilityV2 {
+  type: 'impulse-resolver' | 'tool' | 'activity' | 'mcp-server';
+  shapes?: Array<{
+    name: string;
+    version?: string; // Semver constraint (e.g., "^1.0.0", "~1.2.0", "1.x")
+  }>;
+  tools?: string[];
+  activities?: string[];
+  mcp?: {
+    protocol: string;
+    tools: string[];
+  };
+}
+
+// Legacy format (still supported)
 interface VesselCapability {
   type: 'impulse-resolver' | 'tool' | 'activity' | 'mcp-server';
   shapes?: string[];
@@ -31,10 +48,12 @@ interface RegisterVesselRequest {
   vesselId: string;
   vesselName: string;
   endpoint: string;
-  shapes: string[];
-  capabilities?: VesselCapability[];
+  shapes: string[]; // Simple shape names (for backward compatibility)
+  capabilities?: VesselCapability[] | VesselCapabilityV2[]; // Support both formats
   metadata?: Record<string, any>;
   ttl?: number;
+  version?: string; // Vessel version (semver)
+  protocol?: string; // Communication protocol
 }
 
 interface VesselRecord {
@@ -166,23 +185,63 @@ app.post('/register', async (c) => {
 });
 
 /**
- * GET /v2/vessels/discover?shape=<shape>
+ * GET /v2/vessels/discover?shape=<shape>&version=<version>
  *
  * Find vessels that can resolve a specific impulse shape.
+ * Integrates with shape registry for version compatibility checking.
+ *
+ * Accepts both JWT and API key authentication.
+ * API key auth is validated via identity-vessel and provides orgId for filtering.
  */
 app.get('/discover', async (c) => {
   const auth = getJwtAuthFromContext(c);
-  if (!auth) {
-    return c.json({ error: 'JWT authentication required' }, 401);
+  if (!auth || !auth.orgId) {
+    logger.warn('GET /v2/vessels/discover: no auth or missing orgId', {
+      hasAuth: !!auth,
+      authType: auth?.authType,
+    });
+    return c.json({ error: 'Authentication required (JWT or API key)' }, 401);
   }
 
+  logger.debug('GET /v2/vessels/discover: authenticated', {
+    authType: auth.authType,
+    orgId: auth.orgId,
+  });
+
   const shape = c.req.query('shape');
+  const version = c.req.query('version');
+
   if (!shape) {
     return c.json({ error: 'shape query parameter is required' }, 400);
   }
 
   try {
-    const query = `
+    // Lookup shape in registry to validate it exists
+    const shapeQuery = `
+      SELECT name, version, description
+      FROM shape_definition
+      WHERE name = $shape
+        AND (public = true OR org_id IS NONE OR org_id = $orgId)
+      ORDER BY version DESC
+      LIMIT 1;
+    `;
+
+    const shapeResults = await surrealDB.query<{ name: string; version: string; description: string }[]>(
+      shapeQuery,
+      { shape, orgId: auth.orgId }
+    );
+
+    const shapeDefinition = shapeResults[0]?.[0];
+    if (!shapeDefinition) {
+      return c.json({
+        error: 'Shape not found in registry',
+        shape,
+        suggestion: 'Register this shape via POST /v2/shapes before using it',
+      }, 404);
+    }
+
+    // Find vessels advertising this shape
+    const vesselQuery = `
       SELECT * FROM vessel
       WHERE $shape IN shapes
         AND org_id = $orgId
@@ -190,25 +249,62 @@ app.get('/discover', async (c) => {
       ORDER BY last_heartbeat DESC;
     `;
 
-    const vessels = await surrealDB.query<VesselRecord[]>(query, {
+    const vessels = await surrealDB.query<VesselRecord[]>(vesselQuery, {
       shape,
       orgId: auth.orgId,
     });
 
-    if (vessels.length === 0) {
+    if (vessels[0]?.length === 0) {
       return c.json({
         error: `No vessels found for shape: ${shape}`,
         shape,
+        shape_version: shapeDefinition.version,
       }, 404);
     }
 
-    logger.info('Vessel discovery', {
+    // Record routing trace
+    const traceQuery = `
+      CREATE routing_trace CONTENT {
+        shape: $shape,
+        shape_version: $version,
+        requesting_vessel_id: NONE,
+        selected_vessel_id: $selectedVesselId,
+        selection_reason: 'discovery_query',
+        candidates: $candidates,
+        success: true,
+        latency_ms: 0,
+        org_id: $orgId,
+        timestamp: time::now()
+      };
+    `;
+
+    await surrealDB.query(traceQuery, {
       shape,
+      version: version || shapeDefinition.version,
+      selectedVesselId: vessels[0][0]?.id || null,
+      candidates: vessels[0].map((v: VesselRecord) => ({
+        vessel_id: v.id,
+        endpoint: v.endpoint,
+        last_heartbeat: v.last_heartbeat,
+      })),
       orgId: auth.orgId,
-      found: vessels.length,
     });
 
-    return c.json({ vessels });
+    logger.info('Vessel discovery', {
+      shape,
+      version: version || shapeDefinition.version,
+      orgId: auth.orgId,
+      found: vessels[0].length,
+    });
+
+    return c.json({
+      vessels: vessels[0],
+      shape_info: {
+        name: shapeDefinition.name,
+        version: shapeDefinition.version,
+        description: shapeDefinition.description,
+      },
+    });
   } catch (error) {
     const err = error as Error;
     logger.error('Vessel discovery failed', {
@@ -248,13 +344,14 @@ app.get('/', async (c) => {
       orgId: auth.orgId,
     });
 
+    const vesselList = vessels[0] || [];
     const now = new Date();
-    const active = vessels.filter((v) => new Date(v.expires_at) > now);
-    const expired = vessels.filter((v) => new Date(v.expires_at) <= now);
+    const active = vesselList.filter((v) => new Date(v.expires_at) > now);
+    const expired = vesselList.filter((v) => new Date(v.expires_at) <= now);
 
     return c.json({
-      vessels: activeOnly ? active : vessels,
-      total: vessels.length,
+      vessels: activeOnly ? active : vesselList,
+      total: vesselList.length,
       active: active.length,
       expired: expired.length,
     });
@@ -291,11 +388,11 @@ app.get('/:vesselId', async (c) => {
       orgId: auth.orgId,
     });
 
-    if (vessels.length === 0) {
+    if (vessels[0]?.length === 0) {
       return c.json({ error: 'Vessel not found' }, 404);
     }
 
-    const vessel = vessels[0];
+    const vessel = vessels[0][0];
     const now = new Date();
     const expiresAt = new Date(vessel.expires_at);
     const isHealthy = expiresAt > now;
@@ -364,7 +461,8 @@ app.delete('/:vesselId', async (c) => {
 /**
  * GET /v2/vessels/:vesselId/health
  *
- * Check vessel health (reachability and expiry status).
+ * Get comprehensive health score and status for a vessel.
+ * Uses circuit breaker state, routing history, and heartbeat data.
  */
 app.get('/:vesselId/health', async (c) => {
   const auth = getJwtAuthFromContext(c);
@@ -373,55 +471,55 @@ app.get('/:vesselId/health', async (c) => {
   }
 
   const vesselId = c.req.param('vesselId');
+  const checkEndpoint = c.req.query('check_endpoint') === 'true';
 
   try {
-    const query = `
-      SELECT * FROM vessel
-      WHERE id = $vesselId
-        AND org_id = $orgId
-      LIMIT 1;
-    `;
+    // Compute health score
+    const healthScore = await computeVesselHealthScore(vesselId, auth.orgId);
 
-    const vessels = await surrealDB.query<VesselRecord[]>(query, {
-      vesselId,
-      orgId: auth.orgId,
-    });
-
-    if (vessels.length === 0) {
+    if (healthScore.score === 0 && healthScore.details.lastHeartbeat === 'never') {
       return c.json({ error: 'Vessel not found' }, 404);
     }
 
-    const vessel = vessels[0];
-    const now = new Date();
-    const expiresAt = new Date(vessel.expires_at);
-    const expiresInSeconds = Math.floor((expiresAt.getTime() - now.getTime()) / 1000);
-    const isHealthy = expiresInSeconds > 0;
-
-    // Optionally: ping vessel endpoint to check reachability
+    // Optionally: actively probe vessel endpoint
     let reachable = false;
     let latencyMs = 0;
 
-    try {
-      const startTime = Date.now();
-      const response = await fetch(`${vessel.endpoint}/health`, {
-        method: 'GET',
-        signal: AbortSignal.timeout(5000), // 5 second timeout
+    if (checkEndpoint) {
+      const vesselQuery = `
+        SELECT endpoint FROM vessel
+        WHERE id = $vesselId AND org_id = $orgId
+        LIMIT 1;
+      `;
+      const vesselResults = await surrealDB.query<{ endpoint: string }[]>(vesselQuery, {
+        vesselId,
+        orgId: auth.orgId,
       });
-      latencyMs = Date.now() - startTime;
-      reachable = response.ok;
-    } catch (error) {
-      // Vessel unreachable
-      reachable = false;
+
+      const vessel = vesselResults[0]?.[0];
+      if (vessel) {
+        try {
+          const startTime = Date.now();
+          const response = await fetch(`${vessel.endpoint}/health`, {
+            method: 'GET',
+            signal: AbortSignal.timeout(5000),
+          });
+          latencyMs = Date.now() - startTime;
+          reachable = response.ok;
+        } catch (error) {
+          reachable = false;
+        }
+      }
     }
 
     return c.json({
-      vesselId: vessel.id,
-      endpoint: vessel.endpoint,
-      reachable,
-      latency_ms: latencyMs,
-      last_heartbeat: vessel.last_heartbeat,
-      expires_in_seconds: expiresInSeconds,
-      status: isHealthy && reachable ? 'healthy' : 'unhealthy',
+      ...healthScore,
+      endpoint_check: checkEndpoint
+        ? {
+            reachable,
+            latency_ms: latencyMs,
+          }
+        : undefined,
     });
   } catch (error) {
     const err = error as Error;
@@ -430,6 +528,94 @@ app.get('/:vesselId/health', async (c) => {
       error: err.message,
     });
     return c.json({ error: 'Failed to check vessel health', details: err.message }, 500);
+  }
+});
+
+/**
+ * POST /v2/vessels/heartbeat
+ *
+ * Record vessel heartbeat for health scoring.
+ * Vessels should call this every 60 seconds.
+ */
+app.post('/heartbeat', async (c) => {
+  const auth = getJwtAuthFromContext(c);
+  if (!auth) {
+    return c.json({ error: 'JWT authentication required' }, 401);
+  }
+
+  let body: { vesselId: string; metrics?: any };
+  try {
+    body = await c.req.json();
+  } catch (error) {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  if (!body.vesselId) {
+    return c.json({ error: 'vesselId is required' }, 400);
+  }
+
+  try {
+    // Import health scoring service dynamically to avoid circular deps
+    const { HealthScoringService } = await import('../services/health-scoring');
+
+    // Record heartbeat and update health score
+    const metrics = await HealthScoringService.recordHeartbeat(body.vesselId, auth.orgId);
+
+    logger.debug('Vessel heartbeat recorded', {
+      vesselId: body.vesselId,
+      healthScore: metrics.health_score,
+      availability: metrics.availability,
+    });
+
+    return c.json({
+      vesselId: body.vesselId,
+      health_score: metrics.health_score,
+      eligible_for_routing: metrics.eligible_for_routing,
+      availability: metrics.availability,
+      next_heartbeat_in_seconds: 60,
+    });
+  } catch (error) {
+    const err = error as Error;
+    logger.error('Heartbeat recording failed', {
+      vesselId: body.vesselId,
+      error: err.message,
+    });
+    return c.json({ error: 'Failed to record heartbeat', details: err.message }, 500);
+  }
+});
+
+/**
+ * GET /v2/vessels/health/organization
+ *
+ * Get health scores for all vessels in the organization.
+ */
+app.get('/health/organization', async (c) => {
+  const auth = getJwtAuthFromContext(c);
+  if (!auth) {
+    return c.json({ error: 'JWT authentication required' }, 401);
+  }
+
+  try {
+    const healthScores = await getOrganizationVesselHealth(auth.orgId);
+
+    return c.json({
+      vessels: healthScores,
+      summary: {
+        total: healthScores.length,
+        healthy: healthScores.filter((v) => v.status === 'healthy').length,
+        degraded: healthScores.filter((v) => v.status === 'degraded').length,
+        unhealthy: healthScores.filter((v) => v.status === 'unhealthy').length,
+        expired: healthScores.filter((v) => v.status === 'expired').length,
+        avg_score: healthScores.reduce((sum, v) => sum + v.score, 0) / healthScores.length || 0,
+      },
+    });
+  } catch (error) {
+    const err = error as Error;
+    logger.error('Organization health check failed', {
+      orgId: auth.orgId,
+      error: err.message,
+    });
+    return c.json({ error: 'Failed to get organization health', details: err.message }, 500);
   }
 });
 

@@ -4,7 +4,7 @@
  */
 
 export interface WebSocketMessage {
-  type: 'execution_started' | 'execution_completed' | 'template_updated' | 'pod_status_changed' | 'ci_result';
+  type: 'execution_started' | 'execution_completed' | 'template_updated' | 'pod_status_changed' | 'ci_result' | 'feedback_recorded' | 'variant_created' | 'template_retired';
   timestamp?: string;
   data: any;
 }

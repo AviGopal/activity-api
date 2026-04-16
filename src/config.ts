@@ -48,6 +48,17 @@ export interface Config {
   cors: {
     origins: string[];
   };
+
+  // Discovery Vessel Integration
+  discovery: {
+    enabled: boolean;
+    endpoint: string;
+    vesselId: string;
+    heartbeatIntervalMs: number;
+    retryAttempts: number;
+    retryBackoffMs: number;
+    shapes: string[];  // Default shapes this vessel can resolve
+  };
 }
 
 function parseEnvInt(key: string, defaultValue: number): number {
@@ -76,6 +87,22 @@ function validateNamespace(ns: string | undefined): string {
   }
   
   return ns;
+}
+
+/**
+ * Generates vessel ID from environment variables
+ * Uses VESSEL_ID if set, otherwise generates from hostname + pod name
+ */
+function generateVesselId(): string {
+  if (process.env.VESSEL_ID) {
+    return process.env.VESSEL_ID;
+  }
+
+  // In Kubernetes, use pod name if available
+  const hostname = process.env.HOSTNAME || 'activity-api';
+  const podName = process.env.POD_NAME || hostname;
+
+  return `activity-api-${podName}`;
 }
 
 export function loadConfig(): Config {
@@ -117,6 +144,24 @@ export function loadConfig(): Config {
     
     cors: {
       origins: process.env.CORS_ORIGINS?.split(',') || ['*'],
+    },
+
+    discovery: {
+      enabled: parseEnvBool('DISCOVERY_ENABLED', true),
+      endpoint: process.env.DISCOVERY_VESSEL_ENDPOINT || 'http://discovery-vessel.activity-system.svc.cluster.local:8080',
+      vesselId: generateVesselId(),
+      heartbeatIntervalMs: parseEnvInt('DISCOVERY_HEARTBEAT_INTERVAL_MS', 60000), // 60 seconds
+      retryAttempts: parseEnvInt('DISCOVERY_RETRY_ATTEMPTS', 3),
+      retryBackoffMs: parseEnvInt('DISCOVERY_RETRY_BACKOFF_MS', 1000),
+      shapes: [
+        'activityExecutionTrace',
+        'activityTemplate',
+        'activityMetrics',
+        'activityCompositionGraph',
+        'impulseRelevanceMetrics',
+        'toolUsagePatterns',
+        'executionSequences',
+      ],
     },
   };
 }

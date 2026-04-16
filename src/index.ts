@@ -24,9 +24,11 @@ import vesselsRoutes from './routes/vessels';
 import vesselRegistryRoutes from './routes/vessel-registry';
 import connectionsRoutes from './routes/connections';
 import ribosomeRoutes from './routes/ribosome';
+import shapesRoutes from './routes/shapes';
 import { broadcaster } from './websocket/broadcaster';
 import type { ServerWebSocket } from 'bun';
 import packageJson from '../package.json';
+import { discoveryClient } from './services/discovery-client';
 
 // Define app-wide environment type with jwtAuth context variable
 type AppEnv = {
@@ -43,7 +45,11 @@ const app = new Hono<AppEnv>();
 
 // CORS configuration for cross-origin requests
 app.use('/*', cors({
-  origin: '*', // Allow all origins for development
+  origin: process.env.CORS_ORIGINS?.split(',') || [
+    'https://activity.metabob.com',
+    'https://internal.metabob.com',
+    'https://app.metabob.com',
+  ],
   credentials: true,
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization', 'X-Internal-Api-Key'],
@@ -77,7 +83,8 @@ app.get('/health', async (c) => {
     timestamp: new Date().toISOString(),
     checks: {
       redis: { status: 'unknown', latency_ms: 0 },
-      surrealdb: { status: 'unknown', latency_ms: 0 }
+      surrealdb: { status: 'unknown', latency_ms: 0 },
+      discovery: { status: 'unknown', registered: false }
     }
   };
 
@@ -120,10 +127,30 @@ app.get('/health', async (c) => {
     allHealthy = false;
   }
 
+  // Check Discovery registration status
+  if (discoveryClient.isEnabled()) {
+    const isRegistered = discoveryClient.isRegistered();
+    const lastError = discoveryClient.getLastError();
+
+    healthStatus.checks.discovery = {
+      status: isRegistered ? 'healthy' : (lastError ? 'unhealthy' : 'pending'),
+      registered: isRegistered,
+      error: lastError || undefined
+    };
+
+    // Discovery is optional, don't fail health check if it's down
+    // (graceful degradation)
+  } else {
+    healthStatus.checks.discovery = {
+      status: 'disabled',
+      registered: false
+    };
+  }
+
   healthStatus.status = allHealthy ? 'healthy' : 'unhealthy';
 
-  // Return 503 Service Unavailable if any dependency is unhealthy
-  // This signals Kubernetes to remove pod from load balancer
+  // Return 503 Service Unavailable if any critical dependency is unhealthy
+  // Discovery is non-critical, so it won't affect health status
   return c.json(healthStatus, allHealthy ? 200 : 503);
 });
 
@@ -140,6 +167,9 @@ app.route('/v2/activities/goal-paths', goalPathsRoutes);
 
 // Impulse routes (POST /v2/impulses, GET /v2/impulses/:id, GET /v2/impulses)
 app.route('/v2/impulses', impulsesRoutes);
+
+// Shape registry routes (POST /v2/shapes, GET /v2/shapes, GET /v2/shapes/:name, etc.)
+app.route('/v2/shapes', shapesRoutes);
 
 // Boredom queue routes (GET /boredom-tasks, POST /v2/activities/boredom/enqueue, POST /v2/vessels/register)
 app.route('/', boredomRoutes);
@@ -360,6 +390,53 @@ const server = Bun.serve<WebSocketData>({
 
 logger.info(`Server running at http://localhost:${server.port}`);
 logger.info(`WebSocket endpoint available at ws://localhost:${server.port}/ws`);
+
+// ============================================================================
+// Discovery Vessel Integration
+// ============================================================================
+
+if (discoveryClient.isEnabled()) {
+  // Initial registration
+  discoveryClient.register()
+    .then((success) => {
+      if (success) {
+        logger.info('[Discovery] Initial registration successful');
+      } else {
+        logger.warn('[Discovery] Initial registration failed (will retry)');
+      }
+    })
+    .catch((error) => {
+      logger.error('[Discovery] Initial registration error', { error: error.message });
+    });
+
+  // Start heartbeat manager
+  discoveryClient.startHeartbeatManager();
+  logger.info('[Discovery] Heartbeat manager started');
+} else {
+  logger.info('[Discovery] Discovery integration disabled');
+}
+
+// Graceful shutdown handler
+process.on('SIGTERM', async () => {
+  logger.info('[Server] SIGTERM received, shutting down gracefully');
+
+  // Stop heartbeat and deregister
+  await discoveryClient.shutdown();
+
+  // Stop other workers
+  logger.info('[Server] Graceful shutdown complete');
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  logger.info('[Server] SIGINT received, shutting down gracefully');
+
+  // Stop heartbeat and deregister
+  await discoveryClient.shutdown();
+
+  logger.info('[Server] Graceful shutdown complete');
+  process.exit(0);
+});
 
 // ============================================================================
 // Heartbeat Worker (Connection Slot Management)

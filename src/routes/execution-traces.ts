@@ -12,6 +12,12 @@ import type { SessionData } from '../models/schemas';
 import { getJwtAuthFromContext, hasJwtAuth } from '../middleware/jwtAuth';
 import { config } from '../config';
 import { insertExecution, isDualWriteEnabled, updateShapeActivityScores, type ParadigmExecution } from '../db/paradigm';
+import {
+  extractOutputShapes,
+  validateOutputShapes,
+  computeThompsonSamplingUpdates,
+  type ShapeMatchMetadata,
+} from '../services/thompson-sampling';
 
 const app = new Hono();
 
@@ -714,11 +720,6 @@ app.post('/', async (c) => {
     // Session may be undefined for internal/unauthenticated calls
     const session = ((c.get as any)('session') as SessionData | undefined) || { session_id: 'internal', org_id: null, project_id: null, api_key: null, latest_job_id: null };
 
-    // Use JWT auth claims if available, otherwise fall back to session
-    // Default to 'public' for unauthenticated/improvised executions (schema requires non-null string)
-    const orgId = jwtAuth?.orgId || session?.org_id || 'public';
-    const projectId = jwtAuth?.projectId || session?.project_id || null;
-
     const body = await c.req.json();
 
     // Validate required fields
@@ -730,6 +731,18 @@ app.post('/', async (c) => {
         received: Object.keys(body),
       }, 400);
     }
+
+    // FIX: Use org_id from request body if provided, otherwise fall back to JWT/session
+    // This allows MiniBob to explicitly set org_id when sending traces
+    const traceOrgId = body.org_id || jwtAuth?.orgId || session?.org_id || 'public';
+    const traceProjectId = body.project_id || jwtAuth?.projectId || session?.project_id || null;
+
+    logger.debug('[TRACE DEBUG] Determining org_id for trace', {
+      body_org_id: body.org_id,
+      jwt_org_id: jwtAuth?.orgId,
+      session_org_id: session?.org_id,
+      final_org_id: traceOrgId,
+    });
 
     // Map MiniBob's field names to database schema
     // MiniBob sends: template_id, we store as: variant_id + activity_id
@@ -774,13 +787,14 @@ app.post('/', async (c) => {
           }
         : null,
 
-      // Multi-tenancy (prefer JWT claims over session)
-      org_id: orgId,
-      project_id: projectId,
+      // Multi-tenancy (use org_id from request body if provided)
+      org_id: traceOrgId,
+      project_id: traceProjectId,
 
       // Timestamps (SurrealDB datetime type)
       executed_at: new Date(),
       created_at: new Date(),
+      stored_at: new Date(),
 
       // Edge learning fields (from improvisation traces)
       ...(body.improvisation ? { improvisation: body.improvisation } : {}),
@@ -911,7 +925,8 @@ app.post('/', async (c) => {
         tokens_cache: $tokens_cache,
         org_id: $org_id,
         executed_at: $executed_at,
-        created_at: $created_at${optionalFieldsStr}
+        created_at: $created_at,
+        stored_at: $stored_at${optionalFieldsStr}
       }
     `;
 
@@ -1010,6 +1025,145 @@ app.post('/', async (c) => {
       }
     } // end isDualWriteEnabled()
 
+    // ========================================================================
+    // FIX 2: Update Thompson Sampling scores in activity table
+    // Enhanced with shape match scoring for quality-aware learning
+    // Enables real-time learning loop: execute → update scores → recommend
+    // ========================================================================
+    try {
+      // Fetch activity template to get declared output_shapes
+      const activityQuery = `
+        SELECT output_shapes FROM activity
+        WHERE id = $activity_id
+        LIMIT 1
+      `;
+      const activityResult = await surrealDB.query(activityQuery, {
+        activity_id: trace.variant_id,
+      });
+
+      // Extract actual output shapes from execution
+      const actualShapes = extractOutputShapes({
+        output_impulses: trace.output_impulses,
+        output_impulse_shapes: trace.output_impulse_shapes,
+      });
+
+      // Compute shape match score and weighted success
+      let shapeMatchMetadata: ShapeMatchMetadata | null = null;
+      let alphaDelta = trace.success ? 1 : 0;
+      let betaDelta = trace.success ? 0 : 1;
+
+      if (activityResult && activityResult.length > 0 && activityResult[0]?.output_shapes) {
+        const declaredShapes: string[] = activityResult[0].output_shapes;
+
+        // Validate shapes and compute match score
+        shapeMatchMetadata = validateOutputShapes(declaredShapes, actualShapes, trace.success);
+
+        // Compute Thompson Sampling updates with shape match weighting
+        const tsUpdates = computeThompsonSamplingUpdates(trace.success, shapeMatchMetadata.shapeMatchScore);
+        alphaDelta = tsUpdates.alphaDelta;
+        betaDelta = tsUpdates.betaDelta;
+
+        logger.info('[Thompson Sampling] Using shape-weighted updates', {
+          execution_id: trace.execution_id,
+          activity_id: trace.variant_id,
+          executionSuccess: trace.success,
+          shapeMatchScore: shapeMatchMetadata.shapeMatchScore,
+          weightedScore: tsUpdates.weightedScore,
+          alphaDelta,
+          betaDelta,
+        });
+
+        // Store shape match metadata in trace for analysis
+        if (!trace.metadata) {
+          trace.metadata = {};
+        }
+        (trace.metadata as any).shape_match = shapeMatchMetadata;
+      } else {
+        logger.debug('[Thompson Sampling] No output_shapes in template, using binary success', {
+          execution_id: trace.execution_id,
+          activity_id: trace.variant_id,
+        });
+      }
+
+      const updateQuery = `
+        UPDATE activity
+        SET
+          thompson_alpha = thompson_alpha + $alpha_delta,
+          thompson_beta = thompson_beta + $beta_delta,
+          total_executions = total_executions + 1,
+          successful_executions = successful_executions + $success_delta,
+          failed_executions = failed_executions + $failure_delta,
+          last_executed_at = time::now()
+        WHERE id = $activity_id
+        RETURN {
+          id,
+          thompson_alpha,
+          thompson_beta,
+          total_executions
+        }
+      `;
+
+      const updateParams = {
+        activity_id: trace.variant_id, // variant_id is the activity ID
+        alpha_delta: alphaDelta,
+        beta_delta: betaDelta,
+        success_delta: trace.success ? 1 : 0,
+        failure_delta: trace.success ? 0 : 1,
+      };
+
+      // Use JWT auth if available for RBAC enforcement
+      const updateResult = jwtAuth?.jwtToken
+        ? await queryWithAuth(jwtAuth.jwtToken, updateQuery, updateParams)
+        : await surrealDB.query(updateQuery, updateParams);
+
+      if (updateResult && updateResult.length > 0) {
+        logger.info('[learning] Thompson Sampling scores updated', {
+          execution_id: trace.execution_id,
+          activity_id: trace.variant_id,
+          success: trace.success,
+          new_alpha: updateResult[0].thompson_alpha,
+          new_beta: updateResult[0].thompson_beta,
+          total_executions: updateResult[0].total_executions,
+        });
+
+        // FIX 3: Invalidate Redis cache to ensure fresh scores in next recommendation
+        try {
+          const { RedisClient } = await import('../db/redis');
+          const redis = RedisClient.getInstance();
+
+          // Invalidate both the specific template cache and the template list cache
+          const CACHE_KEY_PREFIX = 'activity:template:';
+          const CACHE_LIST_KEY = 'activity:templates:list';
+
+          await redis.del(`${CACHE_KEY_PREFIX}${trace.variant_id}`);
+          await redis.del(CACHE_LIST_KEY);
+
+          logger.debug('[learning] Redis cache invalidated after score update', {
+            activity_id: trace.variant_id,
+          });
+        } catch (cacheError) {
+          // Non-critical - scores will eventually propagate when cache expires
+          logger.warn('[learning] Failed to invalidate Redis cache (non-blocking)', {
+            execution_id: trace.execution_id,
+            error: cacheError instanceof Error ? cacheError.message : String(cacheError),
+          });
+        }
+      } else {
+        logger.warn('[learning] Thompson Sampling score update returned no results', {
+          execution_id: trace.execution_id,
+          activity_id: trace.variant_id,
+          query_params: updateParams,
+        });
+      }
+    } catch (scoreUpdateError) {
+      // Don't fail the request if score update fails - trace is already stored
+      logger.error('[learning] Failed to update Thompson Sampling scores (non-blocking)', {
+        execution_id: trace.execution_id,
+        activity_id: trace.variant_id,
+        error: scoreUpdateError instanceof Error ? scoreUpdateError.message : String(scoreUpdateError),
+      });
+    }
+
     // Update impulse shape activity scores for shape-conditioned Thompson Sampling
     // Extract input shapes from the execution trace
     const inputShapes: string[] = body.input_impulse_shapes
@@ -1018,9 +1172,9 @@ app.post('/', async (c) => {
       || (trace.metadata as any)?.input_shapes
       || [];
 
-    if (inputShapes.length > 0 && trace.variant_id && orgId) {
+    if (inputShapes.length > 0 && trace.variant_id && traceOrgId) {
       // Fire and forget - don't block the response
-      updateShapeActivityScores(trace.variant_id, inputShapes, trace.success, orgId)
+      updateShapeActivityScores(trace.variant_id, inputShapes, trace.success, traceOrgId)
         .catch(err => logger.warn('[paradigm] Shape score update failed (non-blocking)', {
           execution_id: trace.execution_id,
           error: err instanceof Error ? err.message : String(err),
@@ -1058,7 +1212,7 @@ app.post('/', async (c) => {
     // Forward to learning (non-blocking, don't await)
     if (uniqueFiles.length >= 2) {
       const sessionId = c.req.header('X-Session-ID') || session.session_id || 'unknown';
-      forwardToLearning(sessionId, uniqueFiles, projectId);
+      forwardToLearning(sessionId, uniqueFiles, traceProjectId);
     }
 
     return c.json({

@@ -1,0 +1,46 @@
+# Gitleaks configuration for metabob-activity-api
+# https://github.com/gitleaks/gitleaks
+
+title = "metabob-activity-api secret scanning"
+
+[extend]
+# Use the default gitleaks configuration as base
+useDefault = true
+
+# Additional patterns specific to this project
+[[rules]]
+id = "anthropic-api-key"
+description = "Anthropic API Key"
+regex = '''sk-ant-[a-zA-Z0-9_-]{80,}'''
+tags = ["key", "anthropic"]
+
+[[rules]]
+id = "metabob-api-key"
+description = "Metabob API Key"
+regex = '''mb_[a-zA-Z0-9]{32,}'''
+tags = ["key", "metabob"]
+
+[[rules]]
+id = "surrealdb-password"
+description = "SurrealDB password in code"
+regex = '''SURREALDB_PASSWORD\s*[:=]\s*["']?[^"'\s]{8,}["']?'''
+tags = ["password", "surrealdb"]
+
+# Paths to ignore (test fixtures, examples, etc.)
+[allowlist]
+paths = [
+  '''node_modules/''',
+  '''dist/''',
+  '''coverage/''',
+  '''.gitleaks.toml''',
+  '''docs/''',
+  '''sql/test-data/''',
+]
+
+# Regex patterns to ignore (e.g., example keys in docs)
+regexes = [
+  '''sk-ant-example''',
+  '''your-api-key-here''',
+  '''<your-.*-key>''',
+  '''EXAMPLE_.*_KEY''',
+]

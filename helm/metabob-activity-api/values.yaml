@@ -2,11 +2,12 @@
 replicaCount: 2
 
 image:
-  repository: metabob-activity-api
-  pullPolicy: IfNotPresent
+  repository: metabobapp/metabob-activity-api
+  pullPolicy: Always
   tag: "latest"
 
-imagePullSecrets: []
+imagePullSecrets:
+  - name: docker-hub-pull
 nameOverride: ""
 fullnameOverride: ""
 
@@ -35,15 +36,15 @@ config:
   
   # SurrealDB connection
   surrealdb:
-    url: "http://surrealdb.metabob.svc.cluster.local:8000"
-    namespace: "metabob"
+    url: "http://surrealdb.activity-system.svc.cluster.local:8000"
+    namespace: "activity-system"
     database: "learning_loop"
     username: "root"
     password: "changeme"  # Override in production
   
   # Redis connection
   redis:
-    url: "redis://redis-master.metabob.svc.cluster.local:6379"
+    url: "redis://valkey.activity-system.svc.cluster.local:6379"
     sessionTtl: 86400     # 24 hours
     templateTtl: 3600     # 1 hour
     metricsTtl: 300       # 5 minutes
