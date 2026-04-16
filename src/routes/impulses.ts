@@ -126,26 +126,6 @@ router.post('/', async (c) => {
       return surrealDB.query<T>(sql, params);
     };
 
-    // Check if impulse already exists (by id, RBAC handles org_id filtering)
-    const existsQuery = `
-      SELECT id FROM impulse
-      WHERE id = $impulse_id
-      LIMIT 1
-    `;
-
-    const existing = await executeQuery<any>(existsQuery, {
-      impulse_id,
-    });
-
-    if (existing.length > 0) {
-      logger.warn('Impulse already exists', { impulse_id, project_id });
-      return c.json({
-        error: 'Impulse already exists',
-        impulse_id,
-        project_id,
-      }, 400);
-    }
-
     // Derive shape from impulse_data.type, use pointer directly from impulse_data
     const shape = impulse_data.type || 'unknown';
     // Use the pointer from impulse_data directly (already has proper structure)
@@ -161,6 +141,7 @@ router.post('/', async (c) => {
       token_estimate: impulse_data.budget || 0,
       org_id,
       project_id,
+      created_at: new Date().toISOString(),
     };
 
     // Only include content if it has a value (avoid null → NULL coercion issue)
@@ -175,9 +156,10 @@ router.post('/', async (c) => {
       params.created_by = created_by;
     }
 
-    // Create impulse record using new schema
-    const createQuery = `
-      CREATE impulse CONTENT {
+    // Use UPDATE for idempotency (creates if not exists, updates if exists)
+    // This prevents race conditions where CREATE succeeds but verification fails
+    const createOrUpdateQuery = `
+      UPDATE impulse:${impulse_id} CONTENT {
         id: $impulse_id,
         pointer: $pointer,
         shape: $shape,
@@ -187,24 +169,18 @@ router.post('/', async (c) => {
         org_id: $org_id,
         project_id: $project_id,
         ${createdByField}
-        created_at: time::now()
+        created_at: $created_at
       }
     `;
 
-    await executeQuery<any>(createQuery, params);
+    const [result] = await executeQuery<any>(createOrUpdateQuery, params);
 
-    // Query the created record to get timestamps
-    const selectQuery = `SELECT * FROM impulse WHERE id = $impulse_id LIMIT 1`;
-    const selectResult = await executeQuery<any>(selectQuery, {
-      impulse_id,
-    });
-
-    if (!selectResult || selectResult.length === 0) {
-      logger.error('Failed to retrieve created impulse', { impulse_id });
+    if (!result) {
+      logger.error('Failed to create/update impulse - no record returned', { impulse_id });
       throw new Error('Failed to create impulse in SurrealDB');
     }
 
-    const created = selectResult[0];
+    const created = result;
 
     logger.info('Impulse created', {
       impulse_id,
