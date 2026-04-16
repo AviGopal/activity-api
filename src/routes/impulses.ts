@@ -133,6 +133,7 @@ router.post('/', async (c) => {
 
     // Build query params dynamically to avoid sending null for optional fields
     // SurrealDB's option<T> expects either a value or the field to be omitted, not null
+    // Note: SurrealDB 3.x requires Date objects for datetime fields, not ISO strings
     const params: Record<string, any> = {
       impulse_id,
       pointer,
@@ -141,7 +142,7 @@ router.post('/', async (c) => {
       token_estimate: impulse_data.budget || 0,
       org_id,
       project_id,
-      created_at: new Date().toISOString(),
+      created_at: new Date(), // Pass Date object for SurrealDB datetime field
     };
 
     // Only include content if it has a value (avoid null → NULL coercion issue)
@@ -156,12 +157,12 @@ router.post('/', async (c) => {
       params.created_by = created_by;
     }
 
-    // Use UPDATE for idempotency (creates if not exists, updates if exists)
-    // This prevents race conditions where CREATE succeeds but verification fails
+    // Use UPSERT for idempotency (creates if not exists, updates if exists)
+    // SurrealDB 3.x UPDATE only modifies existing records; UPSERT creates if missing
     // Use backtick escaping for IDs with hyphens (e.g., `impulse:\`goal-123\``)
-    // Note: type::thing() and type::record() don't work in UPDATE context
+    // Note: type::thing() and type::record() don't work in UPSERT context
     const createOrUpdateQuery = `
-      UPDATE impulse:\`${impulse_id}\` CONTENT {
+      UPSERT impulse:\`${impulse_id}\` CONTENT {
         id: $impulse_id,
         pointer: $pointer,
         shape: $shape,
