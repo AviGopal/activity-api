@@ -158,9 +158,9 @@ router.post('/', async (c) => {
 
     // Use UPDATE for idempotency (creates if not exists, updates if exists)
     // This prevents race conditions where CREATE succeeds but verification fails
-    // Use type::thing() to safely handle IDs with hyphens (e.g., goal-123-abc)
+    // Use backticks around ID to safely handle IDs with hyphens (e.g., goal-123-abc)
     const createOrUpdateQuery = `
-      UPDATE type::thing('impulse', $impulse_id) CONTENT {
+      UPDATE impulse:\`${impulse_id}\` CONTENT {
         id: $impulse_id,
         pointer: $pointer,
         shape: $shape,
