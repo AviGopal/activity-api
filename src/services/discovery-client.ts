@@ -275,6 +275,51 @@ export class DiscoveryClient {
   }
 
   /**
+   * Query vessels by shape capability
+   */
+  async discoverVesselsForShape(shape: string): Promise<{
+    found: boolean;
+    vessels: Array<{ vesselId: string; endpoint: string; shapes: string[] }>;
+  }> {
+    if (!this.isEnabled()) {
+      logger.debug('[Discovery] Query skipped (disabled)');
+      return { found: false, vessels: [] };
+    }
+
+    try {
+      const response = await this.retryRequest<any>(
+        'POST',
+        '/resolve',
+        { shape }
+      );
+
+      if (response.found && response.vessels && response.vessels.length > 0) {
+        logger.debug('[Discovery] Found vessels for shape', {
+          shape,
+          count: response.vessels.length,
+        });
+        return {
+          found: true,
+          vessels: response.vessels,
+        };
+      } else {
+        logger.debug('[Discovery] No vessels found for shape', { shape });
+        return { found: false, vessels: [] };
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      this.lastError = errorMsg;
+
+      logger.warn('[Discovery] ✗ Query failed', {
+        shape,
+        error: errorMsg,
+      });
+
+      return { found: false, vessels: [] };
+    }
+  }
+
+  /**
    * Gracefully shutdown (deregister and stop heartbeat)
    */
   async shutdown(): Promise<void> {
