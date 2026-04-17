@@ -119,7 +119,7 @@ async function queryFrequentSequences(
 ): Promise<SequencePattern[]> {
 
   // Build query with proper WHERE clause for org_id if provided
-  const orgFilter = orgId ? `AND org_id = type::thing('organizations', '${orgId}')` : '';
+  const orgFilter = orgId ? `AND org_id = type::record('organizations', '${orgId}')` : '';
 
   const query = `
     SELECT
@@ -243,7 +243,7 @@ async function getCompositionEdgeWeight(
 ): Promise<number> {
 
   const orgFilter = orgId
-    ? `AND org_id = type::thing('organizations', '${orgId}')`
+    ? `AND org_id = type::record('organizations', '${orgId}')`
     : '';
 
   const query = `
@@ -327,7 +327,7 @@ export async function isPatternExtracted(
   const signature = hashActivityIds(activityIds);
 
   const orgFilter = orgId
-    ? `AND org_id = type::thing('organizations', '${orgId}')`
+    ? `AND org_id = type::record('organizations', '${orgId}')`
     : '';
 
   const query = `
