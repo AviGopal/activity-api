@@ -159,8 +159,8 @@ router.post('/', async (c) => {
       budget_exhausted: false,
       org_id,
       project_id,
-      // Use Date object for SurrealDB datetime field (not ISO string)
-      created_at: new Date(),
+      // Note: created_at will be set via time::now() in SQL query (not passed as parameter)
+      // JavaScript Date objects serialize to ISO strings which SurrealDB can't coerce to datetime
     };
 
     // Only include content if it has a value (avoid null → NULL coercion issue)
@@ -192,7 +192,7 @@ router.post('/', async (c) => {
         org_id: $org_id,
         project_id: $project_id,
         ${createdByField}
-        created_at: $created_at
+        created_at: time::now()
       }
     `;
 
@@ -540,9 +540,9 @@ async function recordBudgetConsumption(
   projectId: string | null | undefined
 ): Promise<void> {
   const budgetRemaining = budgetInitial - budgetConsumed;
-  // Use Date object for SurrealDB datetime field (not ISO string)
-  const exhaustedAt = budgetRemaining < 0 ? new Date() : null;
+  const isExhausted = budgetRemaining < 0;
 
+  // Use conditional SQL for exhausted_at: time::now() if exhausted, null otherwise
   const query = `
     CREATE impulse_budget_log SET
       impulse_id = $impulse_id,
@@ -551,7 +551,7 @@ async function recordBudgetConsumption(
       budget_initial = $budget_initial,
       budget_consumed = $budget_consumed,
       budget_remaining = $budget_remaining,
-      exhausted_at = $exhausted_at,
+      exhausted_at = ${isExhausted ? 'time::now()' : 'null'},
       org_id = $org_id,
       project_id = $project_id,
       created_at = time::now()
@@ -564,7 +564,6 @@ async function recordBudgetConsumption(
     budget_initial: budgetInitial,
     budget_consumed: budgetConsumed,
     budget_remaining: budgetRemaining,
-    exhausted_at: exhaustedAt,
     org_id: orgId,
     project_id: projectId || null,
   });
