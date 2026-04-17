@@ -158,10 +158,9 @@ router.post('/', async (c) => {
 
     // Use UPDATE for idempotency (creates if not exists, updates if exists)
     // This prevents race conditions where CREATE succeeds but verification fails
-    // Use backtick escaping for IDs with hyphens (e.g., `impulse:\`goal-123\``)
-    // Note: type::thing() and type::record() don't work in UPDATE context
+    // Use type::record() for SurrealDB 3.x to safely handle IDs with hyphens
     const createOrUpdateQuery = `
-      UPDATE impulse:\`${impulse_id}\` CONTENT {
+      UPDATE type::record('impulse', $impulse_id) CONTENT {
         id: $impulse_id,
         pointer: $pointer,
         shape: $shape,
