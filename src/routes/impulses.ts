@@ -175,12 +175,12 @@ router.post('/', async (c) => {
       params.created_by = created_by;
     }
 
-    // Use UPDATE for idempotency (creates if not exists, updates if exists)
-    // This prevents race conditions where CREATE succeeds but verification fails
+    // Use INSERT for new impulses (respects CREATE permissions with $auth context)
     // Use type::record() for SurrealDB 3.x to safely handle IDs with hyphens
+    // Note: org_id and created_by are set explicitly to match PERMISSIONS validation
     const createOrUpdateQuery = `
-      UPDATE type::record('impulse', $impulse_id) CONTENT {
-        id: $impulse_id,
+      INSERT INTO impulse {
+        id: type::record('impulse', $impulse_id),
         pointer: $pointer,
         shape: $shape,
         summary: $summary,
@@ -238,6 +238,14 @@ router.post('/', async (c) => {
       error: error.message,
       stack: error.stack,
     });
+
+    // Handle duplicate key errors (impulse already exists)
+    if (error.message?.includes('already exists') || error.message?.includes('duplicate')) {
+      return c.json({
+        error: 'Impulse already exists',
+        message: 'An impulse with this ID already exists for this organization',
+      }, 409);
+    }
 
     // Handle Zod validation errors
     if (error.name === 'ZodError') {
