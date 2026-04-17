@@ -164,11 +164,12 @@ function validateExample(example: any, schema: any): { valid: boolean; error?: s
  * POST /v2/shapes
  *
  * Register new shape definition with validation.
+ * Supports both JWT and API key authentication.
  */
 app.post('/', async (c) => {
   const auth = getJwtAuthFromContext(c);
   if (!auth) {
-    return c.json({ error: 'JWT authentication required' }, 401);
+    return c.json({ error: 'Authentication required (JWT or API key)' }, 401);
   }
 
   let body: Partial<ShapeDefinition>;
@@ -320,11 +321,12 @@ app.post('/', async (c) => {
  * GET /v2/shapes/:name
  *
  * Get shape definition by name and optional version constraint.
+ * Supports both JWT and API key authentication.
  */
 app.get('/:name', async (c) => {
   const auth = getJwtAuthFromContext(c);
   if (!auth) {
-    return c.json({ error: 'JWT authentication required' }, 401);
+    return c.json({ error: 'Authentication required (JWT or API key)' }, 401);
   }
 
   const name = c.req.param('name');
@@ -381,11 +383,12 @@ app.get('/:name', async (c) => {
  * GET /v2/shapes/:name/versions
  *
  * List all versions of a shape.
+ * Supports both JWT and API key authentication.
  */
 app.get('/:name/versions', async (c) => {
   const auth = getJwtAuthFromContext(c);
   if (!auth) {
-    return c.json({ error: 'JWT authentication required' }, 401);
+    return c.json({ error: 'Authentication required (JWT or API key)' }, 401);
   }
 
   const name = c.req.param('name');
@@ -426,11 +429,12 @@ app.get('/:name/versions', async (c) => {
  * GET /v2/shapes
  *
  * List all accessible shapes (latest version only).
+ * Supports both JWT and API key authentication.
  */
 app.get('/', async (c) => {
   const auth = getJwtAuthFromContext(c);
   if (!auth) {
-    return c.json({ error: 'JWT authentication required' }, 401);
+    return c.json({ error: 'Authentication required (JWT or API key)' }, 401);
   }
 
   const tag = c.req.query('tag');
@@ -480,11 +484,12 @@ app.get('/', async (c) => {
  * GET /v2/shapes/:name/migrations
  *
  * Get migration path between versions.
+ * Supports both JWT and API key authentication.
  */
 app.get('/:name/migrations', async (c) => {
   const auth = getJwtAuthFromContext(c);
   if (!auth) {
-    return c.json({ error: 'JWT authentication required' }, 401);
+    return c.json({ error: 'Authentication required (JWT or API key)' }, 401);
   }
 
   const name = c.req.param('name');
