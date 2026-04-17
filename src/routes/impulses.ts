@@ -159,7 +159,8 @@ router.post('/', async (c) => {
       budget_exhausted: false,
       org_id,
       project_id,
-      created_at: new Date().toISOString(),
+      // Use Date object for SurrealDB datetime field (not ISO string)
+      created_at: new Date(),
     };
 
     // Only include content if it has a value (avoid null → NULL coercion issue)
@@ -539,7 +540,8 @@ async function recordBudgetConsumption(
   projectId: string | null | undefined
 ): Promise<void> {
   const budgetRemaining = budgetInitial - budgetConsumed;
-  const exhaustedAt = budgetRemaining < 0 ? new Date().toISOString() : null;
+  // Use Date object for SurrealDB datetime field (not ISO string)
+  const exhaustedAt = budgetRemaining < 0 ? new Date() : null;
 
   const query = `
     CREATE impulse_budget_log SET
