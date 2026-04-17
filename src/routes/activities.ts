@@ -5485,15 +5485,9 @@ app.post('/tool-argument-patterns', async (c) => {
         SET
           times_used = times_used + 1,
           times_succeeded = times_succeeded + $success_increment,
-          times_failed = (times_failed OR 0) + $failure_increment,
           avg_execution_ms = (avg_execution_ms * $current_times_used + $execution_ms) / ($current_times_used + 1),
           last_used_at = time::now(),
-          updated_at = time::now(),
-          failure_type = $failure_type,
-          failure_reason = $failure_reason,
-          tool_succeeded = $tool_succeeded,
-          validation_error = $validation_error,
-          failure_counts = $failure_counts
+          updated_at = time::now()
         WHERE argument_hash = $hash AND org_id = <string>$auth.org_id
         RETURN AFTER
       `;
@@ -5501,14 +5495,8 @@ app.post('/tool-argument-patterns', async (c) => {
       const updateResult = await surrealDB.query<any[]>(updateQuery, {
         hash: validated.argument_hash,
         success_increment: successIncrement,
-        failure_increment: failureIncrement,
         current_times_used: currentTimesUsed,
         execution_ms: validated.execution_ms,
-        failure_type: validated.failure_type || undefined,
-        failure_reason: validated.failure_reason || undefined,
-        tool_succeeded: validated.tool_succeeded ?? undefined,
-        validation_error: validated.validation_error || undefined,
-        failure_counts: currentFailureCounts,
       });
 
       pattern = updateResult && updateResult.length > 0 ? updateResult[0] : current;
@@ -5536,14 +5524,8 @@ app.post('/tool-argument-patterns', async (c) => {
           arguments = $arguments,
           times_used = 1,
           times_succeeded = $success_increment,
-          times_failed = $failure_increment,
           avg_execution_ms = $execution_ms,
-          last_used_at = time::now(),
-          failure_type = $failure_type,
-          failure_reason = $failure_reason,
-          tool_succeeded = $tool_succeeded,
-          validation_error = $validation_error,
-          failure_counts = $failure_counts
+          last_used_at = time::now()
       `;
 
       const createResult = await surrealDB.query<any[]>(createQuery, {
@@ -5553,13 +5535,7 @@ app.post('/tool-argument-patterns', async (c) => {
         argument_hash: validated.argument_hash,
         arguments: validated.arguments,
         success_increment: validated.execution_succeeded ? 1 : 0,
-        failure_increment: validated.execution_succeeded ? 0 : 1,
         execution_ms: validated.execution_ms,
-        failure_type: validated.failure_type || undefined,
-        failure_reason: validated.failure_reason || undefined,
-        tool_succeeded: validated.tool_succeeded ?? undefined,
-        validation_error: validated.validation_error || undefined,
-        failure_counts: initialFailureCounts,
       });
 
       pattern = createResult && createResult.length > 0 ? createResult[0] : {
