@@ -131,12 +131,27 @@ router.post('/', async (c) => {
     // Use the pointer from impulse_data directly (already has proper structure)
     const pointer = impulse_data.pointer;
 
+    // Generate summary for metadata-first resolution
+    // Priority: metadata description > pointer path/type > shape
+    let summary = '';
+    if (impulse_data.metadata?.description) {
+      summary = impulse_data.metadata.description.substring(0, 100);
+    } else if (pointer.path || pointer.file_path) {
+      const path = pointer.path || pointer.file_path;
+      summary = `${shape}: ${path}`.substring(0, 100);
+    } else if (pointer.type) {
+      summary = `${shape} (${pointer.type})`.substring(0, 100);
+    } else {
+      summary = shape.substring(0, 100);
+    }
+
     // Build query params dynamically to avoid sending null for optional fields
     // SurrealDB's option<T> expects either a value or the field to be omitted, not null
     const params: Record<string, any> = {
       impulse_id,
       pointer,
       shape,
+      summary,
       metadata: impulse_data.metadata || {},
       token_estimate: impulse_data.budget || 0,
       org_id,
@@ -164,6 +179,7 @@ router.post('/', async (c) => {
         id: $impulse_id,
         pointer: $pointer,
         shape: $shape,
+        summary: $summary,
         ${contentField}
         metadata: $metadata,
         token_estimate: $token_estimate,

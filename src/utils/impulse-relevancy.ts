@@ -1,7 +1,7 @@
 /**
  * Impulse Relevancy Integration
  *
- * Queries impulse_relevance_metric table to boost/penalize activity scores
+ * Queries impulse_relevance_metrics table to boost/penalize activity scores
  * based on which impulses are loaded and how relevant they are.
  */
 
@@ -59,7 +59,7 @@ export async function calculateImpulseRelevancyBoosts(
         times_execution_failed,
         times_not_loaded_succeeded,
         times_not_loaded_failed
-      FROM impulse_relevance_metric
+      FROM impulse_relevance_metrics
       WHERE activity_variant_id IN $activity_ids
         AND (times_loaded > 0 OR times_not_loaded_succeeded + times_not_loaded_failed > 0)
     `;
@@ -201,7 +201,7 @@ export async function discoverMissingImpulses(
         irrelevance_score,
         times_execution_succeeded,
         times_loaded
-      FROM impulse_relevance_metric
+      FROM impulse_relevance_metrics
       WHERE activity_variant_id IN $activity_ids
         AND relevance_score - irrelevance_score > 0.3
         AND times_loaded > 0
