@@ -382,9 +382,12 @@ DEFINE FIELD IF NOT EXISTS irrelevance_score ON impulse_relevance_metrics TYPE f
   VALUE $value OR 0.0
   COMMENT "Calculated irrelevance score: P(success | impulse NOT loaded)";
 
-DEFINE FIELD IF NOT EXISTS avg_tokens ON impulse_relevance_metrics TYPE int
+DEFINE FIELD IF NOT EXISTS avg_content_size_tokens ON impulse_relevance_metrics TYPE int
   VALUE $value OR 0
-  COMMENT "Average token count of this impulse";
+  COMMENT "Average token count of this impulse's content";
+
+DEFINE FIELD IF NOT EXISTS typical_pointer_type ON impulse_relevance_metrics TYPE option<string>
+  COMMENT "Most common pointer type for this impulse (e.g., 'file', 'activityExecutionTrace')";
 
 DEFINE FIELD IF NOT EXISTS created_at ON impulse_relevance_metrics TYPE datetime
   VALUE $value OR time::now()

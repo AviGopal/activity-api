@@ -1317,7 +1317,7 @@ router.post('/resolve', async (c) => {
             times_execution_succeeded,
             times_execution_failed,
             relevance_score,
-            avg_tokens,
+            avg_content_size_tokens AS avg_tokens,
             created_at,
             updated_at
           FROM impulse_relevance_metrics
