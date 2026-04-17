@@ -169,6 +169,8 @@ export interface ParadigmExecution {
   project_id?: string;
   vessel_id?: string;
   vessel_version?: string;
+  resolved_by_vessel_id?: string;
+  resolver_tier?: string;
   executed_at: string;
   created_at: string;
 }
@@ -314,6 +316,9 @@ export async function insertExecution(
     // or should be populated from $auth context
     if (execution.vessel_id) record.vessel_id = execution.vessel_id;
     if (execution.vessel_version) record.vessel_version = execution.vessel_version;
+    // Resolver tracking fields (Migration 067)
+    if (execution.resolved_by_vessel_id) record.resolved_by_vessel_id = execution.resolved_by_vessel_id;
+    if (execution.resolver_tier) record.resolver_tier = execution.resolver_tier;
 
     // Build field list - org_id/project_id are special: use $auth if JWT, or convert to record type
     const fields = Object.keys(record)
