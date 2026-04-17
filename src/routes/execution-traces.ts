@@ -97,68 +97,95 @@ interface ListExecutionTracesResponse {
 }
 
 /**
- * Forward co-change event to analysis-api learning service (async/non-blocking)
- * This updates co-change patterns based on files modified in execution traces.
+ * Record co-change pattern via vessel routing (async/non-blocking)
+ * Routes cochange impulses to Analysis-API via discovery-vessel protocol.
  *
- * M4.2: Wire Activity API to Learning
+ * REFACTORED: Removed direct HTTP proxy to Analysis-API (violates architecture).
+ * Now uses vessel routing pattern: creates impulse, routes via discovery.
+ *
+ * Related: AUDIT_RESOLUTION_PLAN.md Repository 1, Commit 2
  */
-async function forwardToLearning(
+async function recordCochangePattern(
   sessionId: string,
   changedFiles: string[],
   projectId: string | null
 ): Promise<void> {
-  // Only forward if we have at least 2 files changed (co-change requires pairs)
+  // Only process if we have at least 2 files changed (co-change requires pairs)
   if (changedFiles.length < 2) {
-    logger.debug('Skipping learning forward - less than 2 files changed', {
+    logger.debug('[cochange] Skipping - less than 2 files changed', {
       session_id: sessionId,
       files_count: changedFiles.length,
     });
     return;
   }
 
-  const analysisApiUrl = config.analysisApi.url;
-  const endpoint = `${analysisApiUrl}/v2/analysis/learning/cochange`;
-
   try {
-    // Fire and forget - don't await the response
-    fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Session-ID': sessionId,
-      },
-      body: JSON.stringify({
-        session_id: sessionId,
-        changed_files: changedFiles,
-        project_id: projectId || 'default',
-      }),
-      // Short timeout since this is non-blocking
-      signal: AbortSignal.timeout(config.analysisApi.timeout),
-    }).then(async (response) => {
-      if (response.ok) {
-        logger.info('[learning] Co-change event forwarded successfully', {
-          session_id: sessionId,
-          files_count: changedFiles.length,
-        });
-      } else {
-        const errorText = await response.text();
-        logger.warn('[learning] Co-change forward failed', {
-          session_id: sessionId,
-          status: response.status,
-          error: errorText,
-        });
-      }
-    }).catch((error) => {
-      // Log but don't fail - learning is non-critical
-      logger.warn('[learning] Co-change forward error (non-blocking)', {
-        session_id: sessionId,
-        error: error instanceof Error ? error.message : String(error),
+    // Import discovery client dynamically (avoid circular dependency)
+    const { discoveryClient } = await import('../services/discovery-client');
+
+    // Query discovery-vessel for vessels that can handle 'cochange' shape
+    const discovery = await discoveryClient.discoverVesselsForShape('cochange');
+
+    if (discovery.found && discovery.vessels.length > 0) {
+      // Route to first capable vessel (Analysis-API should register this shape)
+      const vessel = discovery.vessels[0];
+      const endpoint = `${vessel.endpoint}/v2/impulses/resolve`;
+
+      logger.debug('[cochange] Routing via discovery', {
+        vesselId: vessel.vesselId,
+        endpoint,
+        sessionId,
+        filesCount: changedFiles.length,
       });
-    });
+
+      // Fire and forget - don't await the response
+      fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Session-ID': sessionId,
+        },
+        body: JSON.stringify({
+          pointer: {
+            type: 'cochange',
+            sessionId,
+            changedFiles,
+            projectId: projectId || 'default',
+          },
+        }),
+        signal: AbortSignal.timeout(30000),
+      }).then(async (response) => {
+        if (response.ok) {
+          logger.info('[cochange] ✓ Routed to Analysis-API via discovery', {
+            vesselId: vessel.vesselId,
+            sessionId,
+            filesCount: changedFiles.length,
+          });
+        } else {
+          const errorText = await response.text();
+          logger.warn('[cochange] ✗ Vessel routing failed', {
+            vesselId: vessel.vesselId,
+            status: response.status,
+            error: errorText,
+          });
+        }
+      }).catch((error) => {
+        // Non-blocking error - cochange learning is optional
+        logger.warn('[cochange] ✗ Vessel call error (non-blocking)', {
+          vesselId: vessel.vesselId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    } else {
+      logger.debug('[cochange] No vessels available for cochange shape', {
+        sessionId,
+        filesCount: changedFiles.length,
+      });
+    }
   } catch (error) {
-    // Catch synchronous errors (shouldn't happen with fetch)
-    logger.warn('[learning] Co-change forward setup error', {
-      session_id: sessionId,
+    // Catch discovery client errors - don't fail the request
+    logger.warn('[cochange] ✗ Discovery query error (non-blocking)', {
+      sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
   }
@@ -1001,11 +1028,14 @@ app.post('/', async (c) => {
         trace: {
           tasks: trace.tasks,
           state_snapshot: trace.state_snapshot,
+          impulse_resolutions: body.impulse_resolutions, // Migration 067
         },
         org_id: typeof trace.org_id === 'string' ? trace.org_id : undefined,
         project_id: typeof trace.project_id === 'string' ? trace.project_id : undefined,
         vessel_id: body.vessel_id || body.pod_name,
         vessel_version: body.vessel_version,
+        resolved_by_vessel_id: body.resolved_by_vessel_id, // Migration 067
+        resolver_tier: body.resolver_tier, // Migration 067
       };
 
       const paradigmResult = await insertExecution(paradigmExecution, jwtAuth?.jwtToken);
@@ -1209,10 +1239,10 @@ app.post('/', async (c) => {
     // Deduplicate
     const uniqueFiles = [...new Set(filesModified)];
 
-    // Forward to learning (non-blocking, don't await)
+    // Record co-change pattern via vessel routing (non-blocking, don't await)
     if (uniqueFiles.length >= 2) {
       const sessionId = c.req.header('X-Session-ID') || session.session_id || 'unknown';
-      forwardToLearning(sessionId, uniqueFiles, traceProjectId);
+      recordCochangePattern(sessionId, uniqueFiles, traceProjectId);
     }
 
     return c.json({

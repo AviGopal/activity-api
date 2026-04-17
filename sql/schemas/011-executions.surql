@@ -366,13 +366,28 @@ DEFINE FIELD IF NOT EXISTS times_execution_failed ON impulse_relevance_metrics T
   VALUE $value OR 0
   COMMENT "Number of failed executions when impulse was loaded";
 
+DEFINE FIELD IF NOT EXISTS times_not_loaded_succeeded ON impulse_relevance_metrics TYPE int
+  VALUE $value OR 0
+  COMMENT "Number of successful executions when impulse was NOT loaded";
+
+DEFINE FIELD IF NOT EXISTS times_not_loaded_failed ON impulse_relevance_metrics TYPE int
+  VALUE $value OR 0
+  COMMENT "Number of failed executions when impulse was NOT loaded";
+
 DEFINE FIELD IF NOT EXISTS relevance_score ON impulse_relevance_metrics TYPE float
   VALUE $value OR 0.0
-  COMMENT "Calculated relevance score (success rate when loaded)";
+  COMMENT "Calculated relevance score: P(success | impulse loaded)";
 
-DEFINE FIELD IF NOT EXISTS avg_tokens ON impulse_relevance_metrics TYPE int
+DEFINE FIELD IF NOT EXISTS irrelevance_score ON impulse_relevance_metrics TYPE float
+  VALUE $value OR 0.0
+  COMMENT "Calculated irrelevance score: P(success | impulse NOT loaded)";
+
+DEFINE FIELD IF NOT EXISTS avg_content_size_tokens ON impulse_relevance_metrics TYPE int
   VALUE $value OR 0
-  COMMENT "Average token count of this impulse";
+  COMMENT "Average token count of this impulse's content";
+
+DEFINE FIELD IF NOT EXISTS typical_pointer_type ON impulse_relevance_metrics TYPE option<string>
+  COMMENT "Most common pointer type for this impulse (e.g., 'file', 'activityExecutionTrace')";
 
 DEFINE FIELD IF NOT EXISTS created_at ON impulse_relevance_metrics TYPE datetime
   VALUE $value OR time::now()

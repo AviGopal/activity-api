@@ -131,18 +131,36 @@ router.post('/', async (c) => {
     // Use the pointer from impulse_data directly (already has proper structure)
     const pointer = impulse_data.pointer;
 
+    // Generate summary for metadata-first resolution
+    // Priority: metadata summary > pointer path/type > shape
+    let summary = '';
+    const metadataDescription = impulse_data.metadata?.summary || impulse_data.metadata?.description;
+    if (typeof metadataDescription === 'string') {
+      summary = metadataDescription.substring(0, 100);
+    } else if (pointer.path || pointer.file_path) {
+      const path = pointer.path || pointer.file_path;
+      summary = `${shape}: ${path}`.substring(0, 100);
+    } else if (pointer.type) {
+      summary = `${shape} (${pointer.type})`.substring(0, 100);
+    } else {
+      summary = shape.substring(0, 100);
+    }
+
     // Build query params dynamically to avoid sending null for optional fields
     // SurrealDB's option<T> expects either a value or the field to be omitted, not null
-    // Note: SurrealDB 3.x requires Date objects for datetime fields, not ISO strings
     const params: Record<string, any> = {
       impulse_id,
       pointer,
       shape,
+      summary,
       metadata: impulse_data.metadata || {},
-      token_estimate: impulse_data.budget || 0,
+      budget: impulse_data.budget || 10000,
+      resources_consumed: 0,
+      budget_exhausted: false,
       org_id,
       project_id,
-      created_at: new Date(), // Pass Date object for SurrealDB datetime field
+      // Use Date object for SurrealDB datetime field (not ISO string)
+      created_at: new Date(),
     };
 
     // Only include content if it has a value (avoid null → NULL coercion issue)
@@ -157,18 +175,20 @@ router.post('/', async (c) => {
       params.created_by = created_by;
     }
 
-    // Use UPSERT for idempotency (creates if not exists, updates if exists)
-    // SurrealDB 3.x UPDATE only modifies existing records; UPSERT creates if missing
-    // Use backtick escaping for IDs with hyphens (e.g., `impulse:\`goal-123\``)
-    // Note: type::thing() and type::record() don't work in UPSERT context
+    // Use UPDATE for idempotency (creates if not exists, updates if exists)
+    // This prevents race conditions where CREATE succeeds but verification fails
+    // Use type::record() for SurrealDB 3.x to safely handle IDs with hyphens
     const createOrUpdateQuery = `
-      UPSERT impulse:\`${impulse_id}\` CONTENT {
+      UPDATE type::record('impulse', $impulse_id) CONTENT {
         id: $impulse_id,
         pointer: $pointer,
         shape: $shape,
+        summary: $summary,
         ${contentField}
         metadata: $metadata,
-        token_estimate: $token_estimate,
+        budget: $budget,
+        resources_consumed: $resources_consumed,
+        budget_exhausted: $budget_exhausted,
         org_id: $org_id,
         project_id: $project_id,
         ${createdByField}
@@ -205,6 +225,10 @@ router.post('/', async (c) => {
       },
       created_at: created.created_at,
       updated_at: created.created_at, // New schema doesn't have updated_at
+      // Budget tracking fields
+      budget: created.budget,
+      resources_consumed: created.resources_consumed,
+      budget_exhausted: created.budget_exhausted,
     };
 
     return c.json(response, 201);
@@ -305,6 +329,10 @@ router.get('/:impulseId', async (c) => {
       },
       created_at: impulse.created_at,
       updated_at: impulse.created_at, // New schema doesn't have updated_at
+      // Budget tracking fields
+      budget: impulse.budget,
+      resources_consumed: impulse.resources_consumed,
+      budget_exhausted: impulse.budget_exhausted,
     };
 
     return c.json(response, 200);
@@ -411,6 +439,10 @@ router.get('/', async (c) => {
       },
       created_at: impulse.created_at,
       updated_at: impulse.created_at, // New schema doesn't have updated_at
+      // Budget tracking fields
+      budget: impulse.budget,
+      resources_consumed: impulse.resources_consumed,
+      budget_exhausted: impulse.budget_exhausted,
     }));
 
     // Return response matching ImpulseListResponse schema
@@ -437,41 +469,186 @@ router.get('/', async (c) => {
 });
 
 /**
+ * Calculate resource consumption based on impulse type and content
+ * Different impulse types use different resource metrics:
+ * - Text-based (markdown, JSON): token count (rough estimate: characters / 4)
+ * - Database queries: row count
+ * - File content: byte count
+ */
+function calculateResourceConsumption(pointer: any, content: string): number {
+  const pointerType = pointer.type;
+
+  // Token-based consumption (text/markdown/JSON content)
+  if (
+    pointerType === 'activityExecutionTrace' ||
+    pointerType === 'activityTemplate' ||
+    pointerType === 'activityMetrics' ||
+    pointerType === 'toolRiskProfile' ||
+    pointerType === 'compositionSuccess' ||
+    pointerType === 'impulseRelevance' ||
+    pointerType === 'preValidationResult' ||
+    pointerType === 'goal'
+  ) {
+    // Rough token estimate: characters / 4 (OpenAI standard)
+    return Math.ceil(content.length / 4);
+  }
+
+  // Row-based consumption (list/array results)
+  if (
+    pointerType === 'executionTraceList' ||
+    pointerType === 'variantMetricsSummary' ||
+    pointerType === 'activityTemplateRecommendation' ||
+    pointerType === 'activityTemplatesByMetrics' ||
+    pointerType === 'executionTraces'
+  ) {
+    // Try to parse as JSON and count rows
+    try {
+      const parsed = JSON.parse(content);
+      if (parsed.metadata?.rowCount) {
+        return parsed.metadata.rowCount;
+      }
+      if (Array.isArray(parsed)) {
+        return parsed.length;
+      }
+      if (parsed.content?.traces?.length) {
+        return parsed.content.traces.length;
+      }
+      if (parsed.content?.variants?.length) {
+        return parsed.content.variants.length;
+      }
+    } catch {
+      // Fall through to character-based
+    }
+    // Fallback to character-based
+    return Math.ceil(content.length / 4);
+  }
+
+  // Default: byte count
+  return content.length;
+}
+
+/**
+ * Record impulse budget consumption to impulse_budget_log table
+ */
+async function recordBudgetConsumption(
+  impulseId: string,
+  activityId: string | undefined,
+  executionId: string | undefined,
+  budgetInitial: number,
+  budgetConsumed: number,
+  orgId: string,
+  projectId: string | null | undefined
+): Promise<void> {
+  const budgetRemaining = budgetInitial - budgetConsumed;
+  // Use Date object for SurrealDB datetime field (not ISO string)
+  const exhaustedAt = budgetRemaining < 0 ? new Date() : null;
+
+  const query = `
+    CREATE impulse_budget_log SET
+      impulse_id = $impulse_id,
+      activity_id = $activity_id,
+      execution_id = $execution_id,
+      budget_initial = $budget_initial,
+      budget_consumed = $budget_consumed,
+      budget_remaining = $budget_remaining,
+      exhausted_at = $exhausted_at,
+      org_id = $org_id,
+      project_id = $project_id,
+      created_at = time::now()
+  `;
+
+  await surrealDB.query(query, {
+    impulse_id: impulseId,
+    activity_id: activityId || 'unknown',
+    execution_id: executionId || null,
+    budget_initial: budgetInitial,
+    budget_consumed: budgetConsumed,
+    budget_remaining: budgetRemaining,
+    exhausted_at: exhaustedAt,
+    org_id: orgId,
+    project_id: projectId || null,
+  });
+
+  logger.info('Budget consumption recorded', {
+    impulse_id: impulseId,
+    budget_initial: budgetInitial,
+    budget_consumed: budgetConsumed,
+    budget_remaining: budgetRemaining,
+    exhausted: budgetRemaining < 0,
+  });
+}
+
+/**
+ * Update impulse table with consumed resources
+ */
+async function updateImpulseResourceConsumption(
+  impulseId: string,
+  resourcesConsumed: number
+): Promise<void> {
+  const query = `
+    UPDATE type::record('impulse', $impulse_id) SET
+      resources_consumed += $resources_consumed,
+      budget_exhausted = (resources_consumed >= budget)
+  `;
+
+  await surrealDB.query(query, {
+    impulse_id: impulseId,
+    resources_consumed: resourcesConsumed,
+  });
+}
+
+/**
  * POST /v2/impulses/resolve
  * Resolve impulse pointer to content string
- * 
+ *
  * This endpoint enables MiniBob to delegate non-local impulse resolution to the backend.
- * 
+ *
  * Architecture (Phase 1.8 - Unified Impulse-Driven):
  * - MiniBob handles local pointers: memo, file
  * - Backend handles all others: activityExecutionTrace, activityTemplate, activityMetrics, etc.
  * - This enables backend to add new pointer types without MiniBob code changes
- * 
+ *
  * Pointer types supported:
  * - activityExecutionTrace: Format trace as markdown for debugging
  * - activityTemplate: Format template as markdown for review
  * - activityMetrics: Format metrics as structured data
  * - (Backend can add more types without MiniBob changes)
- * 
+ *
  * Flow:
  * 1. Receive pointer object { type, executionId?, templateId?, ... }
  * 2. Switch on pointer.type
  * 3. Load data from appropriate table (execution_traces, activity_template, etc.)
  * 4. Format as markdown/structured text
- * 5. Return content string
+ * 5. Calculate resource consumption (tokens/bytes/rows)
+ * 6. Record budget consumption to impulse_budget_log
+ * 7. Update impulse.resources_consumed
+ * 8. Return content string with budget metadata
  */
 router.post('/resolve', async (c) => {
   try {
     const body = await c.req.json();
     const validated = ImpulseResolveRequestSchema.parse(body);
-    
-    logger.info('POST /v2/impulses/resolve', { 
+
+    logger.info('POST /v2/impulses/resolve', {
       pointer_type: validated.pointer.type,
       has_execution_id: !!validated.pointer.executionId,
       has_template_id: !!validated.pointer.templateId,
     });
 
     const { pointer } = validated;
+
+    // Extract context for budget tracking
+    const impulseId = body.impulse_id || body.impulseId; // Support both naming conventions
+    const activityId = body.activity_id || body.activityId;
+    const executionId = body.execution_id || body.executionId;
+    const budgetInitial = body.budget || 10000; // Default 10k if not specified
+
+    // Get org_id from auth context
+    const jwtAuth = getJwtAuthFromContext(c);
+    const sessionData = (c.get as any)('session') as SessionData | undefined;
+    const orgId = jwtAuth?.orgId || sessionData?.org_id || 'unknown';
+    const projectId = jwtAuth?.projectId || sessionData?.project_id;
+
     let content: string;
 
     switch (pointer.type) {
@@ -604,9 +781,11 @@ router.post('/resolve', async (c) => {
         }
 
         // Load metrics for all variants of activity
+        // Exclude deprecated variants by default (use variantPerformance pointer for deprecated ones)
         const query = `
           SELECT * FROM variant_performance_metrics
           WHERE activity_id = $activity_id
+            AND is_deprecated = false
           ORDER BY success_rate DESC
         `;
 
@@ -1303,7 +1482,7 @@ router.post('/resolve', async (c) => {
             times_execution_succeeded,
             times_execution_failed,
             relevance_score,
-            avg_tokens,
+            avg_content_size_tokens AS avg_tokens,
             created_at,
             updated_at
           FROM impulse_relevance_metrics
@@ -1473,10 +1652,53 @@ router.post('/resolve', async (c) => {
       content_length: content.length,
     });
 
+    // Calculate resource consumption
+    const resourcesConsumed = calculateResourceConsumption(pointer, content);
+    const budgetRemaining = budgetInitial - resourcesConsumed;
+    const budgetExhausted = budgetRemaining < 0;
+
+    // Track budget consumption if impulse_id provided
+    if (impulseId) {
+      try {
+        // Record to impulse_budget_log
+        await recordBudgetConsumption(
+          impulseId,
+          activityId,
+          executionId,
+          budgetInitial,
+          resourcesConsumed,
+          orgId,
+          projectId
+        );
+
+        // Update impulse.resources_consumed
+        await updateImpulseResourceConsumption(impulseId, resourcesConsumed);
+
+        logger.info('Budget tracking completed', {
+          impulse_id: impulseId,
+          resources_consumed: resourcesConsumed,
+          budget_exhausted: budgetExhausted,
+        });
+      } catch (budgetError: any) {
+        // Non-critical: log but don't fail the resolution
+        logger.warn('Budget tracking failed (non-critical)', {
+          impulse_id: impulseId,
+          error: budgetError.message,
+        });
+      }
+    }
+
     return c.json({
       success: true,
       content,
-    } as ImpulseResolveResponse, 200);
+      // Include budget metadata in response
+      budget_metadata: impulseId ? {
+        budget_initial: budgetInitial,
+        resources_consumed: resourcesConsumed,
+        budget_remaining: budgetRemaining,
+        budget_exhausted: budgetExhausted,
+      } : undefined,
+    } as ImpulseResolveResponse & { budget_metadata?: any }, 200);
 
   } catch (error: any) {
     logger.error('POST /v2/impulses/resolve failed', {
