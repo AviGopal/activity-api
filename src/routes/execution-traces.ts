@@ -1001,11 +1001,14 @@ app.post('/', async (c) => {
         trace: {
           tasks: trace.tasks,
           state_snapshot: trace.state_snapshot,
+          impulse_resolutions: body.impulse_resolutions, // Migration 067
         },
         org_id: typeof trace.org_id === 'string' ? trace.org_id : undefined,
         project_id: typeof trace.project_id === 'string' ? trace.project_id : undefined,
         vessel_id: body.vessel_id || body.pod_name,
         vessel_version: body.vessel_version,
+        resolved_by_vessel_id: body.resolved_by_vessel_id, // Migration 067
+        resolver_tier: body.resolver_tier, // Migration 067
       };
 
       const paradigmResult = await insertExecution(paradigmExecution, jwtAuth?.jwtToken);
