@@ -240,7 +240,9 @@ router.post('/', async (c) => {
     });
 
     // Handle duplicate key errors (impulse already exists)
-    if (error.message?.includes('already exists') || error.message?.includes('duplicate')) {
+    if (error.message?.includes('already exists') ||
+        error.message?.includes('duplicate') ||
+        error.message?.includes('already contains')) {
       return c.json({
         error: 'Impulse already exists',
         message: 'An impulse with this ID already exists for this organization',
