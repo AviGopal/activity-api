@@ -13,6 +13,8 @@ const SURREALDB_DATABASE = process.env.SURREALDB_DATABASE || 'learning_loop';
 const SURREALDB_USERNAME = process.env.SURREALDB_USERNAME || 'root';
 const SURREALDB_PASSWORD = process.env.SURREALDB_PASSWORD || 'surrealdb-local-dev-123';
 const SURREALDB_AUTH_ENABLED = process.env.SURREALDB_AUTH_ENABLED?.toLowerCase() !== 'false';
+// JWT_SECRET for API key authentication - used to update ACCESS method KEY
+const JWT_SECRET = process.env.JWT_SECRET;
 
 const SQL_DIR = join(import.meta.dir, '../sql');
 
@@ -27,7 +29,17 @@ async function applySQLFile(filePath: string): Promise<boolean> {
   console.log(`\n[Migration] Applying ${fileName}...`);
 
   try {
-    const sqlContent = await readFile(filePath, 'utf-8');
+    let sqlContent = await readFile(filePath, 'utf-8');
+
+    // Substitute JWT_SECRET in migrations that define ACCESS methods
+    // This ensures the SurrealDB ACCESS method KEY matches the application's JWT_SECRET
+    if (JWT_SECRET && sqlContent.includes("KEY 'dev-secret-change-in-production'")) {
+      console.log(`[Migration] Substituting JWT_SECRET in ${fileName}`);
+      sqlContent = sqlContent.replace(
+        /KEY\s+'dev-secret-change-in-production'/g,
+        `KEY '${JWT_SECRET}'`
+      );
+    }
 
     // Build headers - only include Authorization when auth is enabled
     const headers: Record<string, string> = {
@@ -120,6 +132,7 @@ async function main() {
   console.log('='.repeat(80));
   console.log(`Database: ${SURREALDB_NAMESPACE}.${SURREALDB_DATABASE}`);
   console.log(`URL: ${SURREALDB_URL}`);
+  console.log(`JWT_SECRET: ${JWT_SECRET ? '✓ configured (will substitute in ACCESS methods)' : '✗ not set (using dev default)'}`);
   console.log('='.repeat(80));
 
   // Wait for database to be ready
