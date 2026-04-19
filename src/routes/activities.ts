@@ -5485,9 +5485,15 @@ app.post('/tool-argument-patterns', async (c) => {
         SET
           times_used = times_used + 1,
           times_succeeded = times_succeeded + $success_increment,
+          times_failed = (times_failed OR 0) + $failure_increment,
           avg_execution_ms = (avg_execution_ms * $current_times_used + $execution_ms) / ($current_times_used + 1),
           last_used_at = time::now(),
-          updated_at = time::now()
+          updated_at = time::now(),
+          failure_type = $failure_type,
+          failure_reason = $failure_reason,
+          tool_succeeded = $tool_succeeded,
+          validation_error = $validation_error,
+          failure_counts = $failure_counts
         WHERE argument_hash = $hash AND org_id = <string>$auth.org_id
         RETURN AFTER
       `;
@@ -5495,8 +5501,14 @@ app.post('/tool-argument-patterns', async (c) => {
       const updateResult = await surrealDB.query<any[]>(updateQuery, {
         hash: validated.argument_hash,
         success_increment: successIncrement,
+        failure_increment: failureIncrement,
         current_times_used: currentTimesUsed,
         execution_ms: validated.execution_ms,
+        failure_type: validated.failure_type || null,
+        failure_reason: validated.failure_reason || null,
+        tool_succeeded: validated.tool_succeeded ?? null,
+        validation_error: validated.validation_error || null,
+        failure_counts: currentFailureCounts,
       });
 
       pattern = updateResult && updateResult.length > 0 ? updateResult[0] : current;
@@ -5524,8 +5536,14 @@ app.post('/tool-argument-patterns', async (c) => {
           arguments = $arguments,
           times_used = 1,
           times_succeeded = $success_increment,
+          times_failed = $failure_increment,
           avg_execution_ms = $execution_ms,
-          last_used_at = time::now()
+          last_used_at = time::now(),
+          failure_type = $failure_type,
+          failure_reason = $failure_reason,
+          tool_succeeded = $tool_succeeded,
+          validation_error = $validation_error,
+          failure_counts = $failure_counts
       `;
 
       const createResult = await surrealDB.query<any[]>(createQuery, {
@@ -5535,7 +5553,13 @@ app.post('/tool-argument-patterns', async (c) => {
         argument_hash: validated.argument_hash,
         arguments: validated.arguments,
         success_increment: validated.execution_succeeded ? 1 : 0,
+        failure_increment: validated.execution_succeeded ? 0 : 1,
         execution_ms: validated.execution_ms,
+        failure_type: validated.failure_type || null,
+        failure_reason: validated.failure_reason || null,
+        tool_succeeded: validated.tool_succeeded ?? null,
+        validation_error: validated.validation_error || null,
+        failure_counts: initialFailureCounts,
       });
 
       pattern = createResult && createResult.length > 0 ? createResult[0] : {
@@ -6318,6 +6342,303 @@ app.get('/shapes/autocomplete', async (c) => {
     logger.error('GET /shapes/autocomplete failed', { error: error.message, stack: error.stack });
     return c.json({
       error: 'Failed to get shape suggestions',
+      message: error.message,
+    }, 500);
+  }
+});
+
+/**
+ * POST /v2/activities/impulse-resolutions
+ * Store impulse resolution metrics for learning
+ *
+ * Phase 2 of comprehensive impulse state space learning tracking.
+ * Receives resolution metrics from MiniBob executions and stores them
+ * for Thompson Sampling, vessel performance monitoring, and cost optimization.
+ *
+ * Request body:
+ * {
+ *   execution_id?: string,
+ *   resolutions: Array<{
+ *     impulse_id: string,
+ *     impulse_type: string,
+ *     resolver_id: string,
+ *     resolver_tier: string,
+ *     vessel_id: string,
+ *     success: boolean,
+ *     error_reason?: string,
+ *     latency_ms: number,
+ *     cost_usd: number,
+ *     discovery_failure?: boolean,
+ *     requested_shape?: string
+ *   }>
+ * }
+ *
+ * Multi-tenant isolation via org_id from JWT auth context.
+ */
+app.post('/impulse-resolutions', async (c) => {
+  try {
+    const auth = getJwtAuthFromContext(c);
+    if (!auth) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    const orgId = auth.orgId;
+
+    const body = await c.req.json();
+    const { execution_id, resolutions } = body;
+
+    if (!resolutions || !Array.isArray(resolutions)) {
+      return c.json({
+        error: 'Invalid request',
+        message: 'resolutions array is required',
+      }, 400);
+    }
+
+    logger.info('Storing impulse resolution metrics', {
+      org_id: orgId,
+      execution_id,
+      count: resolutions.length,
+    });
+
+    // Store each resolution as a separate record
+    const stored = [];
+    for (const resolution of resolutions) {
+      try {
+        const query = `
+          CREATE impulse_resolution_metrics CONTENT {
+            impulse_id: $impulse_id,
+            impulse_type: $impulse_type,
+            execution_id: $execution_id,
+            resolver_id: $resolver_id,
+            resolver_tier: $resolver_tier,
+            vessel_id: $vessel_id,
+            success: $success,
+            error_reason: $error_reason,
+            latency_ms: $latency_ms,
+            cost_usd: $cost_usd,
+            discovery_failure: $discovery_failure,
+            requested_shape: $requested_shape,
+            org_id: $org_id
+          };
+        `;
+
+        const record = await surrealDB.query(query, {
+          impulse_id: resolution.impulse_id,
+          impulse_type: resolution.impulse_type,
+          execution_id: execution_id || null,
+          resolver_id: resolution.resolver_id,
+          resolver_tier: resolution.resolver_tier,
+          vessel_id: resolution.vessel_id,
+          success: resolution.success,
+          error_reason: resolution.error_reason || null,
+          latency_ms: resolution.latency_ms,
+          cost_usd: resolution.cost_usd,
+          discovery_failure: resolution.discovery_failure || null,
+          requested_shape: resolution.requested_shape || null,
+          org_id: orgId,
+        });
+
+        stored.push(record);
+      } catch (error: any) {
+        logger.error('Failed to store resolution metric', {
+          resolution,
+          error: error.message,
+        });
+        // Continue storing other resolutions even if one fails
+      }
+    }
+
+    logger.info('Stored impulse resolution metrics', {
+      org_id: orgId,
+      execution_id,
+      stored: stored.length,
+      failed: resolutions.length - stored.length,
+    });
+
+    return c.json({
+      success: true,
+      stored: stored.length,
+      total: resolutions.length,
+    }, 201);
+
+  } catch (error: any) {
+    logger.error('POST /impulse-resolutions failed', {
+      error: error.message,
+      stack: error.stack,
+    });
+    return c.json({
+      error: 'Failed to store impulse resolution metrics',
+      message: error.message,
+    }, 500);
+  }
+});
+
+/**
+ * GET /v2/activities/resolver-performance
+ * Query resolver performance metrics for learning
+ *
+ * Query parameters:
+ * - impulse_type: Filter by impulse type
+ * - resolver_id: Filter by resolver ID
+ * - vessel_id: Filter by vessel ID
+ * - limit: Maximum results (default: 100)
+ *
+ * Returns aggregated statistics for resolver selection (Thompson Sampling).
+ */
+app.get('/resolver-performance', async (c) => {
+  try {
+    const auth = getJwtAuthFromContext(c);
+    if (!auth) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    const orgId = auth.orgId;
+
+    const impulse_type = c.req.query('impulse_type');
+    const resolver_id = c.req.query('resolver_id');
+    const vessel_id = c.req.query('vessel_id');
+    const limit = parseInt(c.req.query('limit') || '100', 10);
+
+    logger.debug('Querying resolver performance', {
+      org_id: orgId,
+      impulse_type,
+      resolver_id,
+      vessel_id,
+      limit,
+    });
+
+    // Build query with optional filters
+    let query = `
+      SELECT
+        impulse_type,
+        resolver_id,
+        resolver_tier,
+        vessel_id,
+        count() AS total_attempts,
+        math::sum(success) AS successes,
+        math::mean(latency_ms) AS avg_latency_ms,
+        math::sum(cost_usd) AS total_cost_usd,
+        math::mean(cost_usd) AS avg_cost_usd,
+        (math::sum(success) / count()) AS success_rate
+      FROM impulse_resolution_metrics
+      WHERE org_id = $org_id
+    `;
+
+    const params: any = { org_id: orgId };
+
+    if (impulse_type) {
+      query += ` AND impulse_type = $impulse_type`;
+      params.impulse_type = impulse_type;
+    }
+
+    if (resolver_id) {
+      query += ` AND resolver_id = $resolver_id`;
+      params.resolver_id = resolver_id;
+    }
+
+    if (vessel_id) {
+      query += ` AND vessel_id = $vessel_id`;
+      params.vessel_id = vessel_id;
+    }
+
+    query += `
+      GROUP BY impulse_type, resolver_id, resolver_tier, vessel_id
+      ORDER BY total_attempts DESC
+      LIMIT $limit
+    `;
+
+    params.limit = limit;
+
+    const results = await queryWithAuth<any>(auth.jwtToken, query, params);
+
+    logger.info('Resolver performance query result', {
+      org_id: orgId,
+      results: results.length,
+    });
+
+    return c.json({
+      performance: results,
+      filters: { impulse_type, resolver_id, vessel_id },
+      total: results.length,
+    });
+
+  } catch (error: any) {
+    logger.error('GET /resolver-performance failed', {
+      error: error.message,
+      stack: error.stack,
+    });
+    return c.json({
+      error: 'Failed to query resolver performance',
+      message: error.message,
+    }, 500);
+  }
+});
+
+/**
+ * GET /v2/activities/shape-gaps
+ * Query shapes without available vessels (discovery failures)
+ *
+ * Query parameters:
+ * - limit: Maximum results (default: 50)
+ * - min_failures: Minimum failure count (default: 3)
+ *
+ * Returns shapes that have failed discovery lookups, indicating
+ * missing vessels that should be created.
+ */
+app.get('/shape-gaps', async (c) => {
+  try {
+    const auth = getJwtAuthFromContext(c);
+    if (!auth) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    const orgId = auth.orgId;
+
+    const limit = parseInt(c.req.query('limit') || '50', 10);
+    const min_failures = parseInt(c.req.query('min_failures') || '3', 10);
+
+    logger.debug('Querying shape gaps', {
+      org_id: orgId,
+      limit,
+      min_failures,
+    });
+
+    const query = `
+      SELECT
+        requested_shape,
+        count() AS failure_count,
+        max(timestamp) AS last_seen
+      FROM impulse_resolution_metrics
+      WHERE org_id = $org_id
+        AND discovery_failure = true
+        AND requested_shape IS NOT NULL
+      GROUP BY requested_shape
+      HAVING count() >= $min_failures
+      ORDER BY failure_count DESC
+      LIMIT $limit
+    `;
+
+    const results = await queryWithAuth<any>(auth.jwtToken, query, {
+      org_id: orgId,
+      min_failures,
+      limit,
+    });
+
+    logger.info('Shape gaps query result', {
+      org_id: orgId,
+      gaps: results.length,
+    });
+
+    return c.json({
+      gaps: results,
+      total: results.length,
+      min_failures,
+    });
+
+  } catch (error: any) {
+    logger.error('GET /shape-gaps failed', {
+      error: error.message,
+      stack: error.stack,
+    });
+    return c.json({
+      error: 'Failed to query shape gaps',
       message: error.message,
     }, 500);
   }
