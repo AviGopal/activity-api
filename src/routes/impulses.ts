@@ -156,7 +156,8 @@ router.post('/', async (c) => {
       token_estimate: impulse_data.budget || 0,
       org_id,
       project_id,
-      created_at: new Date().toISOString(),
+      // Note: created_at will be set via time::now() in SQL query (not passed as parameter)
+      // JavaScript Date objects serialize to ISO strings which SurrealDB can't coerce to datetime
     };
 
     // Only include content if it has a value (avoid null → NULL coercion issue)
@@ -174,6 +175,7 @@ router.post('/', async (c) => {
     // Use UPDATE for idempotency (creates if not exists, updates if exists)
     // This prevents race conditions where CREATE succeeds but verification fails
     // Use type::record() for SurrealDB 3.x to safely handle IDs with hyphens
+    // Use time::now() instead of Date parameter to avoid datetime coercion errors
     const createOrUpdateQuery = `
       UPDATE type::record('impulse', $impulse_id) CONTENT {
         id: $impulse_id,
@@ -186,7 +188,7 @@ router.post('/', async (c) => {
         org_id: $org_id,
         project_id: $project_id,
         ${createdByField}
-        created_at: $created_at
+        created_at: time::now()
       }
     `;
 
