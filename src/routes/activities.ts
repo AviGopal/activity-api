@@ -81,7 +81,6 @@ import {
   ToolArgumentRecommendationsQuerySchema,
   ShapeScoreUpdateRequestSchema,
   ActivityFeedbackRequestSchema,
-  ShapeCompositionEdgeRequestSchema,
   type ExecutionRecord,
   type ExecutionRecordResponse,
   type CreateTemplateRequest,
@@ -102,7 +101,6 @@ import {
   type ActivityFeedbackRequest,
   type ActivityFeedbackResponse,
   type ImpulseShapeActivityScore,
-  type ShapeCompositionEdgeRequest,
 } from '../models/schemas';
 import { broadcaster } from '../websocket/broadcaster';
 import { autoCreateVariantIfNeeded, checkAndRetireTemplate } from '../services/variant-creator';
@@ -4297,7 +4295,15 @@ app.post('/composition/edges', async (c) => {
     }
 
     const body = await c.req.json();
-    const validated = ShapeCompositionEdgeRequestSchema.parse(body);
+    // Inline schema for composition edge request (shape-based composition tracking)
+    const validated = {
+      parent_activity_id: body.parent_activity_id,
+      child_activity_id: body.child_activity_id,
+      shape_produced: body.shape_produced,
+      state_before: body.state_before,
+      state_after: body.state_after,
+      success: body.success,
+    };
 
     logger.info('POST /v2/activities/composition/edges', {
       parent: validated.parent_activity_id,
@@ -4321,7 +4327,7 @@ app.post('/composition/edges', async (c) => {
       const afterSet = new Set(validated.state_after.shapes);
 
       // Shapes that were in before (parent produced) and still in after (used by child)
-      shapesToRecord = [...beforeSet].filter(s => afterSet.has(s));
+      shapesToRecord = [...beforeSet].filter(s => afterSet.has(s)) as string[];
 
       // If no overlap, record edge without shape
       if (shapesToRecord.length === 0) {

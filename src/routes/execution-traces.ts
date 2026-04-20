@@ -1110,7 +1110,7 @@ app.post('/', async (c) => {
       `;
 
       // Get org_id from trace for RBAC-compliant update
-      const traceOrgId = (trace as any).org_id || jwtAuth?.org_id;
+      const traceOrgId = (trace as any).org_id || jwtAuth?.orgId;
       const updateParams = {
         activity_id: trace.variant_id, // variant_id is the activity ID
         org_id: traceOrgId, // RBAC: ensure updates only affect org's own templates

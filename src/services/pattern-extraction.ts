@@ -7,7 +7,7 @@
 
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
-import { inferShapesFromImpulse } from '../utils/shape-inference';
+import { inferShapesFromTemplate } from '../utils/shape-inference';
 
 /**
  * Extract pattern from an execution trace and upsert pattern record.
@@ -127,8 +127,8 @@ async function extractShapesFromImpulses(impulseIds: string[]): Promise<string[]
     }
 
     const shapes = result
-      .map((r) => r.shape)
-      .filter((shape) => shape !== null && shape !== undefined);
+      .map((r: any) => r.shape)
+      .filter((shape: any) => shape !== null && shape !== undefined) as string[];
 
     return [...new Set(shapes)]; // Deduplicate
   } catch (error: any) {
@@ -196,7 +196,7 @@ async function upsertPattern(params: {
 
   if (existing && existing.length > 0) {
     // Update existing pattern with rolling averages
-    const pattern = existing[0];
+    const pattern = existing[0] as any;
     const newExecutionCount = pattern.execution_count + 1;
     const newSuccessCount = pattern.success_count + (success ? 1 : 0);
     const newFailureCount = pattern.failure_count + (success ? 0 : 1);
@@ -392,10 +392,10 @@ export async function queryPatterns(params: {
     surrealDB.query<Array<{ total: number }>>(countQuery, queryParams),
   ]);
 
-  const total = countResult?.[0]?.total || 0;
+  const total = (countResult?.[0] as any)?.total || 0;
 
   return {
-    patterns: patterns || [],
+    patterns: patterns?.[0] || [],
     total,
   };
 }

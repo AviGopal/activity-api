@@ -47,7 +47,7 @@ app.post('/query', async (c) => {
     const jwtAuth = getJwtAuthFromContext(c);
     const useJwtAuth = hasJwtAuth(c);
 
-    if (!jwtAuth?.orgId && !jwtAuth?.authenticated) {
+    if (!jwtAuth?.orgId) {
       return c.json({
         error: 'Authentication required',
         message: 'org_id is required to query patterns',
@@ -125,7 +125,7 @@ app.get('/', async (c) => {
     const jwtAuth = getJwtAuthFromContext(c);
     const useJwtAuth = hasJwtAuth(c);
 
-    if (!jwtAuth?.orgId && !jwtAuth?.authenticated) {
+    if (!jwtAuth?.orgId) {
       return c.json({
         error: 'Authentication required',
         message: 'org_id is required to query patterns',

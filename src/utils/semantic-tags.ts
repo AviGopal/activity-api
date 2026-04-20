@@ -202,7 +202,6 @@ const KEYWORD_TO_TAGS: Record<string, string[]> = {
   'performance': ['meta.refactor', 'tool'],
   'slow': ['meta.refactor', 'meta.debug'],
   'latency': ['meta.refactor', 'meta.debug'],
-  'memory': ['meta.debug', 'meta.refactor'],
   'cpu': ['meta.debug', 'meta.refactor'],
   'cache': ['meta.refactor', 'feature.vessel.state'],
 

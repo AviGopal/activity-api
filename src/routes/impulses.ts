@@ -132,15 +132,15 @@ router.post('/', async (c) => {
     const pointer = impulse_data.pointer;
 
     // Generate summary for metadata-first resolution
-    // Priority: metadata description > pointer path/type > shape
+    // Priority: metadata summary > pointer path/type > shape
     let summary = '';
-    if (impulse_data.metadata?.description) {
-      summary = impulse_data.metadata.description.substring(0, 100);
-    } else if (pointer.path || pointer.file_path) {
-      const path = pointer.path || pointer.file_path;
+    if (impulse_data.metadata?.summary) {
+      summary = impulse_data.metadata.summary.substring(0, 100);
+    } else if ((pointer as any).path || (pointer as any).file_path) {
+      const path = (pointer as any).path || (pointer as any).file_path;
       summary = `${shape}: ${path}`.substring(0, 100);
-    } else if (pointer.type) {
-      summary = `${shape} (${pointer.type})`.substring(0, 100);
+    } else if ((pointer as any).type) {
+      summary = `${shape} (${(pointer as any).type})`.substring(0, 100);
     } else {
       summary = shape.substring(0, 100);
     }
