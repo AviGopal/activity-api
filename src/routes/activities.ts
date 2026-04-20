@@ -6145,10 +6145,10 @@ app.post('/tool-argument-patterns', async (c) => {
         failure_increment: failureIncrement,
         current_times_used: currentTimesUsed,
         execution_ms: validated.execution_ms,
-        failure_type: validated.failure_type || null,
-        failure_reason: validated.failure_reason || null,
-        tool_succeeded: validated.tool_succeeded ?? null,
-        validation_error: validated.validation_error || null,
+        failure_type: validated.failure_type || undefined,
+        failure_reason: validated.failure_reason || undefined,
+        tool_succeeded: validated.tool_succeeded ?? undefined,
+        validation_error: validated.validation_error || undefined,
         failure_counts: currentFailureCounts,
       });
 
@@ -6196,10 +6196,10 @@ app.post('/tool-argument-patterns', async (c) => {
         success_increment: validated.execution_succeeded ? 1 : 0,
         failure_increment: validated.execution_succeeded ? 0 : 1,
         execution_ms: validated.execution_ms,
-        failure_type: validated.failure_type || null,
-        failure_reason: validated.failure_reason || null,
-        tool_succeeded: validated.tool_succeeded ?? null,
-        validation_error: validated.validation_error || null,
+        failure_type: validated.failure_type || undefined,
+        failure_reason: validated.failure_reason || undefined,
+        tool_succeeded: validated.tool_succeeded ?? undefined,
+        validation_error: validated.validation_error || undefined,
         failure_counts: initialFailureCounts,
       });
 

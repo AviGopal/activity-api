@@ -155,7 +155,6 @@ router.post('/', async (c) => {
       metadata: impulse_data.metadata || {},
       token_estimate: impulse_data.budget || 0,
       org_id,
-      project_id,
       // Note: created_at will be set via time::now() in SQL query (not passed as parameter)
       // JavaScript Date objects serialize to ISO strings which SurrealDB can't coerce to datetime
     };
@@ -164,6 +163,14 @@ router.post('/', async (c) => {
     const contentField = pointer.content ? 'content: $content,' : '';
     if (pointer.content) {
       params.content = pointer.content;
+    }
+
+    // Only include project_id if it has a value (avoid null → NULL coercion issue)
+    // Convert to record reference if it's a plain string
+    const projectIdField = project_id ? 'project_id: $project_id,' : '';
+    if (project_id) {
+      // Check if it's already a record reference (contains ':')
+      params.project_id = project_id.includes(':') ? project_id : `projects:${project_id}`;
     }
 
     // Only include created_by if it has a value (empty string means internal service)
@@ -186,7 +193,7 @@ router.post('/', async (c) => {
         metadata: $metadata,
         token_estimate: $token_estimate,
         org_id: $org_id,
-        project_id: $project_id,
+        ${projectIdField}
         ${createdByField}
         created_at: time::now()
       }
