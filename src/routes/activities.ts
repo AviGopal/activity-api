@@ -2402,7 +2402,7 @@ app.get('/metrics/aggregate', async (c) => {
 
     // Count templates that have been executed
     const executedTemplatesResult = await surrealDB.query(`
-      SELECT count(DISTINCT activity_id) AS executed_count
+      SELECT array::len(array::distinct(activity_id)) AS executed_count
       FROM activity_execution_traces
       GROUP ALL
     `);
