@@ -323,7 +323,8 @@ async function enrichTemplatesWithMetrics(
 
     logger.info('Enriching templates with metrics', {
       templateCount: templates.length,
-      sampleIds: activityIds.slice(0, 3)
+      sampleIds: activityIds.slice(0, 3),
+      fullIds: activityIds
     });
 
     // Query metrics for all activities in one go
@@ -410,8 +411,10 @@ async function enrichTemplatesWithMetrics(
       sampleMetrics: metricsResult?.slice(0, 2).map((m: any) => ({
         id: m.activity_id || m.variant_id,
         alpha: m.thompson_alpha || m.alpha,
-        beta: m.thompson_beta || m.beta
-      }))
+        beta: m.thompson_beta || m.beta,
+        executions: m.total_executions
+      })),
+      allMetricIds: metricsResult?.map((m: any) => m.activity_id || m.variant_id)
     });
 
     // Create a map of activity_id -> metrics (handle both canonical and legacy field names)
@@ -443,9 +446,18 @@ async function enrichTemplatesWithMetrics(
     const enriched = templates.map(template => {
       const idStr = typeof template.id === 'string' ? template.id : String(template.id);
       const normalizedId = idStr.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
+      const metrics = metricsMap.get(normalizedId);
+
+      logger.debug('Template metrics lookup', {
+        templateId: template.id,
+        normalizedId,
+        found: !!metrics,
+        executions: metrics?.total_executions || 0
+      });
+
       return {
         ...template,
-        metrics: metricsMap.get(normalizedId) || undefined
+        metrics: metrics || undefined
       };
     });
 
@@ -2210,6 +2222,243 @@ app.get('/metrics', async (c) => {
 
     return c.json({
       error: 'Failed to fetch activity metrics',
+      message: error.message,
+    }, 500);
+  }
+});
+
+/**
+ * GET /templates/:templateId/metrics
+ *
+ * Returns comprehensive metrics for a specific template including Thompson Sampling parameters.
+ *
+ * Path params:
+ * - templateId: string (required) - Activity template ID
+ *
+ * Returns:
+ * {
+ *   template_id: string,
+ *   total_executions: number,
+ *   successful_executions: number,
+ *   failed_executions: number,
+ *   success_rate: number,
+ *   avg_duration_ms: number,
+ *   avg_cost_usd: number,
+ *   total_cost_usd: number,
+ *   thompson_alpha: number,
+ *   thompson_beta: number,
+ *   thompson_belief: number,
+ *   last_executed_at: string | null,
+ *   executions_by_day: Array<{date: string, count: number, success_count: number}>
+ * }
+ */
+app.get('/templates/:templateId/metrics', async (c) => {
+  try {
+    const templateId = c.req.param('templateId');
+
+    if (!templateId) {
+      return c.json({ error: 'Missing template ID' }, 400);
+    }
+
+    logger.info('GET /v2/activities/templates/:templateId/metrics', { template_id: templateId });
+
+    // Query execution metrics for this specific template
+    const metricsResult = await surrealDB.query(`
+      SELECT
+        count() AS total_executions,
+        count(IF success = true THEN 1 ELSE NONE END) AS successful_executions,
+        count(IF success = false THEN 1 ELSE NONE END) AS failed_executions,
+        math::mean(IF success = true THEN 1.0 ELSE 0.0 END) AS success_rate,
+        math::mean(duration_ms) AS avg_duration_ms,
+        math::mean(cost_usd) AS avg_cost_usd,
+        math::sum(cost_usd) AS total_cost_usd,
+        time::max(executed_at) AS last_executed_at
+      FROM execution_record
+      WHERE activity_id = $template_id
+      GROUP ALL
+    `, { template_id: templateId });
+
+    const stats = (metricsResult[0] as any) || {};
+
+    const totalExecutions = stats.total_executions || 0;
+    const successfulExecutions = stats.successful_executions || 0;
+    const failedExecutions = stats.failed_executions || 0;
+
+    // Thompson Sampling parameters
+    const thompsonAlpha = successfulExecutions + 1;
+    const thompsonBeta = failedExecutions + 1;
+    const thompsonBelief = thompsonAlpha / (thompsonAlpha + thompsonBeta);
+
+    // Query executions grouped by day
+    const executionsByDayResult = await surrealDB.query(`
+      SELECT
+        time::format(executed_at, '%Y-%m-%d') AS date,
+        count() AS count,
+        count(IF success = true THEN 1 ELSE NONE END) AS success_count
+      FROM execution_record
+      WHERE activity_id = $template_id
+      GROUP BY time::format(executed_at, '%Y-%m-%d')
+      ORDER BY date DESC
+      LIMIT 30
+    `, { template_id: templateId });
+
+    const executionsByDay = (executionsByDayResult as any[]) || [];
+
+    const metrics = {
+      template_id: templateId,
+      total_executions: totalExecutions,
+      successful_executions: successfulExecutions,
+      failed_executions: failedExecutions,
+      success_rate: stats.success_rate || 0,
+      avg_duration_ms: Math.round(stats.avg_duration_ms || 0),
+      avg_cost_usd: stats.avg_cost_usd || 0,
+      total_cost_usd: stats.total_cost_usd || 0,
+      thompson_alpha: thompsonAlpha,
+      thompson_beta: thompsonBeta,
+      thompson_belief: thompsonBelief,
+      last_executed_at: stats.last_executed_at || null,
+      executions_by_day: executionsByDay.map((row: any) => ({
+        date: row.date,
+        count: row.count || 0,
+        success_count: row.success_count || 0,
+      })),
+    };
+
+    logger.debug('Template metrics retrieved', { template_id: templateId, metrics });
+
+    return c.json(metrics);
+
+  } catch (error: any) {
+    logger.error('GET /v2/activities/templates/:templateId/metrics failed', {
+      error: error.message,
+      stack: error.stack,
+    });
+
+    return c.json({
+      error: 'Failed to fetch template metrics',
+      message: error.message,
+    }, 500);
+  }
+});
+
+/**
+ * GET /metrics/aggregate
+ *
+ * Returns system-wide aggregate metrics including top templates.
+ *
+ * Returns:
+ * {
+ *   total_templates: number,
+ *   templates_executed: number,
+ *   templates_never_executed: number,
+ *   total_executions: number,
+ *   successful_executions: number,
+ *   failed_executions: number,
+ *   overall_success_rate: number,
+ *   total_cost_usd: number,
+ *   avg_cost_per_execution: number,
+ *   top_templates_by_executions: Array<{template_id, execution_count, success_rate}>,
+ *   top_templates_by_success_rate: Array<{template_id, success_rate, execution_count}>
+ * }
+ */
+app.get('/metrics/aggregate', async (c) => {
+  try {
+    logger.info('GET /v2/activities/metrics/aggregate');
+
+    // Query overall execution statistics
+    const overallStatsResult = await surrealDB.query(`
+      SELECT
+        count() AS total_executions,
+        count(IF success = true THEN 1 ELSE NONE END) AS successful_executions,
+        count(IF success = false THEN 1 ELSE NONE END) AS failed_executions,
+        math::mean(IF success = true THEN 1.0 ELSE 0.0 END) AS overall_success_rate,
+        math::sum(cost_usd) AS total_cost_usd
+      FROM execution_record
+      GROUP ALL
+    `);
+
+    const overallStats = (overallStatsResult[0] as any) || {};
+    const totalExecutions = overallStats.total_executions || 0;
+    const avgCostPerExecution = totalExecutions > 0
+      ? (overallStats.total_cost_usd || 0) / totalExecutions
+      : 0;
+
+    // Count total templates
+    const totalTemplatesResult = await surrealDB.query(`
+      SELECT count() AS total
+      FROM activity_template
+      GROUP ALL
+    `);
+    const totalTemplates = ((totalTemplatesResult[0] as any)?.total) || 0;
+
+    // Count templates that have been executed
+    const executedTemplatesResult = await surrealDB.query(`
+      SELECT count(DISTINCT activity_id) AS executed_count
+      FROM execution_record
+      GROUP ALL
+    `);
+    const templatesExecuted = ((executedTemplatesResult[0] as any)?.executed_count) || 0;
+    const templatesNeverExecuted = totalTemplates - templatesExecuted;
+
+    // Query top templates by execution count
+    const topByExecutionsResult = await surrealDB.query(`
+      SELECT
+        activity_id AS template_id,
+        count() AS execution_count,
+        math::mean(IF success = true THEN 1.0 ELSE 0.0 END) AS success_rate
+      FROM execution_record
+      GROUP BY activity_id
+      ORDER BY execution_count DESC
+      LIMIT 10
+    `);
+
+    // Query top templates by success rate (min 3 executions)
+    const topBySuccessRateResult = await surrealDB.query(`
+      SELECT
+        activity_id AS template_id,
+        math::mean(IF success = true THEN 1.0 ELSE 0.0 END) AS success_rate,
+        count() AS execution_count
+      FROM execution_record
+      GROUP BY activity_id
+      HAVING execution_count >= 3
+      ORDER BY success_rate DESC, execution_count DESC
+      LIMIT 10
+    `);
+
+    const metrics = {
+      total_templates: totalTemplates,
+      templates_executed: templatesExecuted,
+      templates_never_executed: templatesNeverExecuted,
+      total_executions: totalExecutions,
+      successful_executions: overallStats.successful_executions || 0,
+      failed_executions: overallStats.failed_executions || 0,
+      overall_success_rate: overallStats.overall_success_rate || 0,
+      total_cost_usd: overallStats.total_cost_usd || 0,
+      avg_cost_per_execution: avgCostPerExecution,
+      top_templates_by_executions: (topByExecutionsResult as any[]).map((row: any) => ({
+        template_id: row.template_id,
+        execution_count: row.execution_count || 0,
+        success_rate: row.success_rate || 0,
+      })),
+      top_templates_by_success_rate: (topBySuccessRateResult as any[]).map((row: any) => ({
+        template_id: row.template_id,
+        success_rate: row.success_rate || 0,
+        execution_count: row.execution_count || 0,
+      })),
+    };
+
+    logger.debug('Aggregate metrics retrieved', metrics);
+
+    return c.json(metrics);
+
+  } catch (error: any) {
+    logger.error('GET /v2/activities/metrics/aggregate failed', {
+      error: error.message,
+      stack: error.stack,
+    });
+
+    return c.json({
+      error: 'Failed to fetch aggregate metrics',
       message: error.message,
     }, 500);
   }
@@ -6717,6 +6966,100 @@ app.get('/shapes/autocomplete', async (c) => {
     logger.error('GET /shapes/autocomplete failed', { error: error.message, stack: error.stack });
     return c.json({
       error: 'Failed to get shape suggestions',
+      message: error.message,
+    }, 500);
+  }
+});
+
+/**
+ * GET /scores
+ * Get Thompson Sampling scores for all templates
+ * Returns alpha, beta, confidence intervals, and selection probabilities
+ */
+app.get('/scores', async (c) => {
+  try {
+    const session = (c.get as any)('session') as SessionData | undefined;
+    const orgId = session?.org_id || null;
+    const limitStr = c.req.query('limit') || '50';
+    const limit = Math.min(Math.max(parseInt(limitStr, 10), 1), 100);
+
+    logger.info('GET /v2/activities/scores', { limit, orgId });
+
+    // Query activity_metrics table for Thompson Sampling scores
+    let query = `
+      SELECT
+        activity_id,
+        thompson_alpha AS alpha,
+        thompson_beta AS beta,
+        total_executions,
+        successful_executions,
+        failed_executions,
+        success_rate,
+        avg_duration_ms,
+        avg_cost_usd,
+        total_selections,
+        last_executed_at,
+        updated_at
+      FROM activity_metrics
+      WHERE 1=1
+    `;
+    const params: Record<string, any> = {};
+
+    // Multi-tenant filtering
+    if (orgId) {
+      query += ' AND (org_id = $org_id OR org_id = NONE)';
+      params.org_id = orgId;
+    }
+
+    // Order by total executions (show most used templates first)
+    query += ' ORDER BY total_executions DESC';
+    query += ' LIMIT $limit';
+    params.limit = limit;
+
+    const result = await surrealDB.query(query, params);
+    const scores = Array.isArray(result) ? result : [];
+
+    // Enrich with confidence intervals and selection probability
+    const enrichedScores = scores.map((score: any) => {
+      const alpha = score.alpha || 1;
+      const beta = score.beta || 1;
+      const mean = alpha / (alpha + beta);
+
+      // 95% confidence interval (approximate)
+      const variance = (alpha * beta) / ((alpha + beta) ** 2 * (alpha + beta + 1));
+      const stdDev = Math.sqrt(variance);
+      const confidenceInterval = {
+        lower: Math.max(0, mean - 1.96 * stdDev),
+        upper: Math.min(1, mean + 1.96 * stdDev),
+      };
+
+      // Confidence level (higher is better)
+      const confidence = alpha + beta; // Total observations
+
+      return {
+        ...score,
+        mean_score: mean,
+        confidence_interval: confidenceInterval,
+        confidence_level: confidence,
+        exploring: confidence < 10, // Low confidence = still exploring
+      };
+    });
+
+    logger.info('Thompson Sampling scores retrieved', { count: enrichedScores.length });
+
+    return c.json({
+      scores: enrichedScores,
+      total: enrichedScores.length,
+    });
+
+  } catch (error: any) {
+    logger.error('GET /v2/activities/scores failed', {
+      error: error.message,
+      stack: error.stack,
+    });
+
+    return c.json({
+      error: 'Failed to fetch Thompson Sampling scores',
       message: error.message,
     }, 500);
   }
