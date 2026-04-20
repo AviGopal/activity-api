@@ -1,5 +1,5 @@
 -- ============================================================================
--- Migration 068: Apply Paradigm Backward-Compatibility Views
+-- Migration 069: Apply Paradigm Backward-Compatibility Views
 -- ============================================================================
 -- Created: 2026-04-20
 -- Purpose: Apply paradigm compatibility views from 022-paradigm-compat-views-v3.surql
