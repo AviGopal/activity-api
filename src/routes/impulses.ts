@@ -179,12 +179,11 @@ router.post('/', async (c) => {
       params.created_by = created_by;
     }
 
-    // Use UPDATE for idempotency (creates if not exists, updates if exists)
-    // This prevents race conditions where CREATE succeeds but verification fails
-    // Use type::record() for SurrealDB 3.x to safely handle IDs with hyphens
+    // Use INSERT for impulse creation
+    // INSERT works with root credentials (no org_id permission checks required)
     // Use time::now() instead of Date parameter to avoid datetime coercion errors
-    const createOrUpdateQuery = `
-      UPDATE type::record('impulse', $impulse_id) CONTENT {
+    const insertQuery = `
+      INSERT INTO impulse {
         id: $impulse_id,
         pointer: $pointer,
         shape: $shape,
@@ -199,11 +198,33 @@ router.post('/', async (c) => {
       }
     `;
 
-    const [result] = await executeQuery<any>(createOrUpdateQuery, params);
+    let result: any;
+    try {
+      [result] = await executeQuery<any>(insertQuery, params);
 
-    if (!result) {
-      logger.error('Failed to create/update impulse - no record returned', { impulse_id });
-      throw new Error('Failed to create impulse in SurrealDB');
+      if (!result) {
+        logger.error('Failed to create impulse - no record returned', { impulse_id });
+        throw new Error('Failed to create impulse in SurrealDB');
+      }
+    } catch (err: any) {
+      // Handle duplicate ID errors gracefully
+      if (err.message?.includes('already exists') || err.message?.includes('duplicate')) {
+        logger.info('Impulse already exists, fetching existing record', { impulse_id });
+
+        // Fetch the existing impulse
+        const fetchQuery = `SELECT * FROM type::record('impulse', $impulse_id) LIMIT 1`;
+        const [existing] = await executeQuery<any>(fetchQuery, { impulse_id });
+
+        if (existing) {
+          result = existing;
+        } else {
+          logger.error('Failed to fetch existing impulse after duplicate error', { impulse_id });
+          throw new Error('Failed to create or fetch impulse');
+        }
+      } else {
+        // Re-throw other errors
+        throw err;
+      }
     }
 
     const created = result;
