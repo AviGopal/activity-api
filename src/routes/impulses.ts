@@ -84,8 +84,8 @@ router.post('/', async (c) => {
       }
       logger.debug('Using JWT auth', { orgId: jwtAuth.orgId, projectId: jwtAuth.projectId, createdBy: created_by || 'NONE' });
     } else if (internalApiKey) {
-      // Use record format for consistency with JWT $auth.org_id
-      org_id = 'organizations:metabob_internal'; // Default for internal services
+      // Use plain string for org_id (impulse schema expects TYPE string, not record<organizations>)
+      org_id = 'metabob'; // Default for internal services
       // Internal services don't have a user/instance, leave as NONE (omit field)
       created_by = '';
       logger.debug('Using internal service api_key', { key: internalApiKey.substring(0, 8) + '...' });
