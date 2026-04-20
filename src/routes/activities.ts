@@ -2422,14 +2422,16 @@ app.get('/metrics/aggregate', async (c) => {
     `);
 
     // Query top templates by success rate (min 3 executions)
+    // Note: SurrealDB 2.x does not support HAVING clause, using subquery pattern instead
     const topBySuccessRateResult = await surrealDB.query(`
-      SELECT
-        activity_id AS template_id,
-        math::mean(IF success = true THEN 1.0 ELSE 0.0 END) AS success_rate,
-        count() AS execution_count
-      FROM activity_execution_traces
-      GROUP BY activity_id
-      HAVING execution_count >= 3
+      SELECT * FROM (
+        SELECT
+          activity_id AS template_id,
+          math::mean(IF success = true THEN 1.0 ELSE 0.0 END) AS success_rate,
+          count() AS execution_count
+        FROM activity_execution_traces
+        GROUP BY activity_id
+      ) WHERE execution_count >= 3
       ORDER BY success_rate DESC, execution_count DESC
       LIMIT 10
     `);
@@ -4459,15 +4461,17 @@ app.get('/composition/impulse-success', async (c) => {
     }
 
     // Query from the view (v_composition_impulse_success) or aggregate directly
+    // Note: SurrealDB 2.x does not support HAVING clause, using subquery with WHERE instead
     let ratesQuery = `
-      SELECT
-        edge_id,
-        shape,
-        direction,
-        count() as total_count,
-        count(IF execution_succeeded = true THEN 1 ELSE NONE END) as success_count,
-        (count(IF execution_succeeded = true THEN 1 ELSE NONE END) * 1.0 / count()) as success_rate
-      FROM composition_impulse_flow
+      SELECT * FROM (
+        SELECT
+          edge_id,
+          shape,
+          direction,
+          count() as total_count,
+          count(IF execution_succeeded = true THEN 1 ELSE NONE END) as success_count,
+          (count(IF execution_succeeded = true THEN 1 ELSE NONE END) * 1.0 / count()) as success_rate
+        FROM composition_impulse_flow
     `;
 
     if (whereClauses.length > 0) {
@@ -4475,20 +4479,22 @@ app.get('/composition/impulse-success', async (c) => {
     }
 
     ratesQuery += `
-      GROUP BY edge_id, shape, direction
-      HAVING count() >= $min_count
+        GROUP BY edge_id, shape, direction
+      ) WHERE total_count >= $min_count
       ORDER BY success_rate DESC
       LIMIT $limit START $offset
     `;
 
     // Count query for total
+    // Note: SurrealDB 2.x does not support HAVING clause, using nested subquery with WHERE instead
     let countQuery = `
       SELECT count() as total FROM (
-        SELECT edge_id, shape, direction
-        FROM composition_impulse_flow
-        ${whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : ''}
-        GROUP BY edge_id, shape, direction
-        HAVING count() >= $min_count
+        SELECT * FROM (
+          SELECT edge_id, shape, direction, count() as cnt
+          FROM composition_impulse_flow
+          ${whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : ''}
+          GROUP BY edge_id, shape, direction
+        ) WHERE cnt >= $min_count
       )
     `;
 
@@ -4806,18 +4812,20 @@ app.get('/composition/edges/successors/:activityId', async (c) => {
     });
 
     // Query composition_edge for successors
+    // Note: SurrealDB 2.x does not support HAVING clause, using subquery with WHERE instead
     let query = `
-      SELECT
-        to_activity as child_activity_id,
-        shape_produced,
-        math::sum(success_count) as successful_occurrences,
-        math::sum(total_count) as total_occurrences,
-        (math::sum(success_count) / math::sum(total_count)) as success_rate,
-        math::mean(alpha) as avg_alpha,
-        math::mean(beta) as avg_beta
-      FROM composition_edge
-      WHERE from_activity = $activity_id
-        AND (org_id = $org_id OR public = true)
+      SELECT * FROM (
+        SELECT
+          to_activity as child_activity_id,
+          shape_produced,
+          math::sum(success_count) as successful_occurrences,
+          math::sum(total_count) as total_occurrences,
+          (math::sum(success_count) / math::sum(total_count)) as success_rate,
+          math::mean(alpha) as avg_alpha,
+          math::mean(beta) as avg_beta
+        FROM composition_edge
+        WHERE from_activity = $activity_id
+          AND (org_id = $org_id OR public = true)
     `;
 
     const params: Record<string, any> = {
@@ -4833,8 +4841,8 @@ app.get('/composition/edges/successors/:activityId', async (c) => {
     }
 
     query += `
-      GROUP BY to_activity, shape_produced
-      HAVING math::sum(total_count) >= $min_occurrences
+        GROUP BY to_activity, shape_produced
+      ) WHERE total_occurrences >= $min_occurrences
       ORDER BY success_rate DESC
       LIMIT $limit
     `;
