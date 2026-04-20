@@ -340,13 +340,22 @@ async function enrichTemplatesWithMetrics(
       return idStr.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
     });
 
+    // Also keep original string IDs for matching (covers both ID formats)
+    const originalIds = activityIds.map(id => {
+      const idStr = typeof id === 'string' ? id : String(id);
+      return idStr;
+    });
+
+    // Combine both normalized and original IDs to cover all matching cases
+    const allMatchIds = [...new Set([...normalizedIds, ...originalIds])];
+
     try {
       const metricsQuery = `
         SELECT * FROM v_activity_score
         WHERE activity_id IN $activity_ids
       `;
       metricsResult = await surrealDB.query<any>(metricsQuery, {
-        activity_ids: normalizedIds
+        activity_ids: allMatchIds
       });
     } catch (error: any) {
       // Fallback to variant_performance_metrics if view doesn't exist or fails
@@ -362,16 +371,16 @@ async function enrichTemplatesWithMetrics(
         WHERE activity_id IN $activity_ids
       `;
       metricsResult = await surrealDB.query<any>(fallbackQuery, {
-        activity_ids: normalizedIds  // Use normalized IDs to match stored activity_id format
+        activity_ids: allMatchIds  // Use combined IDs to match all formats
       });
     }
 
     // For templates not found in v_activity_score (no executions yet),
     // try to get initial metrics from variant_performance_metrics
-    if (metricsResult.length < normalizedIds.length) {
+    if (metricsResult.length < allMatchIds.length) {
       const foundIds = new Set(metricsResult.map((m: any) => m.activity_id || m.variant_id));
-      // Use normalized IDs for comparison since variant_performance_metrics stores plain IDs
-      const missingIds = normalizedIds.filter(id => !foundIds.has(id));
+      // Use combined IDs for comparison to match all formats
+      const missingIds = allMatchIds.filter(id => !foundIds.has(id));
 
       if (missingIds.length > 0) {
         logger.debug('Fetching initial metrics for templates without executions', {
