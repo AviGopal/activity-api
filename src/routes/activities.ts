@@ -1628,8 +1628,8 @@ app.post('/executions', async (c) => {
     const failure_delta = validated.success ? 0 : 1;
     
     const updateMetricsQuery = `
-      UPDATE variant_performance_metrics 
-      SET 
+      UPDATE variant_performance_metrics
+      SET
         total_executions += 1,
         successful_executions += $success_delta,
         failed_executions += $failure_delta,
@@ -1640,17 +1640,23 @@ app.post('/executions', async (c) => {
         thompson_beta = failed_executions + 1,
         last_executed_at = time::now(),
         updated_at = time::now()
-      WHERE variant_id = $variant_id
+      WHERE variant_id = $variant_id AND org_id = $org_id
       RETURN AFTER;
     `;
 
-    const metricsResult = await surrealDB.query(updateMetricsQuery, {
+    const metricsParams = {
       variant_id: activityIdFromRequest,
+      org_id: orgId, // RBAC: ensure updates only affect org's own metrics
       success_delta,
       failure_delta,
       duration_ms: validated.duration_ms,
       cost: validated.cost,
-    });
+    };
+
+    // Use authenticated client for RBAC enforcement when available
+    const metricsResult = jwtAuth?.jwtToken
+      ? await queryWithAuth(jwtAuth.jwtToken, updateMetricsQuery, metricsParams)
+      : await surrealDB.query(updateMetricsQuery, metricsParams);
 
     logger.info('Thompson Sampling metrics updated', {
       activity_id: activityIdFromRequest,

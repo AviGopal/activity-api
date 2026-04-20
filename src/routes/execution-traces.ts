@@ -1116,7 +1116,7 @@ app.post('/', async (c) => {
       }
 
       const updateQuery = `
-        UPDATE activity
+        UPDATE activity_template
         SET
           thompson_alpha = thompson_alpha + $alpha_delta,
           thompson_beta = thompson_beta + $beta_delta,
@@ -1124,7 +1124,7 @@ app.post('/', async (c) => {
           successful_executions = successful_executions + $success_delta,
           failed_executions = failed_executions + $failure_delta,
           last_executed_at = time::now()
-        WHERE id = $activity_id
+        WHERE id = $activity_id AND org_id = $org_id
         RETURN {
           id,
           thompson_alpha,
@@ -1135,6 +1135,7 @@ app.post('/', async (c) => {
 
       const updateParams = {
         activity_id: trace.variant_id, // variant_id is the activity ID
+        org_id: traceOrgId, // RBAC: ensure updates only affect org's own templates
         alpha_delta: alphaDelta,
         beta_delta: betaDelta,
         success_delta: trace.success ? 1 : 0,
