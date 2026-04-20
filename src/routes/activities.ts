@@ -2031,7 +2031,7 @@ app.get('/metrics/trend', async (c) => {
         count(IF success = true THEN 1 ELSE NONE END) AS success_count,
         count(IF success = false THEN 1 ELSE NONE END) AS failure_count,
         math::sum(cost_usd) AS total_cost
-      FROM execution_record
+      FROM activity_execution_traces
       WHERE created_at > time::now() - duration::from::days($days)
       GROUP BY time::format(created_at, '%Y-%m-%d')
       ORDER BY date ASC
@@ -2099,7 +2099,7 @@ app.get('/metrics/summary', async (c) => {
         math::mean(IF success = true THEN 1.0 ELSE 0.0 END) AS success_rate,
         math::mean(duration_ms) AS avg_duration,
         math::sum(cost_usd) AS total_cost
-      FROM execution_record
+      FROM activity_execution_traces
       GROUP ALL
     `);
 
@@ -2170,7 +2170,7 @@ app.get('/metrics', async (c) => {
         math::mean(IF success = true THEN 1.0 ELSE 0.0 END) AS success_rate,
         math::mean(duration_ms) AS avg_duration_ms,
         math::mean(cost_usd) AS avg_cost_usd
-      FROM execution_record
+      FROM activity_execution_traces
       WHERE activity_id = $activity_id
       GROUP ALL
     `, { activity_id: activityId });
@@ -2180,7 +2180,7 @@ app.get('/metrics', async (c) => {
     // Query model usage distribution
     const modelDistResult = await surrealDB.query(`
       SELECT model, count() AS count
-      FROM execution_record
+      FROM activity_execution_traces
       WHERE activity_id = $activity_id
       GROUP BY model
     `, { activity_id: activityId });
@@ -2282,7 +2282,7 @@ app.get('/templates/:templateId/metrics', async (c) => {
         math::mean(cost_usd) AS avg_cost_usd,
         math::sum(cost_usd) AS total_cost_usd,
         time::max(executed_at) AS last_executed_at
-      FROM execution_record
+      FROM activity_execution_traces
       WHERE activity_id = $template_id
       GROUP ALL
     `, { template_id: templateId });
@@ -2304,7 +2304,7 @@ app.get('/templates/:templateId/metrics', async (c) => {
         time::format(executed_at, '%Y-%m-%d') AS date,
         count() AS count,
         count(IF success = true THEN 1 ELSE NONE END) AS success_count
-      FROM execution_record
+      FROM activity_execution_traces
       WHERE activity_id = $template_id
       GROUP BY time::format(executed_at, '%Y-%m-%d')
       ORDER BY date DESC
@@ -2382,7 +2382,7 @@ app.get('/metrics/aggregate', async (c) => {
         count(IF success = false THEN 1 ELSE NONE END) AS failed_executions,
         math::mean(IF success = true THEN 1.0 ELSE 0.0 END) AS overall_success_rate,
         math::sum(cost_usd) AS total_cost_usd
-      FROM execution_record
+      FROM activity_execution_traces
       GROUP ALL
     `);
 
@@ -2403,7 +2403,7 @@ app.get('/metrics/aggregate', async (c) => {
     // Count templates that have been executed
     const executedTemplatesResult = await surrealDB.query(`
       SELECT count(DISTINCT activity_id) AS executed_count
-      FROM execution_record
+      FROM activity_execution_traces
       GROUP ALL
     `);
     const templatesExecuted = ((executedTemplatesResult[0] as any)?.executed_count) || 0;
@@ -2415,7 +2415,7 @@ app.get('/metrics/aggregate', async (c) => {
         activity_id AS template_id,
         count() AS execution_count,
         math::mean(IF success = true THEN 1.0 ELSE 0.0 END) AS success_rate
-      FROM execution_record
+      FROM activity_execution_traces
       GROUP BY activity_id
       ORDER BY execution_count DESC
       LIMIT 10
@@ -2427,7 +2427,7 @@ app.get('/metrics/aggregate', async (c) => {
         activity_id AS template_id,
         math::mean(IF success = true THEN 1.0 ELSE 0.0 END) AS success_rate,
         count() AS execution_count
-      FROM execution_record
+      FROM activity_execution_traces
       GROUP BY activity_id
       HAVING execution_count >= 3
       ORDER BY success_rate DESC, execution_count DESC
