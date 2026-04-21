@@ -1669,35 +1669,70 @@ app.post('/executions', async (c) => {
     const success_delta = validated.success ? 1 : 0;
     const failure_delta = validated.success ? 0 : 1;
     
-    const updateMetricsQuery = `
-      UPDATE variant_performance_metrics 
-      SET 
+    // UPSERT PATTERN: Uses INSERT ON DUPLICATE KEY UPDATE for atomic record creation/update
+    // - First execution: INSERT creates new record with initial Thompson Sampling values
+    // - Subsequent executions: ON DUPLICATE KEY UPDATE increments counters atomically
+    // - UNIQUE index on variant_id triggers duplicate detection
+    // - No race conditions, single atomic operation aligned with SurrealDB 3.0
+    const upsertMetricsQuery = `
+      INSERT INTO variant_performance_metrics {
+        variant_id: $variant_id,
+        activity_id: $variant_id,
+        org_id: $org_id,
+        total_executions: 1,
+        successful_executions: $success_delta,
+        failed_executions: $failure_delta,
+        success_rate: $success_delta,
+        avg_duration_ms: $duration_ms,
+        avg_cost_usd: $cost,
+        thompson_alpha: $success_delta + 1,
+        thompson_beta: $failure_delta + 1,
+        total_selections: 0,
+        last_executed_at: time::now(),
+        created_at: time::now(),
+        updated_at: time::now()
+      }
+      ON DUPLICATE KEY UPDATE
         total_executions += 1,
-        successful_executions += $success_delta,
-        failed_executions += $failure_delta,
+        successful_executions += $input.successful_executions,
+        failed_executions += $input.failed_executions,
         success_rate = successful_executions / total_executions,
-        avg_duration_ms = ((avg_duration_ms * (total_executions - 1)) + $duration_ms) / total_executions,
-        avg_cost_usd = ((avg_cost_usd * (total_executions - 1)) + $cost) / total_executions,
+        avg_duration_ms = ((avg_duration_ms * (total_executions - 1)) + $input.avg_duration_ms) / total_executions,
+        avg_cost_usd = ((avg_cost_usd * (total_executions - 1)) + $input.avg_cost_usd) / total_executions,
         thompson_alpha = successful_executions + 1,
         thompson_beta = failed_executions + 1,
         last_executed_at = time::now(),
         updated_at = time::now()
-      WHERE variant_id = $variant_id
       RETURN AFTER;
     `;
 
-    const metricsResult = await surrealDB.query(updateMetricsQuery, {
+    const metricsResult = await surrealDB.query(upsertMetricsQuery, {
       variant_id: activityIdFromRequest,
+      org_id: orgId,
       success_delta,
       failure_delta,
       duration_ms: validated.duration_ms,
       cost: validated.cost,
     });
 
-    logger.info('Thompson Sampling metrics updated', {
-      activity_id: activityIdFromRequest,
-      metricsUpdated: metricsResult.length > 0,
-    });
+    if (metricsResult.length === 0) {
+      logger.error('Thompson Sampling UPSERT failed - no record returned', {
+        activity_id: activityIdFromRequest,
+        org_id: orgId,
+        variant_id: activityIdFromRequest,
+      });
+    } else {
+      const updatedRecord = metricsResult[0];
+      const isNewRecord = updatedRecord.total_executions === 1;
+      logger.info('Thompson Sampling metrics upserted', {
+        activity_id: activityIdFromRequest,
+        operation: isNewRecord ? 'INSERT (new record)' : 'UPDATE (existing record)',
+        total_executions: updatedRecord.total_executions,
+        thompson_alpha: updatedRecord.thompson_alpha,
+        thompson_beta: updatedRecord.thompson_beta,
+        thompson_score: updatedRecord.thompson_alpha / (updatedRecord.thompson_alpha + updatedRecord.thompson_beta),
+      });
+    }
 
     // Step 3: Invalidate Redis cache for this template
     const redis = RedisClient.getInstance();
