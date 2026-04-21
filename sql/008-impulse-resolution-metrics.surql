@@ -33,7 +33,7 @@ DEFINE FIELD requested_shape ON impulse_resolution_metrics TYPE option<string>;
 
 -- Metadata
 DEFINE FIELD timestamp ON impulse_resolution_metrics TYPE datetime DEFAULT time::now();
-DEFINE FIELD org_id ON impulse_resolution_metrics TYPE record<organization>;
+DEFINE FIELD org_id ON impulse_resolution_metrics TYPE string;
 
 -- Indexes for common queries
 DEFINE INDEX idx_resolution_impulse_type ON impulse_resolution_metrics COLUMNS impulse_type;

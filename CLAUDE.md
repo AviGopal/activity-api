@@ -162,10 +162,11 @@ SurrealDB schemas are defined in `sql/migrations/`. Key tables:
 | Table | Purpose |
 |-------|---------|
 | `activity_template` | Activity template definitions |
-| `activity_execution_trace` | Execution history with state |
-| `activity_execution_task_result` | Per-task results |
+| `activity_execution_traces` | Execution history with state (includes `tasks` flexible array) |
 | `activity_metrics` | Thompson Sampling statistics |
 | `tool_argument_pattern` | Tool usage patterns |
+| `tool_usage` | Tool invocation patterns |
+| `impulse_relevance_metrics` | Impulse relevance tracking |
 
 ## Testing
 

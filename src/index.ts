@@ -49,10 +49,17 @@ app.use('/*', cors({
     'https://activity.metabob.com',
     'https://internal.metabob.com',
     'https://app.metabob.com',
+    'https://metabobproject.github.io',  // Dashboard on GitHub Pages
   ],
   credentials: true,
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowHeaders: ['Content-Type', 'Authorization', 'X-Internal-Api-Key'],
+  allowHeaders: [
+    'Content-Type',
+    'Authorization',
+    'X-Internal-Api-Key',
+    'X-Trace-Session',   // Dashboard tracing
+    'X-Trace-Source',    // Dashboard tracing
+  ],
 }));
 
 // Request logging

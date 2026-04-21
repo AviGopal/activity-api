@@ -23,17 +23,12 @@ DEFINE INDEX idx_external_validation_status ON activity_execution_trace
   FIELDS external_validation_passed, external_failure_category;
 
 -- ============================================================================
--- MODIFY: activity_execution_task_result
--- Add external validation to per-task results
+-- SKIP: activity_execution_task_result
+-- This table does not exist. Task-level data is stored in the flexible
+-- activity_execution_traces.tasks array field instead.
+-- External validation tracking at task level should be added directly
+-- to the tasks array objects when needed.
 -- ============================================================================
-
--- Differentiated validation tracking per task
-DEFINE FIELD internal_validation_passed ON activity_execution_task_result TYPE bool DEFAULT true;
-DEFINE FIELD external_validation_passed ON activity_execution_task_result TYPE bool DEFAULT true;
-DEFINE FIELD external_error_type ON activity_execution_task_result TYPE option<string>;
-DEFINE FIELD external_error_message ON activity_execution_task_result TYPE option<string>;
-DEFINE FIELD external_failure_category ON activity_execution_task_result TYPE option<string>;
-DEFINE FIELD external_retriable ON activity_execution_task_result TYPE bool DEFAULT false;
 
 -- ============================================================================
 -- MODIFY: activity_metrics

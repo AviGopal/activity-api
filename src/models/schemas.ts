@@ -460,6 +460,7 @@ export const ImpulseRelevanceRecordRequestSchema = z.object({
   impulse_id: z.string(),
   activity_variant_id: z.string(),
   task_id: z.string().optional(),
+  execution_id: z.string().optional(),
   was_loaded: z.boolean(),
   execution_succeeded: z.boolean(),
   content_size_tokens: z.number().int().optional(),
