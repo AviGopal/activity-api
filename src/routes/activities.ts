@@ -1040,14 +1040,19 @@ app.post('/templates', async (c) => {
     // This happens when legacy records have random IDs but new UPSERTs use deterministic IDs
     // The unique index on variant_id blocks the duplicate
     if (error.message?.includes('Database index') && error.message?.includes('already contains')) {
+      // Extract template ID from error message or use activityId if available
+      // Error format: "already contains 'template-id', with record..."
+      const idMatch = error.message.match(/already contains '([^']+)'/);
+      const templateId = idMatch?.[1] || (typeof activityId !== 'undefined' ? activityId : 'unknown');
+
       logger.info('Template already exists (index conflict)', {
-        id: activityId,
+        id: templateId,
         message: error.message,
       });
       return c.json({
         success: true,
-        id: activityId,
-        variant_id: activityId,
+        id: templateId,
+        variant_id: templateId,
         message: 'Template already exists',
       }, 409);
     }
