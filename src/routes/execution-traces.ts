@@ -1173,6 +1173,81 @@ app.post('/', async (c) => {
       });
     }
 
+    // DUAL-WRITE: Update variant_performance_metrics for dashboard compatibility
+    // Dashboard queries this table for Thompson Sampling scores, so we need to maintain it
+    // in addition to the activity_template updates above.
+    try {
+      const variantMetricsUpsert = `
+        INSERT INTO variant_performance_metrics {
+          variant_id: $variant_id,
+          activity_id: $variant_id,
+          org_id: $org_id,
+          total_executions: 1,
+          successful_executions: $success_delta,
+          failed_executions: $failure_delta,
+          success_rate: type::float($success_delta),
+          avg_duration_ms: type::float($duration_ms),
+          avg_cost_usd: type::float($cost),
+          thompson_alpha: $success_delta + 1,
+          thompson_beta: $failure_delta + 1,
+          total_selections: 0,
+          last_executed_at: time::now(),
+          created_at: time::now(),
+          updated_at: time::now()
+        }
+        ON DUPLICATE KEY UPDATE
+          total_executions += 1,
+          successful_executions += $success_delta,
+          failed_executions += $failure_delta,
+          success_rate = type::float(successful_executions) / type::float(total_executions),
+          avg_duration_ms = type::float((avg_duration_ms * type::float(total_executions - 1) + $duration_ms) / type::float(total_executions)),
+          avg_cost_usd = type::float((avg_cost_usd * type::float(total_executions - 1) + $cost) / type::float(total_executions)),
+          thompson_alpha = successful_executions + 1,
+          thompson_beta = failed_executions + 1,
+          last_executed_at = time::now(),
+          updated_at = time::now()
+        RETURN AFTER;
+      `;
+
+      const variantMetricsParams = {
+        variant_id: trace.variant_id,
+        org_id: traceOrgId,
+        success_delta: trace.success ? 1 : 0,
+        failure_delta: trace.success ? 0 : 1,
+        duration_ms: trace.duration_ms || 0,
+        cost: trace.cost_usd || 0,
+      };
+
+      const variantMetricsResult = jwtAuth?.jwtToken
+        ? await queryWithAuth(jwtAuth.jwtToken, variantMetricsUpsert, variantMetricsParams)
+        : await surrealDB.query(variantMetricsUpsert, variantMetricsParams);
+
+      if (variantMetricsResult && variantMetricsResult.length > 0) {
+        const updatedMetrics = variantMetricsResult[0];
+        logger.info('[learning] Variant performance metrics updated (dual-write)', {
+          execution_id: trace.execution_id,
+          variant_id: trace.variant_id,
+          total_executions: updatedMetrics.total_executions,
+          success_rate: updatedMetrics.success_rate,
+          thompson_alpha: updatedMetrics.thompson_alpha,
+          thompson_beta: updatedMetrics.thompson_beta,
+        });
+      } else {
+        logger.warn('[learning] Variant metrics UPSERT returned no results', {
+          execution_id: trace.execution_id,
+          variant_id: trace.variant_id,
+          query_params: variantMetricsParams,
+        });
+      }
+    } catch (variantMetricsError) {
+      // Don't fail the request if variant metrics update fails - trace is already stored
+      logger.error('[learning] Failed to update variant_performance_metrics (non-blocking)', {
+        execution_id: trace.execution_id,
+        variant_id: trace.variant_id,
+        error: variantMetricsError instanceof Error ? variantMetricsError.message : String(variantMetricsError),
+      });
+    }
+
     // Update impulse shape activity scores for shape-conditioned Thompson Sampling
     // Extract input shapes from the execution trace
     const inputShapes: string[] = body.input_impulse_shapes
