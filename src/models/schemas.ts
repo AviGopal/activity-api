@@ -436,22 +436,29 @@ export const ImpulseRelevanceMetricSchema = z.object({
   impulse_id: z.string(),
   activity_variant_id: z.string(),
   task_id: z.string().optional(),
-  
+
   // Relevance tracking
   times_loaded: z.number().int().default(0),
   times_execution_succeeded: z.number().int().default(0),
   times_execution_failed: z.number().int().default(0),
   times_not_loaded_succeeded: z.number().int().default(0),
   times_not_loaded_failed: z.number().int().default(0),
-  
+
   // Learned scores (Bayesian)
   relevance_score: z.number().min(0).max(1), // P(success | impulse present)
   irrelevance_score: z.number().min(0).max(1), // P(success | impulse absent)
-  
+
   // Context metadata
   avg_content_size_tokens: z.number().int().default(0),
   typical_pointer_type: z.string().optional(),
-  
+
+  // Resolver tracking (resolver-tier-tracking)
+  resolver_tier: z.string().optional(),
+  resolver_name: z.string().optional(),
+  avg_resolution_latency_ms: z.number().int().default(0),
+  resolver_success_count: z.number().int().default(0),
+  resolver_failure_count: z.number().int().default(0),
+
   created_at: z.union([z.string(), z.object({}).passthrough()]),
   updated_at: z.union([z.string(), z.object({}).passthrough()]),
 });
@@ -465,6 +472,10 @@ export const ImpulseRelevanceRecordRequestSchema = z.object({
   execution_succeeded: z.boolean(),
   content_size_tokens: z.number().int().optional(),
   pointer_type: z.string().optional(),
+  // Resolver tracking fields (resolver-tier-tracking)
+  resolver_tier: z.string().optional(),
+  resolver_name: z.string().optional(),
+  resolution_latency_ms: z.number().int().optional(),
 });
 
 export const ImpulseRelevanceQuerySchema = z.object({

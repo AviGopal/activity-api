@@ -5191,9 +5191,30 @@ app.post('/impulse-relevance', async (c) => {
         ? Math.floor((currentAvgSize * totalSizeSamples + validated.content_size_tokens) / (totalSizeSamples + 1))
         : currentAvgSize;
 
+      // Update resolver tracking metrics (resolver-tier-tracking)
+      // @ts-ignore - SurrealDB typing
+      const currentResolverSuccessCount = current.resolver_success_count || 0;
+      // @ts-ignore - SurrealDB typing
+      const currentResolverFailureCount = current.resolver_failure_count || 0;
+      // @ts-ignore - SurrealDB typing
+      const currentAvgLatency = current.avg_resolution_latency_ms || 0;
+      const totalResolutions = currentResolverSuccessCount + currentResolverFailureCount;
+
+      const newResolverSuccessCount = validated.was_loaded && validated.execution_succeeded
+        ? currentResolverSuccessCount + 1
+        : currentResolverSuccessCount;
+      const newResolverFailureCount = validated.was_loaded && !validated.execution_succeeded
+        ? currentResolverFailureCount + 1
+        : currentResolverFailureCount;
+
+      // Update average latency if resolution latency provided
+      const newAvgLatency = validated.resolution_latency_ms !== undefined && totalResolutions > 0
+        ? Math.floor((currentAvgLatency * totalResolutions + validated.resolution_latency_ms) / (totalResolutions + 1))
+        : currentAvgLatency;
+
       const updateQuery = `
         UPDATE impulse_relevance_metrics
-        SET 
+        SET
           times_loaded = $times_loaded,
           times_execution_succeeded = $times_execution_succeeded,
           times_execution_failed = $times_execution_failed,
@@ -5203,6 +5224,11 @@ app.post('/impulse-relevance', async (c) => {
           irrelevance_score = $irrelevance_score,
           avg_content_size_tokens = $avg_content_size_tokens,
           typical_pointer_type = $typical_pointer_type,
+          resolver_tier = $resolver_tier,
+          resolver_name = $resolver_name,
+          avg_resolution_latency_ms = $avg_resolution_latency_ms,
+          resolver_success_count = $resolver_success_count,
+          resolver_failure_count = $resolver_failure_count,
           updated_at = time::now()
         WHERE impulse_id = $impulse_id
           AND activity_variant_id = $activity_variant_id
@@ -5224,6 +5250,14 @@ app.post('/impulse-relevance', async (c) => {
         avg_content_size_tokens: newAvgSize,
         // @ts-ignore - SurrealDB typing
         typical_pointer_type: validated.pointer_type ?? current.typical_pointer_type,
+        // Resolver tracking fields (use most recent values)
+        // @ts-ignore - SurrealDB typing
+        resolver_tier: validated.resolver_tier ?? current.resolver_tier,
+        // @ts-ignore - SurrealDB typing
+        resolver_name: validated.resolver_name ?? current.resolver_name,
+        avg_resolution_latency_ms: newAvgLatency,
+        resolver_success_count: newResolverSuccessCount,
+        resolver_failure_count: newResolverFailureCount,
       });
 
       // @ts-ignore - SurrealDB typing
@@ -5251,6 +5285,11 @@ app.post('/impulse-relevance', async (c) => {
           irrelevance_score: $irrelevance_score,
           avg_content_size_tokens: $avg_content_size_tokens,
           typical_pointer_type: $typical_pointer_type,
+          resolver_tier: $resolver_tier,
+          resolver_name: $resolver_name,
+          avg_resolution_latency_ms: $avg_resolution_latency_ms,
+          resolver_success_count: $resolver_success_count,
+          resolver_failure_count: $resolver_failure_count,
           created_at: time::now(),
           updated_at: time::now()
         }
@@ -5271,6 +5310,12 @@ app.post('/impulse-relevance', async (c) => {
         relevance_score: relevanceScore,
         irrelevance_score: irrelevanceScore,
         avg_content_size_tokens: validated.content_size_tokens || 0,
+        // Resolver tracking fields (resolver-tier-tracking)
+        resolver_tier: validated.resolver_tier ?? undefined,
+        resolver_name: validated.resolver_name ?? undefined,
+        avg_resolution_latency_ms: validated.resolution_latency_ms || 0,
+        resolver_success_count: validated.was_loaded && validated.execution_succeeded ? 1 : 0,
+        resolver_failure_count: validated.was_loaded && !validated.execution_succeeded ? 1 : 0,
         typical_pointer_type: validated.pointer_type || '',
       });
 
