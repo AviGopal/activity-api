@@ -208,7 +208,11 @@ router.post('/', async (c) => {
       }
     } catch (err: any) {
       // Handle duplicate ID errors gracefully
-      if (err.message?.includes('already exists') || err.message?.includes('duplicate')) {
+      // SurrealDB index conflicts say "Database index ... already contains"
+      const isDuplicate = err.message?.includes('already exists') ||
+                          err.message?.includes('duplicate') ||
+                          (err.message?.includes('Database index') && err.message?.includes('already contains'));
+      if (isDuplicate) {
         logger.info('Impulse already exists, fetching existing record', { impulse_id });
 
         // Fetch the existing impulse
@@ -269,11 +273,23 @@ router.post('/', async (c) => {
 
     // Handle duplicate impulse (already exists) - return 409 Conflict instead of 500
     // This allows clients to treat duplicates as successful idempotent operations
-    if (error.message && error.message.includes('already exists')) {
-      logger.info('Impulse already exists (deduplication)', { impulse_id: error.message });
-      return c.json({
-        error: 'Impulse already exists',
+    // SurrealDB index conflicts say "Database index ... already contains"
+    const isDuplicateError = error.message &&
+      (error.message.includes('already exists') ||
+       (error.message.includes('Database index') && error.message.includes('already contains')));
+    if (isDuplicateError) {
+      // Extract impulse ID from error message if possible
+      const idMatch = error.message.match(/already contains (?:impulse:)?[`']?([^`',\s]+)/);
+      const extractedId = idMatch?.[1] || 'unknown';
+
+      logger.info('Impulse already exists (deduplication)', {
+        impulse_id: extractedId,
         message: error.message,
+      });
+      return c.json({
+        success: true,
+        impulse_id: extractedId,
+        message: 'Impulse already exists',
       }, 409);
     }
 
