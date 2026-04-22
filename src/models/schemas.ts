@@ -877,7 +877,7 @@ export const ImpulseResolveRequestSchema = z.object({
     arguments: z.record(z.unknown()).optional(), // For preValidationResult - argument values to validate
     minSuccessRate: z.number().min(0).max(1).optional(), // For preValidationResult - threshold for skip
     skipThreshold: z.number().min(0).max(1).optional(), // For preValidationResult - confidence threshold
-  }),
+  }).passthrough(), // Allow unknown pointer fields (v1.5.0 *_write/_delete/_update resolvers carry typed payloads like traceData, feedbackData, updates, olderThan, etc. — enumerating every one here would fight the open-ended design)
 });
 
 // =============================================================================

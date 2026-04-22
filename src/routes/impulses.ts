@@ -1781,6 +1781,9 @@ router.post('/resolve', async (c) => {
       // =============================================================================
 
       case 'activityTemplate_update': {
+        const authCheck = requireAuthenticated(c);
+        if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
+
         const updatePointer = pointer as typeof pointer & {
           templateId?: string;
           updates?: Record<string, unknown>;
@@ -1788,8 +1791,6 @@ router.post('/resolve', async (c) => {
         if (!updatePointer.templateId || !updatePointer.updates) {
           return c.json({ success: false, error: 'templateId and updates (object) required for activityTemplate_update' } as ImpulseResolveResponse, 400);
         }
-        const authCheck = requireAuthenticated(c);
-        if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
 
         const allowedFields = new Set(['name', 'description', 'tags', 'tasks', 'input_shapes', 'output_shapes', 'deprecated']);
         const rejected = Object.keys(updatePointer.updates).filter((k) => !allowedFields.has(k));
@@ -1847,6 +1848,9 @@ router.post('/resolve', async (c) => {
       }
 
       case 'activityTemplate_deprecate': {
+        const authCheck = requireAuthenticated(c);
+        if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
+
         const deprecatePointer = pointer as typeof pointer & {
           templateId?: string;
           reason?: string;
@@ -1854,8 +1858,6 @@ router.post('/resolve', async (c) => {
         if (!deprecatePointer.templateId) {
           return c.json({ success: false, error: 'templateId required for activityTemplate_deprecate' } as ImpulseResolveResponse, 400);
         }
-        const authCheck = requireAuthenticated(c);
-        if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
 
         const jwtAuth = getJwtAuthFromContext(c)!;
         const templateId = deprecatePointer.templateId;
@@ -1898,6 +1900,11 @@ router.post('/resolve', async (c) => {
       }
 
       case 'activityExecutionTrace_delete': {
+        // Auth check first so unauth'd callers get 401 instead of a hint about
+        // required pointer fields.
+        const authCheck = requireAuthenticated(c);
+        if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
+
         const deletePointer = pointer as typeof pointer & {
           olderThan?: string;
           success?: boolean;
@@ -1908,8 +1915,6 @@ router.post('/resolve', async (c) => {
         if (!deletePointer.olderThan) {
           return c.json({ success: false, error: 'olderThan (ISO datetime) required for activityExecutionTrace_delete' } as ImpulseResolveResponse, 400);
         }
-        const authCheck = requireAuthenticated(c);
-        if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
 
         const olderThan = deletePointer.olderThan;
         const successFilter = deletePointer.success;
