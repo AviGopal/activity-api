@@ -3,50 +3,19 @@
 -- Purpose: Add shape definitions for goal orchestrators (goal:test, goal:refactor)
 --
 -- SPEC: openspec/changes/vessel-integration-standardization/specs/minibob-goal-orchestrators/spec.md
+--
+-- DEDUPLICATION (2026-04-22): Three shapes previously defined here have been
+-- removed to resolve UNIQUE(name, version) index violations in shape_definition.
+-- Canonical definitions live elsewhere:
+--   - requirement         -> src/shapes/context-shapes.ts
+--   - error_log           -> sql/bootstrap-shapes.ts
+--   - codebase_structure  -> src/shapes/context-shapes.ts
 
 -- ============================================================================
 -- Orchestrator Input Shapes
 -- ============================================================================
 
--- requirement shape: Natural language or structured requirement specification
-INSERT INTO shape_definition {
-  name: "requirement",
-  version: "1.0.0",
-  description: "Requirement specification for goal-driven activities. Can be natural language description or structured acceptance criteria.",
-  schema: {
-    type: "object",
-    properties: {
-      description: { type: "string", description: "Natural language requirement" },
-      acceptance_criteria: {
-        type: "array",
-        items: { type: "string" },
-        description: "List of testable acceptance criteria"
-      },
-      priority: {
-        type: "string",
-        enum: ["critical", "high", "medium", "low"],
-        description: "Requirement priority"
-      },
-      component: { type: "string", description: "Component or module targeted" }
-    },
-    required: ["description"]
-  },
-  example: {
-    description: "Write tests for the authentication module",
-    acceptance_criteria: [
-      "Tests cover login, logout, and session management",
-      "Tests validate error handling for invalid credentials",
-      "Tests verify JWT token generation and validation"
-    ],
-    priority: "high",
-    component: "authentication"
-  },
-  tags: ["goal", "orchestration", "requirement"],
-  public: true,
-  org_id: null,
-  deprecated: false,
-  created_at: time::now()
-};
+-- NOTE: `requirement` definition removed; canonical source is src/shapes/context-shapes.ts
 
 -- source_code shape: Reference to source code files or modules
 INSERT INTO shape_definition {
@@ -80,98 +49,9 @@ INSERT INTO shape_definition {
   created_at: time::now()
 };
 
--- error_log shape: Structured error information from execution traces
-INSERT INTO shape_definition {
-  name: "error_log",
-  version: "1.0.0",
-  description: "Structured error information extracted from execution traces or log files.",
-  schema: {
-    type: "object",
-    properties: {
-      error_type: { type: "string", description: "Classification of error" },
-      message: { type: "string", description: "Error message" },
-      stack_trace: { type: "string", description: "Full stack trace if available" },
-      context_files: {
-        type: "array",
-        items: { type: "string" },
-        description: "Files involved in the error"
-      },
-      task_id: { type: "string", description: "Task ID where error occurred" },
-      execution_id: { type: "string", description: "Execution trace ID" },
-      timestamp: { type: "string", format: "date-time", description: "When error occurred" }
-    },
-    required: ["error_type", "message"]
-  },
-  example: {
-    error_type: "validation_failure",
-    message: "Required pattern 'export function authenticate' not found in src/lib/auth.ts",
-    context_files: ["src/lib/auth.ts"],
-    task_id: "task-2",
-    execution_id: "exec_abc123",
-    timestamp: "2026-04-12T10:30:00Z"
-  },
-  tags: ["error", "orchestration", "context"],
-  public: true,
-  org_id: null,
-  deprecated: false,
-  created_at: time::now()
-};
+-- NOTE: `error_log` definition removed; canonical source is sql/bootstrap-shapes.ts
 
--- codebase_structure shape: High-level codebase organization and metadata
-INSERT INTO shape_definition {
-  name: "codebase_structure",
-  version: "1.0.0",
-  description: "High-level codebase structure including directory layout, module dependencies, and architectural patterns.",
-  schema: {
-    type: "object",
-    properties: {
-      root_path: { type: "string", description: "Root directory of codebase" },
-      directories: {
-        type: "array",
-        items: {
-          type: "object",
-          properties: {
-            path: { type: "string" },
-            type: { type: "string", enum: ["src", "test", "docs", "config", "build"] },
-            file_count: { type: "number" }
-          }
-        }
-      },
-      languages: {
-        type: "array",
-        items: { type: "string" },
-        description: "Programming languages detected"
-      },
-      frameworks: {
-        type: "array",
-        items: { type: "string" },
-        description: "Frameworks and libraries detected"
-      },
-      entry_points: {
-        type: "array",
-        items: { type: "string" },
-        description: "Main entry point files"
-      }
-    },
-    required: ["root_path", "directories"]
-  },
-  example: {
-    root_path: "/home/user/project",
-    directories: [
-      { path: "src", type: "src", file_count: 45 },
-      { path: "test", type: "test", file_count: 23 },
-      { path: "docs", type: "docs", file_count: 5 }
-    ],
-    languages: ["typescript", "javascript"],
-    frameworks: ["react", "express", "bun"],
-    entry_points: ["src/index.ts", "src/server.ts"]
-  },
-  tags: ["codebase", "orchestration", "context"],
-  public: true,
-  org_id: null,
-  deprecated: false,
-  created_at: time::now()
-};
+-- NOTE: `codebase_structure` definition removed; canonical source is src/shapes/context-shapes.ts
 
 -- design_pattern shape: Design pattern specification for refactoring
 INSERT INTO shape_definition {
@@ -425,5 +305,5 @@ INSERT INTO shape_definition {
 -- ============================================================================
 
 -- Expected: These queries should work after migration
--- SELECT * FROM shape_definition WHERE name IN ['requirement', 'test_suite', 'test_result', 'refactored_code'] ORDER BY name;
+-- SELECT * FROM shape_definition WHERE name IN ['source_code', 'design_pattern', 'test_suite', 'test_result', 'execution_trace', 'refactored_code'] ORDER BY name;
 -- SELECT * FROM shape_definition WHERE 'orchestration' IN tags;
