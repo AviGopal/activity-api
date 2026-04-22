@@ -72,9 +72,10 @@ async function delegateWriteToRouter(
 
 /**
  * Early-reject unauthenticated requests for destructive resolvers. The
- * authoritative admin check happens at SurrealDB PERMISSIONS level
- * (`$auth.role = 'admin'` on UPDATE/DELETE). This helper only catches the
- * obvious "no JWT at all" case so we can return a 401 before issuing SQL.
+ * authoritative admin check happens at SurrealDB PERMISSIONS level for JWT
+ * auth (`$auth.role = 'admin'` on UPDATE/DELETE). For API key auth we rely
+ * on the key being admin-scoped — PERMISSIONS are bypassed because API keys
+ * use self-signed JWTs SurrealDB can't validate against its ACCESS methods.
  *
  * Returns null if the caller should proceed, or {status, error} to emit.
  */
@@ -84,6 +85,30 @@ function requireAuthenticated(c: any): { status: 401; error: string } | null {
     return { status: 401, error: 'Authentication required for destructive operations' };
   }
   return null;
+}
+
+/**
+ * Execute a query with the right auth context.
+ *
+ * - For API key auth, the JWT is self-signed and SurrealDB cannot validate it
+ *   against the ACCESS method — queryWithAuth returns "The access method
+ *   cannot be used in the requested operation". Fall back to root credentials
+ *   with manual org_id filtering (caller is responsible for including
+ *   `org_id = $orgId` in the WHERE clause).
+ * - For real JWT auth (SurrealDB ACCESS), use queryWithAuth so PERMISSIONS
+ *   fire (which is also where the admin role check lives).
+ *
+ * Matches the pattern already used in POST /v2/impulses (executeQuery).
+ */
+async function executeAsAuth<T>(
+  jwtAuth: JwtAuthContext,
+  sql: string,
+  params: Record<string, unknown>,
+): Promise<T[]> {
+  if (jwtAuth.authType === 'apikey') {
+    return surrealDB.query<T>(sql, params);
+  }
+  return queryWithAuth<T>(jwtAuth.jwtToken, sql, params);
 }
 
 /**
@@ -1806,16 +1831,18 @@ router.post('/resolve', async (c) => {
         const updates = updatePointer.updates;
 
         try {
-          const before = await queryWithAuth<any>(jwtAuth.jwtToken, `SELECT * FROM activity WHERE id = $id LIMIT 1`, { id: templateId });
+          // Org scope added explicitly; queryWithAuth path ignores it since
+          // PERMISSIONS already enforce tenancy, but API-key path (root) needs it.
+          const before = await executeAsAuth<any>(jwtAuth, `SELECT * FROM activity WHERE id = $id AND (org_id = $orgId OR scope = 'global') LIMIT 1`, { id: templateId, orgId: jwtAuth.orgId });
           const beforeRow = (before || [])[0];
           if (!beforeRow) {
             return c.json({ success: false, error: `Template not found: ${templateId}` } as ImpulseResolveResponse, 404);
           }
 
-          const after = await queryWithAuth<any>(
-            jwtAuth.jwtToken,
-            `UPDATE activity MERGE $updates WHERE id = $id RETURN AFTER`,
-            { id: templateId, updates },
+          const after = await executeAsAuth<any>(
+            jwtAuth,
+            `UPDATE activity MERGE $updates WHERE id = $id AND (org_id = $orgId OR scope = 'global') RETURN AFTER`,
+            { id: templateId, updates, orgId: jwtAuth.orgId },
           );
           const afterRow = (after || [])[0];
 
@@ -1864,15 +1891,15 @@ router.post('/resolve', async (c) => {
         const reason = deprecatePointer.reason;
 
         try {
-          const before = await queryWithAuth<any>(jwtAuth.jwtToken, `SELECT id, deprecated FROM activity WHERE id = $id LIMIT 1`, { id: templateId });
+          const before = await executeAsAuth<any>(jwtAuth, `SELECT id, deprecated FROM activity WHERE id = $id AND (org_id = $orgId OR scope = 'global') LIMIT 1`, { id: templateId, orgId: jwtAuth.orgId });
           if (!(before || [])[0]) {
             return c.json({ success: false, error: `Template not found: ${templateId}` } as ImpulseResolveResponse, 404);
           }
 
-          const after = await queryWithAuth<any>(
-            jwtAuth.jwtToken,
-            `UPDATE activity SET deprecated = true, updated_at = time::now() WHERE id = $id RETURN AFTER`,
-            { id: templateId },
+          const after = await executeAsAuth<any>(
+            jwtAuth,
+            `UPDATE activity SET deprecated = true, updated_at = time::now() WHERE id = $id AND (org_id = $orgId OR scope = 'global') RETURN AFTER`,
+            { id: templateId, orgId: jwtAuth.orgId },
           );
           const afterRow = (after || [])[0];
 
@@ -1922,8 +1949,12 @@ router.post('/resolve', async (c) => {
         const dryRun = deletePointer.dryRun !== false; // default true
         const jwtAuth = getJwtAuthFromContext(c)!;
 
-        const conditions = ['executed_at < type::datetime($olderThan)'];
-        const params: Record<string, unknown> = { olderThan, lim: limit };
+        // For API-key auth we use root credentials (self-signed JWTs can't pass
+        // SurrealDB ACCESS validation), so we must add org_id scoping ourselves.
+        // For real JWT auth PERMISSIONS handle it but the extra predicate is
+        // a no-op since the row will already be scoped.
+        const conditions = ['org_id = $orgId', 'executed_at < type::datetime($olderThan)'];
+        const params: Record<string, unknown> = { olderThan, lim: limit, orgId: jwtAuth.orgId };
         if (successFilter !== undefined) {
           conditions.push(`success = ${successFilter ? 'true' : 'false'}`);
         }
@@ -1932,7 +1963,7 @@ router.post('/resolve', async (c) => {
         try {
           if (dryRun) {
             const selectSql = `SELECT id, activity_id, executed_at, success FROM activity_execution_traces ${whereClause} LIMIT $lim`;
-            const rows = await queryWithAuth<any>(jwtAuth.jwtToken, selectSql, params);
+            const rows = await executeAsAuth<any>(jwtAuth, selectSql, params);
             const ids = (rows || []).map((r: any) => String(r.id));
             return c.json({
               success: true,
@@ -1942,7 +1973,7 @@ router.post('/resolve', async (c) => {
           }
 
           const selectSql = `SELECT id FROM activity_execution_traces ${whereClause} LIMIT $lim`;
-          const selected = await queryWithAuth<any>(jwtAuth.jwtToken, selectSql, params);
+          const selected = await executeAsAuth<any>(jwtAuth, selectSql, params);
           const targetIds = (selected || []).map((r: any) => String(r.id));
 
           if (targetIds.length === 0) {
@@ -1953,7 +1984,7 @@ router.post('/resolve', async (c) => {
             } as ImpulseResolveResponse, 200);
           }
 
-          await queryWithAuth<any>(jwtAuth.jwtToken, `DELETE FROM activity_execution_traces WHERE id IN $ids`, { ids: targetIds });
+          await executeAsAuth<any>(jwtAuth, `DELETE FROM activity_execution_traces WHERE id IN $ids AND org_id = $orgId`, { ids: targetIds, orgId: jwtAuth.orgId });
 
           const auditId = await emitUpkeepAudit({
             operation: 'delete',
