@@ -1780,6 +1780,123 @@ router.post('/resolve', async (c) => {
       // operation is traceable independent of app logs.
       // =============================================================================
 
+      case 'activityTemplate_update': {
+        const updatePointer = pointer as typeof pointer & {
+          templateId?: string;
+          updates?: Record<string, unknown>;
+        };
+        if (!updatePointer.templateId || !updatePointer.updates) {
+          return c.json({ success: false, error: 'templateId and updates (object) required for activityTemplate_update' } as ImpulseResolveResponse, 400);
+        }
+        const authCheck = requireAuthenticated(c);
+        if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
+
+        const allowedFields = new Set(['name', 'description', 'tags', 'tasks', 'input_shapes', 'output_shapes', 'deprecated']);
+        const rejected = Object.keys(updatePointer.updates).filter((k) => !allowedFields.has(k));
+        if (rejected.length > 0) {
+          return c.json({
+            success: false,
+            error: `Disallowed update fields: ${rejected.join(', ')}. Allowed: ${Array.from(allowedFields).join(', ')}`,
+          } as ImpulseResolveResponse, 400);
+        }
+
+        const jwtAuth = getJwtAuthFromContext(c)!;
+        const templateId = updatePointer.templateId;
+        const updates = updatePointer.updates;
+
+        try {
+          const before = await queryWithAuth<any>(jwtAuth.jwtToken, `SELECT * FROM activity WHERE id = $id LIMIT 1`, { id: templateId });
+          const beforeRow = (before || [])[0];
+          if (!beforeRow) {
+            return c.json({ success: false, error: `Template not found: ${templateId}` } as ImpulseResolveResponse, 404);
+          }
+
+          const after = await queryWithAuth<any>(
+            jwtAuth.jwtToken,
+            `UPDATE activity MERGE $updates WHERE id = $id RETURN AFTER`,
+            { id: templateId, updates },
+          );
+          const afterRow = (after || [])[0];
+
+          const diff: Record<string, { before: unknown; after: unknown }> = {};
+          for (const key of Object.keys(updates)) {
+            diff[key] = { before: beforeRow[key], after: afterRow?.[key] };
+          }
+
+          const auditId = await emitUpkeepAudit({
+            operation: 'update',
+            target_table: 'activity',
+            target_ids: [templateId],
+            filter_used: { id: templateId },
+            dry_run: false,
+            count: 1,
+            performed_by: jwtAuth.keyId || jwtAuth.userId || 'unknown',
+            org_id: jwtAuth.orgId,
+            diff,
+          });
+
+          return c.json({
+            success: true,
+            content: JSON.stringify({ template: afterRow, auditImpulseId: auditId }),
+            metadata: { shape: 'activityTemplate_update_result', summary: `Updated ${Object.keys(updates).length} field(s) on ${templateId}` },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          logger.error('activityTemplate_update failed', { error: err?.message });
+          return c.json({ success: false, error: err?.message || 'update failed' } as ImpulseResolveResponse, 500);
+        }
+      }
+
+      case 'activityTemplate_deprecate': {
+        const deprecatePointer = pointer as typeof pointer & {
+          templateId?: string;
+          reason?: string;
+        };
+        if (!deprecatePointer.templateId) {
+          return c.json({ success: false, error: 'templateId required for activityTemplate_deprecate' } as ImpulseResolveResponse, 400);
+        }
+        const authCheck = requireAuthenticated(c);
+        if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
+
+        const jwtAuth = getJwtAuthFromContext(c)!;
+        const templateId = deprecatePointer.templateId;
+        const reason = deprecatePointer.reason;
+
+        try {
+          const before = await queryWithAuth<any>(jwtAuth.jwtToken, `SELECT id, deprecated FROM activity WHERE id = $id LIMIT 1`, { id: templateId });
+          if (!(before || [])[0]) {
+            return c.json({ success: false, error: `Template not found: ${templateId}` } as ImpulseResolveResponse, 404);
+          }
+
+          const after = await queryWithAuth<any>(
+            jwtAuth.jwtToken,
+            `UPDATE activity SET deprecated = true, updated_at = time::now() WHERE id = $id RETURN AFTER`,
+            { id: templateId },
+          );
+          const afterRow = (after || [])[0];
+
+          const auditId = await emitUpkeepAudit({
+            operation: 'deprecate',
+            target_table: 'activity',
+            target_ids: [templateId],
+            filter_used: { id: templateId },
+            dry_run: false,
+            count: 1,
+            performed_by: jwtAuth.keyId || jwtAuth.userId || 'unknown',
+            org_id: jwtAuth.orgId,
+            reason,
+          });
+
+          return c.json({
+            success: true,
+            content: JSON.stringify({ template: afterRow, auditImpulseId: auditId }),
+            metadata: { shape: 'activityTemplate_deprecate_result', summary: `Deprecated ${templateId}${reason ? `: ${reason}` : ''}` },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          logger.error('activityTemplate_deprecate failed', { error: err?.message });
+          return c.json({ success: false, error: err?.message || 'deprecate failed' } as ImpulseResolveResponse, 500);
+        }
+      }
+
       case 'activityExecutionTrace_delete': {
         const deletePointer = pointer as typeof pointer & {
           olderThan?: string;
