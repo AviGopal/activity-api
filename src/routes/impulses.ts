@@ -1618,6 +1618,24 @@ router.post('/resolve', async (c) => {
         return c.json(buildWriteResolverResponse('activityComposition_write', delegated, 'composition edge recorded') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
       }
 
+      case 'activityTemplate_write': {
+        const writePointer = pointer as typeof pointer & { templateData?: unknown };
+        if (!writePointer.templateData) {
+          return c.json({ success: false, error: 'templateData required for activityTemplate_write' } as ImpulseResolveResponse, 400);
+        }
+        const delegated = await delegateWriteToRouter(c, activitiesRouter, '/templates', writePointer.templateData);
+        return c.json(buildWriteResolverResponse('activityTemplate_write', delegated, 'template proposed') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
+      }
+
+      case 'activityVariant_write': {
+        const writePointer = pointer as typeof pointer & { activityId?: string; variantData?: unknown };
+        if (!writePointer.activityId || !writePointer.variantData) {
+          return c.json({ success: false, error: 'activityId and variantData required for activityVariant_write' } as ImpulseResolveResponse, 400);
+        }
+        const delegated = await delegateWriteToRouter(c, activitiesRouter, `/${encodeURIComponent(writePointer.activityId)}/variants`, writePointer.variantData);
+        return c.json(buildWriteResolverResponse('activityVariant_write', delegated, 'variant created') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
+      }
+
       default: {
         // Unknown shape - delegate to vessel discovery
         // This follows the "Resolvers live WHERE THE DATA IS" principle
