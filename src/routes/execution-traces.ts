@@ -1109,11 +1109,20 @@ app.post('/', async (c) => {
         }
       `;
 
-      // Get org_id from trace for RBAC-compliant update
-      const traceOrgId = (trace as any).org_id || jwtAuth?.orgId;
+      // Validate org_id is set (defined at line 737 with session fallback)
+      if (!traceOrgId || traceOrgId === 'undefined') {
+        logger.error('[learning] Cannot update Thompson Sampling - org_id is undefined', {
+          execution_id: trace.execution_id,
+          variant_id: trace.variant_id,
+          trace_org_id: trace.org_id,
+          jwt_org_id: jwtAuth?.orgId,
+        });
+        throw new Error('org_id is required for Thompson Sampling updates');
+      }
+
       const updateParams = {
         activity_id: trace.variant_id, // variant_id is the activity ID
-        org_id: traceOrgId, // RBAC: ensure updates only affect org's own templates
+        org_id: traceOrgId, // RBAC: ensure updates only affect org's own templates (from line 737)
         alpha_delta: alphaDelta,
         beta_delta: betaDelta,
         success_delta: trace.success ? 1 : 0,
