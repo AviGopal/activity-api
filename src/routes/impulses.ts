@@ -783,10 +783,14 @@ router.post('/resolve', async (c) => {
           } as ImpulseResolveResponse, 400);
         }
 
-        // Load template from canonical 'activity' table using 'id' field
+        // Load template from canonical 'activity' table. Use record::id(id)
+        // to extract the string portion of the composite record id (e.g.
+        // `activity:\`cleanup-stale-traces-v1\`` -> 'cleanup-stale-traces-v1')
+        // since callers pass the bare id. Matches the pattern used by the
+        // *_update/_deprecate write resolvers.
         const query = `
           SELECT * FROM activity
-          WHERE id = $activity_id
+          WHERE record::id(id) = $activity_id
           LIMIT 1
         `;
 
