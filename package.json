@@ -13,6 +13,7 @@
     "seed-templates": "bun run sql/seed-templates.ts",
     "extract-variants": "bun run sql/extract-best-variants.ts",
     "bootstrap-shapes": "bun run sql/bootstrap-shapes.ts",
+    "seed:cleanup-test": "bun run scripts/seed-cleanup-test-data.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src --ext .ts",
