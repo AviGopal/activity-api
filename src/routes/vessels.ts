@@ -220,17 +220,18 @@ app.post('/heartbeat', deprecationMiddleware, async (c) => {
       last_heartbeat: new Date().toISOString(),
     };
 
-    // Upsert heartbeat record (update if exists, insert if not)
+    // Upsert heartbeat record using record ID-based pattern (SurrealDB 3.0)
+    // Use composite record ID for multi-field key
     const query = `
-      UPSERT vessel_heartbeats SET
-        pod_name = $pod_name,
-        namespace = $namespace,
-        status = $status,
-        current_activity = $current_activity,
-        metrics = $metrics,
-        last_heartbeat = $last_heartbeat,
-        updated_at = $last_heartbeat
-      WHERE pod_name = $pod_name AND namespace = $namespace
+      UPSERT vessel_heartbeats:[$pod_name, $namespace] CONTENT {
+        pod_name: $pod_name,
+        namespace: $namespace,
+        status: $status,
+        current_activity: $current_activity,
+        metrics: $metrics,
+        last_heartbeat: $last_heartbeat,
+        updated_at: $last_heartbeat
+      }
     `;
 
     await surrealDB.query(query, heartbeat);
@@ -396,17 +397,17 @@ app.post('/register', deprecationMiddleware, async (c) => {
       last_seen: new Date().toISOString(),
     };
 
-    // Upsert vessel registration (update if exists, insert if not)
+    // Upsert vessel registration using record ID-based pattern (SurrealDB 3.0)
     const query = `
-      UPSERT vessel_capabilities SET
-        vessel_id = $vessel_id,
-        vessel_name = $vessel_name,
-        endpoint = $endpoint,
-        shapes = $shapes,
-        metadata = $metadata,
-        registered_at = $registered_at,
-        last_seen = $last_seen
-      WHERE vessel_id = $vessel_id
+      UPSERT vessel_capabilities:[$vessel_id] CONTENT {
+        vessel_id: $vessel_id,
+        vessel_name: $vessel_name,
+        endpoint: $endpoint,
+        shapes: $shapes,
+        metadata: $metadata,
+        registered_at: $registered_at,
+        last_seen: $last_seen
+      }
     `;
 
     await surrealDB.query(query, registration);

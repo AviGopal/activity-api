@@ -1082,20 +1082,28 @@ export async function updateShapeActivityScores(
     // For each shape, upsert the score
     // This allows us to track per-shape performance independently
     for (const shape of shapes) {
-      // UPSERT pattern: create if not exists, update if exists
-      // SurrealDB UPSERT with WHERE clause for composite key matching
+      // UPSERT pattern using record ID-based syntax (SurrealDB 3.0)
+      // Use composite record ID for multi-field key matching
       const query = `
-        UPSERT impulse_shape_activity_score
-        SET
-          shape = $shape,
-          activity_id = $activity_id,
-          org_id = $org_id,
-          success_count = IF success_count IS NONE THEN ${success ? 1 : 0} ELSE success_count + ${success ? 1 : 0} END,
-          failure_count = IF failure_count IS NONE THEN ${success ? 0 : 1} ELSE failure_count + ${success ? 0 : 1} END,
-          alpha = IF success_count IS NONE THEN ${success ? 2 : 1} ELSE success_count + ${success ? 2 : 1} END,
-          beta = IF failure_count IS NONE THEN ${success ? 1 : 2} ELSE failure_count + ${success ? 1 : 2} END,
-          updated_at = time::now()
-        WHERE org_id = $org_id AND shape = $shape AND activity_id = $activity_id
+        UPSERT impulse_shape_activity_score:[$org_id, $shape, $activity_id]
+        MERGE {
+          shape: $shape,
+          activity_id: $activity_id,
+          org_id: $org_id,
+          success_count: (
+            SELECT VALUE success_count FROM ONLY impulse_shape_activity_score:[$org_id, $shape, $activity_id]
+          ) ?? 0 + ${success ? 1 : 0},
+          failure_count: (
+            SELECT VALUE failure_count FROM ONLY impulse_shape_activity_score:[$org_id, $shape, $activity_id]
+          ) ?? 0 + ${success ? 0 : 1},
+          alpha: (
+            SELECT VALUE success_count FROM ONLY impulse_shape_activity_score:[$org_id, $shape, $activity_id]
+          ) ?? 0 + ${success ? 2 : 1},
+          beta: (
+            SELECT VALUE failure_count FROM ONLY impulse_shape_activity_score:[$org_id, $shape, $activity_id]
+          ) ?? 0 + ${success ? 1 : 2},
+          updated_at: time::now()
+        }
       `;
 
       const params = {

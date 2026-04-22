@@ -426,10 +426,19 @@ async function enrichTemplatesWithMetrics(
       allMetricIds: metricsResult?.map((m: any) => m.activity_id || m.variant_id)
     });
 
+    // Helper function to normalize IDs for consistent comparison
+    // Strips "activity:" prefix and angle brackets to create canonical lookup keys
+    const normalizeIdForLookup = (id: string | unknown): string => {
+      const idStr = typeof id === 'string' ? id : String(id);
+      return idStr.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
+    };
+
     // Create a map of activity_id -> metrics (handle both canonical and legacy field names)
     const metricsMap = new Map();
     for (const metric of metricsResult) {
       const id = metric.activity_id || metric.variant_id;
+      // Normalize the ID for consistent lookup (strip prefix and brackets)
+      const normalizedKey = normalizeIdForLookup(id);
       // Normalize metrics to canonical field names
       const normalizedMetric = {
         id,
@@ -446,15 +455,14 @@ async function enrichTemplatesWithMetrics(
         created_at: metric.created_at,
         updated_at: metric.updated_at,
       };
-      metricsMap.set(id, normalizedMetric);
+      metricsMap.set(normalizedKey, normalizedMetric);
     }
 
     // Attach metrics to each template using canonical 'id' field
     // Normalize template ID to match metricsMap keys (plain IDs)
     // Note: IDs may be SurrealDB RecordId objects, so convert to string first
     const enriched = templates.map(template => {
-      const idStr = typeof template.id === 'string' ? template.id : String(template.id);
-      const normalizedId = idStr.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
+      const normalizedId = normalizeIdForLookup(template.id);
       const metrics = metricsMap.get(normalizedId);
 
       logger.debug('Template metrics lookup', {
@@ -1499,6 +1507,46 @@ app.post('/executions', async (c) => {
       { activity_id: activityIdFromRequest }
     );
     const activityId = templateLookup[0]?.id || activityIdFromRequest;
+
+    // Auto-create missing base template if it doesn't exist (v1.4.5)
+    // This handles cases where MiniBob executes embedded templates without registering them first
+    if (!templateLookup[0]) {
+      logger.info('[template] Auto-creating missing base template from execution', {
+        activity_id: activityIdFromRequest,
+        org_id: orgId
+      });
+
+      try {
+        // Create minimal template with auto-created tag
+        await surrealDB.query(`
+          INSERT INTO activity {
+            id: $id,
+            name: $name,
+            description: "Auto-created from execution trace",
+            tags: ["infrastructure.auto-created"],
+            tag_prefixes: ["infrastructure"],
+            execution_type: "template",
+            scope: "org",
+            org_id: $org_id,
+            created_at: time::now(),
+            updated_at: time::now()
+          }
+        `, {
+          id: activityIdFromRequest,
+          name: activityIdFromRequest.replace(/^activity:/, '').replace(/[⟨⟩`]/g, ''),
+          org_id: orgId
+        });
+
+        logger.info('[template] Successfully auto-created base template', {
+          activity_id: activityIdFromRequest
+        });
+      } catch (templateError) {
+        logger.warn('[template] Failed to auto-create template (non-blocking)', {
+          activity_id: activityIdFromRequest,
+          error: templateError instanceof Error ? templateError.message : String(templateError)
+        });
+      }
+    }
 
     // Emit execution_started event via WebSocket
     const executionStartedData: any = {
