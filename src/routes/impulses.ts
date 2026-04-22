@@ -1831,9 +1831,10 @@ router.post('/resolve', async (c) => {
         const updates = updatePointer.updates;
 
         try {
-          // Org scope added explicitly; queryWithAuth path ignores it since
-          // PERMISSIONS already enforce tenancy, but API-key path (root) needs it.
-          const before = await executeAsAuth<any>(jwtAuth, `SELECT * FROM activity WHERE id = $id AND (org_id = $orgId OR scope = 'global') LIMIT 1`, { id: templateId, orgId: jwtAuth.orgId });
+          // SurrealDB stores record ids as `table:`id`` composites. Use
+          // record::id(id) to extract the string part for matching, matching
+          // the pattern used elsewhere (execution-traces.ts:1063).
+          const before = await executeAsAuth<any>(jwtAuth, `SELECT * FROM activity WHERE record::id(id) = $id AND (org_id = $orgId OR scope = 'global') LIMIT 1`, { id: templateId, orgId: jwtAuth.orgId });
           const beforeRow = (before || [])[0];
           if (!beforeRow) {
             return c.json({ success: false, error: `Template not found: ${templateId}` } as ImpulseResolveResponse, 404);
@@ -1841,7 +1842,7 @@ router.post('/resolve', async (c) => {
 
           const after = await executeAsAuth<any>(
             jwtAuth,
-            `UPDATE activity MERGE $updates WHERE id = $id AND (org_id = $orgId OR scope = 'global') RETURN AFTER`,
+            `UPDATE activity MERGE $updates WHERE record::id(id) = $id AND (org_id = $orgId OR scope = 'global') RETURN AFTER`,
             { id: templateId, updates, orgId: jwtAuth.orgId },
           );
           const afterRow = (after || [])[0];
@@ -1891,14 +1892,14 @@ router.post('/resolve', async (c) => {
         const reason = deprecatePointer.reason;
 
         try {
-          const before = await executeAsAuth<any>(jwtAuth, `SELECT id, deprecated FROM activity WHERE id = $id AND (org_id = $orgId OR scope = 'global') LIMIT 1`, { id: templateId, orgId: jwtAuth.orgId });
+          const before = await executeAsAuth<any>(jwtAuth, `SELECT id, deprecated FROM activity WHERE record::id(id) = $id AND (org_id = $orgId OR scope = 'global') LIMIT 1`, { id: templateId, orgId: jwtAuth.orgId });
           if (!(before || [])[0]) {
             return c.json({ success: false, error: `Template not found: ${templateId}` } as ImpulseResolveResponse, 404);
           }
 
           const after = await executeAsAuth<any>(
             jwtAuth,
-            `UPDATE activity SET deprecated = true, updated_at = time::now() WHERE id = $id AND (org_id = $orgId OR scope = 'global') RETURN AFTER`,
+            `UPDATE activity SET deprecated = true, updated_at = time::now() WHERE record::id(id) = $id AND (org_id = $orgId OR scope = 'global') RETURN AFTER`,
             { id: templateId, orgId: jwtAuth.orgId },
           );
           const afterRow = (after || [])[0];
