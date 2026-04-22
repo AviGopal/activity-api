@@ -11,7 +11,33 @@
  */
 
 import type { Context, Next } from 'hono';
-import type { Impulse, ImpulseResolution } from '../types';
+
+/**
+ * Minimal local type definitions for runtime tracing.
+ *
+ * These mirror the fields MiniBob publishes for impulses and resolver
+ * invocations, but this file is the only consumer in this backend so
+ * we keep the shape local rather than coupling to a shared model.
+ */
+interface Impulse {
+  id: string;
+  pointer: { type: string; content?: string; [key: string]: unknown };
+  budget: number;
+  priority: 'critical' | 'high' | 'medium' | 'low';
+  loaded: boolean;
+  metadata?: Record<string, unknown>;
+}
+
+interface ImpulseResolution {
+  impulse_id: string;
+  resolver_id: string;
+  resolver_tier: 'deterministic' | 'pattern' | 'llm';
+  vessel_id: string;
+  latency_ms: number;
+  cost_usd: number;
+  success?: boolean;
+  metadata?: Record<string, unknown>;
+}
 
 /**
  * Configuration for runtime tracing
