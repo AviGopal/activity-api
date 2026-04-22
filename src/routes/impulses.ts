@@ -473,9 +473,20 @@ router.get('/:impulseId', async (c) => {
       project_id: project_id || 'not specified',
     });
 
-    // Query impulse by id - RBAC permissions handle org_id filtering
-    let query = `SELECT * FROM impulse WHERE id = $impulse_id`;
+    // Query impulse by id.
+    // - Use record::id(id) = $impulse_id because SurrealDB stores ids as
+    //   composite `impulse:\`strid\``; a plain `id = $impulse_id` never
+    //   matches when callers pass a bare id (same bug fixed elsewhere).
+    // - Add `org_id = $org_id` explicitly for callers on the API-key path
+    //   where PERMISSIONS aren't enforced (self-signed JWT can't pass the
+    //   ACCESS method). JWT-auth path sees the predicate as a no-op since
+    //   PERMISSIONS already scope to `$auth.org_id`.
+    let query = `SELECT * FROM impulse WHERE record::id(id) = $impulse_id`;
     const params: Record<string, any> = { impulse_id };
+    if (jwtAuth?.orgId) {
+      query += ` AND org_id = $org_id`;
+      params.org_id = jwtAuth.orgId;
+    }
 
     // Add optional project_id filter
     if (project_id) {
@@ -484,10 +495,11 @@ router.get('/:impulseId', async (c) => {
     }
     query += ` LIMIT 1`;
 
-    // Use authenticated query when JWT is present
+    // executeAsAuth routes apikey auth -> surrealDB.query (root) and real
+    // JWT auth -> queryWithAuth (PERMISSIONS-enforced).
     let result: any[];
-    if (jwtAuth?.jwtToken) {
-      result = await queryWithAuth<any>(jwtAuth.jwtToken, query, params);
+    if (jwtAuth) {
+      result = await executeAsAuth<any>(jwtAuth, query, params);
     } else {
       result = await surrealDB.query<any>(query, params);
     }
@@ -584,22 +596,27 @@ router.get('/', async (c) => {
       offset,
     });
 
-    // Build query with optional project_id filter
-    // RBAC permissions handle org_id filtering automatically
-    let query = `SELECT * FROM impulse`;
+    // Build query. Org scope is added explicitly for callers on the API-key
+    // path (self-signed JWT cannot pass SurrealDB ACCESS validation so
+    // PERMISSIONS do not fire). JWT auth callers get the same predicate as a
+    // no-op since PERMISSIONS already scope to `$auth.org_id`.
+    const whereParts: string[] = [];
     const params: Record<string, any> = { limit, offset };
-
+    if (jwtAuth?.orgId) {
+      whereParts.push('org_id = $org_id');
+      params.org_id = jwtAuth.orgId;
+    }
     if (project_id) {
-      query += ` WHERE project_id = $project_id`;
+      whereParts.push('project_id = $project_id');
       params.project_id = project_id;
     }
+    let query = 'SELECT * FROM impulse';
+    if (whereParts.length > 0) query += ' WHERE ' + whereParts.join(' AND ');
+    query += ' ORDER BY created_at DESC LIMIT $limit START $offset';
 
-    query += ` ORDER BY created_at DESC LIMIT $limit START $offset`;
-
-    // Use authenticated query when JWT is present
     let result: any[];
-    if (jwtAuth?.jwtToken) {
-      result = await queryWithAuth<any>(jwtAuth.jwtToken, query, params);
+    if (jwtAuth) {
+      result = await executeAsAuth<any>(jwtAuth, query, params);
     } else {
       result = await surrealDB.query<any>(query, params);
     }
