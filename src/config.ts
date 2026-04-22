@@ -136,7 +136,7 @@ export function loadConfig(): Config {
 
     auth: {
       requireAuth: parseEnvBool('REQUIRE_AUTH', false),
-      jwtSecret: process.env.JWT_SECRET || 'dev-secret-change-in-production',
+      jwtSecret: process.env.JWT_SECRET || 'metabob-jwt-secret-key-change-in-production', // Must match KEY in 001-auth-access.surql
     },
     
     logLevel: (process.env.LOG_LEVEL || 'info') as Config['logLevel'],

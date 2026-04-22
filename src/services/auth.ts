@@ -144,13 +144,13 @@ export async function generateJwtToken(context: {
     const token = await new jose.SignJWT({
       NS: config.surrealdb.namespace,
       DB: config.surrealdb.database,
-      AC: 'apikey_token',
+      AC: 'jwt_external', // Must match DEFINE ACCESS name in schema (001-auth-access.surql)
       id: `api_key:${context.keyId}`,
       org_id: `organizations:${context.orgId}`,
       user_id: `users:${context.userId}`,
       scopes: context.scopes,
     })
-      .setProtectedHeader({ alg: 'HS512' })
+      .setProtectedHeader({ alg: 'HS256' }) // Must match ALGORITHM in 001-auth-access.surql
       .setIssuedAt(now)
       .setNotBefore(now)
       .setExpirationTime(now + expirySeconds)
