@@ -153,14 +153,22 @@ export function loadConfig(): Config {
       heartbeatIntervalMs: parseEnvInt('DISCOVERY_HEARTBEAT_INTERVAL_MS', 60000), // 60 seconds
       retryAttempts: parseEnvInt('DISCOVERY_RETRY_ATTEMPTS', 3),
       retryBackoffMs: parseEnvInt('DISCOVERY_RETRY_BACKOFF_MS', 1000),
+      // Entries must match case statements in src/routes/impulses.ts.
+      // Do not advertise shapes that return 410 Gone or have no case.
       shapes: [
         'activityExecutionTrace',
         'activityTemplate',
         'activityMetrics',
-        'activityCompositionGraph',
-        'impulseRelevanceMetrics',
-        'toolUsagePatterns',
-        'executionSequences',
+        'executionTraceList',
+        'variantMetricsSummary',
+        'activityTemplateRecommendation',
+        'activityTemplatesByMetrics',
+        'executionTraces',
+        'goal',
+        'toolRiskProfile',
+        'compositionSuccess',
+        'impulseRelevance',
+        'preValidationResult',
       ],
     },
   };
