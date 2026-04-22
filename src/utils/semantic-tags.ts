@@ -190,13 +190,21 @@ const KEYWORD_TO_TAGS: Record<string, string[]> = {
   // Security
   'security': ['bugfix.security', 'bugfix'],
   'vulnerability': ['bugfix.security', 'bugfix'],
-  'cve': ['bugfix.security', 'bugfix'],
+  'vulnerabilities': ['bugfix.security', 'bugfix'],
+  'cve': ['bugfix.security', 'tool.security'],
+  'owasp': ['bugfix.security', 'development.quality'],
+  'resolve': ['bugfix', 'development.feature'],
+  'scan': ['tool.security', 'bugfix.security', 'tool'],
+  'audit': ['tool.security', 'development.quality', 'tool'],
   'auth': ['feature.security', 'feature.vessel.api'],
   'authentication': ['feature.security', 'feature.vessel.api'],
   'authorization': ['feature.security', 'feature.vessel.api'],
   'injection': ['bugfix.security', 'bugfix'],
   'xss': ['bugfix.security', 'bugfix'],
   'csrf': ['bugfix.security', 'bugfix'],
+  'dependency vulnerabilities': ['bugfix.security', 'tool.dependency'],
+  'security issues': ['bugfix.security', 'bugfix'],
+  'find security': ['bugfix.security', 'tool.security'],
 
   // Performance
   'performance': ['meta.refactor', 'tool'],
