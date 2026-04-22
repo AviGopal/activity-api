@@ -164,6 +164,12 @@ export interface ParadigmExecution {
   tokens_in: number;
   tokens_out: number;
   parent_execution_id?: string;
+  /**
+   * Denormalized ancestor chain: [root_execution_id, ..., parent_execution_id].
+   * Ordered root-first. Lets consumers reconstruct composition trees in a
+   * single read instead of walking parent_execution_id pointers hop-by-hop.
+   */
+  composition_chain?: string[];
   trace?: any;
   org_id: string;
   project_id?: string;
@@ -311,6 +317,9 @@ export async function insertExecution(
     // Optional fields
     if (execution.error) record.error = execution.error;
     if (execution.parent_execution_id) record.parent_execution_id = execution.parent_execution_id;
+    if (execution.composition_chain && execution.composition_chain.length > 0) {
+      record.composition_chain = execution.composition_chain;
+    }
     if (execution.trace) record.trace = execution.trace;
     // org_id and project_id are handled separately - they need record type conversion
     // or should be populated from $auth context
