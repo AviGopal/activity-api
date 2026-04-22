@@ -821,6 +821,12 @@ export const StoreExecutionTraceRequestSchema = z.object({
   duration_ms: z.number(),
   cost_usd: z.number(),
   execution_trace: ExecutionTraceDataSchema,
+  // Composition tracking (three-level activity tracing from minibob).
+  // parent_execution_id: direct parent in the composition tree.
+  // composition_chain: denormalized ancestor chain, ordered root-first,
+  //   so consumers can reconstruct composition trees in a single read.
+  parent_execution_id: z.string().optional(),
+  composition_chain: z.array(z.string()).optional(),
 });
 
 export const StoreExecutionTraceResponseSchema = z.object({

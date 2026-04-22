@@ -269,6 +269,10 @@ DEFINE FIELD IF NOT EXISTS tokens_out ON execution TYPE int
 DEFINE FIELD IF NOT EXISTS parent_execution_id ON execution TYPE option<string>
   COMMENT "Parent execution ID for composition child executions";
 
+-- Composition: Denormalized ancestor chain for single-read tree reconstruction
+DEFINE FIELD IF NOT EXISTS composition_chain ON execution TYPE option<array<string>>
+  COMMENT "Denormalized ancestor chain: [root_execution_id, ..., parent_execution_id]. Ordered root-first.";
+
 -- Detailed trace (task-by-task, tool calls, state transitions)
 DEFINE FIELD IF NOT EXISTS trace ON execution TYPE option<object> FLEXIBLE
   COMMENT "Full execution trace: tasks, tool_calls, state_transition, impulse_evolution";

@@ -808,6 +808,14 @@ app.post('/', async (c) => {
 
       // Selection-to-execution correlation (from /recommend endpoint)
       ...(body.correlation_id ? { correlation_id: body.correlation_id } : {}),
+
+      // Composition tracking (three-level activity tracing):
+      //   parent_execution_id → direct parent in the composition tree
+      //   composition_chain   → denormalized ancestor chain, ordered root-first,
+      //                         so consumers can reconstruct trees in one read
+      ...(body.parent_execution_id ? { parent_execution_id: body.parent_execution_id } : {}),
+      ...(Array.isArray(body.composition_chain) && body.composition_chain.length > 0
+        ? { composition_chain: body.composition_chain } : {}),
     };
 
     // ========================================================================
@@ -905,6 +913,9 @@ app.post('/', async (c) => {
     if (trace.metadata) optionalFields.push('metadata: $metadata');
     // Selection-to-execution correlation
     if ((trace as any).correlation_id) optionalFields.push('correlation_id: $correlation_id');
+    // Composition tracking (from three-level activity tracing)
+    if ((trace as any).parent_execution_id) optionalFields.push('parent_execution_id: $parent_execution_id');
+    if ((trace as any).composition_chain) optionalFields.push('composition_chain: $composition_chain');
     // Project ID - only include if set (MiniBob instances may not have projects)
     if (trace.project_id) optionalFields.push('project_id: $project_id');
 
@@ -999,6 +1010,9 @@ app.post('/', async (c) => {
         tokens_in: trace.tokens_input,
         tokens_out: trace.tokens_output,
         parent_execution_id: body.parent_execution_id,
+        composition_chain: Array.isArray(body.composition_chain) && body.composition_chain.length > 0
+          ? body.composition_chain
+          : undefined,
         trace: {
           tasks: trace.tasks,
           state_snapshot: trace.state_snapshot,

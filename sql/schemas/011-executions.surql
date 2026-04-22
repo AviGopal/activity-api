@@ -166,6 +166,9 @@ DEFINE FIELD IF NOT EXISTS tasks.* ON activity_execution_traces TYPE object FLEX
 DEFINE FIELD IF NOT EXISTS parent_execution_id ON activity_execution_traces TYPE option<string>
   COMMENT "Parent execution ID (for composition tracking)";
 
+DEFINE FIELD IF NOT EXISTS composition_chain ON activity_execution_traces TYPE option<array<string>>
+  COMMENT "Denormalized ancestor chain: [root_execution_id, ..., parent_execution_id]. Ordered root-first. Enables single-read reconstruction of composition trees.";
+
 -- Edge Learning Fields (from improvisation traces)
 DEFINE FIELD IF NOT EXISTS improvisation ON activity_execution_traces TYPE option<bool>
   COMMENT "Whether this was an LLM improvisation (no template matched)";

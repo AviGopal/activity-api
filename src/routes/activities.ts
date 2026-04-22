@@ -1994,6 +1994,7 @@ app.get('/executions', async (c) => {
         trace AS execution_trace,
         trace.state_transition.after AS component_changes,
         parent_execution_id,
+        composition_chain,
         org_id,
         project_id,
         vessel_id,
