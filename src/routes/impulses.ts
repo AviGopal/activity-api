@@ -31,8 +31,70 @@ import {
 } from '../services/impulse-formatters';
 import { getJwtAuthFromContext, type JwtAuthContext } from '../middleware/jwtAuth';
 import activitiesRouter from './activities';
+import executionTracesRouter from './execution-traces';
 
 const router = new Hono();
+
+/**
+ * Delegate a write resolver to the appropriate REST handler, forwarding auth.
+ * Used by `*_write` impulse shapes so activities can invoke learning-loop
+ * writes through POST /v2/impulses/resolve instead of hardcoding REST calls.
+ *
+ * Returns the raw JSON body from the target handler along with its status.
+ * Callers wrap this into the impulse-resolve envelope.
+ */
+async function delegateWriteToRouter(
+  c: any,
+  target: Hono,
+  path: string,
+  body: unknown,
+): Promise<{ status: number; data: any }> {
+  const jwtAuth = getJwtAuthFromContext(c);
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (jwtAuth?.jwtToken) headers['Authorization'] = `Bearer ${jwtAuth.jwtToken}`;
+
+  const internalApiKey = c.req.header('x-internal-api-key');
+  if (internalApiKey) headers['X-Internal-Api-Key'] = internalApiKey;
+
+  const sessionId = c.req.header('x-session-id');
+  if (sessionId) headers['X-Session-ID'] = sessionId;
+
+  const req = new Request(`http://internal${path}`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body ?? {}),
+  });
+
+  const res = await target.fetch(req);
+  const data = await res.json().catch(() => ({}));
+  return { status: res.status, data };
+}
+
+/**
+ * Build a standard impulse-resolve envelope for a successful write resolver.
+ * Write resolvers return structured JSON (not markdown), with the shape tag
+ * suffixed `_result` so clients can distinguish write-ack from read-content.
+ */
+function buildWriteResolverResponse(
+  pointerType: string,
+  delegated: { status: number; data: any },
+  summary?: string,
+): { success: boolean; content?: string; metadata?: any; error?: string } {
+  if (delegated.status >= 200 && delegated.status < 300) {
+    return {
+      success: true,
+      content: JSON.stringify(delegated.data),
+      metadata: {
+        shape: `${pointerType}_result`,
+        summary: summary ?? `${pointerType} delegated successfully`,
+      },
+    };
+  }
+  return {
+    success: false,
+    error: (delegated.data && (delegated.data.error || delegated.data.message)) || `write resolver failed (status ${delegated.status})`,
+  };
+}
 
 /**
  * POST /v2/impulses
@@ -1518,6 +1580,42 @@ router.post('/resolve', async (c) => {
 
         content = formatPreValidationResultAsMarkdown(result);
         break;
+      }
+
+      // =============================================================================
+      // Write resolvers: expose learning-loop writes as impulse shapes so
+      // activities can invoke them through POST /v2/impulses/resolve instead of
+      // hardcoding REST knowledge. Each `*_write` case delegates to the same
+      // underlying handler used by the REST endpoint, reusing all validation
+      // and SQL in place. Returns structured JSON with metadata.shape
+      // suffixed `_result`.
+      // =============================================================================
+
+      case 'activityExecutionTrace_write': {
+        const writePointer = pointer as typeof pointer & { traceData?: unknown };
+        if (!writePointer.traceData) {
+          return c.json({ success: false, error: 'traceData required for activityExecutionTrace_write' } as ImpulseResolveResponse, 400);
+        }
+        const delegated = await delegateWriteToRouter(c, executionTracesRouter, '/', writePointer.traceData);
+        return c.json(buildWriteResolverResponse('activityExecutionTrace_write', delegated, 'execution trace stored') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
+      }
+
+      case 'activityFeedback_write': {
+        const writePointer = pointer as typeof pointer & { feedbackData?: unknown };
+        if (!writePointer.feedbackData) {
+          return c.json({ success: false, error: 'feedbackData required for activityFeedback_write' } as ImpulseResolveResponse, 400);
+        }
+        const delegated = await delegateWriteToRouter(c, activitiesRouter, '/feedback', writePointer.feedbackData);
+        return c.json(buildWriteResolverResponse('activityFeedback_write', delegated, 'feedback applied') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
+      }
+
+      case 'activityComposition_write': {
+        const writePointer = pointer as typeof pointer & { compositionData?: unknown };
+        if (!writePointer.compositionData) {
+          return c.json({ success: false, error: 'compositionData required for activityComposition_write' } as ImpulseResolveResponse, 400);
+        }
+        const delegated = await delegateWriteToRouter(c, activitiesRouter, '/composition', writePointer.compositionData);
+        return c.json(buildWriteResolverResponse('activityComposition_write', delegated, 'composition edge recorded') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
       }
 
       default: {
