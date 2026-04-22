@@ -1636,6 +1636,87 @@ router.post('/resolve', async (c) => {
         return c.json(buildWriteResolverResponse('activityVariant_write', delegated, 'variant created') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
       }
 
+      case 'impulseRelevance_write': {
+        const writePointer = pointer as typeof pointer & { relevanceData?: unknown };
+        if (!writePointer.relevanceData) {
+          return c.json({ success: false, error: 'relevanceData required for impulseRelevance_write' } as ImpulseResolveResponse, 400);
+        }
+        const delegated = await delegateWriteToRouter(c, activitiesRouter, '/impulse-relevance', writePointer.relevanceData);
+        return c.json(buildWriteResolverResponse('impulseRelevance_write', delegated, 'impulse relevance recorded') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
+      }
+
+      case 'toolUsage_write': {
+        const writePointer = pointer as typeof pointer & { usageData?: unknown };
+        if (!writePointer.usageData) {
+          return c.json({ success: false, error: 'usageData required for toolUsage_write' } as ImpulseResolveResponse, 400);
+        }
+        const delegated = await delegateWriteToRouter(c, activitiesRouter, '/tool-usage', writePointer.usageData);
+        return c.json(buildWriteResolverResponse('toolUsage_write', delegated, 'tool usage recorded') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
+      }
+
+      case 'toolArgumentPattern_write': {
+        const writePointer = pointer as typeof pointer & { patternData?: unknown };
+        if (!writePointer.patternData) {
+          return c.json({ success: false, error: 'patternData required for toolArgumentPattern_write' } as ImpulseResolveResponse, 400);
+        }
+        const delegated = await delegateWriteToRouter(c, activitiesRouter, '/tool-argument-patterns', writePointer.patternData);
+        return c.json(buildWriteResolverResponse('toolArgumentPattern_write', delegated, 'tool argument pattern recorded') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
+      }
+
+      case 'executionSequences_write': {
+        const writePointer = pointer as typeof pointer & { sequenceData?: unknown };
+        if (!writePointer.sequenceData) {
+          return c.json({ success: false, error: 'sequenceData required for executionSequences_write' } as ImpulseResolveResponse, 400);
+        }
+        const delegated = await delegateWriteToRouter(c, activitiesRouter, '/execution-sequences', writePointer.sequenceData);
+        return c.json(buildWriteResolverResponse('executionSequences_write', delegated, 'execution sequence recorded') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
+      }
+
+      case 'shapeScore_write': {
+        const writePointer = pointer as typeof pointer & { scoreData?: unknown };
+        if (!writePointer.scoreData) {
+          return c.json({ success: false, error: 'scoreData required for shapeScore_write' } as ImpulseResolveResponse, 400);
+        }
+        const delegated = await delegateWriteToRouter(c, activitiesRouter, '/shape-scores', writePointer.scoreData);
+        return c.json(buildWriteResolverResponse('shapeScore_write', delegated, 'shape score updated') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
+      }
+
+      case 'similarState_write': {
+        const writePointer = pointer as typeof pointer & { stateData?: unknown };
+        if (!writePointer.stateData) {
+          return c.json({ success: false, error: 'stateData required for similarState_write' } as ImpulseResolveResponse, 400);
+        }
+        const delegated = await delegateWriteToRouter(c, activitiesRouter, '/similar-state', writePointer.stateData);
+        return c.json(buildWriteResolverResponse('similarState_write', delegated, 'similar state recorded') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
+      }
+
+      case 'goalSeeking_write': {
+        const writePointer = pointer as typeof pointer & { goalData?: unknown };
+        if (!writePointer.goalData) {
+          return c.json({ success: false, error: 'goalData required for goalSeeking_write' } as ImpulseResolveResponse, 400);
+        }
+        const delegated = await delegateWriteToRouter(c, activitiesRouter, '/create-goal-seeking', writePointer.goalData);
+        return c.json(buildWriteResolverResponse('goalSeeking_write', delegated, 'goal-seeking activity created') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
+      }
+
+      case 'execution_write': {
+        const writePointer = pointer as typeof pointer & { executionData?: unknown };
+        if (!writePointer.executionData) {
+          return c.json({ success: false, error: 'executionData required for execution_write' } as ImpulseResolveResponse, 400);
+        }
+        const delegated = await delegateWriteToRouter(c, activitiesRouter, '/executions', writePointer.executionData);
+        return c.json(buildWriteResolverResponse('execution_write', delegated, 'execution recorded') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
+      }
+
+      case 'compositionEdge_write': {
+        const writePointer = pointer as typeof pointer & { edgeData?: unknown };
+        if (!writePointer.edgeData) {
+          return c.json({ success: false, error: 'edgeData required for compositionEdge_write' } as ImpulseResolveResponse, 400);
+        }
+        const delegated = await delegateWriteToRouter(c, activitiesRouter, '/composition/edges', writePointer.edgeData);
+        return c.json(buildWriteResolverResponse('compositionEdge_write', delegated, 'composition edge recorded') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
+      }
+
       default: {
         // Unknown shape - delegate to vessel discovery
         // This follows the "Resolvers live WHERE THE DATA IS" principle
