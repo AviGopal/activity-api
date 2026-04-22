@@ -71,6 +71,62 @@ async function delegateWriteToRouter(
 }
 
 /**
+ * Early-reject unauthenticated requests for destructive resolvers. The
+ * authoritative admin check happens at SurrealDB PERMISSIONS level
+ * (`$auth.role = 'admin'` on UPDATE/DELETE). This helper only catches the
+ * obvious "no JWT at all" case so we can return a 401 before issuing SQL.
+ *
+ * Returns null if the caller should proceed, or {status, error} to emit.
+ */
+function requireAuthenticated(c: any): { status: 401; error: string } | null {
+  const jwtAuth = getJwtAuthFromContext(c);
+  if (!jwtAuth?.jwtToken) {
+    return { status: 401, error: 'Authentication required for destructive operations' };
+  }
+  return null;
+}
+
+/**
+ * Emit an upkeepAuditLog impulse for a destructive operation. Non-blocking —
+ * a failure to audit never fails the operation (the log is best-effort, the
+ * underlying op has already succeeded in SQL). See migration 077 for schema.
+ */
+async function emitUpkeepAudit(payload: {
+  operation: 'delete' | 'update' | 'deprecate';
+  target_table: string;
+  target_ids: string[];
+  filter_used: Record<string, unknown>;
+  dry_run: boolean;
+  count: number;
+  performed_by: string;
+  org_id: string;
+  reason?: string;
+  diff?: Record<string, unknown>;
+}): Promise<string | null> {
+  const auditId = `upkeep-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+  const audit = { ...payload, performed_at: new Date().toISOString() };
+  try {
+    await surrealDB.query(
+      `INSERT INTO impulse {
+        id: $id,
+        shape: 'upkeepAuditLog',
+        pointer: $pointer,
+        org_id: $org_id,
+        created_at: time::now()
+      }`,
+      { id: auditId, pointer: audit, org_id: payload.org_id },
+    );
+    return auditId;
+  } catch (err) {
+    logger.warn('upkeepAuditLog emit failed (non-fatal)', {
+      error: err instanceof Error ? err.message : String(err),
+      operation: payload.operation,
+    });
+    return null;
+  }
+}
+
+/**
  * Build a standard impulse-resolve envelope for a successful write resolver.
  * Write resolvers return structured JSON (not markdown), with the shape tag
  * suffixed `_result` so clients can distinguish write-ack from read-content.
@@ -1715,6 +1771,88 @@ router.post('/resolve', async (c) => {
         }
         const delegated = await delegateWriteToRouter(c, activitiesRouter, '/composition/edges', writePointer.edgeData);
         return c.json(buildWriteResolverResponse('compositionEdge_write', delegated, 'composition edge recorded') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
+      }
+
+      // =============================================================================
+      // Destructive resolvers: DELETE, UPDATE, DEPRECATE. RBAC is enforced at the
+      // SurrealDB PERMISSIONS layer (`$auth.role = 'admin'` on UPDATE/DELETE).
+      // Each successful destructive op emits an upkeepAuditLog impulse so the
+      // operation is traceable independent of app logs.
+      // =============================================================================
+
+      case 'activityExecutionTrace_delete': {
+        const deletePointer = pointer as typeof pointer & {
+          olderThan?: string;
+          success?: boolean;
+          limit?: number;
+          dryRun?: boolean;
+        };
+
+        if (!deletePointer.olderThan) {
+          return c.json({ success: false, error: 'olderThan (ISO datetime) required for activityExecutionTrace_delete' } as ImpulseResolveResponse, 400);
+        }
+        const authCheck = requireAuthenticated(c);
+        if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
+
+        const olderThan = deletePointer.olderThan;
+        const successFilter = deletePointer.success;
+        const limit = Math.min(Math.max(1, deletePointer.limit ?? 100), 1000);
+        const dryRun = deletePointer.dryRun !== false; // default true
+        const jwtAuth = getJwtAuthFromContext(c)!;
+
+        const conditions = ['executed_at < type::datetime($olderThan)'];
+        const params: Record<string, unknown> = { olderThan, lim: limit };
+        if (successFilter !== undefined) {
+          conditions.push(`success = ${successFilter ? 'true' : 'false'}`);
+        }
+        const whereClause = 'WHERE ' + conditions.join(' AND ');
+
+        try {
+          if (dryRun) {
+            const selectSql = `SELECT id, activity_id, executed_at, success FROM activity_execution_traces ${whereClause} LIMIT $lim`;
+            const rows = await queryWithAuth<any>(jwtAuth.jwtToken, selectSql, params);
+            const ids = (rows || []).map((r: any) => String(r.id));
+            return c.json({
+              success: true,
+              content: JSON.stringify({ type: 'activityExecutionTrace', ids, count: ids.length, dryRun: true, olderThan, successFilter }),
+              metadata: { shape: 'activityExecutionTrace_delete_result', summary: `Dry run: ${ids.length} trace(s) match` },
+            } as ImpulseResolveResponse, 200);
+          }
+
+          const selectSql = `SELECT id FROM activity_execution_traces ${whereClause} LIMIT $lim`;
+          const selected = await queryWithAuth<any>(jwtAuth.jwtToken, selectSql, params);
+          const targetIds = (selected || []).map((r: any) => String(r.id));
+
+          if (targetIds.length === 0) {
+            return c.json({
+              success: true,
+              content: JSON.stringify({ type: 'activityExecutionTrace', count: 0, dryRun: false, olderThan, successFilter }),
+              metadata: { shape: 'activityExecutionTrace_delete_result', summary: 'No matching traces to delete' },
+            } as ImpulseResolveResponse, 200);
+          }
+
+          await queryWithAuth<any>(jwtAuth.jwtToken, `DELETE FROM activity_execution_traces WHERE id IN $ids`, { ids: targetIds });
+
+          const auditId = await emitUpkeepAudit({
+            operation: 'delete',
+            target_table: 'activity_execution_traces',
+            target_ids: targetIds,
+            filter_used: { olderThan, success: successFilter, limit },
+            dry_run: false,
+            count: targetIds.length,
+            performed_by: jwtAuth.keyId || jwtAuth.userId || 'unknown',
+            org_id: jwtAuth.orgId,
+          });
+
+          return c.json({
+            success: true,
+            content: JSON.stringify({ type: 'activityExecutionTrace', count: targetIds.length, dryRun: false, olderThan, successFilter, auditImpulseId: auditId }),
+            metadata: { shape: 'activityExecutionTrace_delete_result', summary: `Deleted ${targetIds.length} trace(s)` },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          logger.error('activityExecutionTrace_delete failed', { error: err?.message });
+          return c.json({ success: false, error: err?.message || 'delete failed' } as ImpulseResolveResponse, 500);
+        }
       }
 
       default: {
