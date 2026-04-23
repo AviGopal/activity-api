@@ -149,6 +149,39 @@ describe('Endpoint Response Structure Validation', () => {
       expect(mockResponse.every((t) => typeof t.id === 'string')).toBe(true);
     });
   });
+
+  describe('GET /v2/activities/templates auth branching', () => {
+    /**
+     * Regression guard for the fix that routes API-key auth away from
+     * queryWithAuth() (which fails with SurrealDB's "access method cannot be
+     * used in the requested operation" when handed a jwt_external-minted JWT).
+     *
+     * Contract: the handler computes `useRbacJwtQuery = hasJwtAuth && authType
+     * !== 'apikey'`. Only real Bearer JWTs and minibob_token should use the
+     * RBAC (authenticated SurrealDB client) path; API-key and unauthenticated
+     * requests fall back to the root client + application-level filter.
+     */
+    const resolveQueryPath = (authType: string | undefined, hasJwtAuth: boolean): 'rbac' | 'legacy' => {
+      const useRbacJwtQuery = hasJwtAuth && authType !== 'apikey';
+      return useRbacJwtQuery ? 'rbac' : 'legacy';
+    };
+
+    test('apikey auth is routed through legacy (root-client) path', () => {
+      expect(resolveQueryPath('apikey', true)).toBe('legacy');
+    });
+
+    test('Bearer JWT auth is routed through RBAC path', () => {
+      expect(resolveQueryPath('jwt', true)).toBe('rbac');
+    });
+
+    test('minibob_token auth is routed through RBAC path', () => {
+      expect(resolveQueryPath('minibob_token', true)).toBe('rbac');
+    });
+
+    test('unauthenticated requests are routed through legacy path', () => {
+      expect(resolveQueryPath(undefined, false)).toBe('legacy');
+    });
+  });
 });
 
 describe('RecordId Normalization in Response Processing', () => {

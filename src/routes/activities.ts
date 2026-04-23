@@ -1117,6 +1117,15 @@ app.get('/templates', async (c) => {
     const jwtAuth = getJwtAuthFromContext(c);
     const useJwtAuth = hasJwtAuth(c);
 
+    // API-key-minted JWTs use the `jwt_external` ACCESS method which SurrealDB
+    // rejects for `db.authenticate()` ("The access method cannot be used in the
+    // requested operation"). Sibling endpoints like `GET /templates/:variantId`
+    // and `GET /public` avoid this by querying through the root client and
+    // relying on application-level WHERE clauses for multi-tenant filtering.
+    // Route API-key auth through that same legacy path here — real Bearer JWTs
+    // (dashboard users) and MiniBob tokens keep the RBAC-enforced path below.
+    const useRbacJwtQuery = useJwtAuth && jwtAuth?.authType !== 'apikey';
+
     // Fall back to Redis session auth for org/project context
     const session = (c.get as any)('session') as SessionData | undefined;
     const orgId = jwtAuth?.orgId || session?.org_id || null;
@@ -1142,7 +1151,7 @@ app.get('/templates', async (c) => {
       limit,
       orgId,
       projectId,
-      authMethod: useJwtAuth ? 'jwt' : 'session',
+      authMethod: useRbacJwtQuery ? 'jwt' : (useJwtAuth ? 'apikey' : 'session'),
     });
 
     // CACHE-ASIDE PATTERN
@@ -1195,20 +1204,25 @@ app.get('/templates', async (c) => {
         lockKey,
         cacheKey,
         async () => {
-          // Load templates from database
-          // Pass JWT token for RBAC enforcement when available
+          // Load templates from database.
+          // Pass JWT token for RBAC enforcement ONLY when we can safely authenticate
+          // it against SurrealDB (real Bearer JWTs / MiniBob tokens). API-key-minted
+          // JWTs are intentionally NOT passed here — they'd trip the
+          // "access method cannot be used" error. Multi-tenant filtering for those
+          // callers is enforced application-side via orgId/projectId below.
           const dbTemplates = await listAllTemplatesFromDB(
             limit * 2,
             orgId,
             projectId,
-            jwtAuth?.jwtToken || null,
+            useRbacJwtQuery ? (jwtAuth?.jwtToken || null) : null,
             scopeFilter,
             executionType // T8: Pass execution_type filter
           );
 
-          // Populate Redis cache (only for non-JWT queries to avoid polluting global cache)
-          // JWT queries are already RBAC-filtered, so caching would leak isolation
-          if (dbTemplates.length > 0 && !useJwtAuth) {
+          // Populate Redis cache only when application-level filtering produced
+          // the result set (legacy path). RBAC-filtered results are per-$auth and
+          // would leak isolation if cached under the shared list key.
+          if (dbTemplates.length > 0 && !useRbacJwtQuery) {
             const cachePromises: Promise<any>[] = [];
 
             for (const template of dbTemplates) {
@@ -1248,9 +1262,10 @@ app.get('/templates', async (c) => {
     // Apply limit
     templates = templates.slice(0, limit);
 
-    // Skip client-side org/project filtering when using JWT auth
-    // SurrealDB PERMISSIONS clauses already enforce isolation via $auth.org_id
-    if (!useJwtAuth) {
+    // Skip client-side org/project filtering when the DB query ran with RBAC
+    // auth (SurrealDB PERMISSIONS clauses already enforced isolation via
+    // $auth.org_id). For API-key / session paths, do the filter in-app.
+    if (!useRbacJwtQuery) {
       // LEGACY PATH: Filter by scope and org_id/project_id (client-side filtering)
       // This enforces multi-tenant isolation for Redis session auth
       templates = templates.filter((template) => {
@@ -1279,7 +1294,7 @@ app.get('/templates', async (c) => {
       count: templates.length,
       category,
       scope: { orgId, projectId },
-      rbacEnforced: useJwtAuth,
+      rbacEnforced: useRbacJwtQuery,
     });
 
     // Enrich templates with execution metrics
