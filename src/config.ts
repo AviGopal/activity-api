@@ -169,6 +169,11 @@ export function loadConfig(): Config {
         'compositionSuccess',
         'impulseRelevance',
         'preValidationResult',
+        // templateAuditReport: per-template deficiency report (read-only).
+        // Scans stored templates and surfaces missing shapes/tags, default
+        // placeholders, hardcoded URLs, etc., with optional semantic-tags
+        // backfill proposals. Feeds audit-and-backfill activities.
+        'templateAuditReport',
       ],
     },
   };

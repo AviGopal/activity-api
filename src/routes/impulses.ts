@@ -12,7 +12,7 @@
  */
 
 import { Hono } from 'hono';
-import { surrealDB, queryWithAuth } from '../db/surreal';
+import { surrealDB, queryWithAuth, createAuthenticatedClient } from '../db/surreal';
 import { logger } from '../utils/logger';
 import {
   ImpulseCreateRequestSchema,
@@ -32,6 +32,8 @@ import {
 import { getJwtAuthFromContext, type JwtAuthContext } from '../middleware/jwtAuth';
 import activitiesRouter from './activities';
 import executionTracesRouter from './execution-traces';
+import { runTemplateAuditReport, type TemplateAuditInput } from './template-audit';
+import { z } from 'zod';
 
 const router = new Hono();
 
@@ -2027,6 +2029,96 @@ router.post('/resolve', async (c) => {
         } catch (err: any) {
           logger.error('activityExecutionTrace_delete failed', { error: err?.message });
           return c.json({ success: false, error: err?.message || 'delete failed' } as ImpulseResolveResponse, 500);
+        }
+      }
+
+      // =============================================================================
+      // templateAuditReport: READ-ONLY. Scans stored templates, returns a per-template
+      // deficiency report (missing shapes/tags, default-shape placeholders, hardcoded
+      // URLs, etc.) plus optional semantic-tags-derived backfill proposals. Feeds the
+      // upcoming audit-and-backfill activity; never mutates.
+      // =============================================================================
+
+      case 'templateAuditReport': {
+        const authCheck = requireAuthenticated(c);
+        if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
+
+        const jwtAuth = getJwtAuthFromContext(c)!;
+
+        // Zod schema local to this case. The global pointer schema is
+        // intentionally permissive; we validate the audit-specific fields here
+        // so bad input produces a clean 400 instead of a cryptic downstream
+        // error.
+        const AuditInputSchema = z.object({
+          filter: z
+            .object({
+              missingMarkers: z
+                .array(
+                  z.enum([
+                    'input_shapes',
+                    'output_shapes',
+                    'tags',
+                    'description',
+                    'task_outputs',
+                    'hardcoded_urls',
+                  ]),
+                )
+                .optional(),
+              taskFormat: z.enum(['all_llm', 'all_resolver', 'mixed', 'any']).optional(),
+              scope: z.enum(['global', 'org', 'project']).optional(),
+              limit: z.number().int().positive().optional(),
+              offset: z.number().int().nonnegative().optional(),
+            })
+            .optional(),
+          includeProposals: z.boolean().optional(),
+          includeAliasWarnings: z.boolean().optional(),
+        });
+
+        let parsed: TemplateAuditInput;
+        try {
+          parsed = AuditInputSchema.parse({
+            filter: (pointer as any).filter,
+            includeProposals: (pointer as any).includeProposals,
+            includeAliasWarnings: (pointer as any).includeAliasWarnings,
+          }) as TemplateAuditInput;
+        } catch (err: any) {
+          return c.json({
+            success: false,
+            error: `Invalid templateAuditReport input: ${err?.message || 'validation failed'}`,
+          } as ImpulseResolveResponse, 400);
+        }
+
+        try {
+          // Pick the right DB client: for API-key auth the self-signed JWT
+          // can't pass SurrealDB ACCESS validation, so we use the root client
+          // (via surrealDB.getInstance()) and rely on runTemplateAuditReport's
+          // app-side org filter. For real JWT auth we create an authenticated
+          // Surreal instance so PERMISSIONS apply. runTemplateAuditReport
+          // expects the raw Surreal client (shared with observeShapes).
+          const db =
+            jwtAuth.authType === 'apikey' || !jwtAuth.jwtToken
+              ? await surrealDB.getInstance()
+              : await createAuthenticatedClient(jwtAuth.jwtToken);
+
+          const report = await runTemplateAuditReport(db, parsed, {
+            orgId: jwtAuth.orgId,
+            authType: jwtAuth.authType,
+          });
+
+          return c.json({
+            success: true,
+            content: JSON.stringify(report),
+            metadata: {
+              shape: 'templateAuditReport',
+              summary: `Audited ${report.total_scanned} template(s), ${report.total_with_deficiencies} with deficiencies`,
+            },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          logger.error('templateAuditReport failed', { error: err?.message });
+          return c.json({
+            success: false,
+            error: err?.message || 'audit failed',
+          } as ImpulseResolveResponse, 500);
         }
       }
 
