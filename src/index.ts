@@ -375,6 +375,26 @@ const server = Bun.serve<WebSocketData>({
             timestamp: new Date().toISOString(),
           }));
         }
+
+        // Handle catchup request after reconnection
+        if (data.type === 'catchup' && typeof data.lastSeenSequence === 'number') {
+          if (!ws.data.authenticated) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              error: 'Not authenticated',
+              timestamp: new Date().toISOString(),
+            }));
+            return;
+          }
+
+          const sentCount = broadcaster.sendCatchup(ws as any, data.lastSeenSequence);
+          ws.send(JSON.stringify({
+            type: 'catchup_complete',
+            sentCount,
+            currentSequence: broadcaster.getCurrentSequence(),
+            timestamp: new Date().toISOString(),
+          }));
+        }
       } catch (error: any) {
         logger.error('[WebSocket] Failed to parse message', {
           error: error.message,

@@ -23,6 +23,9 @@ interface WebSocketData {
 
 class WebSocketBroadcaster {
   private clients: Set<ServerWebSocket<WebSocketData>> = new Set();
+  private eventSequence: number = 0;
+  private eventHistory: WebSocketMessage[] = [];
+  private readonly MAX_HISTORY_SIZE = 1000;  // Keep last 1000 events for catchup
 
   /**
    * Add client to broadcaster
@@ -47,8 +50,22 @@ class WebSocketBroadcaster {
 
   /**
    * Broadcast message to all connected clients
+   * Automatically assigns sequence number and stores in history for catchup
    */
   emit(message: WebSocketMessage): void {
+    // Assign sequence number for fine-grained events
+    if (message.type === 'task.started' || message.type === 'task.completed' || message.type === 'tool.call') {
+      message.sequence = ++this.eventSequence;
+
+      // Store in history for catchup protocol
+      this.eventHistory.push(message);
+
+      // Trim history if it exceeds max size
+      if (this.eventHistory.length > this.MAX_HISTORY_SIZE) {
+        this.eventHistory.shift();
+      }
+    }
+
     const payload = JSON.stringify(message);
     let successCount = 0;
     let failureCount = 0;
@@ -70,6 +87,7 @@ class WebSocketBroadcaster {
 
     logger.debug('[WebSocket] Broadcast complete', {
       messageType: message.type,
+      sequence: message.sequence,
       successCount,
       failureCount,
       totalClients: this.clients.size,
@@ -150,6 +168,46 @@ class WebSocketBroadcaster {
       }
     }
     return count;
+  }
+
+  /**
+   * Send catchup events to a client that reconnected
+   * Returns events with sequence number > lastSeenSequence
+   */
+  sendCatchup(ws: ServerWebSocket<WebSocketData>, lastSeenSequence: number): number {
+    const missedEvents = this.eventHistory.filter(
+      event => event.sequence && event.sequence > lastSeenSequence
+    );
+
+    let sentCount = 0;
+    for (const event of missedEvents) {
+      try {
+        ws.send(JSON.stringify(event));
+        sentCount++;
+      } catch (error: any) {
+        logger.error('[WebSocket] Failed to send catchup event', {
+          error: error.message,
+          sequence: event.sequence,
+        });
+        break;  // Stop sending if client can't receive
+      }
+    }
+
+    logger.info('[WebSocket] Catchup complete', {
+      lastSeenSequence,
+      currentSequence: this.eventSequence,
+      missedCount: missedEvents.length,
+      sentCount,
+    });
+
+    return sentCount;
+  }
+
+  /**
+   * Get current event sequence number
+   */
+  getCurrentSequence(): number {
+    return this.eventSequence;
   }
 }
 
