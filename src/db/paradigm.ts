@@ -1245,24 +1245,57 @@ export interface VariantTreeNode {
  * @param jwtToken - Optional JWT token for RBAC
  * @returns Array of VariantInfo objects including the base activity
  */
+/**
+ * Normalize an activity record id to its plain string form.
+ *
+ * SurrealDB record ids surface in two shapes here:
+ *   - String: `"activity:execute-shell-command"` or `"activity:⟨name⟩"`
+ *   - Object (Thing): `{ tb: 'activity', id: 'execute-shell-command' }`
+ *
+ * Variant-family consumers (variant_performance_metrics, v_activity_score)
+ * key on the plain id, so we strip table prefix + bracket wrappers before
+ * handing ids back to the route layer.
+ */
+export function normalizeActivityId(rawId: unknown): string {
+  if (rawId == null) return '';
+  if (typeof rawId === 'object' && rawId !== null && 'id' in rawId) {
+    return String((rawId as { id: unknown }).id ?? '').replace(/[⟨⟩`]/g, '');
+  }
+  const asStr = String(rawId);
+  return asStr.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
+}
+
 export async function getVariantFamily(
   baseId: string,
   orgId: string,
   jwtToken?: string | null
 ): Promise<QueryPathResult<VariantInfo>> {
   const startTime = Date.now();
+  // The activity table stores org_id as a plain string in some records and as
+  // a record-id-style "organizations:<x>" string in others (depending on which
+  // path wrote the row). Match both forms — mirrors getActivityScores.
   const fullOrgId = orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`;
+  const plainOrgId = orgId.replace(/^organizations:/, '');
 
   try {
     // Recursive CTE-style query to get all descendants
     // SurrealDB doesn't have CTEs, so we use a recursive graph traversal
-    // First, get the base activity, then find all descendants via variant_of
+    // First, get the base activity, then find all descendants via variant_of.
+    //
+    // Match base by `meta::id(id)` (extracts the string portion of the
+    // SurrealDB record id, e.g. `activity:⟨execute-shell-command⟩` →
+    // `execute-shell-command`). The bare `id = $base_id` form silently never
+    // matched because SurrealDB compared the full record id against a plain
+    // string, which is why every variant-family query returned [].
+    //
+    // For descendants, the schema field `variant_of` is plain string
+    // (see 020-paradigm-core-tables.surql:168), so direct equality is fine.
     const query = `
       LET $base = (
         SELECT id, name, variant_of, created_at
         FROM activity
-        WHERE id = $base_id
-          AND (org_id = $org_id OR scope = 'global')
+        WHERE meta::id(id) = $base_id
+          AND (org_id = $org_id OR org_id = $plain_org_id OR scope = 'global')
         LIMIT 1
       )[0];
 
@@ -1270,7 +1303,7 @@ export async function getVariantFamily(
         SELECT id, name, variant_of, created_at
         FROM activity
         WHERE variant_of = $base_id
-          AND (org_id = $org_id OR scope = 'global')
+          AND (org_id = $org_id OR org_id = $plain_org_id OR scope = 'global')
       );
 
       -- Get second-level variants (children of variants)
@@ -1278,7 +1311,7 @@ export async function getVariantFamily(
         SELECT id, name, variant_of, created_at
         FROM activity
         WHERE variant_of IN $variants.id
-          AND (org_id = $org_id OR scope = 'global')
+          AND (org_id = $org_id OR org_id = $plain_org_id OR scope = 'global')
       );
 
       -- Get third-level variants (children of second-level)
@@ -1286,7 +1319,7 @@ export async function getVariantFamily(
         SELECT id, name, variant_of, created_at
         FROM activity
         WHERE variant_of IN $second_level.id
-          AND (org_id = $org_id OR scope = 'global')
+          AND (org_id = $org_id OR org_id = $plain_org_id OR scope = 'global')
       );
 
       -- Combine all levels
@@ -1305,6 +1338,7 @@ export async function getVariantFamily(
     const params = {
       base_id: baseId,
       org_id: fullOrgId,
+      plain_org_id: plainOrgId,
     };
 
     const result = jwtToken
@@ -1316,14 +1350,39 @@ export async function getVariantFamily(
       ? result.flat().filter(a => a && a.id)
       : [];
 
-    // Transform to VariantInfo format
-    const variants: VariantInfo[] = activities.map(a => ({
-      id: a.id,
-      name: a.name,
-      variant_of: a.variant_of || null,
-      created_at: typeof a.created_at === 'object' ? JSON.stringify(a.created_at) : a.created_at,
-      is_base: a.id === baseId,
-    }));
+    // Transform to VariantInfo format. Normalize record ids to plain strings
+    // so variant_performance_metrics / v_activity_score lookups (which key on
+    // plain ids like "execute-shell-command") match.
+    const variants: VariantInfo[] = activities.map(a => {
+      const plainId = normalizeActivityId(a.id);
+      return {
+        id: plainId,
+        name: a.name,
+        variant_of: a.variant_of || null,
+        created_at: typeof a.created_at === 'object' ? JSON.stringify(a.created_at) : a.created_at,
+        is_base: plainId === baseId,
+      };
+    });
+
+    // Singleton-family fallback: if the activity row exists nowhere we can
+    // see (cross-org template, RBAC mismatch, or the row was registered by a
+    // path that bypassed the activity table), still surface a single-entry
+    // family so variant-scores can return its metrics. Scores then come from
+    // variant_performance_metrics (which IS auto-created at template
+    // registration time, see routes/activities.ts POST /templates).
+    if (variants.length === 0) {
+      logger.warn('[paradigm] getVariantFamily: base activity not found, returning singleton fallback', {
+        baseId,
+        org_id: fullOrgId,
+      });
+      variants.push({
+        id: baseId,
+        name: baseId,
+        variant_of: null,
+        created_at: new Date().toISOString(),
+        is_base: true,
+      });
+    }
 
     logger.info('[paradigm] getVariantFamily completed', {
       baseId,
@@ -1343,8 +1402,16 @@ export async function getVariantFamily(
       error: error instanceof Error ? error.message : String(error),
     });
 
+    // Even on error, return the singleton fallback so the variant-scores
+    // endpoint can still surface metrics for the base template.
     return {
-      data: [],
+      data: [{
+        id: baseId,
+        name: baseId,
+        variant_of: null,
+        created_at: new Date().toISOString(),
+        is_base: true,
+      }],
       path: 'new',
       latency_ms: Date.now() - startTime,
     };
