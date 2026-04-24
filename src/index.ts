@@ -168,9 +168,9 @@ app.route('/v2/auth', authRoutes);
 
 // Activity routes (GET /v2/activities/templates, etc.)
 app.route('/v2/activities', activitiesRoutes);
-  
+
 // Goal paths routes (Phase 1.7: Thompson Sampling over paths)
-app.route('/v2/activities/goal-paths', goalPathsRoutes);
+app.route('/v2/goal-paths', goalPathsRoutes);
 
 // Impulse routes (POST /v2/impulses, GET /v2/impulses/:id, GET /v2/impulses)
 app.route('/v2/impulses', impulsesRoutes);
