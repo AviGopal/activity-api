@@ -43,6 +43,8 @@ export interface AuthContext {
   /** API key ID - REQUIRED for api_key authType, used for audit trails */
   keyId?: string;
   scopes?: string[];
+  /** Project IDs the user/key has access to - Required for PERMISSIONS enforcement */
+  projectIds?: string[];
   reason?: string;
   /** Which method resolved the authentication */
   authMethod?: 'identity-vessel' | 'discovery';
@@ -124,6 +126,7 @@ export async function generateJwtToken(context: {
   userId: string;
   keyId: string;
   scopes: string[];
+  projectIds?: string[];
   expirySeconds?: number;
 }): Promise<string | null> {
   try {
@@ -144,13 +147,14 @@ export async function generateJwtToken(context: {
     const token = await new jose.SignJWT({
       NS: config.surrealdb.namespace,
       DB: config.surrealdb.database,
-      AC: 'jwt_external', // Must match DEFINE ACCESS name in schema (001-auth-access.surql)
+      AC: 'apikey_token', // Must match DEFINE ACCESS name in schema (000-auth-schema.surql)
       id: `api_key:${context.keyId}`,
       org_id: `organizations:${context.orgId}`,
       user_id: `users:${context.userId}`,
       scopes: context.scopes,
+      project_ids: context.projectIds || [], // Required for PERMISSIONS enforcement
     })
-      .setProtectedHeader({ alg: 'HS256' }) // Must match ALGORITHM in 001-auth-access.surql
+      .setProtectedHeader({ alg: 'HS512' }) // Must match ALGORITHM in 000-auth-schema.surql
       .setIssuedAt(now)
       .setNotBefore(now)
       .setExpirationTime(now + expirySeconds)

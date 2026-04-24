@@ -87,6 +87,7 @@ async function validateApiKey(apiKey: string): Promise<JwtAuthContext | null> {
       userId: result.userId || 'apikey-user',
       keyId: result.keyId || 'unknown',
       scopes: result.scopes || ['read', 'write'],
+      projectIds: result.projectIds || [], // Include project access for PERMISSIONS
       expirySeconds: 900, // 15 minutes
     });
 
