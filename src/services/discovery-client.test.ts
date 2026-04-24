@@ -246,4 +246,64 @@ describe('DiscoveryClient', () => {
       // Metrics should be updated (verified via heartbeat payload)
     });
   });
+
+  describe('resolver contract (Wave 1)', () => {
+    // These tests lock in the resolver contract advertised to discovery-vessel
+    // so Wave 1D (minibob generic resolver) can dispatch against this vessel
+    // without hardcoded knowledge. See super-repo CLAUDE.md auth section.
+    it('should advertise resolve_endpoint, request_format, auth_scheme, timeout in registration payload', async () => {
+      process.env.DISCOVERY_ENABLED = 'true';
+      let capturedBody: any = null;
+
+      globalThis.fetch = mock(async (_url: any, options: any) => {
+        if (options?.method === 'POST' && options?.body) {
+          capturedBody = JSON.parse(options.body as string);
+        }
+        return new Response(
+          JSON.stringify({
+            success: true,
+            vesselId: 'activity-api-test',
+            expiresAt: Date.now() + 300000,
+          }),
+          { status: 201, headers: { 'Content-Type': 'application/json' } }
+        );
+      });
+
+      const success = await client.register();
+
+      expect(success).toBe(true);
+      expect(capturedBody).not.toBeNull();
+      expect(capturedBody.resolve_endpoint).toBe('/v2/impulses/resolve');
+      expect(capturedBody.resolve_request_format).toBe('pointer');
+      expect(capturedBody.auth_scheme).toBe('ApiKey');
+      expect(capturedBody.resolve_timeout_ms).toBe(10000);
+    });
+
+    it('should keep contract fields alongside pre-existing registration fields', async () => {
+      process.env.DISCOVERY_ENABLED = 'true';
+      let capturedBody: any = null;
+
+      globalThis.fetch = mock(async (_url: any, options: any) => {
+        if (options?.method === 'POST' && options?.body) {
+          capturedBody = JSON.parse(options.body as string);
+        }
+        return new Response(
+          JSON.stringify({
+            success: true,
+            vesselId: 'activity-api-test',
+            expiresAt: Date.now() + 300000,
+          }),
+          { status: 201, headers: { 'Content-Type': 'application/json' } }
+        );
+      });
+
+      await client.register();
+
+      // Contract fields must not clobber pre-existing payload shape
+      expect(capturedBody.vesselName).toBe('metabob-activity-api');
+      expect(capturedBody.protocol).toBe('http');
+      expect(Array.isArray(capturedBody.shapes)).toBe(true);
+      expect(capturedBody.metadata).toBeDefined();
+    });
+  });
 });

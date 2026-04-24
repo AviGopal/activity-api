@@ -18,6 +18,11 @@ interface VesselRegistration {
   protocol?: string;
   orgId?: string;
   metadata?: Record<string, unknown>;
+  // Wave 1 resolver contract (see super-repo CLAUDE.md + Wave 1A)
+  resolve_endpoint?: string;
+  resolve_request_format?: 'pointer' | 'shape' | 'custom';
+  auth_scheme?: 'ApiKey' | 'Bearer' | 'None';
+  resolve_timeout_ms?: number;
 }
 
 interface RegisterResponse {
@@ -105,6 +110,13 @@ export class DiscoveryClient {
         endpoint: this.getEndpoint(),
         shapes: config.discovery.shapes,
         protocol: 'http',
+        // Wave 1 resolver contract — tells consumers (e.g. minibob's generic
+        // resolver) how to dispatch impulse resolution requests against this
+        // vessel without hardcoded knowledge. Dispatched by src/routes/impulses.ts.
+        resolve_endpoint: '/v2/impulses/resolve',
+        resolve_request_format: 'pointer',
+        auth_scheme: 'ApiKey',
+        resolve_timeout_ms: 10000,
         metadata: {
           environment: this.detectEnvironment(),
           podId: process.env.HOSTNAME || 'unknown',
