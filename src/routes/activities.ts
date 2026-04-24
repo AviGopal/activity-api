@@ -3319,15 +3319,20 @@ app.post('/feedback', async (c) => {
 
 /**
  * POST /v2/activities/discover-by-shapes
- * Discover activities by their output shapes
+ * Discover activities by their input/output shapes
  *
- * Use case: Find activities that can produce specific output shapes
- * Useful for goal-to-trajectory recommendations when missing certain shapes
+ * Supports two modes:
+ * - forward (default): Find activities that produce required_shapes (backward chaining - find producers)
+ * - backward: Find activities that consume required_shapes (forward chaining - find consumers)
+ *
+ * Use case:
+ * - Forward mode: "I need shape X, who can produce it?" (prerequisite discovery)
+ * - Backward mode: "I have shape Y, what can consume it?" (next step discovery)
  */
 app.post('/discover-by-shapes', async (c) => {
   try {
     const body = await c.req.json();
-    const { required_shapes, limit = 10 } = body;
+    const { required_shapes, mode = 'forward', limit = 10, current_shapes = [] } = body;
 
     if (!required_shapes || !Array.isArray(required_shapes) || required_shapes.length === 0) {
       return c.json({
@@ -3336,26 +3341,59 @@ app.post('/discover-by-shapes', async (c) => {
       }, 400);
     }
 
+    if (!['forward', 'backward'].includes(mode)) {
+      return c.json({
+        error: 'Validation failed',
+        message: 'mode must be either "forward" or "backward"',
+      }, 400);
+    }
+
     logger.info('Discovering activities by shapes', {
       required_shapes,
+      mode,
+      current_shapes,
       limit,
     });
 
-    // Query activities that have at least one of the required output shapes
-    // Use array:intersect to check if output_shapes contains any required shapes
-    const query = `
-      SELECT * FROM activity
-      WHERE array::len(array::intersect(output_shapes, $required_shapes)) > 0
-      ORDER BY (
-        SELECT VALUE metrics.total_executions FROM activity_metrics WHERE activity = $parent.id LIMIT 1
-      )[0] DESC NULLS LAST
-      LIMIT $limit
-    `;
+    let query: string;
+    let params: any;
 
-    const activities = await surrealDB.query(query, {
-      required_shapes,
-      limit,
-    });
+    if (mode === 'forward') {
+      // Forward mode: Find activities that PRODUCE the required shapes
+      // (backward chaining in trajectory editor - finding prerequisites)
+      query = `
+        SELECT * FROM activity
+        WHERE output_shapes CONTAINSANY $required_shapes
+          AND (retired = false OR retired IS NONE)
+        ORDER BY created_at DESC
+        LIMIT $limit
+      `;
+      params = { required_shapes, limit };
+    } else {
+      // Backward mode: Find activities that CONSUME the required shapes
+      // (forward chaining - finding next steps given current shapes)
+      if (current_shapes.length > 0) {
+        query = `
+          SELECT * FROM activity
+          WHERE input_shapes CONTAINSANY $required_shapes
+            AND (retired = false OR retired IS NONE)
+          ORDER BY created_at DESC
+          LIMIT $limit
+        `;
+        params = { required_shapes, current_shapes, limit };
+      } else {
+        query = `
+          SELECT * FROM activity
+          WHERE input_shapes CONTAINSANY $required_shapes
+            AND (retired = false OR retired IS NONE)
+          ORDER BY created_at DESC
+          LIMIT $limit
+        `;
+        params = { required_shapes, limit };
+      }
+    }
+
+    const activities = await surrealDB.query(query, params);
 
     // Get Thompson Sampling scores for each activity
     const activitiesWithScores = await Promise.all(
@@ -4611,6 +4649,149 @@ app.get('/composition/graph', async (c) => {
 
     return c.json({
       error: 'Failed to query composition graph',
+      message: error.message,
+    }, 500);
+  }
+});
+
+/**
+ * GET /v2/activities/composition/state-transitions
+ * Query state transitions in the composition graph
+ *
+ * Analyzes how shapes flow through activity compositions, showing:
+ * - Which shapes are produced by each activity
+ * - Which shapes are consumed by downstream activities
+ * - Success rates for specific shape transformations
+ *
+ * Query parameters:
+ * - from_shapes: Array of input shapes to analyze
+ * - to_shapes: Array of desired output shapes
+ * - activity_id: Filter by specific activity
+ * - limit: Max results (default: 50)
+ */
+app.get('/composition/state-transitions', async (c) => {
+  try {
+    const query = c.req.query();
+    const fromShapes = query.from_shapes ? JSON.parse(query.from_shapes) : undefined;
+    const toShapes = query.to_shapes ? JSON.parse(query.to_shapes) : undefined;
+    const activityId = query.activity_id;
+    const limit = query.limit ? parseInt(query.limit) : 50;
+
+    logger.info('GET /v2/activities/composition/state-transitions', {
+      from_shapes: fromShapes,
+      to_shapes: toShapes,
+      activity_id: activityId,
+      limit,
+    });
+
+    const whereClauses: string[] = [];
+    const params: Record<string, any> = { limit };
+
+    if (activityId) {
+      whereClauses.push(`(parent_activity_id = $activity_id OR child_activity_id = $activity_id)`);
+      params.activity_id = activityId;
+    }
+
+    if (fromShapes && Array.isArray(fromShapes) && fromShapes.length > 0) {
+      whereClauses.push(`array::len(array::intersect(input_impulse_shapes, $from_shapes)) > 0`);
+      params.from_shapes = fromShapes;
+    }
+
+    if (toShapes && Array.isArray(toShapes) && toShapes.length > 0) {
+      whereClauses.push(`array::len(array::intersect(output_impulse_shapes, $to_shapes)) > 0`);
+      params.to_shapes = toShapes;
+    }
+
+    let transitionsQuery = `
+      SELECT
+        parent_activity_id,
+        child_activity_id,
+        input_impulse_shapes,
+        output_impulse_shapes,
+        weight,
+        execution_count,
+        success_count,
+        math::mean(duration_ms) AS avg_duration_ms,
+        math::mean(cost_usd) AS avg_cost_usd
+      FROM activity_composition_graph
+    `;
+
+    if (whereClauses.length > 0) {
+      transitionsQuery += ` WHERE ${whereClauses.join(' AND ')}`;
+    }
+
+    transitionsQuery += `
+      ORDER BY weight DESC, execution_count DESC
+      LIMIT $limit
+    `;
+
+    const transitions = await surrealDB.query(transitionsQuery, params);
+
+    // Aggregate shape transformation statistics
+    const shapeTransformations = new Map<string, {
+      from_shapes: Set<string>;
+      to_shapes: Set<string>;
+      activities: Set<string>;
+      total_executions: number;
+      successful_executions: number;
+      avg_duration_ms: number;
+      avg_cost_usd: number;
+    }>();
+
+    if (transitions && Array.isArray(transitions)) {
+      for (const edge of transitions.flat()) {
+        const key = `${edge.parent_activity_id}->${edge.child_activity_id}`;
+        const existing = shapeTransformations.get(key);
+
+        if (existing) {
+          edge.input_impulse_shapes?.forEach((s: string) => existing.from_shapes.add(s));
+          edge.output_impulse_shapes?.forEach((s: string) => existing.to_shapes.add(s));
+          existing.total_executions += edge.execution_count || 0;
+          existing.successful_executions += edge.success_count || 0;
+        } else {
+          shapeTransformations.set(key, {
+            from_shapes: new Set(edge.input_impulse_shapes || []),
+            to_shapes: new Set(edge.output_impulse_shapes || []),
+            activities: new Set([edge.parent_activity_id, edge.child_activity_id]),
+            total_executions: edge.execution_count || 0,
+            successful_executions: edge.success_count || 0,
+            avg_duration_ms: edge.avg_duration_ms || 0,
+            avg_cost_usd: edge.avg_cost_usd || 0,
+          });
+        }
+      }
+    }
+
+    // Convert to array for response
+    const stateTransitions = Array.from(shapeTransformations.entries()).map(([key, stats]) => ({
+      transition: key,
+      from_shapes: Array.from(stats.from_shapes),
+      to_shapes: Array.from(stats.to_shapes),
+      activities: Array.from(stats.activities),
+      success_rate: stats.total_executions > 0
+        ? stats.successful_executions / stats.total_executions
+        : 0,
+      total_executions: stats.total_executions,
+      avg_duration_ms: stats.avg_duration_ms,
+      avg_cost_usd: stats.avg_cost_usd,
+    }));
+
+    logger.info('State transitions query result', {
+      transitions: stateTransitions.length,
+    });
+
+    return c.json({
+      state_transitions: stateTransitions,
+      total: stateTransitions.length,
+    });
+  } catch (error: any) {
+    logger.error('GET /v2/activities/composition/state-transitions failed', {
+      error: error.message,
+      stack: error.stack,
+    });
+
+    return c.json({
+      error: 'Failed to query state transitions',
       message: error.message,
     }, 500);
   }

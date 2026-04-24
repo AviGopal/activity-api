@@ -671,11 +671,25 @@ export const PathRecommendationRequestSchema = z.object({
 export const RecommendedPathSchema = z.object({
   path_activities: z.array(z.string()),
   confidence: z.number().min(0).max(1), // Thompson sample score
+  confidence_interval: z.object({
+    lower: z.number().min(0).max(1),
+    upper: z.number().min(0).max(1),
+    confidence_level: z.number().min(0).max(1).default(0.95),
+  }).optional(), // Wilson score confidence interval for success rate
+  endpoint_prediction: z.object({
+    expected_shapes: z.array(z.string()),
+    missing_shapes: z.array(z.string()).optional(),
+    goal_completion: z.number().min(0).max(1).optional(), // % of goal shapes achieved
+  }).optional(), // Predicted endpoint state after executing this path
   success_rate: z.number().min(0).max(1),
   avg_duration_ms: z.number(),
   avg_cost_usd: z.number(),
   total_executions: z.number().int(),
   exploration_bonus: z.number().optional(), // If recommended for exploration
+  thompson_params: z.object({
+    alpha: z.number(),
+    beta: z.number(),
+  }).optional(), // Raw Thompson Sampling parameters
 });
 
 export const PathRecommendationResponseSchema = z.object({

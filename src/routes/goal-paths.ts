@@ -65,17 +65,156 @@ function sampleBeta(alpha: number, beta: number): number {
     const n = alpha + beta - 2;
     const p = (alpha - 1) / n;
     const z = 1.96; // 95% confidence
-    
+
     if (n === 0) return 0.5; // No data
-    
+
     const wilson = (p + z*z/(2*n) - z * Math.sqrt((p*(1-p) + z*z/(4*n))/n)) / (1 + z*z/n);
     return Math.max(0, Math.min(1, wilson));
   }
-  
+
   // For larger samples, use simple mean with small noise
   const mean = (alpha - 1) / (alpha + beta - 2);
   const noise = (Math.random() - 0.5) * 0.1; // +/- 5%
   return Math.max(0, Math.min(1, mean + noise));
+}
+
+/**
+ * Calculate Wilson score confidence interval for success rate
+ * Provides more accurate bounds than normal approximation for small samples
+ */
+function calculateConfidenceInterval(
+  successCount: number,
+  totalCount: number,
+  confidenceLevel: number = 0.95
+): { lower: number; upper: number; confidence_level: number } {
+  if (totalCount === 0) {
+    return { lower: 0, upper: 1, confidence_level: confidenceLevel };
+  }
+
+  const p = successCount / totalCount;
+  // z-score for confidence level (1.96 for 95%, 2.576 for 99%)
+  const z = confidenceLevel === 0.99 ? 2.576 : 1.96;
+
+  const denominator = 1 + (z * z) / totalCount;
+  const centerAdjustment = p + (z * z) / (2 * totalCount);
+  const interval = z * Math.sqrt((p * (1 - p) + (z * z) / (4 * totalCount)) / totalCount);
+
+  const lower = Math.max(0, (centerAdjustment - interval) / denominator);
+  const upper = Math.min(1, (centerAdjustment + interval) / denominator);
+
+  return { lower, upper, confidence_level: confidenceLevel };
+}
+
+/**
+ * Predict endpoint state after executing a path
+ * Fetches output_shapes from each activity in the path and computes accumulated shapes
+ */
+async function predictEndpointState(
+  pathActivities: string[],
+  goalText?: string
+): Promise<{
+  expected_shapes: string[];
+  missing_shapes?: string[];
+  goal_completion?: number;
+}> {
+  try {
+    // Fetch all activities to get their output_shapes
+    if (pathActivities.length === 0) {
+      return { expected_shapes: [] };
+    }
+
+    const activitiesQuery = `
+      SELECT id, output_shapes FROM activity
+      WHERE id INSIDE $activity_ids
+    `;
+
+    const activitiesResult = await surrealDB.query(
+      activitiesQuery,
+      { activity_ids: pathActivities }
+    );
+
+    if (!activitiesResult || activitiesResult.length === 0) {
+      return { expected_shapes: [] };
+    }
+
+    // Flatten the result (SurrealDB returns nested arrays)
+    const rawActivities = activitiesResult[0];
+    const activities: Array<{ id: string; output_shapes: string[] }> = Array.isArray(rawActivities)
+      ? rawActivities
+      : [];
+
+    // Accumulate all output shapes across the path
+    const shapeSet = new Set<string>();
+    const activityMap = new Map<string, { id: string; output_shapes: string[] }>(
+      activities.map(a => [a.id, a])
+    );
+
+    for (const activityId of pathActivities) {
+      const activity = activityMap.get(activityId);
+      if (activity?.output_shapes) {
+        activity.output_shapes.forEach((shape: string) => shapeSet.add(shape));
+      }
+    }
+
+    const expected_shapes = Array.from(shapeSet);
+
+    // If goal text provided, infer expected shapes and compute completion
+    if (goalText) {
+      const inferredGoalShapes = inferShapesFromGoal(goalText);
+      const missing_shapes = inferredGoalShapes.filter(s => !shapeSet.has(s));
+      const goal_completion = inferredGoalShapes.length > 0
+        ? (inferredGoalShapes.length - missing_shapes.length) / inferredGoalShapes.length
+        : 1.0;
+
+      return {
+        expected_shapes,
+        missing_shapes: missing_shapes.length > 0 ? missing_shapes : undefined,
+        goal_completion,
+      };
+    }
+
+    return { expected_shapes };
+  } catch (error) {
+    logger.warn('Failed to predict endpoint state', { error });
+    return { expected_shapes: [] };
+  }
+}
+
+/**
+ * Infer expected shapes from goal text using keyword matching
+ * Simple heuristic-based inference for common patterns
+ */
+function inferShapesFromGoal(goalText: string): string[] {
+  const lower = goalText.toLowerCase();
+  const shapes: string[] = [];
+
+  // Common patterns
+  if (lower.includes('test') || lower.includes('coverage')) {
+    shapes.push('testResults', 'coverageReport');
+  }
+  if (lower.includes('commit') || lower.includes('git')) {
+    shapes.push('gitCommit', 'gitDiff');
+  }
+  if (lower.includes('deploy') || lower.includes('production')) {
+    shapes.push('deploymentStatus', 'healthCheck');
+  }
+  if (lower.includes('bug') || lower.includes('fix')) {
+    shapes.push('patch', 'testResults');
+  }
+  if (lower.includes('feature') || lower.includes('implement')) {
+    shapes.push('sourceCode', 'testResults');
+  }
+  if (lower.includes('refactor')) {
+    shapes.push('sourceCode', 'gitDiff');
+  }
+  if (lower.includes('document') || lower.includes('readme')) {
+    shapes.push('documentation', 'markdown');
+  }
+  if (lower.includes('analyze') || lower.includes('report')) {
+    shapes.push('analysisReport', 'metrics');
+  }
+
+  return shapes.length > 0 ? shapes : ['sourceCode']; // Default fallback
 }
 
 /**
@@ -421,7 +560,7 @@ app.post('/recommend', async (c) => {
     if (shouldExplore) {
       // Exploration: prefer paths with fewer executions (UCB-style)
       logger.info('Thompson Sampling: EXPLORE mode');
-      
+
       const sorted = paths
         .sort((a, b) => {
           // @ts-ignore
@@ -431,47 +570,86 @@ app.post('/recommend', async (c) => {
           return aExec - bExec; // Ascending (fewer executions first)
         })
         .slice(0, validated.top_k);
-      
-      recommendedPaths = sorted.map(p => ({
-        // @ts-ignore
-        path_activities: p.path_activities,
-        confidence: 0.5, // Neutral confidence for exploration
-        // @ts-ignore
-        success_rate: p.success_rate || 0,
-        // @ts-ignore
-        avg_duration_ms: p.avg_duration_ms || 0,
-        // @ts-ignore
-        avg_cost_usd: p.avg_cost_usd || 0,
-        // @ts-ignore
-        total_executions: p.total_executions || 0,
-        // @ts-ignore
-        exploration_bonus: 1.0 / ((p.total_executions || 0) + 1),
-      }));
+
+      // Build recommendations with enhanced metadata
+      recommendedPaths = await Promise.all(
+        sorted.map(async (p) => {
+          // @ts-ignore
+          const totalExec = p.total_executions || 0;
+          // @ts-ignore
+          const successExec = p.successful_executions || 0;
+          // @ts-ignore
+          const alpha = p.thompson_alpha || 1;
+          // @ts-ignore
+          const beta = p.thompson_beta || 1;
+
+          const confidenceInterval = calculateConfidenceInterval(successExec, totalExec, 0.95);
+          // @ts-ignore
+          const endpointPrediction = await predictEndpointState(p.path_activities, validated.goal_text);
+
+          return {
+            // @ts-ignore
+            path_activities: p.path_activities,
+            confidence: 0.5, // Neutral confidence for exploration
+            confidence_interval: confidenceInterval,
+            endpoint_prediction: endpointPrediction,
+            // @ts-ignore
+            success_rate: p.success_rate || 0,
+            // @ts-ignore
+            avg_duration_ms: p.avg_duration_ms || 0,
+            // @ts-ignore
+            avg_cost_usd: p.avg_cost_usd || 0,
+            total_executions: totalExec,
+            exploration_bonus: 1.0 / (totalExec + 1),
+            thompson_params: { alpha, beta },
+          };
+        })
+      );
     } else {
       // Exploitation: sample from Beta distributions
       logger.info('Thompson Sampling: EXPLOIT mode');
-      
+
       const samples = paths.map(p => ({
         path: p,
         // @ts-ignore
         sample: sampleBeta(p.thompson_alpha || 1, p.thompson_beta || 1),
       }));
-      
+
       samples.sort((a, b) => b.sample - a.sample); // Descending
-      
-      recommendedPaths = samples.slice(0, validated.top_k).map(s => ({
-        // @ts-ignore
-        path_activities: s.path.path_activities,
-        confidence: s.sample,
-        // @ts-ignore
-        success_rate: s.path.success_rate || 0,
-        // @ts-ignore
-        avg_duration_ms: s.path.avg_duration_ms || 0,
-        // @ts-ignore
-        avg_cost_usd: s.path.avg_cost_usd || 0,
-        // @ts-ignore
-        total_executions: s.path.total_executions || 0,
-      }));
+
+      // Build recommendations with enhanced metadata
+      recommendedPaths = await Promise.all(
+        samples.slice(0, validated.top_k).map(async (s) => {
+          // @ts-ignore
+          const totalExec = s.path.total_executions || 0;
+          // @ts-ignore
+          const successExec = s.path.successful_executions || 0;
+          // @ts-ignore
+          const alpha = s.path.thompson_alpha || 1;
+          // @ts-ignore
+          const beta = s.path.thompson_beta || 1;
+
+          const confidenceInterval = calculateConfidenceInterval(successExec, totalExec, 0.95);
+          // @ts-ignore
+          const endpointPrediction = await predictEndpointState(s.path.path_activities, validated.goal_text);
+
+          return {
+            // @ts-ignore
+            path_activities: s.path.path_activities,
+            confidence: s.sample,
+            confidence_interval: confidenceInterval,
+            endpoint_prediction: endpointPrediction,
+            // @ts-ignore
+            success_rate: s.path.success_rate || 0,
+            // @ts-ignore
+            avg_duration_ms: s.path.avg_duration_ms || 0,
+            // @ts-ignore
+            avg_cost_usd: s.path.avg_cost_usd || 0,
+            total_executions: totalExec,
+            thompson_params: { alpha, beta },
+          };
+        })
+      );
     }
     
     const response = PathRecommendationResponseSchema.parse({
