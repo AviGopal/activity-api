@@ -3317,6 +3317,115 @@ app.post('/feedback', async (c) => {
   }
 });
 
+/**
+ * POST /v2/activities/discover-by-shapes
+ * Discover activities by their output shapes
+ *
+ * Use case: Find activities that can produce specific output shapes
+ * Useful for goal-to-trajectory recommendations when missing certain shapes
+ */
+app.post('/discover-by-shapes', async (c) => {
+  try {
+    const body = await c.req.json();
+    const { required_shapes, limit = 10 } = body;
+
+    if (!required_shapes || !Array.isArray(required_shapes) || required_shapes.length === 0) {
+      return c.json({
+        error: 'Validation failed',
+        message: 'required_shapes must be a non-empty array',
+      }, 400);
+    }
+
+    logger.info('Discovering activities by shapes', {
+      required_shapes,
+      limit,
+    });
+
+    // Query activities that have at least one of the required output shapes
+    // Use array:intersect to check if output_shapes contains any required shapes
+    const query = `
+      SELECT * FROM activity
+      WHERE array::len(array::intersect(output_shapes, $required_shapes)) > 0
+      ORDER BY (
+        SELECT VALUE metrics.total_executions FROM activity_metrics WHERE activity = $parent.id LIMIT 1
+      )[0] DESC NULLS LAST
+      LIMIT $limit
+    `;
+
+    const activities = await surrealDB.query(query, {
+      required_shapes,
+      limit,
+    });
+
+    // Get Thompson Sampling scores for each activity
+    const activitiesWithScores = await Promise.all(
+      (activities || []).map(async (activity: any) => {
+        try {
+          const scoresQuery = `
+            SELECT * FROM activity_metrics
+            WHERE activity = $activity_id
+            LIMIT 1
+          `;
+          const scores = await surrealDB.query(scoresQuery, {
+            activity_id: activity.id,
+          });
+
+          const score = scores && scores.length > 0 ? scores[0] : null;
+
+          return {
+            ...activity,
+            metrics: score ? {
+              total_executions: score.total_executions || 0,
+              successful_executions: score.successful_executions || 0,
+              success_rate: score.success_rate || 0,
+              thompson_alpha: score.alpha || 1,
+              thompson_beta: score.beta || 1,
+              confidence: (score.alpha || 1) / ((score.alpha || 1) + (score.beta || 1)),
+            } : {
+              total_executions: 0,
+              successful_executions: 0,
+              success_rate: 0,
+              thompson_alpha: 1,
+              thompson_beta: 1,
+              confidence: 0.5,
+            },
+          };
+        } catch (error) {
+          logger.warn('Failed to fetch metrics for activity', {
+            activity_id: activity.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return activity;
+        }
+      })
+    );
+
+    // Transform to legacy format for compatibility
+    const legacyActivities = activitiesWithScores.map(transformToLegacyTemplate);
+
+    logger.info('Activities discovered by shapes', {
+      count: legacyActivities.length,
+      required_shapes,
+    });
+
+    return c.json({
+      activities: legacyActivities,
+      total: legacyActivities.length,
+    });
+
+  } catch (error: any) {
+    logger.error('POST /v2/activities/discover-by-shapes failed', {
+      error: error.message,
+      stack: error.stack,
+    });
+
+    return c.json({
+      error: 'Failed to discover activities by shapes',
+      message: error.message,
+    }, 500);
+  }
+});
+
 export default app;
 
 /**
@@ -5060,6 +5169,192 @@ app.get('/composition/edges/successors/:activityId', async (c) => {
     return c.json({
       error: 'Failed to query composition successors',
       message: error.message,
+    }, 500);
+  }
+});
+
+/**
+ * POST /v2/activities/validate-composition
+ *
+ * Validate a composition graph for cycles and impulse shape compatibility.
+ * Used by the composition builder UI to provide real-time validation feedback.
+ *
+ * Request body:
+ * - nodes: Array of { activity_id: string, output_shapes?: string[] }
+ * - edges: Array of { from: string, to: string }
+ *
+ * Returns:
+ * - valid: boolean
+ * - errors: Array of validation errors
+ *   - { type: 'cycle', path: string[] } for cycles
+ *   - { type: 'shape_mismatch', from: string, to: string, details: string } for incompatible shapes
+ */
+app.post('/validate-composition', async (c) => {
+  try {
+    const body = await c.req.json();
+
+    if (!body.nodes || !Array.isArray(body.nodes) || !body.edges || !Array.isArray(body.edges)) {
+      return c.json({
+        error: 'Invalid request body',
+        required: { nodes: 'array', edges: 'array' },
+      }, 400);
+    }
+
+    const { nodes, edges } = body;
+    const errors: Array<{ type: string; [key: string]: any }> = [];
+
+    // Build adjacency list for cycle detection
+    const adjacencyList = new Map<string, string[]>();
+    for (const node of nodes) {
+      if (!adjacencyList.has(node.activity_id)) {
+        adjacencyList.set(node.activity_id, []);
+      }
+    }
+    for (const edge of edges) {
+      const neighbors = adjacencyList.get(edge.from) || [];
+      neighbors.push(edge.to);
+      adjacencyList.set(edge.from, neighbors);
+    }
+
+    // Cycle detection using DFS
+    const visited = new Set<string>();
+    const recursionStack = new Set<string>();
+    const cycleDetected: string[][] = [];
+
+    function detectCycle(nodeId: string, path: string[]): boolean {
+      visited.add(nodeId);
+      recursionStack.add(nodeId);
+      path.push(nodeId);
+
+      const neighbors = adjacencyList.get(nodeId) || [];
+      for (const neighbor of neighbors) {
+        if (!visited.has(neighbor)) {
+          if (detectCycle(neighbor, [...path])) {
+            return true;
+          }
+        } else if (recursionStack.has(neighbor)) {
+          // Found a cycle
+          const cycleStart = path.indexOf(neighbor);
+          if (cycleStart >= 0) {
+            cycleDetected.push([...path.slice(cycleStart), neighbor]);
+          }
+          return true;
+        }
+      }
+
+      recursionStack.delete(nodeId);
+      return false;
+    }
+
+    for (const node of nodes) {
+      if (!visited.has(node.activity_id)) {
+        detectCycle(node.activity_id, []);
+      }
+    }
+
+    if (cycleDetected.length > 0) {
+      for (const cycle of cycleDetected) {
+        errors.push({
+          type: 'cycle',
+          path: cycle,
+          message: `Cycle detected: ${cycle.join(' → ')}`,
+        });
+      }
+    }
+
+    // Shape compatibility validation
+    // Fetch activity templates to get input/output shapes
+    const activityIds = nodes.map((n: any) => n.activity_id);
+    if (activityIds.length > 0) {
+      try {
+        const templatesQuery = `
+          SELECT id, input_shapes, output_shapes FROM activity
+          WHERE id IN $activity_ids
+        `;
+        const templatesResult = await surrealDB.query<Array<{
+          id: string;
+          input_shapes?: string[];
+          output_shapes?: string[];
+        }>>(templatesQuery, { activity_ids: activityIds });
+
+        // surrealDB.query returns an array of result sets, take the first one
+        const templates = templatesResult[0] || [];
+
+        const shapeMap = new Map<string, { input: string[]; output: string[] }>();
+        for (const template of templates) {
+          shapeMap.set(template.id, {
+            input: template.input_shapes || [],
+            output: template.output_shapes || [],
+          });
+        }
+
+        // Check each edge for shape compatibility
+        for (const edge of edges) {
+          const fromShapes = shapeMap.get(edge.from);
+          const toShapes = shapeMap.get(edge.to);
+
+          if (!fromShapes || !toShapes) {
+            continue; // Skip if template not found
+          }
+
+          // Check if any output shape from 'from' activity matches input shapes of 'to' activity
+          if (toShapes.input.length > 0 && fromShapes.output.length > 0) {
+            const hasCompatibleShape = fromShapes.output.some((outputShape: string) =>
+              toShapes.input.includes(outputShape)
+            );
+
+            if (!hasCompatibleShape) {
+              errors.push({
+                type: 'shape_mismatch',
+                from: edge.from,
+                to: edge.to,
+                fromOutputShapes: fromShapes.output,
+                toInputShapes: toShapes.input,
+                message: `No compatible shapes between ${edge.from} (outputs: ${fromShapes.output.join(', ')}) and ${edge.to} (inputs: ${toShapes.input.join(', ')})`,
+              });
+            }
+          }
+        }
+      } catch (dbError) {
+        logger.error('Failed to fetch activity templates for shape validation', {
+          error: dbError instanceof Error ? dbError.message : String(dbError),
+        });
+        errors.push({
+          type: 'validation_error',
+          message: 'Failed to validate shapes - database error',
+        });
+      }
+    }
+
+    const valid = errors.length === 0;
+
+    logger.info('POST /v2/activities/validate-composition', {
+      nodeCount: nodes.length,
+      edgeCount: edges.length,
+      valid,
+      errorCount: errors.length,
+    });
+
+    return c.json({
+      valid,
+      errors,
+      summary: {
+        nodeCount: nodes.length,
+        edgeCount: edges.length,
+        cyclesDetected: cycleDetected.length,
+        shapeMismatches: errors.filter(e => e.type === 'shape_mismatch').length,
+      },
+    });
+
+  } catch (error) {
+    logger.error('POST /v2/activities/validate-composition failed', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+
+    return c.json({
+      error: 'Failed to validate composition',
+      message: error instanceof Error ? error.message : 'Unknown error',
     }, 500);
   }
 });
