@@ -186,7 +186,7 @@ export const CreateTemplateRequestSchema = z.object({
   org_id: z.string().nullable().optional(),
   project_id: z.string().nullable().optional(),
   // Canonical field: 'variant_of' (also accept legacy 'genealogy')
-  variant_of: z.record(z.any()).optional(),
+  variant_of: z.string().optional(),
   genealogy: z.record(z.any()).optional(),
   // Template-level impulse definitions
   impulses: z.array(TemplateImpulseSchema).optional(),
