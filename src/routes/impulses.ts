@@ -33,6 +33,7 @@ import { getJwtAuthFromContext, type JwtAuthContext } from '../middleware/jwtAut
 import activitiesRouter from './activities';
 import executionTracesRouter from './execution-traces';
 import { runTemplateAuditReport, type TemplateAuditInput } from './template-audit';
+import { runExecutionTraceWithSignatures } from './execution-trace-with-signatures';
 import { z } from 'zod';
 
 const router = new Hono();
@@ -2119,6 +2120,75 @@ router.post('/resolve', async (c) => {
             success: false,
             error: err?.message || 'audit failed',
           } as ImpulseResolveResponse, 500);
+        }
+      }
+
+      // =============================================================================
+      // executionTraceWithSignatures: recent execution traces hydrated with
+      // per-impulse (pointer_type, shape) signatures so the minibob
+      // co-occurrence extractor can avoid a second round trip per impulse id.
+      // Read-only. See src/routes/execution-trace-with-signatures.ts.
+      // =============================================================================
+
+      case 'executionTraceWithSignatures': {
+        const authCheck = requireAuthenticated(c);
+        if (authCheck) {
+          return c.json(
+            { success: false, error: authCheck.error } as ImpulseResolveResponse,
+            authCheck.status,
+          );
+        }
+        const jwtAuth = getJwtAuthFromContext(c)!;
+
+        try {
+          // Same auth-routing pattern as templateAuditReport: API-key auth uses
+          // the root client with an app-side `org_id` filter (self-signed JWTs
+          // can't pass SurrealDB PERMISSIONS); real JWT auth uses the
+          // authenticated client and lets PERMISSIONS fire.
+          const db =
+            jwtAuth.authType === 'apikey' || !jwtAuth.jwtToken
+              ? await surrealDB.getInstance()
+              : await createAuthenticatedClient(jwtAuth.jwtToken);
+
+          const report = await runExecutionTraceWithSignatures(
+            db,
+            pointer as unknown,
+            {
+              orgId: jwtAuth.orgId,
+              authType: jwtAuth.authType,
+            },
+          );
+
+          return c.json(
+            {
+              success: true,
+              content: JSON.stringify(report),
+              metadata: {
+                shape: 'executionTraceWithSignatures',
+                summary: `Hydrated ${report.count} execution trace(s) since ${report.filtered_by.since}`,
+              },
+            } as ImpulseResolveResponse,
+            200,
+          );
+        } catch (err: any) {
+          // parseInput throws {status, message} for bad input. Propagate as
+          // 400 so callers see a clean validation error.
+          if (err && typeof err === 'object' && err.status === 400) {
+            return c.json(
+              { success: false, error: err.message } as ImpulseResolveResponse,
+              400,
+            );
+          }
+          logger.error('executionTraceWithSignatures failed', {
+            error: err?.message,
+          });
+          return c.json(
+            {
+              success: false,
+              error: err?.message || 'executionTraceWithSignatures resolution failed',
+            } as ImpulseResolveResponse,
+            500,
+          );
         }
       }
 

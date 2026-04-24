@@ -174,6 +174,11 @@ export function loadConfig(): Config {
         // placeholders, hardcoded URLs, etc., with optional semantic-tags
         // backfill proposals. Feeds audit-and-backfill activities.
         'templateAuditReport',
+        // executionTraceWithSignatures: recent execution traces hydrated with
+        // a per-impulse (pointer_type, shape) signature map. Read-only; feeds
+        // the minibob co-occurrence extractor (commit 1f8d703) so it can do
+        // signature reasoning without a second round trip per impulse id.
+        'executionTraceWithSignatures',
       ],
     },
   };
