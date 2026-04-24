@@ -42,6 +42,10 @@ export function normalizePersistedTask(task: any): {
   tool_calls: unknown[] | null;
   input_impulse_ids: string[];
   output_impulse_ids: string[];
+  resolver_id?: string;
+  resolver_tier?: string;
+  success?: boolean;
+  cost_usd?: number;
 } {
   const inputImpulseIds = Array.isArray(task?.input_impulse_ids)
     ? task.input_impulse_ids
@@ -57,7 +61,12 @@ export function normalizePersistedTask(task: any): {
       : Array.isArray(task?.outputState?.impulses)
         ? task.outputState.impulses
         : [];
-  return {
+
+  // Per-task resolver attribution (canonical six-field shape from minibob's
+  // serializeTasksForTrace). The `tasks` column is FLEXIBLE so these can ride
+  // through without a schema bump. Only emit a key when a value is present so
+  // SurrealDB stores `null` only where minibob explicitly set it.
+  const out: ReturnType<typeof normalizePersistedTask> = {
     task_id: task?.taskId || task?.task_id,
     description: task?.description,
     status: task?.status,
@@ -70,6 +79,21 @@ export function normalizePersistedTask(task: any): {
     input_impulse_ids: inputImpulseIds,
     output_impulse_ids: outputImpulseIds,
   };
+
+  if (typeof task?.resolver_id === 'string' && task.resolver_id.length > 0) {
+    out.resolver_id = task.resolver_id;
+  }
+  if (typeof task?.resolver_tier === 'string' && task.resolver_tier.length > 0) {
+    out.resolver_tier = task.resolver_tier;
+  }
+  if (typeof task?.success === 'boolean') {
+    out.success = task.success;
+  }
+  if (typeof task?.cost_usd === 'number') {
+    out.cost_usd = task.cost_usd;
+  }
+
+  return out;
 }
 
 /**
@@ -161,7 +185,19 @@ interface ExecutionTrace {
   org_id: string | null;
   project_id: string | null;
   vessel_id?: string;
+  resolved_by_vessel_id?: string;
   vessel_version?: string;
+  // Per-impulse resolver attribution (canonical six-field shape from minibob).
+  // See migration 086 for the persisted form.
+  impulse_resolutions?: Array<{
+    impulse_id: string;
+    resolver_id: string;
+    resolver_tier: string;
+    vessel_id: string;
+    latency_ms: number;
+    cost_usd: number;
+  }>;
+  composition_chain?: string[];
   executed_at: string;
   created_at: string;
   // Edge learning fields
@@ -899,6 +935,16 @@ app.post('/', async (c) => {
       ...(body.parent_execution_id ? { parent_execution_id: body.parent_execution_id } : {}),
       ...(Array.isArray(body.composition_chain) && body.composition_chain.length > 0
         ? { composition_chain: body.composition_chain } : {}),
+
+      // Vessel attribution + per-impulse resolver tracking (minibob 6f8c727+).
+      // See migration 086. The legacy table is SCHEMAFULL, so unknown keys are
+      // dropped silently — this block ensures we round-trip what minibob
+      // actually sends on the wire.
+      ...(body.vessel_id ? { vessel_id: body.vessel_id } : {}),
+      ...(body.resolved_by_vessel_id ? { resolved_by_vessel_id: body.resolved_by_vessel_id } : {}),
+      ...(body.vessel_version ? { vessel_version: body.vessel_version } : {}),
+      ...(Array.isArray(body.impulse_resolutions) && body.impulse_resolutions.length > 0
+        ? { impulse_resolutions: body.impulse_resolutions } : {}),
     };
 
     // ========================================================================
@@ -999,6 +1045,11 @@ app.post('/', async (c) => {
     // Composition tracking (from three-level activity tracing)
     if ((trace as any).parent_execution_id) optionalFields.push('parent_execution_id: $parent_execution_id');
     if ((trace as any).composition_chain) optionalFields.push('composition_chain: $composition_chain');
+    // Vessel attribution + per-impulse resolver tracking (migration 086)
+    if ((trace as any).vessel_id) optionalFields.push('vessel_id: $vessel_id');
+    if ((trace as any).resolved_by_vessel_id) optionalFields.push('resolved_by_vessel_id: $resolved_by_vessel_id');
+    if ((trace as any).vessel_version) optionalFields.push('vessel_version: $vessel_version');
+    if ((trace as any).impulse_resolutions) optionalFields.push('impulse_resolutions: $impulse_resolutions');
     // Project ID - only include if set (MiniBob instances may not have projects)
     if (trace.project_id) optionalFields.push('project_id: $project_id');
 

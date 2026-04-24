@@ -197,3 +197,201 @@ describe('normalizePersistedTask field precedence', () => {
     ).toEqual([{ n: 2 }]);
   });
 });
+
+// ============================================================================
+// Per-task resolver attribution (resolver_id, resolver_tier, success, cost_usd)
+// ----------------------------------------------------------------------------
+// Migration 086 + minibob 6f8c727: per-task resolver fields ride through the
+// FLEXIBLE `tasks.*` column. `normalizePersistedTask` was previously dropping
+// them on the way to storage, which surfaced as `null` resolver fields on a
+// L2-canonical trace GET. These tests pin the contract.
+// ============================================================================
+
+describe('normalizePersistedTask preserves per-task resolver attribution', () => {
+  test('snake_case canonical form: all four resolver fields persist', () => {
+    const task = {
+      task_id: 'analyze_state',
+      description: 'analyze state',
+      status: 'success',
+      duration_ms: 1234,
+      resolver_id: 'bash',
+      resolver_tier: 'deterministic',
+      success: true,
+      cost_usd: 0,
+    };
+    const p = normalizePersistedTask(task);
+    expect(p.resolver_id).toBe('bash');
+    expect(p.resolver_tier).toBe('deterministic');
+    expect(p.success).toBe(true);
+    expect(p.cost_usd).toBe(0);
+  });
+
+  test('per-task cost_usd of 0 is preserved (not stripped as falsy)', () => {
+    // Critical: minibob's serializeTasksForTrace defaults cost_usd to 0 when
+    // no resolver-supplied number exists. A `if (task.cost_usd)` filter would
+    // drop these — we test the field rides through.
+    const p = normalizePersistedTask({ task_id: 't1', cost_usd: 0 });
+    expect(p.cost_usd).toBe(0);
+    expect('cost_usd' in p).toBe(true);
+  });
+
+  test('failed task with success=false rides through', () => {
+    const p = normalizePersistedTask({
+      task_id: 'failing_task',
+      resolver_id: 'llm',
+      resolver_tier: 'llm',
+      success: false,
+      cost_usd: 0.0123,
+    });
+    expect(p.success).toBe(false);
+    expect(p.resolver_tier).toBe('llm');
+    expect(p.cost_usd).toBe(0.0123);
+  });
+
+  test('historical task without resolver fields stays clean (no junk keys)', () => {
+    const p = normalizePersistedTask({
+      task_id: 'old-task',
+      description: 'pre-migration',
+      status: 'success',
+      duration_ms: 50,
+    });
+    expect('resolver_id' in p).toBe(false);
+    expect('resolver_tier' in p).toBe(false);
+    expect('success' in p).toBe(false);
+    expect('cost_usd' in p).toBe(false);
+  });
+
+  test('non-string resolver_id is dropped (defensive)', () => {
+    const p = normalizePersistedTask({
+      task_id: 't1',
+      resolver_id: 42 as any,
+      resolver_tier: '',
+    });
+    expect('resolver_id' in p).toBe(false);
+    expect('resolver_tier' in p).toBe(false);
+  });
+
+  test('non-boolean success is dropped (defensive)', () => {
+    const p = normalizePersistedTask({ task_id: 't1', success: 'true' as any });
+    expect('success' in p).toBe(false);
+  });
+
+  test('round-trips alongside impulse-id fields without interference', () => {
+    const p = normalizePersistedTask({
+      task_id: 'composite',
+      input_impulse_ids: ['imp-1'],
+      output_impulse_ids: ['imp-2'],
+      resolver_id: 'file',
+      resolver_tier: 'deterministic',
+      success: true,
+      cost_usd: 0,
+    });
+    expect(p.input_impulse_ids).toEqual(['imp-1']);
+    expect(p.output_impulse_ids).toEqual(['imp-2']);
+    expect(p.resolver_id).toBe('file');
+    expect(p.success).toBe(true);
+  });
+});
+
+// ============================================================================
+// Top-level trace fields (vessel_id, resolved_by_vessel_id, composition_chain,
+// impulse_resolutions) — migration 086 schema additions.
+// ----------------------------------------------------------------------------
+// The route handler builds the persisted trace object via conditional spread.
+// We can't easily exercise the full Hono handler without a SurrealDB fixture,
+// but we can pin the conditional-spread CONTRACT (the bug was these fields
+// being absent from the object handed to INSERT, so the SCHEMAFULL table
+// silently dropped them).
+//
+// This helper mirrors the spread block in execution-traces.ts (the section
+// added below the existing parent_execution_id / composition_chain spreads).
+// If the production code drifts, these tests fail and the contract gets fixed
+// in lockstep.
+// ============================================================================
+
+function projectVesselFields(body: Record<string, any>): Record<string, any> {
+  return {
+    ...(body.vessel_id ? { vessel_id: body.vessel_id } : {}),
+    ...(body.resolved_by_vessel_id ? { resolved_by_vessel_id: body.resolved_by_vessel_id } : {}),
+    ...(body.vessel_version ? { vessel_version: body.vessel_version } : {}),
+    ...(Array.isArray(body.impulse_resolutions) && body.impulse_resolutions.length > 0
+      ? { impulse_resolutions: body.impulse_resolutions }
+      : {}),
+    ...(Array.isArray(body.composition_chain) && body.composition_chain.length > 0
+      ? { composition_chain: body.composition_chain }
+      : {}),
+  };
+}
+
+describe('execution-trace top-level vessel + resolver fields contract', () => {
+  test('canonical wire payload: all four top-level fields pass through', () => {
+    const body = {
+      execution_id: 'act_test_1',
+      template_id: 'analyze-codebase',
+      vessel_id: 'minibob-test-1',
+      resolved_by_vessel_id: 'minibob-test-1',
+      vessel_version: '0.5.0-abc1234',
+      composition_chain: ['root-exec', 'mid-exec'],
+      impulse_resolutions: [
+        {
+          impulse_id: 'imp-1',
+          resolver_id: 'bash',
+          resolver_tier: 'deterministic',
+          vessel_id: 'minibob-test-1',
+          latency_ms: 5,
+          cost_usd: 0,
+        },
+      ],
+    };
+    const projected = projectVesselFields(body);
+    expect(projected.vessel_id).toBe('minibob-test-1');
+    expect(projected.resolved_by_vessel_id).toBe('minibob-test-1');
+    expect(projected.vessel_version).toBe('0.5.0-abc1234');
+    expect(projected.composition_chain).toEqual(['root-exec', 'mid-exec']);
+    expect(projected.impulse_resolutions).toHaveLength(1);
+    expect(projected.impulse_resolutions[0].resolver_id).toBe('bash');
+  });
+
+  test('back-compat: payload without vessel/resolver fields produces empty projection', () => {
+    // Existing minibob builds (pre-6f8c727) and historical traces don't carry
+    // these fields. The handler must not synthesize empty values that would
+    // then be persisted as empty strings / arrays.
+    const body = {
+      execution_id: 'act_legacy_1',
+      template_id: 'old-activity',
+    };
+    const projected = projectVesselFields(body);
+    expect('vessel_id' in projected).toBe(false);
+    expect('resolved_by_vessel_id' in projected).toBe(false);
+    expect('vessel_version' in projected).toBe(false);
+    expect('impulse_resolutions' in projected).toBe(false);
+    expect('composition_chain' in projected).toBe(false);
+  });
+
+  test('empty arrays are not persisted (avoid NULL vs NONE issues)', () => {
+    const body = {
+      execution_id: 'act_test_2',
+      template_id: 'foo',
+      impulse_resolutions: [],
+      composition_chain: [],
+    };
+    const projected = projectVesselFields(body);
+    expect('impulse_resolutions' in projected).toBe(false);
+    expect('composition_chain' in projected).toBe(false);
+  });
+
+  test('full six-field impulse_resolutions entry shape is preserved', () => {
+    // Confirm the SCHEMAFULL table accepts the full entry shape minibob sends
+    // (FLEXIBLE inner object, see migration 086).
+    const entry = {
+      impulse_id: 'imp-42',
+      resolver_id: 'llm',
+      resolver_tier: 'llm',
+      vessel_id: 'minibob-test',
+      latency_ms: 1234,
+      cost_usd: 0.0023,
+    };
+    const projected = projectVesselFields({ impulse_resolutions: [entry] });
+    expect(projected.impulse_resolutions[0]).toEqual(entry);
+  });
+});

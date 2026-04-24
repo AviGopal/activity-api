@@ -169,6 +169,23 @@ DEFINE FIELD IF NOT EXISTS parent_execution_id ON activity_execution_traces TYPE
 DEFINE FIELD IF NOT EXISTS composition_chain ON activity_execution_traces TYPE option<array<string>>
   COMMENT "Denormalized ancestor chain: [root_execution_id, ..., parent_execution_id]. Ordered root-first. Enables single-read reconstruction of composition trees.";
 
+-- Vessel attribution (added in migration 086)
+DEFINE FIELD IF NOT EXISTS vessel_id ON activity_execution_traces TYPE option<string>
+  COMMENT "Vessel that executed this activity (sender of the trace)";
+
+DEFINE FIELD IF NOT EXISTS resolved_by_vessel_id ON activity_execution_traces TYPE option<string>
+  COMMENT "Vessel that resolved this execution's impulses";
+
+DEFINE FIELD IF NOT EXISTS vessel_version ON activity_execution_traces TYPE option<string>
+  COMMENT "Vessel version (semver-sha7) for learning correlation";
+
+-- Per-impulse resolver attribution (added in migration 086)
+DEFINE FIELD IF NOT EXISTS impulse_resolutions ON activity_execution_traces TYPE option<array<object>> FLEXIBLE
+  COMMENT "Per-impulse resolution detail: [{impulse_id, resolver_id, resolver_tier, vessel_id, latency_ms, cost_usd}]";
+
+DEFINE FIELD IF NOT EXISTS impulse_resolutions.* ON activity_execution_traces TYPE object FLEXIBLE
+  COMMENT "Individual impulse resolution entry with arbitrary nested fields";
+
 -- Edge Learning Fields (from improvisation traces)
 DEFINE FIELD IF NOT EXISTS improvisation ON activity_execution_traces TYPE option<bool>
   COMMENT "Whether this was an LLM improvisation (no template matched)";
@@ -244,6 +261,13 @@ DEFINE INDEX IF NOT EXISTS idx_activity_executions_org_status
 
 DEFINE INDEX IF NOT EXISTS idx_activity_executions_parent
   ON activity_execution_traces FIELDS parent_execution_id;
+
+-- Vessel-scoped indexes (added in migration 086)
+DEFINE INDEX IF NOT EXISTS idx_activity_execution_traces_vessel_id
+  ON activity_execution_traces FIELDS vessel_id;
+
+DEFINE INDEX IF NOT EXISTS idx_activity_execution_traces_resolved_by_vessel_id
+  ON activity_execution_traces FIELDS resolved_by_vessel_id;
 
 -- =============================================================================
 -- Table: activity_composition_graph
