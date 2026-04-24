@@ -21,6 +21,57 @@ import {
 
 const app = new Hono();
 
+/**
+ * Normalize a minibob-sent task object into the persisted shape. Preserves
+ * per-task impulse grouping (`input_impulse_ids`, `output_impulse_ids`) so
+ * `executionTraceWithSignatures` can surface task-scoped signal to the
+ * co-occurrence extractor.
+ *
+ * The canonical wire shape (emitted by minibob's `serializeTasksForTrace`)
+ * uses snake_case. We also accept camelCase and the richer
+ * `inputState.impulses` / `outputState.impulses` shapes as fallbacks so
+ * payloads from older minibob builds keep writing cleanly.
+ *
+ * Exported for tests — see `execution-traces.test.ts`.
+ */
+export function normalizePersistedTask(task: any): {
+  task_id: string;
+  description?: string;
+  status?: string;
+  duration_ms?: number;
+  tool_calls: unknown[] | null;
+  input_impulse_ids: string[];
+  output_impulse_ids: string[];
+} {
+  const inputImpulseIds = Array.isArray(task?.input_impulse_ids)
+    ? task.input_impulse_ids
+    : Array.isArray(task?.inputImpulseIds)
+      ? task.inputImpulseIds
+      : Array.isArray(task?.inputState?.impulses)
+        ? task.inputState.impulses
+        : [];
+  const outputImpulseIds = Array.isArray(task?.output_impulse_ids)
+    ? task.output_impulse_ids
+    : Array.isArray(task?.outputImpulseIds)
+      ? task.outputImpulseIds
+      : Array.isArray(task?.outputState?.impulses)
+        ? task.outputState.impulses
+        : [];
+  return {
+    task_id: task?.taskId || task?.task_id,
+    description: task?.description,
+    status: task?.status,
+    duration_ms: task?.duration ?? task?.duration_ms,
+    tool_calls: Array.isArray(task?.toolCalls)
+      ? task.toolCalls
+      : Array.isArray(task?.tool_calls)
+        ? task.tool_calls
+        : null,
+    input_impulse_ids: inputImpulseIds,
+    output_impulse_ids: outputImpulseIds,
+  };
+}
+
 interface ExecutionTrace {
   execution_id: string;
   variant_id: string;
@@ -767,15 +818,15 @@ app.post('/', async (c) => {
       ...(body.impulses_used && body.impulses_used.length > 0 ? { impulses_used: body.impulses_used } : {}),
       ...(body.component_changes && body.component_changes.length > 0 ? { component_changes: body.component_changes } : {}),
 
-      // Extract task details from execution_trace if available
+      // Extract task details from execution_trace if available.
+      //
+      // Per-task impulse grouping (`input_impulse_ids`, `output_impulse_ids`)
+      // is the canonical snake_case shape emitted by minibob's
+      // `serializeTasksForTrace` (see repos/minibob/src/mcp.ts). The read
+      // resolver in `execution-trace-with-signatures.ts` reads these fields
+      // to surface task-scoped signal to the co-occurrence extractor.
       tasks: body.execution_trace?.tasks && body.execution_trace.tasks.length > 0
-        ? body.execution_trace.tasks.map((task: any) => ({
-            task_id: task.taskId || task.task_id,
-            description: task.description,
-            status: task.status,
-            duration_ms: task.duration || task.duration_ms,
-            tool_calls: task.toolCalls || null,
-          }))
+        ? body.execution_trace.tasks.map(normalizePersistedTask)
         : null,
 
       // Extract state snapshot from execution_trace
@@ -979,6 +1030,64 @@ app.post('/', async (c) => {
       task_count: body.execution_trace?.tasks?.length || 0,
       db_result: result[0],
     });
+
+    // Emit fine-grained WebSocket events for real-time execution visualization
+    if (body.execution_trace?.tasks && Array.isArray(body.execution_trace.tasks)) {
+      const { broadcaster } = await import('../websocket/broadcaster');
+
+      for (let taskIndex = 0; taskIndex < body.execution_trace.tasks.length; taskIndex++) {
+        const task = body.execution_trace.tasks[taskIndex];
+        const taskId = task.id || task.taskId || `task-${taskIndex}`;
+
+        // Emit task.started event
+        broadcaster.emit({
+          type: 'task.started',
+          timestamp: new Date().toISOString(),
+          data: {
+            execution_id: trace.execution_id,
+            task_id: taskId,
+            task_index: taskIndex,
+            description: task.description || '',
+            started_at: new Date().toISOString(),
+          },
+        });
+
+        // Emit tool.call events for each tool call in the task
+        if (task.toolCalls && Array.isArray(task.toolCalls)) {
+          for (const toolCall of task.toolCalls) {
+            broadcaster.emit({
+              type: 'tool.call',
+              timestamp: new Date().toISOString(),
+              data: {
+                execution_id: trace.execution_id,
+                task_id: taskId,
+                tool_name: toolCall.name || 'unknown',
+                resolver_tier: toolCall.resolver_tier || 'llm',
+                latency_ms: toolCall.duration_ms || 0,
+                cost_usd: toolCall.cost_usd || 0,
+                timestamp: new Date().toISOString(),
+              },
+            });
+          }
+        }
+
+        // Emit task.completed event
+        const taskSuccess = task.result?.status === 'success';
+        broadcaster.emit({
+          type: 'task.completed',
+          timestamp: new Date().toISOString(),
+          data: {
+            execution_id: trace.execution_id,
+            task_id: taskId,
+            task_index: taskIndex,
+            success: taskSuccess,
+            duration_ms: task.duration || task.duration_ms || 0,
+            completed_at: new Date().toISOString(),
+            error: taskSuccess ? undefined : (task.result?.error || task.error),
+          },
+        });
+      }
+    }
 
     // DUAL-WRITE: Also insert into new paradigm execution table (schema-paradigm-alignment)
     // v_activity_score view computes Thompson Sampling from execution table automatically
