@@ -695,10 +695,18 @@ router.get('/', async (c) => {
  */
 router.post('/resolve', async (c) => {
   try {
+    // Auth check — reject unauthenticated callers before parsing body.
+    // Spec 4: all shapes in this endpoint are org-scoped; no public carveout.
+    const authCheck = requireAuthenticated(c);
+    if (authCheck) {
+      return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
+    }
+    const jwtAuthCtx = getJwtAuthFromContext(c)!;
+
     const body = await c.req.json();
     const validated = ImpulseResolveRequestSchema.parse(body);
-    
-    logger.info('POST /v2/impulses/resolve', { 
+
+    logger.info('POST /v2/impulses/resolve', {
       pointer_type: validated.pointer.type,
       has_execution_id: !!validated.pointer.executionId,
       has_template_id: !!validated.pointer.templateId,
@@ -724,11 +732,13 @@ router.post('/resolve', async (c) => {
           const newQuery = `
             SELECT * FROM execution
             WHERE id = $execution_id
+            AND org_id = $orgId
             LIMIT 1
           `;
 
-          const newResult = await surrealDB.query<any>(newQuery, {
+          const newResult = await executeAsAuth<any>(jwtAuthCtx, newQuery, {
             execution_id: pointer.executionId,
+            orgId: jwtAuthCtx.orgId,
           });
 
           if (newResult && newResult.length > 0) {
@@ -740,9 +750,11 @@ router.post('/resolve', async (c) => {
               const impulseQuery = `
                 SELECT id, shape, summary, content FROM impulse
                 WHERE id IN $impulse_ids
+                AND org_id = $orgId
               `;
-              const impulses = await surrealDB.query<any>(impulseQuery, {
+              const impulses = await executeAsAuth<any>(jwtAuthCtx, impulseQuery, {
                 impulse_ids: trace.input_impulses,
+                orgId: jwtAuthCtx.orgId,
               });
               trace.resolved_impulses = impulses;
             }
@@ -765,11 +777,13 @@ router.post('/resolve', async (c) => {
           const legacyQuery = `
             SELECT * FROM activity_execution_traces
             WHERE execution_id = $execution_id
+            AND org_id = $orgId
             LIMIT 1
           `;
 
-          const legacyResult = await surrealDB.query<any>(legacyQuery, {
+          const legacyResult = await executeAsAuth<any>(jwtAuthCtx, legacyQuery, {
             execution_id: pointer.executionId,
+            orgId: jwtAuthCtx.orgId,
           });
 
           if (legacyResult && legacyResult.length > 0) {
@@ -808,14 +822,17 @@ router.post('/resolve', async (c) => {
         // `activity:\`cleanup-stale-traces-v1\`` -> 'cleanup-stale-traces-v1')
         // since callers pass the bare id. Matches the pattern used by the
         // *_update/_deprecate write resolvers.
+        // Org scoping: allow caller's org templates OR global/system templates.
         const query = `
           SELECT * FROM activity
           WHERE record::id(id) = $activity_id
+          AND (org_id = $orgId OR scope = 'global' OR org_id IS NONE)
           LIMIT 1
         `;
 
-        const result = await surrealDB.query<any>(query, {
+        const result = await executeAsAuth<any>(jwtAuthCtx, query, {
           activity_id: pointer.templateId,
+          orgId: jwtAuthCtx.orgId,
         });
 
         if (result.length === 0) {
@@ -840,15 +857,17 @@ router.post('/resolve', async (c) => {
           } as ImpulseResolveResponse, 400);
         }
 
-        // Load metrics for all variants of activity
+        // Load metrics for all variants of activity — org scoped
         const query = `
           SELECT * FROM variant_performance_metrics
           WHERE activity_id = $activity_id
+          AND (org_id = $orgId OR org_id IS NONE)
           ORDER BY success_rate DESC
         `;
 
-        const result = await surrealDB.query<any>(query, {
+        const result = await executeAsAuth<any>(jwtAuthCtx, query, {
           activity_id: pointer.activityId,
+          orgId: jwtAuthCtx.orgId,
         });
 
         if (result.length === 0) {
@@ -872,9 +891,9 @@ router.post('/resolve', async (c) => {
         const since = pointer.since;
         const limit = pointer.limit || 50;
 
-        // Build WHERE clause dynamically
-        const conditions: string[] = [];
-        const params: Record<string, any> = { limit };
+        // Build WHERE clause dynamically — always include org_id scoping
+        const conditions: string[] = ['org_id = $orgId'];
+        const params: Record<string, any> = { limit, orgId: jwtAuthCtx.orgId };
 
         if (filter === 'successful') {
           conditions.push('success = true');
@@ -897,7 +916,7 @@ router.post('/resolve', async (c) => {
           params.since = since;
         }
 
-        const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+        const whereClause = 'WHERE ' + conditions.join(' AND ');
 
         // Query execution table
         const query = `
@@ -914,7 +933,7 @@ router.post('/resolve', async (c) => {
           LIMIT $limit
         `;
 
-        const traces = await surrealDB.query<any>(query, params);
+        const traces = await executeAsAuth<any>(jwtAuthCtx, query, params);
 
         // Compute metadata
         const successCount = traces.filter(t => t.success === true).length;
@@ -992,11 +1011,15 @@ router.post('/resolve', async (c) => {
             math::mean(<float> cost_usd) AS avg_cost_usd
           FROM execution
           WHERE activity_id CONTAINS $activityId
+          AND org_id = $orgId
           GROUP BY activity_id
           ORDER BY success_rate DESC
         `;
 
-        const variants = await surrealDB.query<any>(query, { activityId: pointer.activityId });
+        const variants = await executeAsAuth<any>(jwtAuthCtx, query, {
+          activityId: pointer.activityId,
+          orgId: jwtAuthCtx.orgId,
+        });
 
         if (variants.length === 0) {
           content = JSON.stringify({
@@ -1111,15 +1134,21 @@ router.post('/resolve', async (c) => {
         //   params.category = categoryValue;
         // }
 
+        // Org-scope: show caller's templates and global/system templates
+        const orgCondition = whereClause
+          ? whereClause + ' AND (org_id = $orgId OR scope = \'global\' OR org_id IS NONE)'
+          : 'WHERE (org_id = $orgId OR scope = \'global\' OR org_id IS NONE)';
+        params.orgId = jwtAuthCtx.orgId;
+
         const templatesQuery = `
           SELECT variant_id, variant_name, description, category, task_steps, created_at
           FROM activity_template
-          ${whereClause}
+          ${orgCondition}
           ORDER BY created_at DESC
           LIMIT $limit
         `;
 
-        const templates = await surrealDB.query<any>(templatesQuery, params);
+        const templates = await executeAsAuth<any>(jwtAuthCtx, templatesQuery, params);
 
         if (templates.length === 0) {
           content = `# Similar Templates\n\nNo templates found matching query: "${query_text}"`;
@@ -1144,13 +1173,15 @@ router.post('/resolve', async (c) => {
           SELECT variant_id, total_executions, success_rate, avg_duration_ms, avg_cost_usd
           FROM variant_performance_metrics
           WHERE total_executions >= $min_executions
+          AND (org_id = $orgId OR org_id IS NONE)
           ORDER BY ${orderField} DESC
           LIMIT $limit
         `;
 
-        const metrics = await surrealDB.query<any>(metricsQuery, {
+        const metrics = await executeAsAuth<any>(jwtAuthCtx, metricsQuery, {
           min_executions: minExecutions,
-          limit
+          limit,
+          orgId: jwtAuthCtx.orgId,
         });
 
         if (metrics.length === 0) {
@@ -1162,8 +1193,12 @@ router.post('/resolve', async (c) => {
             SELECT variant_id, variant_name, description, category, task_steps
             FROM activity_template
             WHERE variant_id IN $variant_ids
+            AND (org_id = $orgId OR scope = 'global' OR org_id IS NONE)
           `;
-          const templateDetails = await surrealDB.query<any>(templateQuery, { variant_ids: variantIds });
+          const templateDetails = await executeAsAuth<any>(jwtAuthCtx, templateQuery, {
+            variant_ids: variantIds,
+            orgId: jwtAuthCtx.orgId,
+          });
 
           // Merge metrics with template details
           const templates = metrics.map((m: any) => {
@@ -1198,8 +1233,12 @@ router.post('/resolve', async (c) => {
 
         logger.info('Resolving executionTraces', { templateId, success, limit });
 
-        let whereClause = 'WHERE variant_id = $template_id';
-        const params: Record<string, any> = { template_id: templateId, limit };
+        let whereClause = 'WHERE variant_id = $template_id AND org_id = $orgId';
+        const params: Record<string, any> = {
+          template_id: templateId,
+          limit,
+          orgId: jwtAuthCtx.orgId,
+        };
 
         if (success === true) {
           whereClause += ' AND status = "success"';
@@ -1216,7 +1255,7 @@ router.post('/resolve', async (c) => {
           LIMIT $limit
         `;
 
-        const traces = await surrealDB.query<any>(tracesQuery, params);
+        const traces = await executeAsAuth<any>(jwtAuthCtx, tracesQuery, params);
 
         if (traces.length === 0) {
           const filterDesc = success === true ? 'successful' : success === false ? 'failed' : 'any';
@@ -1274,9 +1313,11 @@ router.post('/resolve', async (c) => {
             const contextQuery = `
               SELECT id, shape, summary FROM impulse
               WHERE id IN $impulse_ids
+              AND org_id = $orgId
             `;
-            impulseContext = await surrealDB.query(contextQuery, {
+            impulseContext = await executeAsAuth(jwtAuthCtx, contextQuery, {
               impulse_ids: impulseRefs,
+              orgId: jwtAuthCtx.orgId,
             });
             impulseShapes = impulseContext.map((i: any) => i.shape).filter(Boolean);
             logger.debug('Loaded impulse context for goal', {
@@ -1854,11 +1895,16 @@ router.post('/resolve', async (c) => {
         const templateId = updatePointer.templateId;
         const updates = updatePointer.updates;
 
+        // Helper: is this caller an admin?
+        const isAdmin = jwtAuth.role === 'admin' ||
+          (Array.isArray(jwtAuth.scopes) && jwtAuth.scopes.includes('admin'));
+
         try {
           // SurrealDB stores record ids as `table:`id`` composites. Use
           // record::id(id) to extract the string part for matching, matching
           // the pattern used elsewhere (execution-traces.ts:1063).
-          const before = await executeAsAuth<any>(jwtAuth, `SELECT * FROM activity WHERE record::id(id) = $id AND (org_id = $orgId OR scope = 'global') LIMIT 1`, { id: templateId, orgId: jwtAuth.orgId });
+          // Spec 6: global templates may only be modified by admin callers.
+          const before = await executeAsAuth<any>(jwtAuth, `SELECT * FROM activity WHERE record::id(id) = $id AND (org_id = $orgId OR (scope = 'global' AND $isAdmin = true)) LIMIT 1`, { id: templateId, orgId: jwtAuth.orgId, isAdmin });
           const beforeRow = (before || [])[0];
           if (!beforeRow) {
             return c.json({ success: false, error: `Template not found: ${templateId}` } as ImpulseResolveResponse, 404);
@@ -1866,8 +1912,8 @@ router.post('/resolve', async (c) => {
 
           const after = await executeAsAuth<any>(
             jwtAuth,
-            `UPDATE activity MERGE $updates WHERE record::id(id) = $id AND (org_id = $orgId OR scope = 'global') RETURN AFTER`,
-            { id: templateId, updates, orgId: jwtAuth.orgId },
+            `UPDATE activity MERGE $updates WHERE record::id(id) = $id AND (org_id = $orgId OR (scope = 'global' AND $isAdmin = true)) RETURN AFTER`,
+            { id: templateId, updates, orgId: jwtAuth.orgId, isAdmin },
           );
           const afterRow = (after || [])[0];
 
@@ -1915,16 +1961,20 @@ router.post('/resolve', async (c) => {
         const templateId = deprecatePointer.templateId;
         const reason = deprecatePointer.reason;
 
+        // Spec 6: admin check for global template deprecation
+        const isAdminDep = jwtAuth.role === 'admin' ||
+          (Array.isArray(jwtAuth.scopes) && jwtAuth.scopes.includes('admin'));
+
         try {
-          const before = await executeAsAuth<any>(jwtAuth, `SELECT id, deprecated FROM activity WHERE record::id(id) = $id AND (org_id = $orgId OR scope = 'global') LIMIT 1`, { id: templateId, orgId: jwtAuth.orgId });
+          const before = await executeAsAuth<any>(jwtAuth, `SELECT id, deprecated FROM activity WHERE record::id(id) = $id AND (org_id = $orgId OR (scope = 'global' AND $isAdmin = true)) LIMIT 1`, { id: templateId, orgId: jwtAuth.orgId, isAdmin: isAdminDep });
           if (!(before || [])[0]) {
             return c.json({ success: false, error: `Template not found: ${templateId}` } as ImpulseResolveResponse, 404);
           }
 
           const after = await executeAsAuth<any>(
             jwtAuth,
-            `UPDATE activity SET deprecated = true, updated_at = time::now() WHERE record::id(id) = $id AND (org_id = $orgId OR scope = 'global') RETURN AFTER`,
-            { id: templateId, orgId: jwtAuth.orgId },
+            `UPDATE activity SET deprecated = true, updated_at = time::now() WHERE record::id(id) = $id AND (org_id = $orgId OR (scope = 'global' AND $isAdmin = true)) RETURN AFTER`,
+            { id: templateId, orgId: jwtAuth.orgId, isAdmin: isAdminDep },
           );
           const afterRow = (after || [])[0];
 

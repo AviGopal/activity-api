@@ -44,7 +44,25 @@ export interface JwtAuthContext {
   // For audit trail - API key ID or user ID
   keyId?: string;
   userId?: string;
+  // Role claim from JWT (e.g. 'admin') — used for admin-only destructive ops
+  role?: string;
+  // Scopes from the token
+  scopes?: string[];
 }
+
+/**
+ * Paths that are publicly accessible without an Authorization header.
+ * Exact match or prefix match (string ending with '/') is used.
+ *
+ * Keep this list minimal — the default posture is reject-by-default.
+ * Any path NOT listed here will return 401 when called without auth.
+ */
+export const PUBLIC_PATHS: string[] = [
+  '/health',
+  '/v2/auth/', // all auth sub-paths (prefix)
+  '/ws',       // WebSocket upgrade path
+  '/boredom-tasks', // boredom polling (MiniBob workers)
+];
 
 /**
  * Validate API key via identity-vessel (vessel pattern)
@@ -107,6 +125,7 @@ async function validateApiKey(apiKey: string): Promise<JwtAuthContext | null> {
       keyId: result.keyId,
       userId: result.userId,
       authType: 'apikey',
+      scopes: result.scopes || ['read', 'write'],
     };
   } catch (error) {
     const err = error as Error;
@@ -116,13 +135,30 @@ async function validateApiKey(apiKey: string): Promise<JwtAuthContext | null> {
 }
 
 /**
+ * Returns true if the given path is in the PUBLIC_PATHS allowlist.
+ * Exact match or prefix match (path starts with a listed prefix that ends in '/').
+ */
+function isPublicPath(path: string): boolean {
+  for (const allowed of PUBLIC_PATHS) {
+    if (allowed.endsWith('/')) {
+      if (path.startsWith(allowed) || path === allowed.slice(0, -1)) return true;
+    } else {
+      if (path === allowed) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * JWT authentication middleware
  *
  * Extracts token from Authorization header and validates based on header prefix:
  * - Bearer: JWT token validated against SurrealDB
  * - ApiKey: API key validated via identity-vessel HMAC
  *
- * Allows requests without auth header to proceed (falls back to Redis session auth).
+ * Reject-by-default: if no Authorization header is present and the path is not
+ * in PUBLIC_PATHS, returns 401. Route handlers should keep their existing
+ * requireAuthenticated() calls as defense-in-depth.
  */
 export async function jwtAuthMiddleware(c: Context, next: Next) {
   const authHeader = c.req.header('Authorization');
@@ -133,9 +169,16 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
   });
 
   if (!authHeader) {
-    c.set('jwtAuth', null);
-    await next();
-    return;
+    if (isPublicPath(c.req.path)) {
+      c.set('jwtAuth', null);
+      await next();
+      return;
+    }
+    logger.warn('Missing Authorization header on protected path', { path: c.req.path });
+    return c.json(
+      { error: { code: 'MISSING_AUTH', message: 'Authorization header required' } },
+      401,
+    );
   }
 
   // Check for ApiKey prefix first (API keys validated via identity-vessel impulse pattern)
@@ -265,6 +308,9 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
       // Extract user_id if present
       userId: auth.user_id ? String(auth.user_id).replace(/^users:/, '') : undefined,
       authType: 'jwt',
+      // Role and scopes from JWT claims (used for admin-only operations)
+      role: auth.role ? String(auth.role) : undefined,
+      scopes: Array.isArray(auth.scopes) ? auth.scopes.map(String) : undefined,
     };
 
     logger.debug('JWT authentication successful', {
