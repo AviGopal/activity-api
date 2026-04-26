@@ -34,6 +34,11 @@ import activitiesRouter from './activities';
 import executionTracesRouter from './execution-traces';
 import { runTemplateAuditReport, type TemplateAuditInput } from './template-audit';
 import { runExecutionTraceWithSignatures } from './execution-trace-with-signatures';
+import {
+  runDiscoverByShapes,
+  validateDiscoverByShapesInput,
+  type DiscoverByShapesMode,
+} from '../services/discover-by-shapes';
 import { z } from 'zod';
 
 const router = new Hono();
@@ -2325,6 +2330,61 @@ router.post('/resolve', async (c) => {
           } as ImpulseResolveResponse,
           200,
         );
+      }
+
+      // discoverByShapesQuery (F-6 corrected, 2026-04-26): pure-vessel shape
+      // wrapping POST /v2/activities/discover-by-shapes. Activity-api advertises
+      // this shape via discovery-vessel; meta-activities reach it through the
+      // existing generic `impulse-resolve` resolver in minibob — zero source
+      // changes in the integrating vessel.
+      //
+      // Pointer fields mirror the route body: required_shapes (required),
+      // mode (optional: forward|backward|candidates_with_scores),
+      // output_shapes (optional, additive backward filter),
+      // current_shapes (optional), limit (optional, default 10),
+      // predecessor_activity_id (optional, candidates_with_scores edge selector).
+      case 'discoverByShapesQuery': {
+        const extendedPointer = pointer as typeof pointer & {
+          required_shapes?: string[];
+          mode?: DiscoverByShapesMode;
+          output_shapes?: string[];
+          current_shapes?: string[];
+          predecessor_activity_id?: string;
+        };
+
+        const input = {
+          required_shapes: extendedPointer.required_shapes ?? [],
+          mode: extendedPointer.mode ?? 'forward',
+          limit: extendedPointer.limit ?? 10,
+          current_shapes: extendedPointer.current_shapes ?? [],
+          output_shapes: extendedPointer.output_shapes ?? [],
+          predecessor_activity_id: extendedPointer.predecessor_activity_id,
+        };
+
+        const validationError = validateDiscoverByShapesInput(input);
+        if (validationError) {
+          return c.json({
+            success: false,
+            error: validationError.error,
+            // ImpulseResolveResponseSchema only declares { success, content, error, metadata, loaded };
+            // surface the detail through `error` to keep the envelope canonical.
+          } as ImpulseResolveResponse, 400);
+        }
+
+        const result = await runDiscoverByShapes(input);
+
+        return c.json({
+          success: true,
+          content: JSON.stringify({
+            activities: result.activities,
+            total: result.total,
+          }),
+          metadata: {
+            shape: 'discoverByShapesQuery',
+            summary: `${result.total} activities discovered for shapes [${input.required_shapes.join(', ')}] (mode=${input.mode})`,
+            rowCount: result.total,
+          },
+        } as ImpulseResolveResponse, 200);
       }
 
       default: {
