@@ -11,7 +11,7 @@ import { logger } from '../utils/logger';
 import type { SessionData } from '../models/schemas';
 import { getJwtAuthFromContext, hasJwtAuth } from '../middleware/jwtAuth';
 import { config } from '../config';
-import { insertExecution, isDualWriteEnabled, updateShapeActivityScores, type ParadigmExecution } from '../db/paradigm';
+import { insertExecution, isDualWriteEnabled, normalizeActivityId, updateShapeActivityScores, type ParadigmExecution } from '../db/paradigm';
 import {
   extractOutputShapes,
   validateOutputShapes,
@@ -136,6 +136,14 @@ export function normalizePersistedTask(task: any): {
  * Returns a de-duplicated list with `variant_id` first (so it's logged as the
  * primary update) and `metadata.template_id` appended only when distinct.
  *
+ * IDs are normalized to plain string form (strips `activity:` prefix and
+ * `⟨...⟩` brackets) before deduplication. The wrapped `activity:⟨name⟩` form
+ * and the plain `name` form must collapse to the same row in
+ * `variant_performance_metrics` — otherwise the UNIQUE index on `variant_id`
+ * treats them as separate records and Thompson Sampling sees split α/β.
+ * Mirrors the read-path normalization in `enrichTemplatesWithMetrics` (see
+ * `routes/activities.ts`) and the `getVariantFamily` fix in `db/paradigm.ts`.
+ *
  * Exported for tests.
  */
 export function resolveTemplateIdsForUpdate(args: {
@@ -150,7 +158,10 @@ export function resolveTemplateIdsForUpdate(args: {
   const candidates = [
     variantId,
     ...(metadataTemplateId && metadataTemplateId !== variantId ? [metadataTemplateId] : []),
-  ].filter((id): id is string => typeof id === 'string' && id.length > 0);
+  ]
+    .filter((id): id is string => typeof id === 'string' && id.length > 0)
+    .map((id) => normalizeActivityId(id))
+    .filter((id) => id.length > 0);
   return Array.from(new Set(candidates));
 }
 

@@ -99,6 +99,52 @@ describe('resolveTemplateIdsForUpdate (Bug C: failure track)', () => {
     });
     expect(ids).toEqual(['real-template']);
   });
+
+  test('normalizes wrapped activity:⟨name⟩ form to plain id (10.4 α/β write-back)', () => {
+    // Bug 10.4: 501 executions of `goal-processing-activity-driven` were not
+    // reflected in thompson_alpha/thompson_beta because the trace's variant_id
+    // arrived in the wrapped record-id form `activity:⟨goal-processing-activity-driven⟩`,
+    // creating a SECOND row in variant_performance_metrics (the UNIQUE index on
+    // `variant_id` is plain string equality). Reads keyed on the plain form
+    // missed every increment. Fix: normalize before fan-out so both wire forms
+    // collapse to the same row.
+    const ids = resolveTemplateIdsForUpdate({
+      variantId: 'activity:⟨goal-processing-activity-driven⟩',
+      metadata: null,
+    });
+    expect(ids).toEqual(['goal-processing-activity-driven']);
+  });
+
+  test('normalizes wrapped form in metadata.template_id too', () => {
+    // The meta-trace fan-out path also feeds writes — make sure
+    // metadata.template_id arriving wrapped lands on the same plain row.
+    const ids = resolveTemplateIdsForUpdate({
+      variantId: '_goal_resolve',
+      metadata: { template_id: 'activity:⟨goal-processing-activity-driven⟩' },
+    });
+    expect(ids).toEqual(['_goal_resolve', 'goal-processing-activity-driven']);
+  });
+
+  test('de-duplicates across mixed wrapped + plain forms of the same id', () => {
+    // Wrapped variant_id and plain metadata.template_id naming the SAME
+    // template must collapse to a single update — otherwise a single trace
+    // double-counts α/β on the dispatched template.
+    const ids = resolveTemplateIdsForUpdate({
+      variantId: 'activity:⟨goal-processing-activity-driven⟩',
+      metadata: { template_id: 'goal-processing-activity-driven' },
+    });
+    expect(ids).toEqual(['goal-processing-activity-driven']);
+  });
+
+  test('strips activity: prefix without brackets too', () => {
+    // SurrealDB sometimes returns ids without brackets when the id is a plain
+    // identifier. Both forms must normalize identically.
+    const ids = resolveTemplateIdsForUpdate({
+      variantId: 'activity:execute-shell-command',
+      metadata: null,
+    });
+    expect(ids).toEqual(['execute-shell-command']);
+  });
 });
 
 describe('normalizeActivityId (Bug B: variant family lookup)', () => {

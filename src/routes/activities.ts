@@ -41,6 +41,7 @@ import {
   getVariantFamily,
   getVariantScores,
   buildVariantTree,
+  normalizeActivityId,
   type ParadigmActivity,
   type ParadigmExecution,
   type ActivityScore,
@@ -1771,6 +1772,14 @@ app.post('/executions', async (c) => {
     // - Subsequent executions: ON DUPLICATE KEY UPDATE increments counters atomically
     // - UNIQUE index on variant_id triggers duplicate detection
     // - No race conditions, single atomic operation aligned with SurrealDB 3.0
+    //
+    // Normalize variant_id to plain form (strip `activity:` prefix and `⟨...⟩`
+    // brackets) BEFORE the INSERT. The UNIQUE index on `variant_id` is plain
+    // string equality, so the wrapped form `activity:⟨name⟩` and the plain
+    // `name` form land in DIFFERENT rows — splitting α/β across two records
+    // and stalling Thompson Sampling. Mirrors `resolveTemplateIdsForUpdate`
+    // in execution-traces.ts.
+    const normalizedVariantId = normalizeActivityId(activityIdFromRequest);
     const upsertMetricsQuery = `
       INSERT INTO variant_performance_metrics {
         variant_id: $variant_id,
@@ -1804,7 +1813,7 @@ app.post('/executions', async (c) => {
     `;
 
     const metricsResult = await surrealDB.query(upsertMetricsQuery, {
-      variant_id: activityIdFromRequest,
+      variant_id: normalizedVariantId,
       org_id: orgId,
       success_delta,
       failure_delta,
@@ -8053,6 +8062,12 @@ app.post('/relevance-feedback', async (c) => {
     const alpha_delta = was_selected ? 1 : 0;
     const beta_delta = was_selected ? 0 : 1;
 
+    // Normalize template_id to plain form before write — wrapped vs plain
+    // forms must collapse to the same row (UNIQUE index on variant_id is
+    // plain string equality). See variant_performance_metrics UPSERT comment
+    // in /executions handler.
+    const normalizedTemplateId = normalizeActivityId(template_id);
+
     // Upsert variant_performance_metrics Thompson params
     surrealDB.query(`
       INSERT INTO variant_performance_metrics {
@@ -8076,7 +8091,7 @@ app.post('/relevance-feedback', async (c) => {
         thompson_alpha += $alpha_delta,
         thompson_beta += $beta_delta,
         updated_at = time::now()
-    `, { variant_id: template_id, org_id: orgId, alpha_delta, beta_delta }).catch((err: any) => {
+    `, { variant_id: normalizedTemplateId, org_id: orgId, alpha_delta, beta_delta }).catch((err: any) => {
       logger.warn('relevance-feedback: variant_performance_metrics upsert failed', { error: err.message });
     });
 
