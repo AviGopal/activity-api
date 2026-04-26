@@ -179,6 +179,13 @@ export function loadConfig(): Config {
         // the minibob co-occurrence extractor (commit 1f8d703) so it can do
         // signature reasoning without a second round trip per impulse id.
         'executionTraceWithSignatures',
+        // mcpTool: discovery-to-tools bridge. Activity-api currently exposes
+        // its write surface through *_write impulse shapes (the preferred
+        // dispatch path per docs/specs/discovery-to-tools-bridge.md
+        // § "Relationship to impulse-write resolver"), not as MCP tools.
+        // The resolver is still wired so consumers can fan out to activity-api
+        // without 4xx-ing; it returns an empty tool list. See impulses.ts.
+        'mcpTool',
       ],
     },
   };

@@ -2242,6 +2242,39 @@ router.post('/resolve', async (c) => {
         }
       }
 
+      // =============================================================================
+      // mcpTool: discovery-to-tools bridge.
+      // See docs/specs/discovery-to-tools-bridge.md.
+      //
+      // Activity-api today exposes its write surface through the `*_write`
+      // impulse shapes above (`activityExecutionTrace_write`, etc.). Those
+      // are the preferred dispatch path per the spec's "Relationship to
+      // impulse-write resolver" section — every step is one impulse-resolve,
+      // resolver-tier accounting falls out for free, and we don't duplicate
+      // a parallel MCP tool catalog over the same operations.
+      //
+      // The resolver is wired so consumers can fan out to activity-api for
+      // mcpTool without 4xx-ing; it returns an empty content array. If a
+      // future use case calls for activity-api-specific MCP tools (e.g. an
+      // operation with no write-shape equivalent), wrap them inline here.
+      // =============================================================================
+
+      case 'mcpTool': {
+        return c.json(
+          {
+            success: true,
+            content: JSON.stringify([]),
+            metadata: {
+              shape: 'mcpTool',
+              summary: '0 tools (activity-api dispatches via *_write impulse shapes)',
+              rowCount: 0,
+              vessel_id: config.discovery.vesselId,
+            },
+          } as ImpulseResolveResponse,
+          200,
+        );
+      }
+
       default: {
         // Unknown shape - delegate to vessel discovery
         // This follows the "Resolvers live WHERE THE DATA IS" principle
