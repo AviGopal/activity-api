@@ -1580,7 +1580,11 @@ router.post('/resolve', async (c) => {
             times_loaded,
             times_execution_succeeded,
             times_execution_failed,
+            times_not_loaded_succeeded,
+            times_not_loaded_failed,
             relevance_score,
+            irrelevance_score,
+            net_value_score,
             avg_content_size_tokens AS avg_tokens,
             created_at,
             updated_at
@@ -1591,6 +1595,16 @@ router.post('/resolve', async (c) => {
         `;
 
         const relevanceData = await surrealDB.query<any>(query, params);
+
+        // Backfill net_value_score and not_loaded_observations for pre-migration rows
+        for (const item of relevanceData) {
+          if (item.net_value_score === undefined || item.net_value_score === null) {
+            const rs = item.relevance_score ?? 0;
+            const is = item.irrelevance_score ?? 0;
+            item.net_value_score = Math.max(-1, Math.min(1, rs - is * 0.5));
+          }
+          item.not_loaded_observations = (item.times_not_loaded_succeeded ?? 0) + (item.times_not_loaded_failed ?? 0);
+        }
 
         // Try to enrich with shape info from impulse table
         const impulseIds = relevanceData.map((r: any) => r.impulse_id);

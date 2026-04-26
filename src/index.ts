@@ -29,6 +29,8 @@ import { broadcaster } from './websocket/broadcaster';
 import type { ServerWebSocket } from 'bun';
 import packageJson from '../package.json';
 import { discoveryClient } from './services/discovery-client';
+import { localEmbeddingService } from './services/embedding-service';
+import { surrealDB as surrealDBForBackfill } from './db/surreal';
 
 // Define app-wide environment type with jwtAuth context variable
 type AppEnv = {
@@ -91,7 +93,8 @@ app.get('/health', async (c) => {
     checks: {
       redis: { status: 'unknown', latency_ms: 0 },
       surrealdb: { status: 'unknown', latency_ms: 0 },
-      discovery: { status: 'unknown', registered: false }
+      discovery: { status: 'unknown', registered: false },
+      embedding: localEmbeddingService.getStatus(),
     }
   };
 
@@ -442,6 +445,82 @@ if (discoveryClient.isEnabled()) {
 } else {
   logger.info('[Discovery] Discovery integration disabled');
 }
+
+// ============================================================================
+// Local Embedding Service — async init + optional backfill
+// ============================================================================
+
+// Non-blocking: start embedding model load in the background.
+// HTTP listener is already up; any search that arrives before init completes
+// will degrade to BM25-only (localEmbeddingService.isReady() === false).
+localEmbeddingService.init().then(async () => {
+  if (!localEmbeddingService.isReady()) return; // Model files absent, skip backfill
+
+  const backfillEnabled = process.env.DENSE_BACKFILL_ENABLED !== 'false';
+  if (!backfillEnabled) {
+    logger.info('[LocalEmbedding] Backfill disabled (DENSE_BACKFILL_ENABLED=false)');
+    return;
+  }
+
+  logger.info('[LocalEmbedding] Starting backfill for activities without embeddings');
+  let offset = 0;
+  const batchSize = 50;
+  let totalProcessed = 0;
+
+  for (;;) {
+    let rows: any[];
+    try {
+      rows = await surrealDBForBackfill.query<any>(
+        `SELECT id, name, description FROM activity WHERE name_embedding IS NONE LIMIT $limit START $offset`,
+        { limit: batchSize, offset }
+      );
+    } catch (err) {
+      logger.warn('[LocalEmbedding] Backfill query failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      break;
+    }
+
+    if (!rows || rows.length === 0) break;
+
+    for (const row of rows) {
+      try {
+        const rawId = typeof row.id === 'object' ? JSON.stringify(row.id) : String(row.id);
+        const plainId = rawId.replace(/^activity:/, '').replace(/[⟨⟩`"]/g, '');
+        const nameText = row.name || plainId;
+        const nameVec = await localEmbeddingService.embed(nameText);
+        const updates: Record<string, any> = { name_embedding: Array.from(nameVec) };
+        if (row.description) {
+          const descVec = await localEmbeddingService.embed(row.description);
+          updates.description_embedding = Array.from(descVec);
+        }
+        const setClause = Object.keys(updates).map(k => `${k} = $${k}`).join(', ');
+        await surrealDBForBackfill.query(
+          `UPDATE type::record("activity", $id) SET ${setClause}`,
+          { id: plainId, ...updates }
+        );
+        totalProcessed++;
+        if (totalProcessed % 250 === 0) {
+          logger.info('[LocalEmbedding] Backfill progress', { totalProcessed });
+        }
+      } catch (err) {
+        logger.warn('[LocalEmbedding] Backfill row failed, skipping', {
+          id: row.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    offset += batchSize;
+    if (rows.length < batchSize) break; // Last page
+  }
+
+  logger.info('[LocalEmbedding] Backfill complete', { totalProcessed });
+}).catch((err) => {
+  logger.error('[LocalEmbedding] Unexpected error during init/backfill', {
+    error: err instanceof Error ? err.message : String(err),
+  });
+});
 
 // Graceful shutdown handler
 process.on('SIGTERM', async () => {

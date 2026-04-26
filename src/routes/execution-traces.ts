@@ -1477,6 +1477,114 @@ app.post('/', async (c) => {
       });
     }
 
+    // Context-bucketed Thompson update (Spec 3)
+    // Derive context_bucket from metadata if present, or re-derive from input_impulse_shapes.
+    const rawContextBucket: unknown =
+      body.metadata?.context_bucket ??
+      body.selection_metadata?.context_bucket;
+
+    const isValidBucket = (v: unknown): v is string =>
+      typeof v === 'string' && /^[0-9a-f]{8}$/.test(v);
+
+    if (isValidBucket(rawContextBucket)) {
+      try {
+        const ctxAlphaDelta = trace.success ? 1 : 0;
+        const ctxBetaDelta  = trace.success ? 0 : 1;
+
+        await surrealDB.query(`
+          LET $existing = (SELECT * FROM context_thompson_scores
+            WHERE org_id = $org_id AND template_id = $template_id AND context_bucket = $bucket
+            LIMIT 1);
+          IF array::len($existing) > 0 THEN
+            UPDATE context_thompson_scores
+            SET alpha = alpha + $alpha_delta,
+                beta  = beta  + $beta_delta,
+                n_observations = n_observations + 1,
+                last_updated_at = time::now()
+            WHERE org_id = $org_id AND template_id = $template_id AND context_bucket = $bucket
+          ELSE
+            CREATE context_thompson_scores CONTENT {
+              org_id: $org_id,
+              template_id: $template_id,
+              context_bucket: $bucket,
+              alpha: 1.0 + $alpha_delta,
+              beta:  1.0 + $beta_delta,
+              n_observations: 1,
+              last_updated_at: time::now(),
+              created_at: time::now()
+            }
+          END
+        `, {
+          org_id: traceOrgId,
+          template_id: trace.variant_id,
+          bucket: rawContextBucket,
+          alpha_delta: ctxAlphaDelta,
+          beta_delta: ctxBetaDelta,
+        });
+
+        logger.debug('[learning] context_thompson_scores updated', {
+          execution_id: trace.execution_id,
+          context_bucket: rawContextBucket,
+          success: trace.success,
+        });
+      } catch (ctxErr: any) {
+        logger.warn('[learning] context_thompson_scores update failed (non-blocking)', {
+          execution_id: trace.execution_id,
+          error: ctxErr.message,
+        });
+      }
+    } else if (
+      !rawContextBucket &&
+      body.input_impulse_shapes &&
+      Array.isArray(body.input_impulse_shapes) &&
+      body.input_impulse_shapes.length > 0
+    ) {
+      // Re-derive bucket when caller didn't embed it but shapes are known
+      try {
+        const { computeContextBucket } = await import('../utils/session-context');
+        const taskDesc = body.metadata?.task_description ?? body.execution_trace?.goalContext?.goal ?? '';
+        const rederived = computeContextBucket(taskDesc, body.input_impulse_shapes, traceOrgId);
+        const rdAlphaDelta = trace.success ? 1 : 0;
+        const rdBetaDelta  = trace.success ? 0 : 1;
+
+        await surrealDB.query(`
+          LET $existing = (SELECT * FROM context_thompson_scores
+            WHERE org_id = $org_id AND template_id = $template_id AND context_bucket = $bucket
+            LIMIT 1);
+          IF array::len($existing) > 0 THEN
+            UPDATE context_thompson_scores
+            SET alpha = alpha + $alpha_delta,
+                beta  = beta  + $beta_delta,
+                n_observations = n_observations + 1,
+                last_updated_at = time::now()
+            WHERE org_id = $org_id AND template_id = $template_id AND context_bucket = $bucket
+          ELSE
+            CREATE context_thompson_scores CONTENT {
+              org_id: $org_id,
+              template_id: $template_id,
+              context_bucket: $bucket,
+              alpha: 1.0 + $alpha_delta,
+              beta:  1.0 + $beta_delta,
+              n_observations: 1,
+              last_updated_at: time::now(),
+              created_at: time::now()
+            }
+          END
+        `, {
+          org_id: traceOrgId,
+          template_id: trace.variant_id,
+          bucket: rederived,
+          alpha_delta: rdAlphaDelta,
+          beta_delta: rdBetaDelta,
+        });
+      } catch (ctxRederiveErr: any) {
+        logger.warn('[learning] context_thompson_scores re-derive update failed (non-blocking)', {
+          execution_id: trace.execution_id,
+          error: ctxRederiveErr.message,
+        });
+      }
+    }
+
     // DUAL-WRITE: Update variant_performance_metrics for dashboard compatibility
     // Dashboard queries this table for Thompson Sampling scores, so we need to maintain it
     // in addition to the activity_template updates above.

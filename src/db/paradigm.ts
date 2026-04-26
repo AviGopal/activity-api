@@ -11,6 +11,7 @@
 
 import { surrealDB, queryWithAuth } from './surreal';
 import { logger } from '../utils/logger';
+import { localEmbeddingService } from '../services/embedding-service';
 
 // =============================================================================
 // FEATURE FLAGS (P4.1: Dual-write control)
@@ -1055,6 +1056,121 @@ export async function queryActivitiesByFTS(
       path: 'new',
       latency_ms: latencyMs,
     };
+  }
+}
+
+/**
+ * Compute cosine similarity between two L2-normalised Float32Arrays.
+ * Because both vectors are unit-normalised, cosine == dot product.
+ */
+function cosine(a: Float32Array, b: Float32Array): number {
+  let dot = 0;
+  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
+  return dot;
+}
+
+/**
+ * Query activities using local dense embeddings (all-MiniLM-L6-v2, 384-dim).
+ *
+ * Fetches all candidate rows that have at least one embedding field populated,
+ * scores them in-process using cosine similarity (O(n) scan), and returns the
+ * top `limit` results.
+ *
+ * Returns an empty array when the LocalEmbeddingService is not ready (model
+ * files absent, ONNX error, etc.) so callers can silently fall back to BM25.
+ *
+ * @param searchQuery - Free-text search query to embed
+ * @param orgId - Organization ID for multi-tenant filtering
+ * @param executionType - Optional filter (template, tool, composition, vessel_function)
+ * @param limit - Maximum number of results (default 50)
+ * @param jwtToken - Optional JWT for RBAC
+ */
+export async function queryActivitiesByDense(
+  searchQuery: string,
+  orgId?: string | null,
+  executionType?: 'template' | 'tool' | 'composition' | 'vessel_function' | null,
+  limit = 50,
+  jwtToken?: string | null
+): Promise<(ParadigmActivity & { dense_score: number })[]> {
+  if (!localEmbeddingService.isReady()) return [];
+  if (!searchQuery || searchQuery.trim() === '') return [];
+
+  const startTime = Date.now();
+
+  let queryVec: Float32Array;
+  try {
+    queryVec = await localEmbeddingService.embed(searchQuery.trim());
+  } catch (err) {
+    logger.warn('[paradigm] queryActivitiesByDense: embed failed', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
+
+  try {
+    // Fetch candidates that have at least one embedding field
+    const whereClauses: string[] = [
+      '(name_embedding IS NOT NONE OR description_embedding IS NOT NONE)',
+      '(retired = false OR retired IS NONE)',
+    ];
+    const params: Record<string, any> = {};
+
+    if (orgId && !jwtToken) {
+      whereClauses.push(`(scope = 'global' OR org_id = $org_id)`);
+      params.org_id = orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`;
+    }
+    if (executionType) {
+      whereClauses.push('execution_type = $execution_type');
+      params.execution_type = executionType;
+    }
+
+    const query = `
+      SELECT *, name_embedding, description_embedding
+      FROM activity
+      WHERE ${whereClauses.join(' AND ')}
+    `;
+
+    const rows: any[] = jwtToken
+      ? await queryWithAuth<any>(jwtToken, query, params)
+      : await surrealDB.query<any>(query, params);
+
+    if (!rows || rows.length === 0) {
+      logger.debug('[paradigm] queryActivitiesByDense: no rows with embeddings');
+      return [];
+    }
+
+    // Score each row in-process
+    const scored = rows.map((row: any) => {
+      let score = 0;
+      if (row.name_embedding && row.name_embedding.length === 384) {
+        score = Math.max(score, cosine(queryVec, new Float32Array(row.name_embedding)));
+      }
+      if (row.description_embedding && row.description_embedding.length === 384) {
+        score = Math.max(score, cosine(queryVec, new Float32Array(row.description_embedding)));
+      }
+      return { ...row, dense_score: score };
+    });
+
+    const results = scored
+      .sort((a: any, b: any) => b.dense_score - a.dense_score)
+      .slice(0, limit);
+
+    logger.info('[paradigm] queryActivitiesByDense: completed', {
+      searchQuery: searchQuery.substring(0, 50),
+      candidateCount: rows.length,
+      resultCount: results.length,
+      topScore: results[0]?.dense_score ?? null,
+      latency_ms: Date.now() - startTime,
+    });
+
+    return results;
+  } catch (error) {
+    logger.error('[paradigm] queryActivitiesByDense: query failed', {
+      searchQuery: searchQuery.substring(0, 50),
+      error: error instanceof Error ? error.message : String(error),
+      latency_ms: Date.now() - startTime,
+    });
+    return [];
   }
 }
 

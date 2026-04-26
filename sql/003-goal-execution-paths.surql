@@ -81,6 +81,10 @@ DEFINE FIELD typical_files_modified ON goal_execution_paths TYPE option<array<st
 DEFINE FIELD typical_tools_used ON goal_execution_paths TYPE option<array<string>>
   COMMENT "Most frequently used tools in this path";
 
+-- Denormalized terminal output shapes (OpenSpec change 2026-04-26-shape-provider-goal-creation)
+DEFINE FIELD endpoint_output_shapes ON goal_execution_paths TYPE option<array<string>>
+  COMMENT "Denormalized terminal output shapes accumulated from path_activities[*].output_shapes. Indexed for shape-keyed lookup. See OpenSpec change 2026-04-26-shape-provider-goal-creation.";
+
 -- Timestamps
 DEFINE FIELD last_executed_at ON goal_execution_paths TYPE option<datetime>
   COMMENT "Timestamp of last execution";
@@ -106,5 +110,9 @@ DEFINE INDEX idx_goal_paths_signature
 DEFINE INDEX idx_goal_paths_success_rate 
   ON goal_execution_paths FIELDS success_rate;
 
-DEFINE INDEX idx_goal_paths_executions 
+DEFINE INDEX idx_goal_paths_executions
   ON goal_execution_paths FIELDS total_executions;
+
+-- Shape-keyed lookup index (OpenSpec change 2026-04-26-shape-provider-goal-creation)
+DEFINE INDEX idx_goal_paths_endpoint_shapes
+  ON goal_execution_paths FIELDS endpoint_output_shapes;

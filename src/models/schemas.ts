@@ -447,6 +447,7 @@ export const ImpulseRelevanceMetricSchema = z.object({
   // Learned scores (Bayesian)
   relevance_score: z.number().min(0).max(1), // P(success | impulse present)
   irrelevance_score: z.number().min(0).max(1), // P(success | impulse absent)
+  net_value_score: z.number().min(-1).max(1).optional(), // relevance_score - irrelevance_score * 0.5
 
   // Context metadata
   avg_content_size_tokens: z.number().int().default(0),
@@ -615,6 +616,9 @@ export const GoalExecutionPathSchema = z.object({
   
   // Path definition
   path_activities: z.array(z.string()),
+  // Denormalized terminal output shapes accumulated from path_activities[*].output_shapes.
+  // Indexed for shape-keyed lookup. See OpenSpec change 2026-04-26-shape-provider-goal-creation.
+  endpoint_output_shapes: z.array(z.string()).optional(),
   path_signature: z.string(),
   
   // Thompson Sampling
@@ -828,6 +832,104 @@ export const ExecutionTraceDataSchema = z.object({
   }).optional(),
 });
 
+// =============================================================================
+// FAILURE MODE TAXONOMY
+// =============================================================================
+// Structured object recorded on execution traces to stratify failures.
+// Metadata only — Thompson updates remain uniform per spec
+// 2026-04-26-validators-and-failure-modes.
+//
+// Variants:
+//   verifier_negative — a validator/check rejected the output.
+//   budget_exhausted  — cost or duration budget exceeded.
+//   safety_breach     — depth or cycle safety guard tripped.
+//   cascading         — failure caused by an upstream task; recursively
+//                       carries the upstream failure_mode when known.
+//   user_abort        — user cancelled the execution.
+//
+// Note on recursive typing: zod's discriminatedUnion + z.lazy combination
+// produces `any` for the recursive `upstream_failure_mode` field at the
+// TypeScript-inference layer (a known zod limitation). Runtime validation
+// still works correctly. Callers needing the precise nested type can cast
+// via `FailureMode` after parsing.
+// =============================================================================
+
+const VerifierEvidenceSchema = z.object({
+  check_id: z.string(),
+  details: z.string().optional(),
+  location: z.string().optional(),
+});
+
+export const FailureModeSchema: z.ZodType<unknown> = z.lazy(() =>
+  z.discriminatedUnion("type", [
+    z.object({
+      type: z.literal("verifier_negative"),
+      reason: z.string(),
+      validator_id: z.string(),
+      failed_evidence: z.array(VerifierEvidenceSchema),
+    }),
+    z.object({
+      type: z.literal("budget_exhausted"),
+      reason: z.string(),
+      budget_type: z.enum(["cost", "duration"]),
+      consumed: z.number(),
+      allowed: z.number(),
+    }),
+    z.object({
+      type: z.literal("safety_breach"),
+      reason: z.string(),
+      breach_type: z.enum(["depth", "cycle"]),
+      // Optional: cycle breaches don't have an integer limit; depth breaches do.
+      limit: z.number().optional(),
+      ancestor_chain: z.array(z.string()),
+    }),
+    z.object({
+      type: z.literal("cascading"),
+      reason: z.string(),
+      upstream_task_id: z.string(),
+      upstream_failure_mode: z.lazy(() => FailureModeSchema).optional(),
+    }),
+    z.object({
+      type: z.literal("user_abort"),
+      reason: z.string(),
+      abort_source: z.string(),
+    }),
+  ])
+);
+
+export type FailureMode =
+  | {
+      type: "verifier_negative";
+      reason: string;
+      validator_id: string;
+      failed_evidence: Array<{ check_id: string; details?: string; location?: string }>;
+    }
+  | {
+      type: "budget_exhausted";
+      reason: string;
+      budget_type: "cost" | "duration";
+      consumed: number;
+      allowed: number;
+    }
+  | {
+      type: "safety_breach";
+      reason: string;
+      breach_type: "depth" | "cycle";
+      limit?: number;
+      ancestor_chain: string[];
+    }
+  | {
+      type: "cascading";
+      reason: string;
+      upstream_task_id: string;
+      upstream_failure_mode?: FailureMode;
+    }
+  | {
+      type: "user_abort";
+      reason: string;
+      abort_source: string;
+    };
+
 export const StoreExecutionTraceRequestSchema = z.object({
   execution_id: z.string(),
   template_id: z.string(),
@@ -841,6 +943,9 @@ export const StoreExecutionTraceRequestSchema = z.object({
   //   so consumers can reconstruct composition trees in a single read.
   parent_execution_id: z.string().optional(),
   composition_chain: z.array(z.string()).optional(),
+  // Failure mode taxonomy (sibling spec 2026-04-26-validators-and-failure-modes).
+  // Metadata only — Thompson updates uniform; future learners may stratify by type.
+  failure_mode: FailureModeSchema.optional(),
 });
 
 export const StoreExecutionTraceResponseSchema = z.object({

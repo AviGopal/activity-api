@@ -16,11 +16,18 @@ import { RedisClient } from '../db/redis';
 import { logger } from '../utils/logger';
 import { ensureTags, computeTagPrefixes, deriveCategory } from '../utils/tags';
 import { analyzeTaskSemantics } from '../utils/semantic-tags';
+import {
+  extractContextTokensWithDecay,
+  computeContextBucket,
+  decayWeight,
+  type SessionContext,
+} from '../utils/session-context';
 import { calculateImpulseRelevancyBoosts, discoverMissingImpulses } from '../utils/impulse-relevancy';
 import { inferShapesFromTemplate, mergeShapes } from '../utils/shape-inference';
 import { calculateOutputShapeCoverage } from '../utils/outcome-to-shape';
 import { captureValidationTrace } from '../utils/validation-traces';
 import { normalizeRecordId } from '../utils/surrealdb-types';
+import { localEmbeddingService } from '../services/embedding-service';
 import {
   insertActivity,
   insertExecution,
@@ -28,6 +35,7 @@ import {
   getShapeConditionedScores,
   queryActivitiesByShapes,
   queryActivitiesByFTS,
+  queryActivitiesByDense,
   transformToLegacyTemplate,
   isDualWriteEnabled,
   getVariantFamily,
@@ -40,6 +48,7 @@ import {
   type VariantScore,
   type VariantTreeNode,
 } from '../db/paradigm';
+import { mergeByRRF } from '../utils/rrf';
 
 /**
  * Thompson Sampling Beta distribution sampler.
@@ -1007,6 +1016,31 @@ app.post('/templates', async (c) => {
     logger.debug('Redis template list cache invalidated after template registration', {
       id: activityId,
     });
+
+    // Fire-and-forget: generate dense embeddings for the new activity
+    Promise.resolve().then(async () => {
+      if (!localEmbeddingService.isReady()) return;
+      try {
+        const nameVec = await localEmbeddingService.embed(activityName || activityId);
+        const nameArr = Array.from(nameVec);
+        const updates: Record<string, any> = { name_embedding: nameArr };
+        if (validated.description) {
+          const descVec = await localEmbeddingService.embed(validated.description);
+          updates.description_embedding = Array.from(descVec);
+        }
+        const setClause = Object.keys(updates).map(k => `${k} = $${k}`).join(', ');
+        await surrealDB.query(
+          `UPDATE type::record("activity", $id) SET ${setClause}`,
+          { id: activityId, ...updates }
+        );
+        logger.debug('[embedding] Wrote embeddings for new activity', { id: activityId });
+      } catch (err) {
+        logger.warn('[embedding] Failed to write embeddings for new activity', {
+          id: activityId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }).catch(() => { /* swallow — never throw into request path */ });
 
     return c.json({
       success: true,
@@ -3332,7 +3366,8 @@ app.post('/feedback', async (c) => {
 app.post('/discover-by-shapes', async (c) => {
   try {
     const body = await c.req.json();
-    const { required_shapes, mode = 'forward', limit = 10, current_shapes = [] } = body;
+    // output_shapes: optional additive filter on backward mode — see OpenSpec change 2026-04-26-validators-and-failure-modes.
+    const { required_shapes, mode = 'forward', limit = 10, current_shapes = [], output_shapes = [] } = body;
 
     if (!required_shapes || !Array.isArray(required_shapes) || required_shapes.length === 0) {
       return c.json({
@@ -3341,12 +3376,18 @@ app.post('/discover-by-shapes', async (c) => {
       }, 400);
     }
 
-    if (!['forward', 'backward'].includes(mode)) {
+    if (!['forward', 'backward', 'candidates_with_scores'].includes(mode)) {
       return c.json({
         error: 'Validation failed',
-        message: 'mode must be either "forward" or "backward"',
+        message: 'mode must be one of "forward", "backward", or "candidates_with_scores"',
       }, 400);
     }
+
+    // candidates_with_scores treats the query as forward mode (find producers)
+    // and augments each result with composition_score from activity_composition_graph.
+    // See OpenSpec change 2026-04-26-impulse-binding-selection-layer.
+    const predecessorActivityId = body.predecessor_activity_id;
+    const queryMode = mode === 'candidates_with_scores' ? 'forward' : mode;
 
     logger.info('Discovering activities by shapes', {
       required_shapes,
@@ -3358,7 +3399,7 @@ app.post('/discover-by-shapes', async (c) => {
     let query: string;
     let params: any;
 
-    if (mode === 'forward') {
+    if (queryMode === 'forward') {
       // Forward mode: Find activities that PRODUCE the required shapes
       // (backward chaining in trajectory editor - finding prerequisites)
       query = `
@@ -3372,10 +3413,14 @@ app.post('/discover-by-shapes', async (c) => {
     } else {
       // Backward mode: Find activities that CONSUME the required shapes
       // (forward chaining - finding next steps given current shapes)
+      // Optional additive filter on output_shapes — see OpenSpec change 2026-04-26-validators-and-failure-modes.
+      const outputFilterClause = output_shapes.length > 0
+        ? ' AND output_shapes CONTAINSANY $output_shapes_filter'
+        : '';
       if (current_shapes.length > 0) {
         query = `
           SELECT * FROM activity
-          WHERE input_shapes CONTAINSANY $required_shapes
+          WHERE input_shapes CONTAINSANY $required_shapes${outputFilterClause}
             AND (retired = false OR retired IS NONE)
           ORDER BY created_at DESC
           LIMIT $limit
@@ -3384,12 +3429,15 @@ app.post('/discover-by-shapes', async (c) => {
       } else {
         query = `
           SELECT * FROM activity
-          WHERE input_shapes CONTAINSANY $required_shapes
+          WHERE input_shapes CONTAINSANY $required_shapes${outputFilterClause}
             AND (retired = false OR retired IS NONE)
           ORDER BY created_at DESC
           LIMIT $limit
         `;
         params = { required_shapes, limit };
+      }
+      if (output_shapes.length > 0) {
+        params.output_shapes_filter = output_shapes;
       }
     }
 
@@ -3441,14 +3489,51 @@ app.post('/discover-by-shapes', async (c) => {
     // Transform to legacy format for compatibility
     const legacyActivities = activitiesWithScores.map(transformToLegacyTemplate);
 
+    // Augment each result with composition_score for candidates_with_scores mode.
+    // Pulls success/execution counts from activity_composition_graph and produces
+    // smoothed Beta(α, β) parameters consumable by Thompson Sampling on the
+    // resolver side. Failures are non-fatal (composition_score: null).
+    const finalActivities = mode === 'candidates_with_scores'
+      ? await Promise.all(
+          legacyActivities.map(async (legacyActivity: any, idx: number) => {
+            const sourceActivity: any = activitiesWithScores[idx];
+            try {
+              const compQuery = predecessorActivityId
+                ? `SELECT success_count, execution_count FROM activity_composition_graph WHERE parent_activity_id = $predecessor_activity_id AND child_activity_id = $activity_id LIMIT 1`
+                : `SELECT math::sum(success_count) AS success_count, math::sum(execution_count) AS execution_count FROM activity_composition_graph WHERE child_activity_id = $activity_id GROUP ALL`;
+              const compParams: Record<string, unknown> = predecessorActivityId
+                ? { predecessor_activity_id: predecessorActivityId, activity_id: sourceActivity.id }
+                : { activity_id: sourceActivity.id };
+              const compRows: any = await surrealDB.query(compQuery, compParams);
+              const row = compRows && compRows.length > 0 ? compRows[0] : null;
+              const composition_score = row && (row.execution_count || 0) > 0
+                ? {
+                    alpha: (row.success_count || 0) + 1,
+                    beta: ((row.execution_count || 0) - (row.success_count || 0)) + 1,
+                    sample_count: row.execution_count || 0,
+                    predecessor_id: predecessorActivityId || undefined,
+                  }
+                : null;
+              return { ...legacyActivity, composition_score };
+            } catch (error) {
+              logger.warn('Failed to fetch composition score', {
+                activity_id: sourceActivity.id,
+                error: error instanceof Error ? error.message : String(error),
+              });
+              return { ...legacyActivity, composition_score: null };
+            }
+          })
+        )
+      : legacyActivities;
+
     logger.info('Activities discovered by shapes', {
-      count: legacyActivities.length,
+      count: finalActivities.length,
       required_shapes,
     });
 
     return c.json({
-      activities: legacyActivities,
-      total: legacyActivities.length,
+      activities: finalActivities,
+      total: finalActivities.length,
     });
 
   } catch (error: any) {
@@ -3471,7 +3556,7 @@ export default app;
  */
 type TieredFallbackResult = {
   activities: ParadigmActivity[];
-  tier: 'exact' | 'compatible' | 'fts';
+  tier: 'exact' | 'compatible' | 'fts' | 'fts_hybrid';
 };
 
 /**
@@ -3576,26 +3661,38 @@ async function getActivitiesWithTieredFallback(
     goalDescription: goalDescription?.substring(0, 50),
   });
 
-  // Tier 3: FTS fallback - search by goal description
+  // Tier 3: Hybrid FTS + dense fallback — search by goal description
   if (goalDescription && goalDescription.trim()) {
-    const tier3Result = await queryActivitiesByFTS(
-      goalDescription,
-      orgId,
-      executionType,
-      limit * 3,
-      jwtToken
-    );
+    const [tier3Result, denseResults] = await Promise.all([
+      queryActivitiesByFTS(goalDescription, orgId, executionType, limit * 3, jwtToken),
+      queryActivitiesByDense(goalDescription, orgId, executionType, limit * 3, jwtToken),
+    ]);
 
-    if (tier3Result.data && tier3Result.data.length > 0) {
-      logger.info('[tiered-fallback] Tier 3 (FTS) succeeded', {
-        resultCount: tier3Result.data.length,
+    const ftsData = tier3Result.data ?? [];
+
+    if (denseResults.length > 0) {
+      const merged = mergeByRRF(ftsData as ParadigmActivity[], denseResults as ParadigmActivity[]);
+      logger.info('[tiered-fallback] Tier 3 (FTS+dense hybrid) succeeded', {
+        ftsCount: ftsData.length,
+        denseCount: denseResults.length,
+        mergedCount: merged.length,
         searchQuery: goalDescription.substring(0, 50),
-        topScore: tier3Result.data[0]?.fts_score,
+      });
+      return {
+        activities: merged,
+        tier: 'fts_hybrid',
+      };
+    }
+
+    if (ftsData.length > 0) {
+      logger.info('[tiered-fallback] Tier 3 (FTS) succeeded', {
+        resultCount: ftsData.length,
+        searchQuery: goalDescription.substring(0, 50),
+        topScore: ftsData[0]?.fts_score,
         latency_ms: tier3Result.latency_ms,
       });
-
       return {
-        activities: tier3Result.data,
+        activities: ftsData,
         tier: 'fts',
       };
     }
@@ -3669,8 +3766,29 @@ app.post('/recommend', async (c) => {
       impulse_shapes = [],  // Array of impulse shapes for schema filtering
       expected_output_shapes = [],  // Array of expected output shapes from goal enrichment
       limit = 3,
-      exclude_activities = []  // T4: Blacklist of activity IDs to exclude
+      exclude_activities = [],  // T4: Blacklist of activity IDs to exclude
+      session_context,          // Spec 2/3/4: loaded impulse state with timestamps
+      exploration_config: rawExplorationConfig,
     } = body;
+
+    const exploration_config = {
+      exploration_ratio: 0.2,
+      min_observations_threshold: 5,
+      ...(rawExplorationConfig ?? {}),
+    };
+    const exploration_ratio = Math.max(0, Math.min(1, exploration_config.exploration_ratio ?? 0.2));
+    const min_observations_threshold = Math.max(0, Math.floor(exploration_config.min_observations_threshold ?? 5));
+
+    if (session_context) {
+      const sc = session_context as SessionContext;
+      const len = sc.loaded_shapes?.length ?? 0;
+      if (
+        (sc.loaded_pointer_paths?.length ?? 0) !== len ||
+        (sc.load_timestamps_ms?.length ?? 0) !== len
+      ) {
+        return c.json({ error: 'session_context arrays must be the same length' }, 400);
+      }
+    }
 
     logger.info('POST /recommend', {
       task_description: task_description?.substring(0, 100),
@@ -3716,12 +3834,39 @@ app.post('/recommend', async (c) => {
     const orgId = jwtAuth?.orgId || sessionData?.org_id || null;
     const projectId = jwtAuth?.projectId || sessionData?.project_id || null;
 
+    // Build FTS query: augment task_description with session_context tokens when present.
+    // Tier 1/2 (shape-based) are not affected — only the FTS (Tier 3) query is enriched.
+    let ftsQuery = task_description;
+    let contextDecayWeightsByShape: Map<string, number> = new Map();
+    if (session_context) {
+      const sc = session_context as SessionContext;
+      const nowMs = Date.now();
+      const { tokens: augmentTokens, decayWeightsByShape } = extractContextTokensWithDecay(sc, 3, nowMs);
+      contextDecayWeightsByShape = decayWeightsByShape;
+      if (augmentTokens.length > 0) {
+        ftsQuery = `${task_description} ${augmentTokens.join(' ')}`;
+        logger.debug('FTS query augmented with session_context tokens', {
+          fts_query_augmented: ftsQuery.substring(0, 120),
+          augment_tokens: augmentTokens,
+          hot_count: 3,
+        });
+      }
+    }
+
+    // Compute context_bucket for per-context Thompson Sampling (Spec 3)
+    const contextBucket = orgId
+      ? computeContextBucket(task_description, effectiveShapes, orgId)
+      : null;
+    if (contextBucket) {
+      logger.debug('context_bucket computed', { context_bucket: contextBucket });
+    }
+
     // Query activities using tiered fallback strategy
     // Tier 1: Exact shape match, Tier 2: Compatible (no shapes), Tier 3: FTS on goal description
     const fallbackResult = await getActivitiesWithTieredFallback(
       effectiveShapes,
       category || null,
-      task_description,
+      ftsQuery,
       orgId,
       execution_type || null,
       limit,
@@ -3800,8 +3945,33 @@ app.post('/recommend', async (c) => {
       templates = await enrichTemplatesWithMetrics(templates);
     }
 
-    // Calculate impulse relevancy boosts
-    const impulseBoostsMap = await calculateImpulseRelevancyBoosts(activityIds, loaded_impulses);
+    // Lookup per-bucket Thompson scores (Spec 3)
+    let contextScoresMap = new Map<string, { alpha: number; beta: number; n_observations: number }>();
+    if (contextBucket && activityIds.length > 0) {
+      try {
+        const ctxResult = await surrealDB.query<any>(`
+          SELECT template_id, alpha, beta, n_observations
+          FROM context_thompson_scores
+          WHERE org_id = $org_id AND context_bucket = $bucket AND template_id IN $ids
+        `, { org_id: orgId, bucket: contextBucket, ids: activityIds });
+
+        for (const row of (ctxResult || [])) {
+          contextScoresMap.set(row.template_id, {
+            alpha: row.alpha ?? 1,
+            beta: row.beta ?? 1,
+            n_observations: row.n_observations ?? 0,
+          });
+        }
+      } catch (ctxErr: any) {
+        logger.warn('context_thompson_scores lookup failed (non-blocking)', {
+          error: ctxErr.message,
+        });
+      }
+    }
+
+    // Calculate impulse relevancy boosts (with optional decay weights from session_context)
+    const decayWeightsForRelevancy = contextDecayWeightsByShape.size > 0 ? contextDecayWeightsByShape : undefined;
+    const impulseBoostsMap = await calculateImpulseRelevancyBoosts(activityIds, loaded_impulses, decayWeightsForRelevancy);
 
     // Discover missing impulses that would unlock better activities
     const missingImpulseSuggestions = await discoverMissingImpulses(activityIds, loaded_impulses, 5);
@@ -3849,6 +4019,15 @@ app.post('/recommend', async (c) => {
         after: validTemplates.length,
         filtered: templates.length - validTemplates.length,
       });
+    }
+
+    // UCB: total org executions derived from already-fetched scoresMap — no extra DB query
+    const total_org_executions = Math.max(1, [...scoresMap.values()].reduce((sum, s) => sum + (s.total_executions ?? 0), 0));
+
+    function ucbScore(totalExecs: number, successes: number): number {
+      const n = totalExecs;
+      const mean = n === 0 ? 0 : successes / n;
+      return mean + Math.sqrt(2 * Math.log(total_org_executions) / Math.max(n, 1));
     }
 
     // Apply Thompson Sampling with heuristic prior boosting
@@ -3963,10 +4142,21 @@ app.post('/recommend', async (c) => {
         alpha += totalBoost;
         const adjustedBeta = betaVal + impulseBetaPenalty;
 
+        // Context-bucketed Thompson blend (Spec 3)
+        const ctxRow = contextScoresMap.get(activityId);
+        const nContext = ctxRow ? (ctxRow.alpha + ctxRow.beta - 2) : 0;
+        const blendWeight = nContext >= 5 ? 0.7 : nContext >= 2 ? 0.3 : 0.0;
+        const alphaBlended = blendWeight * (ctxRow?.alpha ?? 1) + (1 - blendWeight) * alpha;
+        const betaBlended  = blendWeight * (ctxRow?.beta  ?? 1) + (1 - blendWeight) * adjustedBeta;
+
         // Sample from Beta(alpha, beta) distribution for Thompson Sampling
         // This enables exploration (high variance for uncertain templates) and
         // exploitation (high mean for proven templates) tradeoff
-        const sample = betaSample(alpha, adjustedBeta);
+        const sample = betaSample(alphaBlended, betaBlended);
+
+        const rawTotalExecs = scores?.total_executions ?? 0;
+        const rawSuccesses = scores?.successes ?? 0;
+        const computed_ucb_score = ucbScore(rawTotalExecs, rawSuccesses);
 
         return {
           template_id: activityId,
@@ -3978,14 +4168,18 @@ app.post('/recommend', async (c) => {
           output_shapes: template.output_shapes || [],
           input_schema: template.input_schema || null,
           output_schema: template.output_schema || null,
+          _ucb_score: computed_ucb_score,
+          _total_executions: rawTotalExecs,
           selection_metadata: {
             method: 'thompson_sampling',
-            score_source: scoreMethod, // shape_conditioned | global | legacy
-            alpha,
-            beta: adjustedBeta,
+            score_source: blendWeight > 0 ? 'context_bucketed' : scoreMethod,
+            alpha: alphaBlended,
+            beta: betaBlended,
             original_beta: betaVal,
             sample,
-            score: sample, // Use sample as score for ranking
+            score: sample,
+            ucb_score: computed_ucb_score,
+            exploration_slot: false, // patched after pool partitioning
             // Semantic matching quality
             tag_match_quality: tagMatchQuality,
             heuristic_boost: totalBoost,
@@ -4000,6 +4194,12 @@ app.post('/recommend', async (c) => {
               output_shape_coverage: outputShapeBoost,
               shape_mismatch_penalty: shapeMismatchPenalty,
             },
+            // Context-bucketed Thompson metadata (Spec 3)
+            ...(contextBucket ? {
+              context_bucket: contextBucket,
+              context_blend_weight: blendWeight,
+              context_n_observations: nContext,
+            } : {}),
             // Output shape analysis
             output_shape_analysis: expected_output_shapes.length > 0 ? {
               expected_shapes: expected_output_shapes,
@@ -4022,10 +4222,6 @@ app.post('/recommend', async (c) => {
           },
         };
       })
-      // Sort by Thompson sample (highest first)
-      .sort((a: any, b: any) => b.selection_metadata.sample - a.selection_metadata.sample)
-      // Take top N
-      .slice(0, limit)
       // Final defensive filter: ensure all recommendations have valid template_id
       .filter((rec: any) => {
         if (!rec.template_id || typeof rec.template_id !== 'string' || rec.template_id.trim() === '') {
@@ -4038,34 +4234,57 @@ app.post('/recommend', async (c) => {
         return true;
       });
 
+    // UCB pool partitioning: split into exploration/exploitation, assemble final list
+    const reserved = exploration_ratio > 0 ? Math.max(1, Math.floor(limit * exploration_ratio)) : 0;
+    const explorationPool = recommendations.filter((c: any) => c._total_executions < min_observations_threshold);
+    const exploitationPool = recommendations.filter((c: any) => c._total_executions >= min_observations_threshold);
+    explorationPool.sort((a: any, b: any) => b._ucb_score - a._ucb_score);
+    exploitationPool.sort((a: any, b: any) => b._ucb_score - a._ucb_score);
+    const headSlots = limit - reserved;
+    const head = exploitationPool.slice(0, headSlots);
+    const tail = explorationPool.slice(0, reserved);
+    const tailFill = exploitationPool.slice(headSlots, headSlots + (reserved - tail.length));
+    const finalRecommendations = [...head, ...tail, ...tailFill].slice(0, limit);
+
+    // Patch exploration_slot and clean up internal fields
+    const explorationSet = new Set(explorationPool);
+    for (const rec of finalRecommendations) {
+      rec.selection_metadata.exploration_slot = explorationSet.has(rec);
+      delete (rec as any)._ucb_score;
+      delete (rec as any)._total_executions;
+    }
+
     // Generate correlation IDs for selection-to-execution linkage
     const timestamp = Date.now();
     const randomSuffix = Math.random().toString(36).substring(2, 8);
-    recommendations.forEach((rec: any, index: number) => {
+    finalRecommendations.forEach((rec: any, index: number) => {
       rec.correlation_id = `sel_${timestamp}_${randomSuffix}_${index}`;
     });
 
     logger.info('Recommendations generated', {
-      count: recommendations.length,
-      top: recommendations[0]?.template_id,
-      correlationIds: recommendations.map((r: any) => r.correlation_id),
+      count: finalRecommendations.length,
+      top: finalRecommendations[0]?.template_id,
+      correlationIds: finalRecommendations.map((r: any) => r.correlation_id),
       scoreMethod,
       fallbackTier,
+      explorationRatio: exploration_ratio,
       // Log selection details for top recommendation
-      topRecommendation: recommendations[0] ? {
-        template_id: recommendations[0].template_id,
-        thompson_sample: recommendations[0].selection_metadata.sample,
-        alpha: recommendations[0].selection_metadata.alpha,
-        beta: recommendations[0].selection_metadata.beta,
-        output_shapes: recommendations[0].output_shapes,
+      topRecommendation: finalRecommendations[0] ? {
+        template_id: finalRecommendations[0].template_id,
+        thompson_sample: finalRecommendations[0].selection_metadata.sample,
+        alpha: finalRecommendations[0].selection_metadata.alpha,
+        beta: finalRecommendations[0].selection_metadata.beta,
+        ucb_score: finalRecommendations[0].selection_metadata.ucb_score,
+        exploration_slot: finalRecommendations[0].selection_metadata.exploration_slot,
+        output_shapes: finalRecommendations[0].output_shapes,
       } : null,
     });
 
     // Log Thompson Sampling selections for explainability (non-blocking)
     // Only log if we have an org context and recommendations
-    if (orgId && recommendations.length > 0) {
+    if (orgId && finalRecommendations.length > 0) {
       // Log each selection to thompson_selection_log for explainability
-      const selectionLogs = recommendations.map((rec: any, index: number) => ({
+      const selectionLogs = finalRecommendations.map((rec: any, index: number) => ({
         correlation_id: rec.correlation_id, // Link to execution via correlation_id
         execution_id: `recommend-${timestamp}-${index}`, // Placeholder until actual execution
         activity_id: rec.template_id,
@@ -4074,6 +4293,7 @@ app.post('/recommend', async (c) => {
         beta: rec.selection_metadata.beta,
         selection_method: 'thompson_sampling',
         candidates_count: templates.length,
+        exploration_slot: rec.selection_metadata.exploration_slot,
       }));
 
       // Insert selection logs (fire-and-forget for performance)
@@ -4090,6 +4310,7 @@ app.post('/recommend', async (c) => {
             beta: $log.beta,
             selection_method: $log.selection_method,
             candidates_count: $log.candidates_count,
+            exploration_slot: $log.exploration_slot,
             org_id: $org_name,
             project_id: IF $project_name IS NOT NONE AND $project_name IS NOT NULL THEN type::record('projects', $project_name) ELSE NONE END
           }
@@ -4103,7 +4324,7 @@ app.post('/recommend', async (c) => {
       });
 
       // Increment total_selections for recommended activities
-      const activityIds = recommendations.map((r: any) => r.template_id);
+      const activityIds = finalRecommendations.map((r: any) => r.template_id);
       surrealDB.query(`
         UPDATE variant_performance_metrics
         SET total_selections = total_selections + 1,
@@ -4121,7 +4342,7 @@ app.post('/recommend', async (c) => {
     }
 
     return c.json({
-      recommendations,
+      recommendations: finalRecommendations,
       // Include fallback tier to indicate which matching strategy was used
       fallback_tier: fallbackTier,
       // Include missing impulse suggestions if any were found
@@ -5796,12 +6017,13 @@ app.post('/impulse-relevance', async (c) => {
       }
 
       // Calculate Bayesian scores
-      const relevanceScore = newTimesLoaded > 0 
-        ? newTimesExecutionSucceeded / newTimesLoaded 
+      const relevanceScore = newTimesLoaded > 0
+        ? newTimesExecutionSucceeded / newTimesLoaded
         : 0;
       const irrelevanceScore = (newTimesNotLoadedSucceeded + newTimesNotLoadedFailed) > 0
         ? newTimesNotLoadedSucceeded / (newTimesNotLoadedSucceeded + newTimesNotLoadedFailed)
         : 0;
+      const netValueScore = Math.max(-1, Math.min(1, relevanceScore - irrelevanceScore * 0.5));
 
       // Update average content size
       // @ts-ignore - SurrealDB typing
@@ -5843,6 +6065,7 @@ app.post('/impulse-relevance', async (c) => {
           times_not_loaded_failed = $times_not_loaded_failed,
           relevance_score = $relevance_score,
           irrelevance_score = $irrelevance_score,
+          net_value_score = $net_value_score,
           avg_content_size_tokens = $avg_content_size_tokens,
           typical_pointer_type = $typical_pointer_type,
           resolver_tier = $resolver_tier,
@@ -5868,6 +6091,7 @@ app.post('/impulse-relevance', async (c) => {
         times_not_loaded_failed: newTimesNotLoadedFailed,
         relevance_score: relevanceScore,
         irrelevance_score: irrelevanceScore,
+        net_value_score: netValueScore,
         avg_content_size_tokens: newAvgSize,
         // @ts-ignore - SurrealDB typing
         typical_pointer_type: validated.pointer_type ?? current.typical_pointer_type,
@@ -5904,6 +6128,7 @@ app.post('/impulse-relevance', async (c) => {
           times_not_loaded_failed: $times_not_loaded_failed,
           relevance_score: $relevance_score,
           irrelevance_score: $irrelevance_score,
+          net_value_score: $net_value_score,
           avg_content_size_tokens: $avg_content_size_tokens,
           typical_pointer_type: $typical_pointer_type,
           resolver_tier: $resolver_tier,
@@ -5918,6 +6143,7 @@ app.post('/impulse-relevance', async (c) => {
 
       const relevanceScore = validated.was_loaded && validated.execution_succeeded ? 1.0 : 0.0;
       const irrelevanceScore = !validated.was_loaded && validated.execution_succeeded ? 1.0 : 0.0;
+      const netValueScore = Math.max(-1, Math.min(1, relevanceScore - irrelevanceScore * 0.5));
 
       const created = await surrealDB.query<ImpulseRelevanceMetric[]>(createQuery, {
         impulse_id: validated.impulse_id,
@@ -5930,6 +6156,7 @@ app.post('/impulse-relevance', async (c) => {
         times_not_loaded_failed: !validated.was_loaded && !validated.execution_succeeded ? 1 : 0,
         relevance_score: relevanceScore,
         irrelevance_score: irrelevanceScore,
+        net_value_score: netValueScore,
         avg_content_size_tokens: validated.content_size_tokens || 0,
         // Resolver tracking fields (resolver-tier-tracking)
         resolver_tier: validated.resolver_tier ?? undefined,
@@ -5952,6 +6179,7 @@ app.post('/impulse-relevance', async (c) => {
         times_not_loaded_failed: !validated.was_loaded && !validated.execution_succeeded ? 1 : 0,
         relevance_score: relevanceScore,
         irrelevance_score: irrelevanceScore,
+        net_value_score: netValueScore,
         avg_content_size_tokens: validated.content_size_tokens || 0,
         typical_pointer_type: validated.pointer_type || '',
         created_at: new Date().toISOString(),
@@ -7789,4 +8017,120 @@ app.get('/scores', async (c) => {
       message: error.message,
     }, 500);
   }
+});
+
+/**
+ * POST /relevance-feedback
+ *
+ * Explicit relevance signal for a template recommendation.
+ * was_selected=true increments alpha; false increments beta in both
+ * variant_performance_metrics and (if context_bucket provided) context_thompson_scores.
+ * Returns 204 No Content immediately — all DB writes are fire-and-forget.
+ */
+app.post('/relevance-feedback', async (c) => {
+  const jwtAuth = getJwtAuthFromContext(c);
+  const session = (c.get as any)('session') as SessionData | undefined;
+  const orgId = jwtAuth?.orgId || session?.org_id || null;
+
+  if (!orgId) {
+    return c.json({ error: 'Unauthorized', message: 'Missing organization context' }, 401);
+  }
+
+  let body: any;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  const { template_id, was_selected, context_bucket, reason, correlation_id } = body;
+
+  if (!template_id || typeof template_id !== 'string' || typeof was_selected !== 'boolean') {
+    return c.json({ error: 'template_id (string) and was_selected (boolean) are required' }, 400);
+  }
+
+  const alpha_delta = was_selected ? 1 : 0;
+  const beta_delta = was_selected ? 0 : 1;
+
+  // Upsert variant_performance_metrics Thompson params
+  surrealDB.query(`
+    INSERT INTO variant_performance_metrics {
+      variant_id: $variant_id,
+      activity_id: $variant_id,
+      org_id: $org_id,
+      total_executions: 0,
+      successful_executions: 0,
+      failed_executions: 0,
+      success_rate: 0,
+      avg_duration_ms: 0,
+      avg_cost_usd: 0,
+      thompson_alpha: $alpha_delta + 1,
+      thompson_beta: $beta_delta + 1,
+      total_selections: 0,
+      last_executed_at: time::now(),
+      created_at: time::now(),
+      updated_at: time::now()
+    }
+    ON DUPLICATE KEY UPDATE
+      thompson_alpha += $alpha_delta,
+      thompson_beta += $beta_delta,
+      updated_at = time::now()
+  `, { variant_id: template_id, org_id: orgId, alpha_delta, beta_delta }).catch((err: any) => {
+    logger.warn('relevance-feedback: variant_performance_metrics upsert failed', { error: err.message });
+  });
+
+  // Upsert context_thompson_scores when context_bucket is provided
+  if (context_bucket && typeof context_bucket === 'string') {
+    surrealDB.query(`
+      INSERT INTO context_thompson_scores {
+        template_id: $template_id,
+        org_id: $org_id,
+        context_bucket: $bucket,
+        alpha: $alpha_delta + 1,
+        beta: $beta_delta + 1,
+        n_observations: 1,
+        last_updated_at: time::now(),
+        created_at: time::now()
+      }
+      ON DUPLICATE KEY UPDATE
+        alpha += $alpha_delta,
+        beta += $beta_delta,
+        n_observations += 1,
+        last_updated_at = time::now()
+    `, { template_id, org_id: orgId, bucket: context_bucket, alpha_delta, beta_delta }).catch((err: any) => {
+      logger.warn('relevance-feedback: context_thompson_scores upsert failed', { error: err.message });
+    });
+  }
+
+  // Persist the feedback record for audit / future learning
+  surrealDB.query(`
+    CREATE relevance_feedback CONTENT {
+      template_id: $template_id,
+      org_id: $org_id,
+      was_selected: $was_selected,
+      context_bucket: $context_bucket,
+      reason: $reason,
+      correlation_id: $correlation_id,
+      created_at: time::now()
+    }
+  `, {
+    template_id,
+    org_id: orgId,
+    was_selected,
+    context_bucket: context_bucket ?? null,
+    reason: reason ?? null,
+    correlation_id: correlation_id ?? null,
+  }).catch((err: any) => {
+    logger.warn('relevance-feedback: feedback record insert failed', { error: err.message });
+  });
+
+  logger.info('POST /v2/activities/relevance-feedback', {
+    template_id,
+    was_selected,
+    context_bucket: context_bucket ?? null,
+    correlation_id: correlation_id ?? null,
+    orgId,
+  });
+
+  return new Response(null, { status: 204 });
 });
