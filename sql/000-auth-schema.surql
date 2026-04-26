@@ -108,11 +108,22 @@ DEFINE INDEX IF NOT EXISTS idx_minibob_instance_id
 --   "exp": <timestamp>
 -- }
 --
--- IMPORTANT: The KEY must match JWT_SECRET environment variable in Activity-API
--- Default for dev: 'dev-secret-change-in-production'
+-- IMPORTANT: The KEY here is a PLACEHOLDER — the schema as-checked-in does NOT
+-- contain a working JWT secret. The migration runner (`scripts/init-database.ts`)
+-- substitutes `__JWT_SECRET__` with the value of the `JWT_SECRET` environment
+-- variable before applying this file to SurrealDB. The same `JWT_SECRET` env var
+-- is read by `src/config.ts` at runtime, so signing (config) and verification
+-- (this ACCESS method) share a single source of truth: the JWT_SECRET env var
+-- (sourced from k8s secret `metabob-activity-api.jwt-secret`).
+--
+-- If JWT_SECRET is unset:
+--   - init-database.ts FAILS (does not apply with placeholder)
+--   - config.ts FAILS in production, warns + uses dev-only sentinel locally
+--
+-- DO NOT replace `__JWT_SECRET__` with a literal value in this file.
 -- =============================================================================
 
 DEFINE ACCESS IF NOT EXISTS apikey_token ON DATABASE TYPE JWT
   ALGORITHM HS512
-  KEY 'dev-secret-change-in-production'
+  KEY '__JWT_SECRET__'
   DURATION FOR TOKEN 15m, FOR SESSION 1h;

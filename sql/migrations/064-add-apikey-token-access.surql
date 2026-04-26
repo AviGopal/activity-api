@@ -25,7 +25,11 @@
 -- }
 --
 -- The JWT secret MUST match the JWT_SECRET environment variable in Activity-API.
--- Default: 'dev-secret-change-in-production' (see config.ts)
+--
+-- Single source of truth: JWT_SECRET env var (k8s secret `metabob-activity-api.jwt-secret`).
+-- The migration runner (`scripts/init-database.ts`) substitutes `__JWT_SECRET__`
+-- with the value of that env var before applying. config.ts reads the same
+-- env var at runtime. DO NOT hardcode a working secret here.
 -- =============================================================================
 
 -- Define JWT ACCESS method for API key-generated tokens
@@ -33,9 +37,9 @@
 DEFINE ACCESS OVERWRITE apikey_token ON DATABASE TYPE JWT
   -- Algorithm must match what jose library uses in generateJwtToken (HS512)
   ALGORITHM HS512
-  -- Key must match JWT_SECRET environment variable
-  -- In production, set this via SOPS secrets management
-  KEY 'dev-secret-change-in-production'
+  -- Placeholder substituted at deploy time by scripts/init-database.ts.
+  -- See sql/000-auth-schema.surql for the canonical comment block.
+  KEY '__JWT_SECRET__'
   -- Duration settings for token and session
   -- Note: Token duration is controlled by generateJwtToken (15 min default)
   -- Session duration allows token refresh without re-auth

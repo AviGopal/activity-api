@@ -131,6 +131,34 @@ bun run lint
 | `DISCOVERY_HEARTBEAT_INTERVAL_MS` | Heartbeat interval | `60000` (1 min) |
 | `DISCOVERY_RETRY_ATTEMPTS` | Max retry attempts | `3` |
 
+### JWT Secret (Single Source of Truth)
+
+The `apikey_token` JWT ACCESS method (defined in `sql/000-auth-schema.surql`) MUST
+use the same secret that `src/services/auth.ts` uses to sign tokens. Otherwise
+every authenticated query fails with `"The access method cannot be used in the
+requested operation"` — see the v1.12.0 canary regression for an example.
+
+**One source. Two consumers. One placeholder.**
+
+- **Source**: the `JWT_SECRET` environment variable, populated from the k8s
+  secret `metabob-activity-api.jwt-secret` (see helmfile + chart `secret.yaml`).
+- **Runtime consumer**: `src/config.ts` → `resolveJwtSecret()` reads the env var
+  directly. In production, missing env var = startup error. In dev, falls back
+  to the explicit sentinel `"dev-only-jwt-secret-do-not-use-in-prod"` with a
+  loud warning.
+- **Schema consumer**: `scripts/init-database.ts` (the `bun run init-db` job)
+  reads the same env var and substitutes the `__JWT_SECRET__` placeholder in
+  `.surql` files before sending them to SurrealDB. Files keep the placeholder
+  as-checked-in — there is **no working hardcoded secret**.
+
+**Do not** add a `JWT_SECRET` default literal in code. **Do not** put a working
+secret value in any `.surql` schema file. If you find yourself wanting to align
+two literals, you are reintroducing the duplication that caused the bug.
+
+**Adding a new schema with JWT ACCESS?** Use `KEY '__JWT_SECRET__'` in the
+`.surql` file. The init-database substitution and the run-time defense check
+will handle the rest.
+
 ## CI/CD Integration
 
 This vessel is deployed via the deployment repository CI/CD pipeline.

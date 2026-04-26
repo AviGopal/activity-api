@@ -13,8 +13,47 @@ const SURREALDB_DATABASE = process.env.SURREALDB_DATABASE || 'learning_loop';
 const SURREALDB_USERNAME = process.env.SURREALDB_USERNAME || 'root';
 const SURREALDB_PASSWORD = process.env.SURREALDB_PASSWORD || 'surrealdb-local-dev-123';
 const SURREALDB_AUTH_ENABLED = process.env.SURREALDB_AUTH_ENABLED?.toLowerCase() !== 'false';
-// JWT_SECRET for API key authentication - used to update ACCESS method KEY
-const JWT_SECRET = process.env.JWT_SECRET;
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const IS_PRODUCTION = NODE_ENV === 'production';
+
+// =============================================================================
+// JWT_SECRET - single source of truth for the apikey_token JWT ACCESS method
+// =============================================================================
+// Schema files use the placeholder `__JWT_SECRET__` in their `DEFINE ACCESS ...
+// JWT KEY '...'` clauses. This script substitutes the placeholder with the
+// JWT_SECRET env var before sending SQL to SurrealDB. The same env var is
+// consumed by `src/config.ts` at runtime, so signing and verification share
+// one source.
+//
+// Production: JWT_SECRET MUST be set; we fail-fast if missing.
+// Development: a clearly-marked sentinel keeps `bun run init-db` working
+//              against a local stack, with a loud warning.
+// =============================================================================
+const JWT_SECRET_PLACEHOLDER = '__JWT_SECRET__';
+const DEV_JWT_SECRET_SENTINEL = 'dev-only-jwt-secret-do-not-use-in-prod';
+
+function resolveJwtSecret(): string {
+  const fromEnv = process.env.JWT_SECRET;
+  if (fromEnv && fromEnv.length > 0) return fromEnv;
+
+  if (IS_PRODUCTION) {
+    console.error(
+      '[Init] FATAL: JWT_SECRET environment variable is unset in production. ' +
+      'It must come from k8s secret `metabob-activity-api.jwt-secret`. ' +
+      'Refusing to apply schema with placeholder.'
+    );
+    process.exit(1);
+  }
+
+  console.warn(
+    '[Init] WARNING: JWT_SECRET unset; using non-production sentinel ' +
+    `"${DEV_JWT_SECRET_SENTINEL}". Schema's apikey_token ACCESS will use this. ` +
+    'Set JWT_SECRET to silence this warning.'
+  );
+  return DEV_JWT_SECRET_SENTINEL;
+}
+
+const JWT_SECRET = resolveJwtSecret();
 
 const SQL_DIR = join(import.meta.dir, '../sql');
 
@@ -31,14 +70,36 @@ async function applySQLFile(filePath: string): Promise<boolean> {
   try {
     let sqlContent = await readFile(filePath, 'utf-8');
 
-    // Substitute JWT_SECRET in migrations that define ACCESS methods
-    // This ensures the SurrealDB ACCESS method KEY matches the application's JWT_SECRET
-    if (JWT_SECRET && sqlContent.includes("KEY 'dev-secret-change-in-production'")) {
-      console.log(`[Migration] Substituting JWT_SECRET in ${fileName}`);
-      sqlContent = sqlContent.replace(
-        /KEY\s+'dev-secret-change-in-production'/g,
-        `KEY '${JWT_SECRET}'`
+    // Substitute the JWT_SECRET placeholder in schema files that DEFINE
+    // ACCESS ... TYPE JWT methods. The placeholder `__JWT_SECRET__` is the
+    // single source of truth for the JWT secret across schema and runtime
+    // config (see resolveJwtSecret() above and src/config.ts).
+    if (sqlContent.includes(JWT_SECRET_PLACEHOLDER)) {
+      console.log(`[Migration] Substituting ${JWT_SECRET_PLACEHOLDER} in ${fileName}`);
+      sqlContent = sqlContent.replaceAll(JWT_SECRET_PLACEHOLDER, JWT_SECRET);
+    }
+
+    // Backward-compat: older migrations (064, pre-fix) used a literal
+    // 'dev-secret-change-in-production'. Substitute those too so re-runs
+    // against existing databases still upgrade to the env-var JWT secret.
+    if (sqlContent.includes("'dev-secret-change-in-production'")) {
+      console.log(`[Migration] Substituting legacy literal in ${fileName}`);
+      sqlContent = sqlContent.replaceAll(
+        "'dev-secret-change-in-production'",
+        `'${JWT_SECRET}'`
       );
+    }
+
+    // Defense-in-depth: never apply a schema that still mentions our
+    // placeholder. If we got here with the placeholder still in the SQL,
+    // a future schema author added it without going through resolveJwtSecret().
+    if (sqlContent.includes(JWT_SECRET_PLACEHOLDER)) {
+      console.error(
+        `[Migration] FATAL: ${fileName} still contains ${JWT_SECRET_PLACEHOLDER} ` +
+        'after substitution. This would leak a non-functional JWT KEY into ' +
+        'SurrealDB and break authentication. Aborting.'
+      );
+      return false;
     }
 
     // Build headers - only include Authorization when auth is enabled
@@ -132,7 +193,13 @@ async function main() {
   console.log('='.repeat(80));
   console.log(`Database: ${SURREALDB_NAMESPACE}.${SURREALDB_DATABASE}`);
   console.log(`URL: ${SURREALDB_URL}`);
-  console.log(`JWT_SECRET: ${JWT_SECRET ? '✓ configured (will substitute in ACCESS methods)' : '✗ not set (using dev default)'}`);
+  console.log(
+    `JWT_SECRET: ${
+      process.env.JWT_SECRET
+        ? '✓ from env (will substitute __JWT_SECRET__ in ACCESS methods)'
+        : '⚠ unset; using dev sentinel (production-mode init-db would have aborted)'
+    }`
+  );
   console.log('='.repeat(80));
 
   // Wait for database to be ready

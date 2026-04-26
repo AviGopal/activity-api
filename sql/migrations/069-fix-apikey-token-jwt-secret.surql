@@ -41,12 +41,14 @@
 DEFINE ACCESS OVERWRITE apikey_token ON DATABASE TYPE JWT
   -- Algorithm must match what jose library uses in generateJwtToken (HS512)
   ALGORITHM HS512
-  -- KEY MUST BE REPLACED AT DEPLOYMENT TIME
-  -- The placeholder __JWT_SECRET_PLACEHOLDER__ must be substituted with the
-  -- actual JWT_SECRET from environment variables before applying this migration.
+  -- KEY is replaced at deployment time by scripts/init-database.ts using the
+  -- JWT_SECRET environment variable. The same env var is consumed by
+  -- src/config.ts so signing and verification share one source. The unified
+  -- placeholder is `__JWT_SECRET__` (matches sql/000-auth-schema.surql and
+  -- sql/migrations/064-add-apikey-token-access.surql).
   --
   -- DO NOT deploy with the placeholder value - authentication will fail.
-  KEY '__JWT_SECRET_PLACEHOLDER__'
+  KEY '__JWT_SECRET__'
   -- Duration settings for token and session
   -- Token: 15 minutes (controlled by generateJwtToken)
   -- Session: 1 hour (allows token refresh without re-auth)

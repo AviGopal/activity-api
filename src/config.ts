@@ -66,6 +66,48 @@ function parseEnvInt(key: string, defaultValue: number): number {
   return value ? parseInt(value, 10) : defaultValue;
 }
 
+/**
+ * Single source of truth for the JWT signing secret.
+ *
+ * The same value is used by:
+ *   - `generateJwtToken` / `validateJwtToken` (src/services/auth.ts) at runtime
+ *   - the `apikey_token` ACCESS method KEY in SurrealDB (sql/000-auth-schema.surql,
+ *     substituted by scripts/init-database.ts at deploy time)
+ *
+ * In production, the value MUST come from the `JWT_SECRET` env var (sourced
+ * from the k8s secret `metabob-activity-api.jwt-secret`). If unset, this
+ * throws at startup — better to refuse to boot than to ship a known-bad
+ * secret that causes silent auth mismatches like the v1.12.0 canary bug
+ * (POST /v2/impulses/resolve returning "The access method cannot be used in
+ * the requested operation").
+ *
+ * In non-production environments, an explicit dev-only sentinel is used so
+ * `bun run dev` and unit tests work without manual setup; a warning is
+ * logged so it's never confused with a real secret.
+ */
+function resolveJwtSecret(): string {
+  const fromEnv = process.env.JWT_SECRET;
+  if (fromEnv && fromEnv.length > 0) return fromEnv;
+
+  const nodeEnv = process.env.NODE_ENV ?? 'development';
+  if (nodeEnv === 'production') {
+    throw new Error(
+      'JWT_SECRET environment variable is required in production. ' +
+      'It must come from the k8s secret `metabob-activity-api.jwt-secret`. ' +
+      'Refusing to start with a fallback default — see CLAUDE.md "JWT secret".'
+    );
+  }
+
+  // Loud, single dev-only sentinel. Mirrors scripts/init-database.ts so
+  // schema KEY and runtime config agree even without JWT_SECRET set.
+  // eslint-disable-next-line no-console
+  console.warn(
+    '[config] JWT_SECRET unset; using non-production sentinel ' +
+    '"dev-only-jwt-secret-do-not-use-in-prod". Do NOT use in production.'
+  );
+  return 'dev-only-jwt-secret-do-not-use-in-prod';
+}
+
 function parseEnvBool(key: string, defaultValue: boolean): boolean {
   const value = process.env[key];
   if (!value) return defaultValue;
@@ -136,7 +178,7 @@ export function loadConfig(): Config {
 
     auth: {
       requireAuth: parseEnvBool('REQUIRE_AUTH', false),
-      jwtSecret: process.env.JWT_SECRET || 'metabob-jwt-secret-key-change-in-production', // Must match KEY in 001-auth-access.surql
+      jwtSecret: resolveJwtSecret(),
     },
     
     logLevel: (process.env.LOG_LEVEL || 'info') as Config['logLevel'],
