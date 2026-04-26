@@ -8028,109 +8028,122 @@ app.get('/scores', async (c) => {
  * Returns 204 No Content immediately — all DB writes are fire-and-forget.
  */
 app.post('/relevance-feedback', async (c) => {
-  const jwtAuth = getJwtAuthFromContext(c);
-  const session = (c.get as any)('session') as SessionData | undefined;
-  const orgId = jwtAuth?.orgId || session?.org_id || null;
-
-  if (!orgId) {
-    return c.json({ error: 'Unauthorized', message: 'Missing organization context' }, 401);
-  }
-
-  let body: any;
   try {
-    body = await c.req.json();
-  } catch {
-    return c.json({ error: 'Invalid JSON body' }, 400);
-  }
+    const jwtAuth = getJwtAuthFromContext(c);
+    const session = (c.get as any)('session') as SessionData | undefined;
+    const orgId = jwtAuth?.orgId || session?.org_id || null;
 
-  const { template_id, was_selected, context_bucket, reason, correlation_id } = body;
-
-  if (!template_id || typeof template_id !== 'string' || typeof was_selected !== 'boolean') {
-    return c.json({ error: 'template_id (string) and was_selected (boolean) are required' }, 400);
-  }
-
-  const alpha_delta = was_selected ? 1 : 0;
-  const beta_delta = was_selected ? 0 : 1;
-
-  // Upsert variant_performance_metrics Thompson params
-  surrealDB.query(`
-    INSERT INTO variant_performance_metrics {
-      variant_id: $variant_id,
-      activity_id: $variant_id,
-      org_id: $org_id,
-      total_executions: 0,
-      successful_executions: 0,
-      failed_executions: 0,
-      success_rate: 0,
-      avg_duration_ms: 0,
-      avg_cost_usd: 0,
-      thompson_alpha: $alpha_delta + 1,
-      thompson_beta: $beta_delta + 1,
-      total_selections: 0,
-      last_executed_at: time::now(),
-      created_at: time::now(),
-      updated_at: time::now()
+    if (!orgId) {
+      return c.json({ error: 'Unauthorized', message: 'Missing organization context' }, 401);
     }
-    ON DUPLICATE KEY UPDATE
-      thompson_alpha += $alpha_delta,
-      thompson_beta += $beta_delta,
-      updated_at = time::now()
-  `, { variant_id: template_id, org_id: orgId, alpha_delta, beta_delta }).catch((err: any) => {
-    logger.warn('relevance-feedback: variant_performance_metrics upsert failed', { error: err.message });
-  });
 
-  // Upsert context_thompson_scores when context_bucket is provided
-  if (context_bucket && typeof context_bucket === 'string') {
+    let body: any;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    const { template_id, was_selected, context_bucket, reason, correlation_id } = body;
+
+    if (!template_id || typeof template_id !== 'string' || typeof was_selected !== 'boolean') {
+      return c.json({ error: 'template_id (string) and was_selected (boolean) are required' }, 400);
+    }
+
+    const alpha_delta = was_selected ? 1 : 0;
+    const beta_delta = was_selected ? 0 : 1;
+
+    // Upsert variant_performance_metrics Thompson params
     surrealDB.query(`
-      INSERT INTO context_thompson_scores {
-        template_id: $template_id,
+      INSERT INTO variant_performance_metrics {
+        variant_id: $variant_id,
+        activity_id: $variant_id,
         org_id: $org_id,
-        context_bucket: $bucket,
-        alpha: $alpha_delta + 1,
-        beta: $beta_delta + 1,
-        n_observations: 1,
-        last_updated_at: time::now(),
-        created_at: time::now()
+        total_executions: 0,
+        successful_executions: 0,
+        failed_executions: 0,
+        success_rate: 0,
+        avg_duration_ms: 0,
+        avg_cost_usd: 0,
+        thompson_alpha: $alpha_delta + 1,
+        thompson_beta: $beta_delta + 1,
+        total_selections: 0,
+        last_executed_at: time::now(),
+        created_at: time::now(),
+        updated_at: time::now()
       }
       ON DUPLICATE KEY UPDATE
-        alpha += $alpha_delta,
-        beta += $beta_delta,
-        n_observations += 1,
-        last_updated_at = time::now()
-    `, { template_id, org_id: orgId, bucket: context_bucket, alpha_delta, beta_delta }).catch((err: any) => {
-      logger.warn('relevance-feedback: context_thompson_scores upsert failed', { error: err.message });
+        thompson_alpha += $alpha_delta,
+        thompson_beta += $beta_delta,
+        updated_at = time::now()
+    `, { variant_id: template_id, org_id: orgId, alpha_delta, beta_delta }).catch((err: any) => {
+      logger.warn('relevance-feedback: variant_performance_metrics upsert failed', { error: err.message });
     });
-  }
 
-  // Persist the feedback record for audit / future learning
-  surrealDB.query(`
-    CREATE relevance_feedback CONTENT {
-      template_id: $template_id,
-      org_id: $org_id,
-      was_selected: $was_selected,
-      context_bucket: $context_bucket,
-      reason: $reason,
-      correlation_id: $correlation_id,
-      created_at: time::now()
+    // Upsert context_thompson_scores when context_bucket is provided
+    if (context_bucket && typeof context_bucket === 'string') {
+      surrealDB.query(`
+        INSERT INTO context_thompson_scores {
+          template_id: $template_id,
+          org_id: $org_id,
+          context_bucket: $bucket,
+          alpha: $alpha_delta + 1,
+          beta: $beta_delta + 1,
+          n_observations: 1,
+          last_updated_at: time::now(),
+          created_at: time::now()
+        }
+        ON DUPLICATE KEY UPDATE
+          alpha += $alpha_delta,
+          beta += $beta_delta,
+          n_observations += 1,
+          last_updated_at = time::now()
+      `, { template_id, org_id: orgId, bucket: context_bucket, alpha_delta, beta_delta }).catch((err: any) => {
+        logger.warn('relevance-feedback: context_thompson_scores upsert failed', { error: err.message });
+      });
     }
-  `, {
-    template_id,
-    org_id: orgId,
-    was_selected,
-    context_bucket: context_bucket ?? null,
-    reason: reason ?? null,
-    correlation_id: correlation_id ?? null,
-  }).catch((err: any) => {
-    logger.warn('relevance-feedback: feedback record insert failed', { error: err.message });
-  });
 
-  logger.info('POST /v2/activities/relevance-feedback', {
-    template_id,
-    was_selected,
-    context_bucket: context_bucket ?? null,
-    correlation_id: correlation_id ?? null,
-    orgId,
-  });
+    // Persist the feedback record for audit / future learning
+    // SurrealDB 3.x distinguishes NONE (undefined) from NULL; `none | string` fields
+    // reject JavaScript null. Pass undefined so the driver sends NONE.
+    surrealDB.query(`
+      CREATE relevance_feedback CONTENT {
+        template_id: $template_id,
+        org_id: $org_id,
+        was_selected: $was_selected,
+        context_bucket: $context_bucket,
+        reason: $reason,
+        correlation_id: $correlation_id,
+        created_at: time::now()
+      }
+    `, {
+      template_id,
+      org_id: orgId,
+      was_selected,
+      context_bucket: context_bucket ?? undefined,
+      reason: reason ?? undefined,
+      correlation_id: correlation_id ?? undefined,
+    }).catch((err: any) => {
+      logger.warn('relevance-feedback: feedback record insert failed', { error: err.message });
+    });
 
-  return new Response(null, { status: 204 });
+    logger.info('POST /v2/activities/relevance-feedback', {
+      template_id,
+      was_selected,
+      context_bucket: context_bucket ?? null,
+      correlation_id: correlation_id ?? null,
+      orgId,
+    });
+
+    return c.body(null, 204);
+  } catch (error: any) {
+    logger.error('POST /v2/activities/relevance-feedback failed', {
+      error: error.message,
+      stack: error.stack,
+    });
+    return c.json({
+      error: 'Failed to record relevance feedback',
+      message: error.message,
+    }, 500);
+  }
 });
