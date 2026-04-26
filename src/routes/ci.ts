@@ -17,6 +17,7 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { surrealDB } from '../db/surreal';
+import { normalizeActivityId } from '../db/paradigm';
 import { RedisClient } from '../db/redis';
 import { logger } from '../utils/logger';
 import { broadcaster } from '../websocket/broadcaster';
@@ -198,6 +199,15 @@ router.post('/ci-result', async (c) => {
 
     if (template_id) {
       try {
+        // Normalize template_id to plain form before querying/writing —
+        // wrapped (`activity:⟨name⟩`) vs plain (`name`) forms must collapse
+        // to the same row. The UNIQUE index on `variant_id` is plain string
+        // equality, so un-normalized writes split α/β across two records and
+        // stall Thompson Sampling. Mirrors the 10.4 fix in
+        // `routes/activities.ts` (POST /executions, POST /relevance-feedback)
+        // and `routes/execution-traces.ts:resolveTemplateIdsForUpdate`.
+        const normalizedTemplateId = normalizeActivityId(template_id);
+
         // Load current metrics
         const metricsQuery = `
           SELECT * FROM variant_performance_metrics
@@ -206,7 +216,7 @@ router.post('/ci-result', async (c) => {
         `;
 
         const metricsResult = await surrealDB.query<any>(metricsQuery, {
-          variant_id: template_id,
+          variant_id: normalizedTemplateId,
         });
 
         if (metricsResult.length > 0) {
@@ -239,7 +249,7 @@ router.post('/ci-result', async (c) => {
           const ciSuccessRate = ciPassCount / (ciPassCount + ciFailCount);
 
           await surrealDB.query(updateMetricsQuery, {
-            variant_id: template_id,
+            variant_id: normalizedTemplateId,
             thompson_alpha: newAlpha,
             thompson_beta: newBeta,
             ci_pass_count: ciPassCount,
