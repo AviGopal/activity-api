@@ -147,6 +147,12 @@ router.post('/ci-result', async (c) => {
 
     const trace = traces[0];
     const template_id = request.template_id || trace.template_id;
+    // Normalize once at the top so all downstream sites (metrics WHERE/UPDATE,
+    // Redis cache invalidation, deployment task payload) collapse wrapped
+    // (`activity:⟨name⟩`) and plain (`name`) forms to the same key. See
+    // `execution-traces.ts:resolveTemplateIdsForUpdate` for the canonical
+    // convention this aligns with.
+    const normalizedTemplateId = template_id ? normalizeActivityId(template_id) : undefined;
 
     // Update execution trace with CI results
     const now = new Date().toISOString();
@@ -197,16 +203,14 @@ router.post('/ci-result', async (c) => {
     // CI success/failure affects template selection probability
     let metricsUpdated = false;
 
-    if (template_id) {
+    if (template_id && normalizedTemplateId) {
       try {
-        // Normalize template_id to plain form before querying/writing —
-        // wrapped (`activity:⟨name⟩`) vs plain (`name`) forms must collapse
-        // to the same row. The UNIQUE index on `variant_id` is plain string
-        // equality, so un-normalized writes split α/β across two records and
-        // stall Thompson Sampling. Mirrors the 10.4 fix in
-        // `routes/activities.ts` (POST /executions, POST /relevance-feedback)
-        // and `routes/execution-traces.ts:resolveTemplateIdsForUpdate`.
-        const normalizedTemplateId = normalizeActivityId(template_id);
+        // `normalizedTemplateId` is computed once at the top of the handler.
+        // The variant_performance_metrics row stores `variant_id` as a plain
+        // string (UNIQUE index is plain-string equality), so wrapped forms
+        // would split α/β across two records and stall Thompson Sampling.
+        // Mirrors the 10.4 fix in `routes/activities.ts` and
+        // `routes/execution-traces.ts:resolveTemplateIdsForUpdate`.
 
         // Load current metrics
         const metricsQuery = `
@@ -267,9 +271,13 @@ router.post('/ci-result', async (c) => {
 
           metricsUpdated = true;
 
-          // Invalidate Redis cache for this template
+          // Invalidate Redis cache for this template — must use normalized id
+          // to match `execution-traces.ts:1551` (cache invalidation after score
+          // updates uses `candidateId` from `resolveTemplateIdsForUpdate`,
+          // which normalizes all ids). Wrapped vs plain forms would otherwise
+          // miss the entry written by the trace path.
           const redis = RedisClient.getInstance();
-          await redis.getClient().del(`activity:template:${template_id}`);
+          await redis.getClient().del(`activity:template:${normalizedTemplateId}`);
           await redis.getClient().del('activity:templates:list');
 
         } else {
@@ -317,7 +325,9 @@ router.post('/ci-result', async (c) => {
           goal: `Deploy ${request.branch} (${request.commit.substring(0, 8)}) to staging environment`,
           variables: {
             execution_id: request.execution_id,
-            template_id,
+            // Pass normalized form downstream so the deployment consumer keys
+            // off the same id as Thompson Sampling / cache layers.
+            template_id: normalizedTemplateId,
             branch: request.branch,
             commit: request.commit,
             ci_run_url: request.run_url,
