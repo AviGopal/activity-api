@@ -55,6 +55,52 @@ ws.send(JSON.stringify({
 }
 ```
 
+**`impulse.resolved` Event Body Contract** (formalised 2026-04-26):
+
+Emitted once per resolved impulse during trace ingestion (one per
+`impulse_resolutions[]` entry on the persisted trace; see migration 086).
+All canonical fields ride **flat** on `data` — there is no nested
+`impulse` envelope. Consumers MAY tolerate the nested form for
+forward-compat with other vessels (e.g. minibob's normalised
+`impulse:completed`), but activity-api always emits the flat form.
+
+The `body` field carries the resolved-impulse content when minibob
+included it on the matching `output_impulses[]` entry (typically for
+`validation_result` shapes). When the body cannot be sourced (e.g.
+file-pointer impulses where content lives on disk only), the field is
+**omitted**. Consumers MUST treat absent `body` as a non-error signal —
+the impulse is still considered resolved.
+
+```json
+{
+  "type": "impulse.resolved",
+  "sequence": 44,
+  "timestamp": "2026-04-24T12:00:00.000Z",
+  "data": {
+    "execution_id": "exec-123",
+    "task_id": "task-1",                       // optional
+    "impulse_id": "imp-validation-1",
+    "shape": "validation_result",              // optional
+    "resolver_id": "validation",
+    "resolver_tier": "deterministic",          // 'deterministic' | 'pattern' | 'llm'
+    "vessel_id": "minibob-canary",
+    "latency_ms": 12,
+    "cost_usd": 0,
+    "body": {                                  // optional — see above
+      "passed": true,
+      "confidence": 0.9,
+      "validator_id": "v1",
+      "evidence": [],
+      "messages": []
+    },
+    "timestamp": "2026-04-24T12:00:00.000Z"
+  }
+}
+```
+
+See `src/websocket/types.ts` (`ImpulseResolvedMessage`) for the formal
+TypeScript contract.
+
 ---
 
 ### 2. Discover Activities by Shapes (Bidirectional)

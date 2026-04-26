@@ -54,7 +54,12 @@ class WebSocketBroadcaster {
    */
   emit(message: WebSocketMessage): void {
     // Assign sequence number for fine-grained events
-    if (message.type === 'task.started' || message.type === 'task.completed' || message.type === 'tool.call') {
+    if (
+      message.type === 'task.started' ||
+      message.type === 'task.completed' ||
+      message.type === 'tool.call' ||
+      message.type === 'impulse.resolved'
+    ) {
       message.sequence = ++this.eventSequence;
 
       // Store in history for catchup protocol

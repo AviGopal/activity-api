@@ -1215,6 +1215,107 @@ app.post('/', async (c) => {
           },
         });
       }
+
+      // Emit impulse.resolved events — one per impulse_resolutions[] entry.
+      // F-9 resolution (2026-04-26): formalises the broadcaster contract so
+      // workbench's `routeValidationResultImpulse` no longer has to defend
+      // against an undocumented event body. Canonical fields ride flat;
+      // `body` is optional (sourced from a matching output_impulses[] entry
+      // when minibob included one — typically validation_result shapes).
+      // See `src/websocket/types.ts` (ImpulseResolvedMessage) and
+      // `docs/API_PHASE1_ENDPOINTS.md` for the formal contract.
+      const impulseResolutions = (trace as any).impulse_resolutions;
+      if (Array.isArray(impulseResolutions) && impulseResolutions.length > 0) {
+        // Build a lookup of output_impulses by impulse_id (when minibob includes it)
+        // so we can attach resolved-impulse content to the matching event.
+        const outputImpulses = trace.output_impulses;
+        const bodyByImpulseId = new Map<string, unknown>();
+        if (Array.isArray(outputImpulses)) {
+          for (const oi of outputImpulses) {
+            if (!oi || typeof oi !== 'object') continue;
+            const impulseId = (oi as any).impulse_id ?? (oi as any).id;
+            const body = (oi as any).body ?? (oi as any).content;
+            if (typeof impulseId === 'string' && impulseId.length > 0 && body !== undefined) {
+              bodyByImpulseId.set(impulseId, body);
+            }
+          }
+        }
+
+        // Map from impulse_id → owning task_id by scanning per-task output arrays.
+        // Falls back to undefined when the resolution isn't task-scoped.
+        const taskIdByImpulseId = new Map<string, string>();
+        const tasks = body.execution_trace?.tasks;
+        if (Array.isArray(tasks)) {
+          for (let i = 0; i < tasks.length; i++) {
+            const t = tasks[i];
+            const tId = t?.id || t?.taskId || `task-${i}`;
+            const { output_impulse_ids: outIds, input_impulse_ids: inIds } =
+              extractTaskImpulseIds(t);
+            for (const id of [...outIds, ...inIds]) {
+              if (!taskIdByImpulseId.has(id)) taskIdByImpulseId.set(id, tId);
+            }
+          }
+        }
+
+        for (const r of impulseResolutions) {
+          if (!r || typeof r !== 'object') continue;
+          const impulseId: string | undefined =
+            typeof (r as any).impulse_id === 'string' ? (r as any).impulse_id : undefined;
+          const resolverId: string | undefined =
+            typeof (r as any).resolver_id === 'string' ? (r as any).resolver_id : undefined;
+          if (!impulseId || !resolverId) continue;
+
+          const resolverTierRaw = (r as any).resolver_tier;
+          const resolverTier: 'deterministic' | 'pattern' | 'llm' =
+            resolverTierRaw === 'deterministic' || resolverTierRaw === 'pattern' || resolverTierRaw === 'llm'
+              ? resolverTierRaw
+              : 'llm';
+          const vesselId: string =
+            typeof (r as any).vessel_id === 'string' ? (r as any).vessel_id : (trace.vessel_id ?? 'unknown');
+          const latencyMs: number =
+            typeof (r as any).latency_ms === 'number' ? (r as any).latency_ms : 0;
+          const costUsd: number =
+            typeof (r as any).cost_usd === 'number' ? (r as any).cost_usd : 0;
+
+          // Derive shape from the matching output_impulses entry when present.
+          let shape: string | undefined;
+          if (Array.isArray(outputImpulses)) {
+            for (const oi of outputImpulses) {
+              if (!oi || typeof oi !== 'object') continue;
+              const oiId = (oi as any).impulse_id ?? (oi as any).id;
+              if (oiId === impulseId && typeof (oi as any).shape === 'string') {
+                shape = (oi as any).shape;
+                break;
+              }
+            }
+          }
+
+          const resolvedBody = bodyByImpulseId.get(impulseId);
+          const owningTaskId = taskIdByImpulseId.get(impulseId);
+
+          // Canonical flat payload — see ImpulseResolvedMessage in
+          // src/websocket/types.ts for the formal contract.
+          const data: Record<string, unknown> = {
+            execution_id: trace.execution_id,
+            impulse_id: impulseId,
+            resolver_id: resolverId,
+            resolver_tier: resolverTier,
+            vessel_id: vesselId,
+            latency_ms: latencyMs,
+            cost_usd: costUsd,
+            timestamp: new Date().toISOString(),
+          };
+          if (owningTaskId) data.task_id = owningTaskId;
+          if (shape) data.shape = shape;
+          if (resolvedBody !== undefined) data.body = resolvedBody;
+
+          broadcaster.emit({
+            type: 'impulse.resolved',
+            timestamp: new Date().toISOString(),
+            data,
+          });
+        }
+      }
     }
 
     // DUAL-WRITE: Also insert into new paradigm execution table (schema-paradigm-alignment)

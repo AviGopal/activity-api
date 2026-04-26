@@ -236,4 +236,105 @@ describe('WebSocket Event Types', () => {
     expect(message.data).toHaveProperty('latency_ms');
     expect(message.data).toHaveProperty('cost_usd');
   });
+
+  // F-9 resolution (2026-04-26): impulse.resolved event body contract.
+  // The flat-payload form is canonical; `body` is OPTIONAL and present only
+  // when the broadcaster could source resolved-impulse content from the
+  // matching output_impulses[] entry. See src/websocket/types.ts
+  // (ImpulseResolvedMessage) for the formal contract.
+  test('impulse.resolved event should have correct flat structure with body', () => {
+    const validationBody = {
+      passed: true,
+      confidence: 0.9,
+      validator_id: 'v1',
+      evidence: [],
+      messages: [],
+    };
+    const message: WebSocketMessage = {
+      type: 'impulse.resolved',
+      timestamp: new Date().toISOString(),
+      sequence: 4,
+      data: {
+        execution_id: 'exec-123',
+        task_id: 'task-1',
+        impulse_id: 'imp-validation-result-1',
+        shape: 'validation_result',
+        resolver_id: 'validation',
+        resolver_tier: 'deterministic',
+        vessel_id: 'minibob-canary',
+        latency_ms: 12,
+        cost_usd: 0,
+        body: validationBody,
+        timestamp: new Date().toISOString(),
+      },
+    };
+
+    expect(message.type).toBe('impulse.resolved');
+    // Canonical flat fields.
+    expect(message.data).toHaveProperty('execution_id');
+    expect(message.data).toHaveProperty('impulse_id');
+    expect(message.data).toHaveProperty('resolver_id');
+    expect(message.data).toHaveProperty('resolver_tier');
+    expect(message.data).toHaveProperty('vessel_id');
+    expect(message.data).toHaveProperty('latency_ms');
+    expect(message.data).toHaveProperty('cost_usd');
+    // shape + task_id + body are optional but present here.
+    expect(message.data).toHaveProperty('shape');
+    expect(message.data).toHaveProperty('task_id');
+    expect(message.data).toHaveProperty('body');
+    // The body is the resolved impulse content — opaque to the broadcaster
+    // but recoverable by consumers (e.g. workbench's parseValidationResult).
+    expect(message.data.body).toEqual(validationBody);
+  });
+
+  test('impulse.resolved event omits body when content not available', () => {
+    // F-9 contract: `body` is optional. When the trace doesn't carry
+    // matching content (e.g. file-pointer impulses where content lives on
+    // disk only), the field is omitted. Consumers MUST treat absent body as
+    // a non-error — the impulse is still considered resolved.
+    const message: WebSocketMessage = {
+      type: 'impulse.resolved',
+      timestamp: new Date().toISOString(),
+      sequence: 5,
+      data: {
+        execution_id: 'exec-456',
+        impulse_id: 'imp-file-1',
+        resolver_id: 'file',
+        resolver_tier: 'deterministic',
+        vessel_id: 'minibob-canary',
+        latency_ms: 3,
+        cost_usd: 0,
+        timestamp: new Date().toISOString(),
+      },
+    };
+
+    expect(message.type).toBe('impulse.resolved');
+    expect(message.data).toHaveProperty('impulse_id');
+    expect(message.data).not.toHaveProperty('body');
+  });
+
+  test('impulse.resolved event gets sequence number from broadcaster', () => {
+    const initialSequence = broadcaster.getCurrentSequence();
+    const message: WebSocketMessage = {
+      type: 'impulse.resolved',
+      timestamp: new Date().toISOString(),
+      data: {
+        execution_id: 'exec-seq',
+        impulse_id: 'imp-seq-1',
+        resolver_id: 'memo',
+        resolver_tier: 'deterministic',
+        vessel_id: 'minibob',
+        latency_ms: 1,
+        cost_usd: 0,
+        timestamp: new Date().toISOString(),
+      },
+    };
+
+    broadcaster.emit(message);
+
+    const newSequence = broadcaster.getCurrentSequence();
+    expect(newSequence).toBe(initialSequence + 1);
+    // The broadcaster mutates the message in-place, assigning sequence.
+    expect(message.sequence).toBe(newSequence);
+  });
 });
