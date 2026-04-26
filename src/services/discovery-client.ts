@@ -23,6 +23,12 @@ interface VesselRegistration {
   resolve_request_format?: 'pointer' | 'shape' | 'custom';
   auth_scheme?: 'ApiKey' | 'Bearer' | 'None';
   resolve_timeout_ms?: number;
+  // Auth token source (Wave A3, 2026-04-23, forward-mode only). See
+  // super-repo `docs/specs/auth-token-source-field.md`. Activity-api
+  // tenants by `$auth.org_id` from the caller's service identity, so
+  // caller_identity is correct.
+  auth_token_source?: 'caller_identity' | 'user_identity' | 'service_identity' | 'no_token';
+  auth_delegation_mode?: 'forward' | 'mint' | 'none';
 }
 
 interface RegisterResponse {
@@ -117,6 +123,12 @@ export class DiscoveryClient {
         resolve_request_format: 'pointer',
         auth_scheme: 'ApiKey',
         resolve_timeout_ms: 10000,
+        // Auth token source (Wave A3, 2026-04-23). Activity-api tenants by
+        // `$auth.org_id` from the caller's service identity; caller_identity
+        // is correct. Forward-mode delegation default applies — harmless
+        // for caller_identity vessels.
+        auth_token_source: 'caller_identity',
+        auth_delegation_mode: 'forward',
         metadata: {
           environment: this.detectEnvironment(),
           podId: process.env.HOSTNAME || 'unknown',
