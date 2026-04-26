@@ -1918,10 +1918,28 @@ router.post('/resolve', async (c) => {
           // record::id(id) to extract the string part for matching, matching
           // the pattern used elsewhere (execution-traces.ts:1063).
           // Spec 6: global templates may only be modified by admin callers.
-          const before = await executeAsAuth<any>(jwtAuth, `SELECT * FROM activity WHERE record::id(id) = $id AND (org_id = $orgId OR (scope = 'global' AND $isAdmin = true)) LIMIT 1`, { id: templateId, orgId: jwtAuth.orgId, isAdmin });
-          const beforeRow = (before || [])[0];
+          //
+          // B-2-fix (2026-04-26): Split existence check from RBAC check so we
+          // can return 404 vs 403 distinctly. The previous combined query
+          // returned 404 both for missing rows AND for rows excluded by the
+          // admin/org gate, which leaked no info but also misled callers.
+          const existing = await executeAsAuth<any>(
+            jwtAuth,
+            `SELECT * FROM activity WHERE record::id(id) = $id LIMIT 1`,
+            { id: templateId },
+          );
+          const beforeRow = (existing || [])[0];
           if (!beforeRow) {
             return c.json({ success: false, error: `Template not found: ${templateId}` } as ImpulseResolveResponse, 404);
+          }
+
+          const isGlobal = beforeRow.scope === 'global';
+          const sameOrg = beforeRow.org_id === jwtAuth.orgId;
+          if (isGlobal && !isAdmin) {
+            return c.json({ success: false, error: 'Forbidden: admin scope required for global-scope templates' } as ImpulseResolveResponse, 403);
+          }
+          if (!isGlobal && !sameOrg) {
+            return c.json({ success: false, error: 'Forbidden: template belongs to a different org' } as ImpulseResolveResponse, 403);
           }
 
           const after = await executeAsAuth<any>(
@@ -1980,9 +1998,29 @@ router.post('/resolve', async (c) => {
           (Array.isArray(jwtAuth.scopes) && jwtAuth.scopes.includes('admin'));
 
         try {
-          const before = await executeAsAuth<any>(jwtAuth, `SELECT id, deprecated FROM activity WHERE record::id(id) = $id AND (org_id = $orgId OR (scope = 'global' AND $isAdmin = true)) LIMIT 1`, { id: templateId, orgId: jwtAuth.orgId, isAdmin: isAdminDep });
-          if (!(before || [])[0]) {
+          // B-2-fix (2026-04-26): Split existence check from RBAC check so we
+          // can return distinct status codes. Returning 404 on RBAC denial
+          // leaks no info about whether the row exists, but it also confused
+          // the iter-26 11.1 retry into chasing phantom id-format issues
+          // before realizing the real cause was admin-scope RBAC. Now: row
+          // missing → 404; row present but caller lacks permission → 403.
+          const existing = await executeAsAuth<any>(
+            jwtAuth,
+            `SELECT id, scope, org_id FROM activity WHERE record::id(id) = $id LIMIT 1`,
+            { id: templateId },
+          );
+          const existingRow = (existing || [])[0];
+          if (!existingRow) {
             return c.json({ success: false, error: `Template not found: ${templateId}` } as ImpulseResolveResponse, 404);
+          }
+
+          const isGlobal = existingRow.scope === 'global';
+          const sameOrg = existingRow.org_id === jwtAuth.orgId;
+          if (isGlobal && !isAdminDep) {
+            return c.json({ success: false, error: 'Forbidden: admin scope required for global-scope templates' } as ImpulseResolveResponse, 403);
+          }
+          if (!isGlobal && !sameOrg) {
+            return c.json({ success: false, error: 'Forbidden: template belongs to a different org' } as ImpulseResolveResponse, 403);
           }
 
           const after = await executeAsAuth<any>(
