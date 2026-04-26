@@ -77,6 +77,11 @@ export interface TaskCompletedMessage extends WebSocketMessage {
     duration_ms: number;
     completed_at: string;
     error?: string;
+    // Per-task impulse grouping. Always present (possibly empty arrays).
+    // Symmetric with `tasks[*].input_impulse_ids` / `output_impulse_ids` on
+    // the persisted row. See docs/specs/broadcaster-per-task-grouping.md.
+    input_impulse_ids: string[];
+    output_impulse_ids: string[];
   };
 }
 

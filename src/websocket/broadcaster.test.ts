@@ -148,6 +148,8 @@ describe('WebSocket Event Types', () => {
         success: true,
         duration_ms: 1500,
         completed_at: new Date().toISOString(),
+        input_impulse_ids: [],
+        output_impulse_ids: [],
       },
     };
 
@@ -157,6 +159,57 @@ describe('WebSocket Event Types', () => {
     expect(message.data).toHaveProperty('success');
     expect(message.data).toHaveProperty('duration_ms');
     expect(message.data).toHaveProperty('completed_at');
+    expect(message.data).toHaveProperty('input_impulse_ids');
+    expect(message.data).toHaveProperty('output_impulse_ids');
+  });
+
+  test('task.completed event carries per-task impulse arrays (broadcaster-per-task-grouping spec)', () => {
+    // The broadcaster must forward the per-task impulse arrays minibob
+    // serializes into each task. Spec: docs/specs/broadcaster-per-task-grouping.md
+    const message: WebSocketMessage = {
+      type: 'task.completed',
+      timestamp: new Date().toISOString(),
+      sequence: 99,
+      data: {
+        execution_id: 'exec-impulse',
+        task_id: 'task-impulse',
+        task_index: 0,
+        success: true,
+        duration_ms: 100,
+        completed_at: new Date().toISOString(),
+        input_impulse_ids: ['concept:c1', 'memo:m1'],
+        output_impulse_ids: ['concept:c2'],
+      },
+    };
+
+    expect((message.data as any).input_impulse_ids).toEqual(['concept:c1', 'memo:m1']);
+    expect((message.data as any).output_impulse_ids).toEqual(['concept:c2']);
+  });
+
+  test('task.completed event with no impulses still carries empty arrays (never undefined)', () => {
+    // The latent workbench bug: events lacking the field would throw on
+    // .length. The broadcaster guarantees explicit empty arrays.
+    const message: WebSocketMessage = {
+      type: 'task.completed',
+      timestamp: new Date().toISOString(),
+      sequence: 100,
+      data: {
+        execution_id: 'exec-empty',
+        task_id: 'task-empty',
+        task_index: 0,
+        success: true,
+        duration_ms: 50,
+        completed_at: new Date().toISOString(),
+        input_impulse_ids: [],
+        output_impulse_ids: [],
+      },
+    };
+
+    expect((message.data as any).input_impulse_ids).toEqual([]);
+    expect((message.data as any).output_impulse_ids).toEqual([]);
+    // Explicit: arrays, never undefined.
+    expect((message.data as any).input_impulse_ids).not.toBeUndefined();
+    expect((message.data as any).output_impulse_ids).not.toBeUndefined();
   });
 
   test('tool.call event should have correct structure', () => {

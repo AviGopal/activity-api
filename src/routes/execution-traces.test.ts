@@ -15,7 +15,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { normalizePersistedTask } from './execution-traces';
+import { normalizePersistedTask, extractTaskImpulseIds } from './execution-traces';
 import { _internals as readInternals } from './execution-trace-with-signatures';
 
 describe('execution-traces write -> read round trip', () => {
@@ -393,5 +393,193 @@ describe('execution-trace top-level vessel + resolver fields contract', () => {
     };
     const projected = projectVesselFields({ impulse_resolutions: [entry] });
     expect(projected.impulse_resolutions[0]).toEqual(entry);
+  });
+});
+
+// ============================================================================
+// Broadcaster per-task impulse grouping (spec: broadcaster-per-task-grouping.md)
+// ----------------------------------------------------------------------------
+// The broadcaster emits `task.completed` events that must carry the same
+// per-task impulse arrays as the persisted row. Both leg shapes are derived
+// from the same `extractTaskImpulseIds` helper. These tests pin the helper
+// contract and the persistence/broadcast symmetry.
+// ============================================================================
+
+describe('extractTaskImpulseIds (shared helper)', () => {
+  test('snake_case canonical: returns the explicit arrays', () => {
+    const r = extractTaskImpulseIds({
+      input_impulse_ids: ['a', 'b'],
+      output_impulse_ids: ['c'],
+    });
+    expect(r.input_impulse_ids).toEqual(['a', 'b']);
+    expect(r.output_impulse_ids).toEqual(['c']);
+  });
+
+  test('camelCase fallback: applied when snake_case absent', () => {
+    const r = extractTaskImpulseIds({
+      inputImpulseIds: ['x'],
+      outputImpulseIds: ['y'],
+    });
+    expect(r.input_impulse_ids).toEqual(['x']);
+    expect(r.output_impulse_ids).toEqual(['y']);
+  });
+
+  test('inputState/outputState fallback: applied when neither snake nor camel present', () => {
+    const r = extractTaskImpulseIds({
+      inputState: { impulses: ['from-in'] },
+      outputState: { impulses: ['from-out'] },
+    });
+    expect(r.input_impulse_ids).toEqual(['from-in']);
+    expect(r.output_impulse_ids).toEqual(['from-out']);
+  });
+
+  test('snake_case wins over camelCase when both present', () => {
+    const r = extractTaskImpulseIds({
+      input_impulse_ids: ['snake'],
+      inputImpulseIds: ['camel'],
+      output_impulse_ids: ['snake-out'],
+      outputImpulseIds: ['camel-out'],
+    });
+    expect(r.input_impulse_ids).toEqual(['snake']);
+    expect(r.output_impulse_ids).toEqual(['snake-out']);
+  });
+
+  test('camelCase wins over inputState container when both present', () => {
+    const r = extractTaskImpulseIds({
+      inputImpulseIds: ['camel'],
+      inputState: { impulses: ['rich'] },
+    });
+    expect(r.input_impulse_ids).toEqual(['camel']);
+  });
+
+  test('empty/missing task object: returns empty arrays (never undefined)', () => {
+    expect(extractTaskImpulseIds(undefined)).toEqual({
+      input_impulse_ids: [],
+      output_impulse_ids: [],
+    });
+    expect(extractTaskImpulseIds(null)).toEqual({
+      input_impulse_ids: [],
+      output_impulse_ids: [],
+    });
+    expect(extractTaskImpulseIds({})).toEqual({
+      input_impulse_ids: [],
+      output_impulse_ids: [],
+    });
+  });
+
+  test('non-array fields are ignored, fallback continues', () => {
+    const r = extractTaskImpulseIds({
+      input_impulse_ids: 'not-an-array' as any,
+      inputImpulseIds: ['camel-fallback'],
+    });
+    expect(r.input_impulse_ids).toEqual(['camel-fallback']);
+  });
+});
+
+describe('broadcaster.task.completed payload symmetry', () => {
+  // The broadcaster builds payload data for each task; per-task impulse
+  // arrays must come from the same helper that drives persistence so the
+  // two legs (persist + broadcast) carry identical arrays for the same
+  // task. This test simulates the broadcaster's payload constructor and
+  // asserts the contract against the spec.
+  function buildTaskCompletedData(task: any, executionId: string, taskIndex: number) {
+    const taskId = task.id || task.taskId || `task-${taskIndex}`;
+    const taskSuccess = task.result?.status === 'success';
+    const { input_impulse_ids, output_impulse_ids } = extractTaskImpulseIds(task);
+    return {
+      execution_id: executionId,
+      task_id: taskId,
+      task_index: taskIndex,
+      success: taskSuccess,
+      duration_ms: task.duration || task.duration_ms || 0,
+      completed_at: new Date().toISOString(),
+      error: taskSuccess ? undefined : task.result?.error || task.error,
+      input_impulse_ids,
+      output_impulse_ids,
+    };
+  }
+
+  test('canonical snake_case task: impulse arrays ride on broadcast data', () => {
+    const task = {
+      task_id: 'task-x',
+      result: { status: 'success' },
+      duration_ms: 42,
+      input_impulse_ids: ['imp-in-1', 'imp-in-2'],
+      output_impulse_ids: ['imp-out-1'],
+    };
+    const data = buildTaskCompletedData(task, 'exec-1', 0);
+    expect(data.input_impulse_ids).toEqual(['imp-in-1', 'imp-in-2']);
+    expect(data.output_impulse_ids).toEqual(['imp-out-1']);
+    expect(data.success).toBe(true);
+  });
+
+  test('empty-arrays case: task with no impulse data emits explicit []', () => {
+    // The latent workbench bug: pre-fix the field could arrive undefined,
+    // throwing on `.length`. Spec contract: always emit arrays, even empty.
+    const task = {
+      task_id: 'task-empty',
+      result: { status: 'success' },
+    };
+    const data = buildTaskCompletedData(task, 'exec-1', 0);
+    expect(data.input_impulse_ids).toEqual([]);
+    expect(data.output_impulse_ids).toEqual([]);
+    // Critical: never undefined.
+    expect(data.input_impulse_ids).not.toBeUndefined();
+    expect(data.output_impulse_ids).not.toBeUndefined();
+  });
+
+  test('camelCase fallback: legacy minibob payloads still broadcast correctly', () => {
+    const task = {
+      taskId: 'task-camel',
+      result: { status: 'success' },
+      inputImpulseIds: ['cam-in-1'],
+      outputImpulseIds: ['cam-out-1'],
+    };
+    const data = buildTaskCompletedData(task, 'exec-1', 0);
+    expect(data.input_impulse_ids).toEqual(['cam-in-1']);
+    expect(data.output_impulse_ids).toEqual(['cam-out-1']);
+  });
+
+  test('inputState/outputState fallback rides through to broadcast', () => {
+    const task = {
+      task_id: 'task-rich',
+      result: { status: 'success' },
+      inputState: { impulses: ['rich-in-1'] },
+      outputState: { impulses: ['rich-out-1'] },
+    };
+    const data = buildTaskCompletedData(task, 'exec-1', 0);
+    expect(data.input_impulse_ids).toEqual(['rich-in-1']);
+    expect(data.output_impulse_ids).toEqual(['rich-out-1']);
+  });
+
+  test('persistence + broadcast leg symmetry: identical arrays for the same task', () => {
+    // Critical contract: a task fed through `normalizePersistedTask` (write
+    // leg) and through `extractTaskImpulseIds` (broadcast leg) must yield
+    // identical impulse-ID arrays. Drift here means cooccurrence learning
+    // and live observers see different views of the same task.
+    const task = {
+      task_id: 'task-sym',
+      result: { status: 'success' },
+      input_impulse_ids: ['imp-in-1', 'imp-in-2'],
+      output_impulse_ids: ['imp-out-1'],
+    };
+    const persisted = normalizePersistedTask(task);
+    const broadcastData = buildTaskCompletedData(task, 'exec-sym', 0);
+    expect(persisted.input_impulse_ids).toEqual(broadcastData.input_impulse_ids);
+    expect(persisted.output_impulse_ids).toEqual(broadcastData.output_impulse_ids);
+  });
+
+  test('failure case: broadcast carries error from task.result.error', () => {
+    const task = {
+      task_id: 'task-fail',
+      result: { status: 'failure', error: 'boom' },
+      input_impulse_ids: ['imp-in-1'],
+      output_impulse_ids: [],
+    };
+    const data = buildTaskCompletedData(task, 'exec-fail', 0);
+    expect(data.success).toBe(false);
+    expect(data.error).toBe('boom');
+    expect(data.input_impulse_ids).toEqual(['imp-in-1']);
+    expect(data.output_impulse_ids).toEqual([]);
   });
 });

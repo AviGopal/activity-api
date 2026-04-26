@@ -34,6 +34,44 @@ const app = new Hono();
  *
  * Exported for tests — see `execution-traces.test.ts`.
  */
+/**
+ * Extract per-task impulse-ID arrays from a minibob-emitted task object.
+ *
+ * Priority order (matches `serializeTasksForTrace` canonical wire shape):
+ *   1. snake_case `input_impulse_ids` / `output_impulse_ids` (canonical)
+ *   2. camelCase `inputImpulseIds` / `outputImpulseIds` (legacy minibob)
+ *   3. richer `inputState.impulses` / `outputState.impulses` containers
+ *      (improviser path, ExecutedTask shape)
+ *   4. `[]` (no source) — never undefined
+ *
+ * Used by both `normalizePersistedTask` (write/persist path) and the
+ * broadcaster's `task.completed` payload constructor so the persisted shape
+ * and the live broadcast carry identical impulse-ID arrays for the same
+ * task. Single source of truth for the priority order.
+ *
+ * Exported for tests — see `execution-traces.test.ts`.
+ */
+export function extractTaskImpulseIds(task: any): {
+  input_impulse_ids: string[];
+  output_impulse_ids: string[];
+} {
+  const input_impulse_ids: string[] = Array.isArray(task?.input_impulse_ids)
+    ? task.input_impulse_ids
+    : Array.isArray(task?.inputImpulseIds)
+      ? task.inputImpulseIds
+      : Array.isArray(task?.inputState?.impulses)
+        ? task.inputState.impulses
+        : [];
+  const output_impulse_ids: string[] = Array.isArray(task?.output_impulse_ids)
+    ? task.output_impulse_ids
+    : Array.isArray(task?.outputImpulseIds)
+      ? task.outputImpulseIds
+      : Array.isArray(task?.outputState?.impulses)
+        ? task.outputState.impulses
+        : [];
+  return { input_impulse_ids, output_impulse_ids };
+}
+
 export function normalizePersistedTask(task: any): {
   task_id: string;
   description?: string;
@@ -47,20 +85,8 @@ export function normalizePersistedTask(task: any): {
   success?: boolean;
   cost_usd?: number;
 } {
-  const inputImpulseIds = Array.isArray(task?.input_impulse_ids)
-    ? task.input_impulse_ids
-    : Array.isArray(task?.inputImpulseIds)
-      ? task.inputImpulseIds
-      : Array.isArray(task?.inputState?.impulses)
-        ? task.inputState.impulses
-        : [];
-  const outputImpulseIds = Array.isArray(task?.output_impulse_ids)
-    ? task.output_impulse_ids
-    : Array.isArray(task?.outputImpulseIds)
-      ? task.outputImpulseIds
-      : Array.isArray(task?.outputState?.impulses)
-        ? task.outputState.impulses
-        : [];
+  const { input_impulse_ids: inputImpulseIds, output_impulse_ids: outputImpulseIds } =
+    extractTaskImpulseIds(task);
 
   // Per-task resolver attribution (canonical six-field shape from minibob's
   // serializeTasksForTrace). The `tasks` column is FLEXIBLE so these can ride
@@ -1154,8 +1180,14 @@ app.post('/', async (c) => {
           }
         }
 
-        // Emit task.completed event
+        // Emit task.completed event. Per-task impulse arrays are derived
+        // from the same task object that `normalizePersistedTask` consumes
+        // (via the shared `extractTaskImpulseIds` helper) so the broadcast
+        // and persisted shape are perfectly symmetric. Always emit arrays
+        // (possibly empty) — never undefined — so consumers can
+        // unconditionally call .length / iterate.
         const taskSuccess = task.result?.status === 'success';
+        const { input_impulse_ids, output_impulse_ids } = extractTaskImpulseIds(task);
         broadcaster.emit({
           type: 'task.completed',
           timestamp: new Date().toISOString(),
@@ -1167,6 +1199,8 @@ app.post('/', async (c) => {
             duration_ms: task.duration || task.duration_ms || 0,
             completed_at: new Date().toISOString(),
             error: taskSuccess ? undefined : (task.result?.error || task.error),
+            input_impulse_ids,
+            output_impulse_ids,
           },
         });
       }
