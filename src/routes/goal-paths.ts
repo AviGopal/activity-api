@@ -29,6 +29,66 @@ import {
 const app = new Hono();
 
 /**
+ * Accumulate (and deduplicate) the terminal output shapes produced by
+ * executing the activities in `pathActivities`, in path order.
+ *
+ * Joins `activity` records via the supplied ids and unions their
+ * `output_shapes` arrays. Used at write-time on `goal_execution_paths` to
+ * populate the denormalised `endpoint_output_shapes` field (migration 092),
+ * and at read-time as the fallback when the field is missing.
+ *
+ * Behaviour mirrors the previous in-line accumulation that lived inside
+ * `predictEndpointState` — empty input returns `[]`, missing rows are
+ * skipped, and duplicates are collapsed via Set.
+ */
+export async function accumulateEndpointShapes(
+  pathActivities: string[]
+): Promise<string[]> {
+  if (pathActivities.length === 0) {
+    return [];
+  }
+
+  try {
+    const activitiesQuery = `
+      SELECT id, output_shapes FROM activity
+      WHERE id INSIDE $activity_ids
+    `;
+
+    const activitiesResult = await surrealDB.query(
+      activitiesQuery,
+      { activity_ids: pathActivities }
+    );
+
+    if (!activitiesResult || activitiesResult.length === 0) {
+      return [];
+    }
+
+    // Flatten the result (SurrealDB returns nested arrays).
+    const rawActivities = activitiesResult[0];
+    const activities: Array<{ id: string; output_shapes: string[] }> = Array.isArray(rawActivities)
+      ? rawActivities
+      : [];
+
+    const shapeSet = new Set<string>();
+    const activityMap = new Map<string, { id: string; output_shapes: string[] }>(
+      activities.map(a => [a.id, a])
+    );
+
+    for (const activityId of pathActivities) {
+      const activity = activityMap.get(activityId);
+      if (activity?.output_shapes) {
+        activity.output_shapes.forEach((shape: string) => shapeSet.add(shape));
+      }
+    }
+
+    return Array.from(shapeSet);
+  } catch (error) {
+    logger.warn('Failed to accumulate endpoint shapes', { error });
+    return [];
+  }
+}
+
+/**
  * Normalize goal text for consistent hashing
  */
 function normalizeGoal(goal: string): string {
@@ -106,57 +166,33 @@ function calculateConfidenceInterval(
 }
 
 /**
- * Predict endpoint state after executing a path
- * Fetches output_shapes from each activity in the path and computes accumulated shapes
+ * Predict endpoint state after executing a path.
+ *
+ * Reads the denormalised `endpoint_output_shapes` (when supplied via
+ * `precomputedShapes` — i.e. the path row already has it) and falls back to
+ * on-the-fly accumulation via {@link accumulateEndpointShapes} for legacy
+ * rows whose field was never backfilled.
  */
 async function predictEndpointState(
   pathActivities: string[],
-  goalText?: string
+  goalText?: string,
+  precomputedShapes?: string[] | null
 ): Promise<{
   expected_shapes: string[];
   missing_shapes?: string[];
   goal_completion?: number;
 }> {
   try {
-    // Fetch all activities to get their output_shapes
-    if (pathActivities.length === 0) {
+    if (pathActivities.length === 0 && (!precomputedShapes || precomputedShapes.length === 0)) {
       return { expected_shapes: [] };
     }
 
-    const activitiesQuery = `
-      SELECT id, output_shapes FROM activity
-      WHERE id INSIDE $activity_ids
-    `;
+    // Prefer the denormalised field when present; otherwise accumulate live.
+    const expected_shapes = precomputedShapes && precomputedShapes.length > 0
+      ? Array.from(new Set(precomputedShapes))
+      : await accumulateEndpointShapes(pathActivities);
 
-    const activitiesResult = await surrealDB.query(
-      activitiesQuery,
-      { activity_ids: pathActivities }
-    );
-
-    if (!activitiesResult || activitiesResult.length === 0) {
-      return { expected_shapes: [] };
-    }
-
-    // Flatten the result (SurrealDB returns nested arrays)
-    const rawActivities = activitiesResult[0];
-    const activities: Array<{ id: string; output_shapes: string[] }> = Array.isArray(rawActivities)
-      ? rawActivities
-      : [];
-
-    // Accumulate all output shapes across the path
-    const shapeSet = new Set<string>();
-    const activityMap = new Map<string, { id: string; output_shapes: string[] }>(
-      activities.map(a => [a.id, a])
-    );
-
-    for (const activityId of pathActivities) {
-      const activity = activityMap.get(activityId);
-      if (activity?.output_shapes) {
-        activity.output_shapes.forEach((shape: string) => shapeSet.add(shape));
-      }
-    }
-
-    const expected_shapes = Array.from(shapeSet);
+    const shapeSet = new Set<string>(expected_shapes);
 
     // If goal text provided, infer expected shapes and compute completion
     if (goalText) {
@@ -228,14 +264,22 @@ app.post('/', async (c) => {
     
     const goalHash = hashGoal(validated.goal_text);
     const pathSignature = hashPath(validated.path_activities);
-    
+
+    // Denormalise terminal output shapes so shape-keyed lookup
+    // (`WHERE endpoint_output_shapes CONTAINS $shape`) doesn't need the
+    // join at read-time. Failure to accumulate is non-fatal: the helper
+    // returns [] on error, the field is nullable, and the read-time
+    // fallback in predictEndpointState recomputes for legacy rows.
+    const endpointOutputShapes = await accumulateEndpointShapes(validated.path_activities);
+
     logger.info('Recording goal path', {
       goal: validated.goal_text,
       goal_hash: goalHash,
       path: validated.path_activities,
       success: validated.success,
+      endpoint_output_shapes: endpointOutputShapes,
     });
-    
+
     // Check if this goal+path combination exists
     const checkQuery = `
       SELECT * FROM goal_execution_paths
@@ -294,13 +338,14 @@ app.post('/', async (c) => {
           avg_duration_ms = $avg_duration_ms,
           avg_cost_usd = $avg_cost_usd,
           avg_token_usage = $avg_token_usage,
+          endpoint_output_shapes = $endpoint_output_shapes,
           last_executed_at = time::now(),
           updated_at = time::now()
         WHERE goal_hash = $goal_hash
           AND path_signature = $path_signature
         RETURN AFTER
       `;
-      
+
       const updated = await surrealDB.query<GoalExecutionPath[]>(updateQuery, {
         goal_hash: goalHash,
         path_signature: pathSignature,
@@ -313,6 +358,7 @@ app.post('/', async (c) => {
         avg_duration_ms: newAvgDuration,
         avg_cost_usd: newAvgCost,
         avg_token_usage: newAvgTokens,
+        endpoint_output_shapes: endpointOutputShapes,
       });
       
       // @ts-ignore - SurrealDB query typing
@@ -338,6 +384,7 @@ app.post('/', async (c) => {
           goal_category: $goal_category,
           path_activities: $path_activities,
           path_signature: $path_signature,
+          endpoint_output_shapes: $endpoint_output_shapes,
           total_executions: 1,
           successful_executions: $successful_executions,
           failed_executions: $failed_executions,
@@ -354,13 +401,14 @@ app.post('/', async (c) => {
           updated_at: time::now()
         }
       `;
-      
+
       const created = await surrealDB.query<GoalExecutionPath[]>(createQuery, {
         goal_hash: goalHash,
         goal_text: validated.goal_text,
         goal_category: validated.goal_category,
         path_activities: validated.path_activities,
         path_signature: pathSignature,
+        endpoint_output_shapes: endpointOutputShapes,
         successful_executions: validated.success ? 1 : 0,
         failed_executions: validated.success ? 0 : 1,
         thompson_alpha: thompsonAlpha,
@@ -379,6 +427,7 @@ app.post('/', async (c) => {
         goal_text: validated.goal_text,
         goal_category: validated.goal_category,
         path_activities: validated.path_activities,
+        endpoint_output_shapes: endpointOutputShapes,
         path_signature: pathSignature,
         total_executions: 1,
         successful_executions: validated.success ? 1 : 0,
@@ -440,13 +489,21 @@ app.get('/', async (c) => {
       limit: query.limit ? parseInt(query.limit) : undefined,
       offset: query.offset ? parseInt(query.offset) : undefined,
     });
-    
+
+    // Optional shape filter — parsed alongside the schema-validated fields so
+    // we don't have to extend PathQuerySchema in models/schemas.ts. A single
+    // shape only for now; multi-shape filtering can come later.
+    const endpointOutputShape: string | undefined =
+      typeof query.endpoint_output_shape === 'string' && query.endpoint_output_shape.length > 0
+        ? query.endpoint_output_shape
+        : undefined;
+
     let whereClause = '';
     const params: Record<string, any> = {
       limit: validated.limit,
       offset: validated.offset,
     };
-    
+
     if (validated.goal_hash) {
       whereClause = 'WHERE goal_hash = $goal_hash';
       params.goal_hash = validated.goal_hash;
@@ -458,11 +515,17 @@ app.get('/', async (c) => {
       whereClause = 'WHERE goal_category = $goal_category';
       params.goal_category = validated.goal_category;
     }
-    
+
     if (validated.min_executions > 1) {
       whereClause += whereClause ? ' AND ' : 'WHERE ';
       whereClause += 'total_executions >= $min_executions';
       params.min_executions = validated.min_executions;
+    }
+
+    if (endpointOutputShape) {
+      whereClause += whereClause ? ' AND ' : 'WHERE ';
+      whereClause += 'endpoint_output_shapes CONTAINS $endpoint_output_shape';
+      params.endpoint_output_shape = endpointOutputShape;
     }
     
     const selectQuery = `
@@ -519,24 +582,40 @@ app.post('/recommend', async (c) => {
   try {
     const body = await c.req.json();
     const validated = PathRecommendationRequestSchema.parse(body);
-    
+
+    // Optional shape filter — applied as a hard constraint on the candidate
+    // set BEFORE Thompson Sampling so we never recommend a path whose
+    // terminal state can't produce the requested shape. Parsed alongside the
+    // schema-validated body so we don't have to extend
+    // PathRecommendationRequestSchema in models/schemas.ts.
+    const endpointOutputShape: string | undefined =
+      typeof body?.endpoint_output_shape === 'string' && body.endpoint_output_shape.length > 0
+        ? body.endpoint_output_shape
+        : undefined;
+
     const goalHash = hashGoal(validated.goal_text);
-    
+
     logger.info('Recommending path for goal', {
       goal: validated.goal_text,
       goal_hash: goalHash,
       exploration_rate: validated.exploration_rate,
+      endpoint_output_shape: endpointOutputShape,
     });
-    
+
     // Get all paths for this goal
     let whereClause = 'WHERE goal_hash = $goal_hash';
     const params: Record<string, any> = { goal_hash: goalHash };
-    
+
     if (validated.goal_category) {
       whereClause += ' AND goal_category = $goal_category';
       params.goal_category = validated.goal_category;
     }
-    
+
+    if (endpointOutputShape) {
+      whereClause += ' AND endpoint_output_shapes CONTAINS $endpoint_output_shape';
+      params.endpoint_output_shape = endpointOutputShape;
+    }
+
     const selectQuery = `
       SELECT * FROM goal_execution_paths
       ${whereClause}
@@ -584,8 +663,13 @@ app.post('/recommend', async (c) => {
           const beta = p.thompson_beta || 1;
 
           const confidenceInterval = calculateConfidenceInterval(successExec, totalExec, 0.95);
-          // @ts-ignore
-          const endpointPrediction = await predictEndpointState(p.path_activities, validated.goal_text);
+          const endpointPrediction = await predictEndpointState(
+            // @ts-ignore
+            p.path_activities,
+            validated.goal_text,
+            // @ts-ignore - prefer denormalised shapes when present (post-backfill)
+            p.endpoint_output_shapes,
+          );
 
           return {
             // @ts-ignore
@@ -630,8 +714,13 @@ app.post('/recommend', async (c) => {
           const beta = s.path.thompson_beta || 1;
 
           const confidenceInterval = calculateConfidenceInterval(successExec, totalExec, 0.95);
-          // @ts-ignore
-          const endpointPrediction = await predictEndpointState(s.path.path_activities, validated.goal_text);
+          const endpointPrediction = await predictEndpointState(
+            // @ts-ignore
+            s.path.path_activities,
+            validated.goal_text,
+            // @ts-ignore - prefer denormalised shapes when present (post-backfill)
+            s.path.endpoint_output_shapes,
+          );
 
           return {
             // @ts-ignore
