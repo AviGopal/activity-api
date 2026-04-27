@@ -482,7 +482,58 @@ app.get('/', async (c) => {
       rbacEnforced: useJwtAuth,
     });
 
-    const total = countResult?.[0]?.total || 0;
+    let total = countResult?.[0]?.total || 0;
+
+    // L-4: When parent_execution_id is provided and activity_execution_traces returns
+    // nothing, fall back to the paradigm execution table. Leaf activities dispatched
+    // by slot-binding / validator-dispatch carry exec_ IDs and are dual-written to
+    // this table, not to activity_execution_traces.
+    if (parentExecutionId && (executions?.length ?? 0) === 0) {
+      try {
+        const bareId = params.parent_execution_id as string;
+        const paradigmQuery = `
+          SELECT * FROM execution
+          WHERE (
+            parent_execution_id = $pid
+            OR parent_execution_id = $pid_prefixed
+            OR parent_execution_id = $pid_exec_prefixed
+          )
+          ORDER BY executed_at ASC
+          LIMIT $limit
+        `;
+        const paradigmRows = await surrealDB.query<any>(paradigmQuery, {
+          pid: bareId,
+          pid_prefixed: `activity_execution_traces:${bareId}`,
+          pid_exec_prefixed: `execution:${bareId}`,
+          limit,
+        });
+        if (paradigmRows && paradigmRows.length > 0) {
+          logger.info('[L-4] Parent ID found in paradigm execution table', {
+            count: paradigmRows.length,
+            parentExecutionId,
+          });
+          executions = paradigmRows.map((row: any) => {
+            const rowId = typeof row.id === 'string'
+              ? row.id.includes(':') ? row.id.split(':').pop()! : row.id
+              : String(row.id ?? '');
+            return {
+              ...row,
+              execution_id: row.execution_id || rowId,
+              activity_name: row.activity_id || 'Unknown Activity',
+              created_at: row.created_at || row.executed_at || new Date().toISOString(),
+              error_message: row.error?.message ?? row.error_message,
+              tasks: row.trace?.tasks ?? row.tasks ?? [],
+            } as ExecutionTrace;
+          });
+          total = paradigmRows.length;
+        }
+      } catch (paradigmError) {
+        logger.warn('[L-4] Paradigm execution fallback query failed', {
+          error: paradigmError instanceof Error ? paradigmError.message : String(paradigmError),
+          parentExecutionId,
+        });
+      }
+    }
 
     logger.info('Execution traces fetched', {
       count: executions?.length || 0,
