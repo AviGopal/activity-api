@@ -85,11 +85,19 @@ async function delegateWriteToRouter(
  * on the key being admin-scoped — PERMISSIONS are bypassed because API keys
  * use self-signed JWTs SurrealDB can't validate against its ACCESS methods.
  *
+ * "Authenticated" here means *some* JwtAuthContext was set by the middleware
+ * (API key, JWT, or MiniBob token). We deliberately do NOT require
+ * `jwtToken` to be non-empty — for API-key auth, generateJwtToken can fail
+ * silently when the canary JWT_SECRET is misaligned (see
+ * `repos/metabob-activity-api/CLAUDE.md` §"JWT Secret"), but the API-key
+ * org_id has already been validated by identity-vessel and is usable for
+ * org-scoped reads via the executeAsAuth root-credentials fallback.
+ *
  * Returns null if the caller should proceed, or {status, error} to emit.
  */
 function requireAuthenticated(c: any): { status: 401; error: string } | null {
   const jwtAuth = getJwtAuthFromContext(c);
-  if (!jwtAuth?.jwtToken) {
+  if (!jwtAuth) {
     return { status: 401, error: 'Authentication required for destructive operations' };
   }
   return null;
