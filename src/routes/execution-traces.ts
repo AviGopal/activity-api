@@ -409,6 +409,14 @@ app.get('/', async (c) => {
       params.end_date = endDate;
     }
 
+    // Filter by parent_execution_id — returns only direct child executions of the given parent.
+    // See impulse-activity-loop design.md §L-1: required for NestedTrajectoryNode inline expansion.
+    const parentExecutionId = c.req.query('parent_execution_id');
+    if (parentExecutionId) {
+      whereConditions.push('parent_execution_id = $parent_execution_id');
+      params.parent_execution_id = parentExecutionId;
+    }
+
     const whereClause = whereConditions.length > 0
       ? `WHERE ${whereConditions.join(' AND ')}`
       : '';
