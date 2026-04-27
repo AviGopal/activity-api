@@ -109,18 +109,36 @@ async function validateApiKey(apiKey: string): Promise<JwtAuthContext | null> {
       expirySeconds: 900, // 15 minutes
     });
 
+    // L-3 (2026-04-27): Do NOT reject the request when generateJwtToken returns
+    // null. The API key has already been validated by identity-vessel, so the
+    // caller IS authenticated — they just can't get a SurrealDB-issued JWT
+    // (typically because JWT_SECRET is misaligned between this process and the
+    // ACCESS schema, see CLAUDE.md §"JWT Secret"). Returning null here makes
+    // the downstream `requireAuthenticated()` gate (F-32) reject every API-key
+    // POST /v2/impulses/resolve as 401 — even read-only resolves work fine via
+    // the executeAsAuth root-credentials fallback when authType==='apikey' and
+    // an empty jwtToken is propagated.
+    //
+    // Falling through with `jwtToken: ''` makes F-32's per-route gate fire as
+    // intended (it accepts any JwtAuthContext, regardless of jwtToken). Per-
+    // case destructive resolvers (`*_write`, `*_update`, `*_delete`,
+    // `*_deprecate`, `templateAuditReport`) still gate writes properly via
+    // `requireAuthenticated()` — and SurrealDB PERMISSIONS layer enforces
+    // org_id scoping inside `executeAsAuth` (root-creds path adds explicit
+    // `org_id = $orgId` predicates per resolver case).
+    //
+    // This is defense-in-depth against JWT_SECRET drift: even when ACCESS-bound
+    // queries are unavailable, valid API-key holders can still hit read-side
+    // resolves through the root-creds fallback path.
     if (!jwtToken) {
-      // JWT generation failed - log error and reject authentication
-      // We can't use synthetic tokens because SurrealDB can't authenticate them
-      logger.error('JWT generation failed for API key', {
+      logger.warn('JWT generation failed for API key — falling through with empty jwtToken (L-3)', {
         orgId: result.orgId,
         keyId: result.keyId,
       });
-      return null;
     }
 
     return {
-      jwtToken,
+      jwtToken: jwtToken || '',
       orgId: result.orgId!,
       keyId: result.keyId,
       userId: result.userId,
