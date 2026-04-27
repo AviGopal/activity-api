@@ -196,3 +196,214 @@ describe('F-NN-D: activityTemplatesByMetrics merges RecordId variant_id correctl
     expect(md).toContain('| 7 |');
   });
 });
+
+// ============================================================================
+// F-NN-D hot-fix regression — polymorphic variant_id (string + RecordId mix)
+// ============================================================================
+// Symptom (canary post-caa86b5): hard 500 on
+//   POST /v2/impulses/resolve { pointer: { type: "activityTemplatesByMetrics" } }
+// because caa86b5 used `meta::id(variant_id) IN $variant_ids`
+// unconditionally. `meta::id()` rejects string arguments with
+//   "Incorrect arguments for function meta::id(). Argument 1 was the wrong
+//    type. Expected record but found '<id>'"
+// `activity_template` is queried polymorphically: schemafull table has
+// `variant_id TYPE string`, paradigm view aliases `id AS variant_id`
+// (RecordId). On canary, both row shapes can coexist depending on which
+// migrations have been applied.
+//
+// Fix (this commit): polymorphic SQL WHERE clause using
+// `type::is::record(variant_id)` / `type::is::string(variant_id)` to gate
+// `meta::id()` so it only runs against record-form values. Plain-string
+// variant_id is matched directly. Both branches feed the same
+// `$variant_ids` (already in bare-name form on the JS side).
+// ============================================================================
+
+describe('F-NN-D hot-fix: activityTemplatesByMetrics handles mixed string + RecordId variant_id', () => {
+  test('merges template details when activity_template returns MIXED string and RecordId variant_ids', async () => {
+    // Reset module cache so we can re-mock with a different templateRows
+    // shape than the top-level mock used above. We rebuild the surreal
+    // mock with mixed-shape rows that simulate the polymorphic canary
+    // state (one row from schemafull table → string variant_id; one row
+    // from paradigm view → RecordId variant_id).
+    const mixedMetrics = [
+      {
+        variant_id: 'hello-world-minimal',
+        total_executions: 619,
+        success_rate: 1.0,
+        avg_duration_ms: 506084,
+        avg_cost_usd: null,
+      },
+      {
+        variant_id: 'execute-shell-command',
+        total_executions: 7,
+        success_rate: 1.0,
+        avg_duration_ms: 52826,
+        avg_cost_usd: 0.2149,
+      },
+    ];
+
+    const mixedTemplateRows = [
+      // Schemafull-table row: variant_id is plain string
+      {
+        variant_id: 'hello-world-minimal',
+        variant_name: 'Hello World Minimal',
+        description: 'A minimal hello-world template',
+        category: 'infrastructure',
+        task_steps: [],
+      },
+      // Paradigm-view row: variant_id is RecordId object
+      {
+        variant_id: recordId('execute-shell-command'),
+        variant_name: 'Execute Shell Command',
+        description: 'Run a shell command',
+        category: 'tool',
+        task_steps: [],
+      },
+    ];
+
+    // Re-mock surreal with mixed-shape rows. The mock.module call
+    // overrides the previous module mock for this test scope.
+    mock.module('../db/surreal', () => ({
+      surrealDB: {
+        query: mock(async (sql: string) => {
+          if (sql.includes('variant_performance_metrics')) {
+            return mixedMetrics;
+          }
+          if (sql.includes('activity_template')) {
+            return mixedTemplateRows;
+          }
+          return [];
+        }),
+      },
+      queryWithAuth: async () => [],
+      createAuthenticatedClient: async () => ({}),
+    }));
+
+    // Re-import the router so it picks up the new mock.
+    const freshRouter = (await import('./impulses')).default;
+    const app = new Hono();
+    app.use('*', async (c, next) => {
+      c.set('jwtAuth', {
+        orgId: 'test-org',
+        authType: 'apikey',
+        jwtToken: 'stub-jwt',
+        keyId: 'test-key',
+        scopes: ['read'],
+      });
+      await next();
+    });
+    app.route('/v2/impulses', freshRouter);
+
+    const res = await app.request('/v2/impulses/resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        pointer: { type: 'activityTemplatesByMetrics', limit: 2 },
+        budget: 2000,
+        priority: 'medium',
+      }),
+    });
+    const body = await res.json();
+    const md: string = body.content;
+
+    // No 500 — handler runs to completion despite mixed variant_id shapes.
+    expect(res.status).toBe(200);
+    expect(body.success).toBe(true);
+
+    // Both rows merge — name surfaces in markdown for the schemafull
+    // (string) AND view (RecordId) variant_id rows. This is the actual
+    // regression from the post-caa86b5 hard-500 case.
+    expect(md).toContain('Hello World Minimal');
+    expect(md).toContain('Execute Shell Command');
+
+    // Bare-form ID rendered for both, regardless of source shape.
+    expect(md).toContain('**ID**: `hello-world-minimal`');
+    expect(md).toContain('**ID**: `execute-shell-command`');
+
+    // No "undefined" leak from a failed merge.
+    expect(md).not.toMatch(/\| undefined \|/);
+    expect(md).not.toContain('**ID**: `undefined`');
+    expect(md).not.toContain('**Category**: undefined');
+
+    // Metrics data preserved.
+    expect(md).toContain('| 619 |');
+    expect(md).toContain('| 7 |');
+  });
+
+  test('SQL WHERE clause uses polymorphic comparison (gates meta::id behind type::is::record)', async () => {
+    // Capture the SQL emitted for the activity_template query and
+    // assert it carries the polymorphic guard. Without the guard,
+    // `meta::id(variant_id)` runs against schemafull string rows and
+    // throws — that's the canary 500 we're hot-fixing.
+    let capturedTemplateSql = '';
+
+    mock.module('../db/surreal', () => ({
+      surrealDB: {
+        query: mock(async (sql: string) => {
+          if (sql.includes('variant_performance_metrics')) {
+            return [
+              {
+                variant_id: 'hello-world-minimal',
+                total_executions: 619,
+                success_rate: 1.0,
+                avg_duration_ms: 506084,
+                avg_cost_usd: null,
+              },
+            ];
+          }
+          if (sql.includes('activity_template')) {
+            capturedTemplateSql = sql;
+            return [
+              {
+                variant_id: 'hello-world-minimal',
+                variant_name: 'Hello World Minimal',
+                description: 'desc',
+                category: 'infrastructure',
+                task_steps: [],
+              },
+            ];
+          }
+          return [];
+        }),
+      },
+      queryWithAuth: async () => [],
+      createAuthenticatedClient: async () => ({}),
+    }));
+
+    const freshRouter = (await import('./impulses')).default;
+    const app = new Hono();
+    app.use('*', async (c, next) => {
+      c.set('jwtAuth', {
+        orgId: 'test-org',
+        authType: 'apikey',
+        jwtToken: 'stub-jwt',
+        keyId: 'test-key',
+        scopes: ['read'],
+      });
+      await next();
+    });
+    app.route('/v2/impulses', freshRouter);
+
+    await app.request('/v2/impulses/resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        pointer: { type: 'activityTemplatesByMetrics', limit: 1 },
+        budget: 2000,
+        priority: 'medium',
+      }),
+    });
+
+    // Polymorphic guards present.
+    expect(capturedTemplateSql).toContain('type::is::record(variant_id)');
+    expect(capturedTemplateSql).toContain('type::is::string(variant_id)');
+    // `meta::id` only runs after the record-type guard.
+    expect(capturedTemplateSql).toMatch(
+      /type::is::record\(variant_id\)\s+AND\s+meta::id\(variant_id\)\s+IN\s+\$variant_ids/
+    );
+    // Plain string equality branch present for the schemafull case.
+    expect(capturedTemplateSql).toMatch(
+      /type::is::string\(variant_id\)\s+AND\s+variant_id\s+IN\s+\$variant_ids/
+    );
+  });
+});

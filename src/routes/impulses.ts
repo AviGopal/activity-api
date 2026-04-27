@@ -1203,14 +1203,26 @@ router.post('/resolve', async (c) => {
         } else {
           // Fetch template details for the top performers.
           //
-          // F-NN-D (2026-04-27): the `activity_template` view aliases
-          // `id AS variant_id`, so SurrealDB returns `t.variant_id` as a
-          // RecordId object that stringifies to `activity:⟨name⟩`. Meanwhile
-          // `variant_performance_metrics.variant_id` is a plain `string` (the
-          // unprefixed activity id). The previous strict-equality merge
-          // (`t.variant_id === m.variant_id`) always failed, leaving every
-          // template field undefined in the rendered markdown. Compute a
-          // normalized lookup key on both sides so the merge actually fires.
+          // F-NN-D (2026-04-27): `activity_template` is queried polymorphically
+          // on canary — depending on which schema migrations have been applied,
+          // `variant_id` may be a plain `string` (schemafull table at
+          // `sql/001-init-schema.surql:46`) OR a SurrealDB `RecordId` object
+          // (paradigm view `v_paradigm_activity_template` at
+          // `sql/migrations/069-paradigm-compat-views.surql:23-46`, which
+          // aliases `id AS variant_id`).
+          //
+          // Hot-fix (caa86b5 follow-up): the prior fix used
+          // `meta::id(variant_id) IN $variant_ids` unconditionally, which
+          // throws `Incorrect arguments for function meta::id(). Argument 1
+          // was the wrong type. Expected record but found '<id>'` whenever a
+          // schemafull row (string variant_id) is returned, producing a hard
+          // 500 on canary.
+          //
+          // Polymorphic comparison: gate `meta::id()` behind
+          // `type::is::record(variant_id)` and use a plain string match for
+          // the schemafull form. Both branches feed the same `$variant_ids`
+          // (already in bare-name form). SurrealDB short-circuits boolean
+          // expressions, so `meta::id` only runs when the value is a record.
           const stripActivityPrefix = (id: unknown): string =>
             normalizeRecordId(id).replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
 
@@ -1218,7 +1230,10 @@ router.post('/resolve', async (c) => {
           const templateQuery = `
             SELECT variant_id, variant_name, description, category, task_steps
             FROM activity_template
-            WHERE meta::id(variant_id) IN $variant_ids
+            WHERE (
+              (type::is::record(variant_id) AND meta::id(variant_id) IN $variant_ids)
+              OR (type::is::string(variant_id) AND variant_id IN $variant_ids)
+            )
             AND (org_id = $orgId OR scope = 'global' OR org_id IS NONE)
           `;
           const templateDetails = await executeAsAuth<any>(jwtAuthCtx, templateQuery, {
