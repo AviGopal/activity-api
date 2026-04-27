@@ -939,6 +939,73 @@ export async function denormalizeCompositionChain(
 }
 
 /**
+ * Backfill `composition_chain` on already-inserted children of a just-inserted
+ * trace. Closes the write-order race in F-37.
+ *
+ * F-40 (2026-04-26): F-37 computes the chain at insert time by reading the
+ * parent. That works for L3 template runs but breaks for minibob's L1/L2
+ * synthetic meta-traces (`emitMetaTrace` for `_goal_resolve` /
+ * `_activity_execute`) which insert AFTER their children — the meta-trace
+ * wraps the entire goal flow and emits at the end. F-37's parent-lookup at
+ * child-insert time finds nothing, the child lands with empty chain, and
+ * Phase 8 chain-depth audits stay blind.
+ *
+ * Strategy: after a successful insert, run a single best-effort UPDATE that
+ * sets `composition_chain` on every existing row whose `parent_execution_id`
+ * matches the inserted row's `execution_id` AND whose chain is currently
+ * empty/none. The new chain is `[...inserted.composition_chain, inserted.execution_id]`,
+ * which collapses to `[inserted.execution_id]` for root-level inserts.
+ *
+ * Idempotent: the WHERE clause excludes children that already have a
+ * non-empty chain, so a duplicate insert is a no-op for backfill purposes.
+ *
+ * Best-effort: we swallow errors and log. Losing the backfill on a transient
+ * DB error is acceptable; failing the insert that already succeeded is not.
+ *
+ * Scope: this only walks one level (direct children). We deliberately do NOT
+ * recursively walk grandchildren — see comment in the route handler. In
+ * practice traces arrive in approximately top-down or bottom-up order; the
+ * insert-time helper handles top-down, and this backfill handles bottom-up.
+ * Mixed/interleaved orders are rare enough that one-shot migration is the
+ * right tool, not an O(depth²) recursive walk on every insert.
+ *
+ * Exported for tests.
+ */
+export async function backfillChildCompositionChains(
+  insertedExecutionId: string,
+  insertedCompositionChain: string[],
+): Promise<void> {
+  if (!insertedExecutionId || typeof insertedExecutionId !== 'string') return;
+  // newChain = parent's chain + parent's own id (root-first ordering, matches
+  // migration 081 + minibob composition-chain.ts contract).
+  const newChain: string[] = [...insertedCompositionChain, insertedExecutionId];
+  try {
+    // Single statement. SurrealQL handles the row scan; no app-side loop.
+    // The `composition_chain IS NONE OR array::len(composition_chain) = 0`
+    // clause is the idempotency guard — we never overwrite a populated
+    // chain (those children already had a parent at their insert time and
+    // the F-37 helper resolved them correctly).
+    await surrealDB.query(
+      `
+        UPDATE activity_execution_traces
+        SET composition_chain = $new_chain
+        WHERE parent_execution_id = $parent_execution_id
+          AND (composition_chain IS NONE OR array::len(composition_chain) = 0)
+      `,
+      {
+        parent_execution_id: insertedExecutionId,
+        new_chain: newChain,
+      },
+    );
+  } catch (err) {
+    logger.warn('[F-40] Failed to backfill child composition_chains — leaving empty', {
+      inserted_execution_id: insertedExecutionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
  * POST /v2/activities/execution-traces
  *
  * Store execution trace for future reference (debugging, ribosome, impulses)
@@ -1242,6 +1309,15 @@ app.post('/', async (c) => {
       task_count: body.execution_trace?.tasks?.length || 0,
       db_result: result[0],
     });
+
+    // F-40 (2026-04-26): backfill composition_chain on any already-inserted
+    // children of this trace. Handles minibob's L1/L2 meta-trace write-order
+    // race where children land before parent. Single best-effort UPDATE — we
+    // never fail the just-succeeded insert on a backfill error.
+    await backfillChildCompositionChains(
+      trace.execution_id,
+      resolvedCompositionChain,
+    );
 
     // Emit fine-grained WebSocket events for real-time execution visualization
     if (body.execution_trace?.tasks && Array.isArray(body.execution_trace.tasks)) {

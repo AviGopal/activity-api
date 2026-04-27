@@ -19,6 +19,7 @@ import {
   normalizePersistedTask,
   extractTaskImpulseIds,
   denormalizeCompositionChain,
+  backfillChildCompositionChains,
 } from './execution-traces';
 import { _internals as readInternals } from './execution-trace-with-signatures';
 import { surrealDB } from '../db/surreal';
@@ -717,5 +718,148 @@ describe('denormalizeCompositionChain (F-37 server-side denormalization)', () =>
         computedChain: ['root', 'parent'],
       }),
     ).toEqual(['root', 'parent']);
+  });
+});
+
+// ============================================================================
+// F-40 (2026-04-26): backfillChildCompositionChains — write-order race fix
+// ----------------------------------------------------------------------------
+// F-37 computes composition_chain at child-insert time by reading the parent.
+// minibob's L1/L2 meta-traces (`emitMetaTrace` for `_goal_resolve` /
+// `_activity_execute`) wrap an entire goal flow and emit AFTER their
+// children, so the F-37 lookup finds nothing. F-40 closes the race: after a
+// successful insert, run a best-effort UPDATE on already-inserted children
+// whose chain is still empty. These tests are a behavioural simulation of
+// the round-trip: child inserts first (chain stays []), then parent inserts
+// and the backfill rewrites the child's chain.
+//
+// The helper itself is one SurrealQL UPDATE; we mock surrealDB.query and
+// assert (a) the call shape and (b) the post-conditions a real DB would
+// produce. We also pin best-effort failure semantics: a thrown UPDATE must
+// not propagate.
+// ============================================================================
+
+describe('backfillChildCompositionChains (F-40 write-order race)', () => {
+  let queryMock: ReturnType<typeof spyOn> | null = null;
+
+  afterEach(() => {
+    if (queryMock) {
+      queryMock.mockRestore();
+      queryMock = null;
+    }
+  });
+
+  test('late parent: child inserted first lands with [], parent insert backfills to [parent.id]', async () => {
+    // Round-trip simulation. Step 1: child inserts before parent → F-37
+    // helper finds no parent and returns []. Step 2: parent inserts → F-40
+    // backfill runs an UPDATE that sets the child's chain to
+    // [...parent.chain, parent.id]. Parent itself is a root, so its chain
+    // is [] → child's new chain is [parent.id].
+
+    // Step 1: child-insert path. F-37 helper finds nothing for missing
+    // parent and returns []. (This piece is already covered upstream; we
+    // pin it here to lock the round-trip.)
+    queryMock = spyOn(surrealDB, 'query').mockResolvedValueOnce([] as any);
+    const childInitialChain = await denormalizeCompositionChain('parent-id');
+    expect(childInitialChain).toEqual([]);
+    queryMock.mockRestore();
+
+    // Step 2: parent-insert path. F-40 backfill runs. We capture the
+    // arguments and assert the parameter shape — that's all a real DB
+    // would need to produce the right post-condition.
+    const updateMock = spyOn(surrealDB, 'query').mockResolvedValueOnce(
+      [] as any,
+    );
+    queryMock = updateMock;
+
+    await backfillChildCompositionChains('parent-id', []);
+
+    expect(updateMock).toHaveBeenCalledTimes(1);
+    const [sql, params] = updateMock.mock.calls[0] as [string, any];
+    expect(sql).toMatch(/UPDATE\s+activity_execution_traces/i);
+    expect(sql).toMatch(/parent_execution_id\s*=\s*\$parent_execution_id/i);
+    // Idempotency guard: only update children with empty/none chain.
+    expect(sql).toMatch(/composition_chain IS NONE/i);
+    expect(sql).toMatch(/array::len\(composition_chain\)\s*=\s*0/i);
+    expect(params).toEqual({
+      parent_execution_id: 'parent-id',
+      // Root parent → child chain = [parent.id]
+      new_chain: ['parent-id'],
+    });
+  });
+
+  test('late grandparent (mid-tree backfill): parent insert with chain=[root] backfills children to [root, parent]', async () => {
+    // The parent itself is a mid-tree node — its chain is already populated
+    // by F-37 at its own insert time (because the grandparent inserted
+    // first, which is the common L3-template case). When this mid-tree
+    // parent inserts, any already-inserted children get backfilled with
+    // [...parent.chain, parent.id] = [root, parent].
+    queryMock = spyOn(surrealDB, 'query').mockResolvedValueOnce([] as any);
+
+    await backfillChildCompositionChains('parent-id', ['root-id']);
+
+    expect(queryMock).toHaveBeenCalledTimes(1);
+    const [, params] = queryMock.mock.calls[0] as [string, any];
+    expect(params).toEqual({
+      parent_execution_id: 'parent-id',
+      new_chain: ['root-id', 'parent-id'],
+    });
+  });
+
+  test('root-only insert (no parent_execution_id): backfills children to [root.id]', async () => {
+    // Root inserts (no parent_execution_id) still need to backfill any
+    // children that referenced them before they landed. The handler calls
+    // backfillChildCompositionChains(execution_id, [])  for roots
+    // (resolvedCompositionChain is empty for root-level inserts).
+    queryMock = spyOn(surrealDB, 'query').mockResolvedValueOnce([] as any);
+
+    await backfillChildCompositionChains('root-id', []);
+
+    expect(queryMock).toHaveBeenCalledTimes(1);
+    const [, params] = queryMock.mock.calls[0] as [string, any];
+    expect(params).toEqual({
+      parent_execution_id: 'root-id',
+      new_chain: ['root-id'],
+    });
+  });
+
+  test('idempotency: second insert of same parent does not re-trigger updates on populated children', async () => {
+    // The WHERE clause filters out children whose chain is already populated.
+    // We can't fully simulate "real DB filters rows" with a mock, but we
+    // can pin the SQL contract: the WHERE clause MUST include the
+    // empty-chain guard, and the UPDATE always passes the same new_chain.
+    // A duplicate parent insert therefore produces the same UPDATE with the
+    // same parameters — and any child already populated by an earlier call
+    // is excluded by the DB-side filter. No duplicate appended ids.
+    queryMock = spyOn(surrealDB, 'query').mockResolvedValue([] as any);
+
+    await backfillChildCompositionChains('parent-id', ['root-id']);
+    await backfillChildCompositionChains('parent-id', ['root-id']);
+
+    expect(queryMock).toHaveBeenCalledTimes(2);
+
+    const [sql1, params1] = queryMock.mock.calls[0] as [string, any];
+    const [sql2, params2] = queryMock.mock.calls[1] as [string, any];
+
+    // Identical query and params — the DB-side guard handles dedup.
+    expect(sql1).toBe(sql2);
+    expect(params1).toEqual(params2);
+    // The new_chain is exactly two-deep (no duplicate parent.id appends).
+    expect((params1 as any).new_chain).toEqual(['root-id', 'parent-id']);
+  });
+
+  test('best-effort: UPDATE throws → returns without throwing, insert path unaffected', async () => {
+    // Simulate SurrealDB throwing on the backfill UPDATE. The helper must
+    // swallow and log — never rethrow — because the parent insert has
+    // already succeeded and the response is on its way back to the client.
+    queryMock = spyOn(surrealDB, 'query').mockRejectedValueOnce(
+      new Error('boom: connection refused'),
+    );
+
+    // No throw expected.
+    await expect(
+      backfillChildCompositionChains('parent-id', []),
+    ).resolves.toBeUndefined();
+    expect(queryMock).toHaveBeenCalledTimes(1);
   });
 });
