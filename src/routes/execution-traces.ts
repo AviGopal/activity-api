@@ -410,11 +410,20 @@ app.get('/', async (c) => {
     }
 
     // Filter by parent_execution_id — returns only direct child executions of the given parent.
-    // See impulse-activity-loop design.md §L-1: required for NestedTrajectoryNode inline expansion.
+    // The stored field may be a bare ID ("act_...") or a full record ID
+    // ("activity_execution_traces:act_..."). Accept both forms so callers can pass
+    // either without knowing the storage format.
     const parentExecutionId = c.req.query('parent_execution_id');
     if (parentExecutionId) {
-      whereConditions.push('parent_execution_id = $parent_execution_id');
-      params.parent_execution_id = parentExecutionId;
+      // Strip table prefix if present so we compare bare IDs consistently
+      const bareId = parentExecutionId.includes(':')
+        ? parentExecutionId.split(':').slice(1).join(':')
+        : parentExecutionId;
+      whereConditions.push(
+        '(parent_execution_id = $parent_execution_id OR parent_execution_id = $parent_execution_id_prefixed)'
+      );
+      params.parent_execution_id = bareId;
+      params.parent_execution_id_prefixed = `activity_execution_traces:${bareId}`;
     }
 
     const whereClause = whereConditions.length > 0
