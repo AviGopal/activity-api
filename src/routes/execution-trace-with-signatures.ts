@@ -31,6 +31,10 @@
 import type { Surreal } from 'surrealdb';
 
 import { logger } from '../utils/logger';
+import {
+  applyChainFallback,
+  type CompositionChainCache,
+} from './execution-traces';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -482,7 +486,7 @@ export async function runExecutionTraceWithSignatures(
     auth,
   );
 
-  const traces: ExecutionTraceHydrated[] = execRows.map((row) => {
+  const tracesRaw: ExecutionTraceHydrated[] = execRows.map((row) => {
     const input_impulses = toStringArray(row.input_impulses);
     const output_impulses = toStringArray(row.output_impulses);
 
@@ -522,6 +526,17 @@ export async function runExecutionTraceWithSignatures(
       tasks,
     };
   });
+
+  // F-37/F-40 read-time fallback (2026-04-26): when stored chain is empty
+  // but parent_execution_id is set, walk on the fly. Read-only — never
+  // writes back. Per-request memoization cache: sibling traces sharing a
+  // parent collapse to one DB walk per distinct parent. The walk reads
+  // from `activity_execution_traces` (canonical chain store, dual-write
+  // target shared with the paradigm `execution` table this resolver reads).
+  const chainCache: CompositionChainCache = new Map();
+  const traces: ExecutionTraceHydrated[] = await Promise.all(
+    tracesRaw.map((t) => applyChainFallback(t, chainCache)),
+  );
 
   const filtered_by: ExecutionTraceWithSignaturesReport['filtered_by'] = {
     since: input.since,

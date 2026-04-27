@@ -22,6 +22,8 @@ import {
   backfillChildCompositionChains,
   walkCompositionChain,
   applyChainFallback,
+  resolveCompositionChain,
+  type CompositionChainCache,
 } from './execution-traces';
 import { _internals as readInternals } from './execution-trace-with-signatures';
 import { surrealDB } from '../db/surreal';
@@ -994,5 +996,117 @@ describe('applyChainFallback (GET handler integration)', () => {
     const trace = { execution_id: 'root-id', composition_chain: [] };
     expect((await applyChainFallback(trace)).composition_chain).toEqual([]);
     expect(queryMock).not.toHaveBeenCalled();
+  });
+});
+
+// ============================================================================
+// walkCompositionChain — additional edge cases (orphan mid-walk, depth cap)
+// ----------------------------------------------------------------------------
+// Pin the safety-net behavior: an orphan parent encountered MID-walk returns
+// what the walk has already accumulated rather than throwing or returning [].
+// Depth cap on a linear non-cyclic chain returns the truncated prefix.
+// ============================================================================
+
+describe('walkCompositionChain — orphan mid-walk + depth cap', () => {
+  let queryMock: ReturnType<typeof spyOn> | null = null;
+  afterEach(() => {
+    queryMock?.mockRestore();
+    queryMock = null;
+  });
+
+  const row = (id: string, parent: string | null, chain: string[]) => [
+    { execution_id: id, parent_execution_id: parent, composition_chain: chain },
+  ];
+
+  test('orphan parent mid-walk: returns partial chain (no throw)', async () => {
+    // 1st hop: parent exists, points to a missing grandparent.
+    // 2nd hop: grandparent lookup returns nothing — walker returns the
+    // partial chain it accumulated rather than throwing.
+    queryMock = spyOn(surrealDB, 'query')
+      .mockResolvedValueOnce(row('parent-id', 'missing-grandparent-id', []) as any)
+      .mockResolvedValueOnce([] as any);
+    expect(await walkCompositionChain('parent-id')).toEqual(['parent-id']);
+    expect(queryMock).toHaveBeenCalledTimes(2);
+  });
+
+  test('depth cap on linear chain: returns truncated prefix, never infinite-loops', async () => {
+    // Linear chain 4 deep, depth cap of 2 — only the closest two ancestors
+    // appear. No throw, no infinite loop.
+    queryMock = spyOn(surrealDB, 'query')
+      .mockResolvedValueOnce(row('A', 'B', []) as any)
+      .mockResolvedValueOnce(row('B', 'C', []) as any)
+      .mockResolvedValueOnce(row('C', 'D', []) as any)
+      .mockResolvedValueOnce(row('D', null, []) as any);
+    expect(await walkCompositionChain('A', 2)).toEqual(['B', 'A']);
+    // Cap fires after 2 lookups — third+ never run.
+    expect(queryMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ============================================================================
+// resolveCompositionChain — in-request memoization
+// ----------------------------------------------------------------------------
+// Per-request cache collapses identical walks to a single DB roundtrip. List
+// responses with many sibling traces sharing a parent benefit. Without the
+// cache, each row triggers its own walk.
+// ============================================================================
+
+describe('resolveCompositionChain (in-request memoization)', () => {
+  let queryMock: ReturnType<typeof spyOn> | null = null;
+  afterEach(() => {
+    queryMock?.mockRestore();
+    queryMock = null;
+  });
+
+  const row = (id: string, parent: string | null, chain: string[]) => [
+    { execution_id: id, parent_execution_id: parent, composition_chain: chain },
+  ];
+
+  test('same parent twice with shared cache: walks once, both calls return same chain', async () => {
+    queryMock = spyOn(surrealDB, 'query').mockResolvedValueOnce(
+      row('parent-id', null, []) as any,
+    );
+    const cache: CompositionChainCache = new Map();
+    const a = await resolveCompositionChain('parent-id', cache);
+    const b = await resolveCompositionChain('parent-id', cache);
+    expect(a).toEqual(['parent-id']);
+    expect(b).toEqual(['parent-id']);
+    // Single DB walk shared across both callers via the cache.
+    expect(queryMock).toHaveBeenCalledTimes(1);
+  });
+
+  test('without cache: each call walks independently', async () => {
+    queryMock = spyOn(surrealDB, 'query')
+      .mockResolvedValueOnce(row('parent-id', null, []) as any)
+      .mockResolvedValueOnce(row('parent-id', null, []) as any);
+    await resolveCompositionChain('parent-id');
+    await resolveCompositionChain('parent-id');
+    expect(queryMock).toHaveBeenCalledTimes(2);
+  });
+
+  test('applyChainFallback shares cache across siblings', async () => {
+    // Two sibling traces with the same parent. With a shared cache only one
+    // walk fires; the second sibling reuses the in-flight promise.
+    queryMock = spyOn(surrealDB, 'query').mockResolvedValueOnce(
+      row('parent-id', null, []) as any,
+    );
+    const cache: CompositionChainCache = new Map();
+    const sibling1 = {
+      execution_id: 'child-1',
+      parent_execution_id: 'parent-id',
+      composition_chain: [],
+    };
+    const sibling2 = {
+      execution_id: 'child-2',
+      parent_execution_id: 'parent-id',
+      composition_chain: [],
+    };
+    const [r1, r2] = await Promise.all([
+      applyChainFallback(sibling1, cache),
+      applyChainFallback(sibling2, cache),
+    ]);
+    expect(r1.composition_chain).toEqual(['parent-id']);
+    expect(r2.composition_chain).toEqual(['parent-id']);
+    expect(queryMock).toHaveBeenCalledTimes(1);
   });
 });
