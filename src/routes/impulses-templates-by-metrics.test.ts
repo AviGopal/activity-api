@@ -212,7 +212,7 @@ describe('F-NN-D: activityTemplatesByMetrics merges RecordId variant_id correctl
 // migrations have been applied.
 //
 // Fix (this commit): polymorphic SQL WHERE clause using
-// `type::is::record(variant_id)` / `type::is::string(variant_id)` to gate
+// `type::is_record(variant_id)` / `type::is_string(variant_id)` to gate
 // `meta::id()` so it only runs against record-form values. Plain-string
 // variant_id is matched directly. Both branches feed the same
 // `$variant_ids` (already in bare-name form on the JS side).
@@ -330,7 +330,7 @@ describe('F-NN-D hot-fix: activityTemplatesByMetrics handles mixed string + Reco
     expect(md).toContain('| 7 |');
   });
 
-  test('SQL WHERE clause uses polymorphic comparison (gates meta::id behind type::is::record)', async () => {
+  test('SQL WHERE clause uses polymorphic comparison (gates meta::id behind type::is_record)', async () => {
     // Capture the SQL emitted for the activity_template query and
     // assert it carries the polymorphic guard. Without the guard,
     // `meta::id(variant_id)` runs against schemafull string rows and
@@ -395,15 +395,15 @@ describe('F-NN-D hot-fix: activityTemplatesByMetrics handles mixed string + Reco
     });
 
     // Polymorphic guards present.
-    expect(capturedTemplateSql).toContain('type::is::record(variant_id)');
-    expect(capturedTemplateSql).toContain('type::is::string(variant_id)');
+    expect(capturedTemplateSql).toContain('type::is_record(variant_id)');
+    expect(capturedTemplateSql).toContain('type::is_string(variant_id)');
     // `meta::id` only runs after the record-type guard.
     expect(capturedTemplateSql).toMatch(
-      /type::is::record\(variant_id\)\s+AND\s+meta::id\(variant_id\)\s+IN\s+\$variant_ids/
+      /type::is_record\(variant_id\)\s+AND\s+meta::id\(variant_id\)\s+IN\s+\$variant_ids/
     );
     // Plain string equality branch present for the schemafull case.
     expect(capturedTemplateSql).toMatch(
-      /type::is::string\(variant_id\)\s+AND\s+variant_id\s+IN\s+\$variant_ids/
+      /type::is_string\(variant_id\)\s+AND\s+variant_id\s+IN\s+\$variant_ids/
     );
   });
 });

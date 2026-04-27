@@ -1219,7 +1219,7 @@ router.post('/resolve', async (c) => {
           // 500 on canary.
           //
           // Polymorphic comparison: gate `meta::id()` behind
-          // `type::is::record(variant_id)` and use a plain string match for
+          // `type::is_record(variant_id)` and use a plain string match for
           // the schemafull form. Both branches feed the same `$variant_ids`
           // (already in bare-name form). SurrealDB short-circuits boolean
           // expressions, so `meta::id` only runs when the value is a record.
@@ -1231,8 +1231,8 @@ router.post('/resolve', async (c) => {
             SELECT variant_id, variant_name, description, category, task_steps
             FROM activity_template
             WHERE (
-              (type::is::record(variant_id) AND meta::id(variant_id) IN $variant_ids)
-              OR (type::is::string(variant_id) AND variant_id IN $variant_ids)
+              (type::is_record(variant_id) AND meta::id(variant_id) IN $variant_ids)
+              OR (type::is_string(variant_id) AND variant_id IN $variant_ids)
             )
             AND (org_id = $orgId OR scope = 'global' OR org_id IS NONE)
           `;
