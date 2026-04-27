@@ -838,7 +838,20 @@ app.post('/templates', async (c) => {
     const validated = CreateTemplateRequestSchema.parse(body);
 
     // Normalize to canonical field names (accept both legacy and canonical)
-    const activityId = validated.id || validated.variant_id;
+    //
+    // F-49 (2026-04-27): clients sometimes round-trip a previously-fetched
+    // template id back into POST /templates without unwrapping the
+    // SurrealDB record-id form (e.g. `"activity:hello-world-minimal"` or
+    // `"activity:⟨hello-world-minimal⟩"`). The downstream
+    // `UPSERT activity:\`${activityId}\`` then creates a *new* record with
+    // a doubled prefix (`activity:⟨activity:⟨hello-world-minimal⟩⟩`)
+    // instead of overwriting the original. Strip any leading `activity:`
+    // and SurrealDB angle-bracket / backtick wrapping so the upsert always
+    // targets the canonical bare-name record.
+    const rawActivityId = validated.id || validated.variant_id;
+    const activityId = typeof rawActivityId === 'string'
+      ? rawActivityId.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '').trim()
+      : rawActivityId;
     const activityName = validated.name || validated.variant_name;
     const activityTasks = validated.tasks || validated.task_steps;
     const activityVariantOf = validated.variant_of || validated.genealogy;

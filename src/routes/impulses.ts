@@ -30,6 +30,7 @@ import {
   formatPreValidationResultAsMarkdown,
 } from '../services/impulse-formatters';
 import { getJwtAuthFromContext, type JwtAuthContext } from '../middleware/jwtAuth';
+import { normalizeRecordId } from '../utils/surrealdb-types';
 import activitiesRouter from './activities';
 import executionTracesRouter from './execution-traces';
 import { runTemplateAuditReport, type TemplateAuditInput } from './template-audit';
@@ -1200,12 +1201,24 @@ router.post('/resolve', async (c) => {
         if (metrics.length === 0) {
           content = `# Top Performing Templates\n\nNo templates found with at least ${minExecutions} executions.`;
         } else {
-          // Fetch template details for the top performers
-          const variantIds = metrics.map((m: any) => m.variant_id);
+          // Fetch template details for the top performers.
+          //
+          // F-NN-D (2026-04-27): the `activity_template` view aliases
+          // `id AS variant_id`, so SurrealDB returns `t.variant_id` as a
+          // RecordId object that stringifies to `activity:⟨name⟩`. Meanwhile
+          // `variant_performance_metrics.variant_id` is a plain `string` (the
+          // unprefixed activity id). The previous strict-equality merge
+          // (`t.variant_id === m.variant_id`) always failed, leaving every
+          // template field undefined in the rendered markdown. Compute a
+          // normalized lookup key on both sides so the merge actually fires.
+          const stripActivityPrefix = (id: unknown): string =>
+            normalizeRecordId(id).replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
+
+          const variantIds = metrics.map((m: any) => stripActivityPrefix(m.variant_id));
           const templateQuery = `
             SELECT variant_id, variant_name, description, category, task_steps
             FROM activity_template
-            WHERE variant_id IN $variant_ids
+            WHERE meta::id(variant_id) IN $variant_ids
             AND (org_id = $orgId OR scope = 'global' OR org_id IS NONE)
           `;
           const templateDetails = await executeAsAuth<any>(jwtAuthCtx, templateQuery, {
@@ -1213,11 +1226,23 @@ router.post('/resolve', async (c) => {
             orgId: jwtAuthCtx.orgId,
           });
 
+          // Build a normalized-key lookup so RecordId vs. string comparisons
+          // collapse to the same key on both sides of the merge.
+          const detailsByKey = new Map<string, any>();
+          for (const t of templateDetails) {
+            detailsByKey.set(stripActivityPrefix(t.variant_id), t);
+          }
+
           // Merge metrics with template details
           const templates = metrics.map((m: any) => {
-            const template = templateDetails.find((t: any) => t.variant_id === m.variant_id) || {};
+            const key = stripActivityPrefix(m.variant_id);
+            const template = detailsByKey.get(key) || {};
             return {
               ...template,
+              // Ensure variant_id renders as the canonical plain-string id even
+              // when the view returned a RecordId object (avoids "undefined"
+              // in the markdown "ID" column).
+              variant_id: key || normalizeRecordId(template.variant_id) || normalizeRecordId(m.variant_id),
               total_executions: m.total_executions,
               success_rate: m.success_rate,
               avg_duration_ms: m.avg_duration_ms,
@@ -2935,6 +2960,15 @@ function formatTemplateListAsMarkdown(templates: any[], heading: string): string
  * Used by activityTemplatesByMetrics resolver
  */
 function formatTemplateListWithMetricsAsMarkdown(templates: any[]): string {
+  // F-NN-D defense in depth: variant_id may arrive as a SurrealDB RecordId
+  // object from view-aliased columns. Coerce via normalizeRecordId so the
+  // markdown never renders "[object Object]" or "undefined" for ids that
+  // came back wrapped.
+  const idStr = (v: unknown): string => {
+    const s = normalizeRecordId(v);
+    return s.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '') || s;
+  };
+
   let md = `# Top Performing Templates\n\n`;
   md += `Found ${templates.length} template(s) with sufficient execution history\n\n`;
 
@@ -2946,15 +2980,17 @@ function formatTemplateListWithMetricsAsMarkdown(templates: any[]): string {
     const successRate = t.success_rate ? `${(t.success_rate * 100).toFixed(1)}%` : 'N/A';
     const avgDuration = t.avg_duration_ms ? `${t.avg_duration_ms.toFixed(0)}ms` : 'N/A';
     const avgCost = t.avg_cost_usd ? `$${t.avg_cost_usd.toFixed(4)}` : 'N/A';
-    md += `| ${t.variant_name || t.variant_id} | ${successRate} | ${t.total_executions || 0} | ${avgDuration} | ${avgCost} |\n`;
+    const displayName = t.variant_name || idStr(t.variant_id) || 'unknown';
+    md += `| ${displayName} | ${successRate} | ${t.total_executions || 0} | ${avgDuration} | ${avgCost} |\n`;
   }
   md += `\n`;
 
   // Detailed task structure for learning
   for (const template of templates) {
-    md += `## ${template.variant_name || template.variant_id}\n\n`;
-    md += `**ID**: \`${template.variant_id}\`\n`;
-    md += `**Category**: ${template.category}\n`;
+    const displayName = template.variant_name || idStr(template.variant_id) || 'unknown';
+    md += `## ${displayName}\n\n`;
+    md += `**ID**: \`${idStr(template.variant_id) || 'unknown'}\`\n`;
+    md += `**Category**: ${template.category ?? 'uncategorized'}\n`;
     md += `**Description**: ${template.description || 'No description'}\n`;
     md += `**Success Rate**: ${template.success_rate ? `${(template.success_rate * 100).toFixed(1)}%` : 'N/A'}\n\n`;
 
