@@ -50,6 +50,11 @@ spec:
             secretKeyRef:
               name: {{ include "metabob-activity-api.fullname" . }}
               key: surrealdb-password
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "metabob-activity-api.fullname" . }}
+              key: jwt-secret
         resources:
           {{- toYaml .Values.initDatabase.resources | nindent 12 }}
       {{- end }}
@@ -84,6 +89,11 @@ spec:
             secretKeyRef:
               name: {{ include "metabob-activity-api.fullname" . }}
               key: surrealdb-password
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "metabob-activity-api.fullname" . }}
+              key: jwt-secret
         - name: REDIS_URL
           value: {{ .Values.config.redis.url | quote }}
         - name: REDIS_SESSION_TTL

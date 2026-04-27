@@ -1,6 +1,18 @@
 # Default values for metabob-activity-api
 replicaCount: 2
 
+# Secrets injected by helmfile from secrets/{env}.secrets.yaml.
+# `secrets.jwtSecret` is the source-of-truth value for the JWT signing key
+# used by metabob-activity-api. Populates the k8s secret data key
+# `jwt-secret`, which is read by BOTH the API container (env JWT_SECRET via
+# config.ts → resolveJwtSecret) AND the init-database initContainer (which
+# substitutes `__JWT_SECRET__` in .surql migration files via
+# scripts/init-database.ts). Misalignment between the two breaks
+# /v2/impulses/resolve with "The access method cannot be used in the
+# requested operation". See helmfile.yaml.gotmpl for the injection wiring.
+secrets:
+  jwtSecret: ""
+
 image:
   repository: metabobapp/metabob-activity-api
   pullPolicy: Always
