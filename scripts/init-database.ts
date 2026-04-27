@@ -228,6 +228,23 @@ async function main() {
     console.log('[Init] No schemas subdirectory found, skipping...');
   }
 
+  // Also include migration files from sql/migrations/ subdirectory.
+  // F-35: prior versions silently skipped this dir, leaving 60+ migrations
+  // (including 064/069 JWT secret OVERWRITE) unapplied on canary. The
+  // applySQLFile path is idempotent — DEFINE * IF NOT EXISTS / OVERWRITE
+  // semantics mean re-runs are safe. Errors continue rather than abort.
+  const migrationsDir = join(SQL_DIR, 'migrations');
+  try {
+    const migrationFiles = await readdir(migrationsDir);
+    const migrationsSqlFiles = migrationFiles
+      .filter(f => f.endsWith('.surql'))
+      .map(f => `migrations/${f}`)
+      .sort();
+    sqlFiles.push(...migrationsSqlFiles);
+  } catch (error) {
+    console.log('[Init] No migrations subdirectory found, skipping...');
+  }
+
   if (sqlFiles.length === 0) {
     console.log('[Init] No migration files found');
     return;
