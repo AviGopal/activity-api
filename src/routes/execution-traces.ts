@@ -872,6 +872,73 @@ app.get('/selection-events', async (c) => {
 });
 
 /**
+ * Denormalize the composition_chain at trace-insert time.
+ *
+ * F-37 fix (2026-04-26): every execution trace on canary had
+ * `composition_chain: []` despite `parent_execution_id` being set
+ * correctly. The denormalization step that should compute the chain by
+ * reading the parent's chain at insert time was missing entirely; clients
+ * (minibob) compute it for L3 template runs but L1/L2 meta-traces fall
+ * through without populating it. Phase 8 criterion 2 (recursive escalation
+ * auditing) was effectively blind because chain-depth queries always
+ * returned 0 traces.
+ *
+ * Strategy: when a parent is referenced, look it up and compute
+ *   composition_chain = parent.composition_chain.concat(parent.execution_id)
+ * (root-first ordering — matches the contract in migration 081 and
+ * `composition-chain.ts` in minibob). When parent isn't found (orphan or
+ * race-condition), return an empty array so the trace lands as root-like.
+ *
+ * Trust client-provided non-empty chains (callers that already compute it
+ * client-side stay authoritative). Only compute when the field is missing
+ * or empty.
+ *
+ * Exported for tests.
+ */
+export async function denormalizeCompositionChain(
+  parentExecutionId: string,
+): Promise<string[]> {
+  if (!parentExecutionId || typeof parentExecutionId !== 'string') return [];
+  try {
+    const parentResult = await surrealDB.query<{
+      execution_id?: string;
+      composition_chain?: string[] | null;
+    }>(
+      `
+        SELECT execution_id, composition_chain FROM activity_execution_traces
+        WHERE execution_id = $parent_execution_id
+        LIMIT 1
+      `,
+      { parent_execution_id: parentExecutionId },
+    );
+    if (!parentResult || parentResult.length === 0) {
+      // Orphan parent — could be a race (parent trace lands after child)
+      // or a parent in a different store. Leave chain empty; root-like.
+      return [];
+    }
+    const parent = parentResult[0] as
+      | { execution_id?: string; composition_chain?: string[] | null }
+      | undefined;
+    const parentChain: string[] = Array.isArray(parent?.composition_chain)
+      ? (parent!.composition_chain as string[])
+      : [];
+    // Use the parent's stored execution_id when present, else fall back
+    // to the id we were given (defensive — they should be equal).
+    const parentId =
+      typeof parent?.execution_id === 'string' && parent.execution_id.length > 0
+        ? parent.execution_id
+        : parentExecutionId;
+    return [...parentChain, parentId];
+  } catch (err) {
+    logger.warn('[F-37] Failed to denormalize composition_chain — leaving empty', {
+      parent_execution_id: parentExecutionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
+}
+
+/**
  * POST /v2/activities/execution-traces
  *
  * Store execution trace for future reference (debugging, ribosome, impulses)
@@ -907,6 +974,23 @@ app.post('/', async (c) => {
       session_org_id: session?.org_id,
       final_org_id: traceOrgId,
     });
+
+    // F-37 (2026-04-26): denormalize composition_chain when client didn't.
+    // When a parent is referenced but the client didn't supply a chain (or
+    // supplied an empty one), look the parent up and compute
+    //   chain = parent.composition_chain.concat(parent.execution_id)
+    // so audit queries on chain depth work without walking parents one-by-one.
+    // Client-supplied non-empty chains are trusted (backward-compat).
+    const clientCompositionChain: string[] | null =
+      Array.isArray(body.composition_chain) && body.composition_chain.length > 0
+        ? body.composition_chain
+        : null;
+    const resolvedCompositionChain: string[] =
+      clientCompositionChain !== null
+        ? clientCompositionChain
+        : body.parent_execution_id
+          ? await denormalizeCompositionChain(body.parent_execution_id)
+          : [];
 
     // Map MiniBob's field names to database schema
     // MiniBob sends: template_id, we store as: variant_id + activity_id
@@ -978,8 +1062,8 @@ app.post('/', async (c) => {
       //   composition_chain   → denormalized ancestor chain, ordered root-first,
       //                         so consumers can reconstruct trees in one read
       ...(body.parent_execution_id ? { parent_execution_id: body.parent_execution_id } : {}),
-      ...(Array.isArray(body.composition_chain) && body.composition_chain.length > 0
-        ? { composition_chain: body.composition_chain } : {}),
+      ...(resolvedCompositionChain.length > 0
+        ? { composition_chain: resolvedCompositionChain } : {}),
 
       // Vessel attribution + per-impulse resolver tracking (minibob 6f8c727+).
       // See migration 086. The legacy table is SCHEMAFULL, so unknown keys are
@@ -1356,8 +1440,10 @@ app.post('/', async (c) => {
         tokens_in: trace.tokens_input,
         tokens_out: trace.tokens_output,
         parent_execution_id: body.parent_execution_id,
-        composition_chain: Array.isArray(body.composition_chain) && body.composition_chain.length > 0
-          ? body.composition_chain
+        // F-37: prefer the denormalized chain (computed above) so the
+        // paradigm dual-write also lands with a populated chain.
+        composition_chain: resolvedCompositionChain.length > 0
+          ? resolvedCompositionChain
           : undefined,
         trace: {
           tasks: trace.tasks,
