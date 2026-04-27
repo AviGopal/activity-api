@@ -1314,6 +1314,23 @@ app.get('/templates', async (c) => {
     // holds the top-N list under one shared key; mid-page slices must hit DB.
     const paginating = offset > 0;
 
+    // Natural-language full-text search — bypasses Redis cache and returns
+    // BM25-ranked results from the FTS index. Same engine used by the
+    // recommendation system (Tier 3 fallback).
+    const q = c.req.query('q')?.trim() ?? null;
+    if (q && q.length > 0) {
+      logger.info('GET /v2/activities/templates — FTS path', { q: q.slice(0, 80), orgId, limit });
+      const ftsResult = await queryActivitiesByFTS(
+        q,
+        orgId,
+        executionType as 'template' | 'tool' | 'composition' | 'vessel_function' | null,
+        limit,
+        useRbacJwtQuery && jwtAuth?.jwtToken ? jwtAuth.jwtToken : null
+      );
+      const ftsTemplates = (ftsResult.data ?? []) as unknown as ActivityTemplate[];
+      return c.json({ templates: ftsTemplates, total: ftsTemplates.length, limit, offset: 0, fts: true });
+    }
+
     logger.info('GET /v2/activities/templates', {
       category,
       scopeFilter,
@@ -5991,6 +6008,17 @@ app.post('/similar-state', async (c) => {
 app.post('/impulse-relevance', async (c) => {
   try {
     const body = await c.req.json();
+    // F-43 coercion: legacy callers (e.g. minibob mcp.ts) send `activity_id`,
+    // but the schema requires `activity_variant_id`. Map the legacy field to
+    // the canonical one when the canonical one is absent. Explicit
+    // `activity_variant_id` always wins. Remove once all callers are updated.
+    if (body && body.activity_id && !body.activity_variant_id) {
+      logger.warn(
+        "[impulse-relevance] caller using deprecated 'activity_id' field; use 'activity_variant_id'. F-43 coercion applied.",
+        { activity_id: body.activity_id },
+      );
+      body.activity_variant_id = body.activity_id;
+    }
     const validated = ImpulseRelevanceRecordRequestSchema.parse(body);
 
     logger.info('POST /v2/activities/impulse-relevance', {
