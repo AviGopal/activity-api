@@ -203,7 +203,10 @@ app.get('/', async (c) => {
       GROUP ALL
     `;
 
-    if (useJwtAuth && jwtAuth?.jwtToken) {
+    // F-36: skip JWT path for API-key auth (SurrealDB rejects api_key:N id
+    // claim as unresolvable record reference). Falls back to root creds
+    // with manual org_id filtering.
+    if (useJwtAuth && jwtAuth?.jwtToken && jwtAuth.authType !== 'apikey') {
       // JWT AUTH PATH: Use RBAC-enforced query
       variants = await queryWithAuth<CodeVariant>(jwtAuth.jwtToken, query, params);
       countResult = await queryWithAuth<{ total: number }>(jwtAuth.jwtToken, countQuery, params);

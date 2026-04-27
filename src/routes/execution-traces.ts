@@ -433,7 +433,11 @@ app.get('/', async (c) => {
     let executions: ExecutionTrace[];
     let countResult: { total: number }[];
 
-    if (useJwtAuth && jwtAuth?.jwtToken) {
+    // F-36: API-key auth produces a JWT with `id: api_key:N` which SurrealDB
+    // 3.x interprets as a record reference and rejects with "access method
+    // cannot be used". Skip JWT path for API-key auth and fall back to root
+    // creds + manual org_id filtering. Same pattern as routes/activities.ts.
+    if (useJwtAuth && jwtAuth?.jwtToken && jwtAuth.authType !== 'apikey') {
       // JWT AUTH PATH: Use RBAC-enforced query
       executions = await queryWithAuth<ExecutionTrace>(jwtAuth.jwtToken, query, params);
       const countQuery = `
@@ -819,7 +823,11 @@ app.get('/selection-events', async (c) => {
     let events: any[];
     let countResult: { total: number }[];
 
-    if (useJwtAuth && jwtAuth?.jwtToken) {
+    // F-36: API-key auth produces a JWT with `id: api_key:N` which SurrealDB
+    // 3.x interprets as a record reference and rejects with "access method
+    // cannot be used". Skip JWT path for API-key auth and fall back to root
+    // creds + manual org_id filtering. Same pattern as routes/activities.ts.
+    if (useJwtAuth && jwtAuth?.jwtToken && jwtAuth.authType !== 'apikey') {
       events = await queryWithAuth(jwtAuth.jwtToken, query, params);
       const countQuery = `
         SELECT count() as total FROM thompson_selection_log
@@ -1935,7 +1943,11 @@ app.get('/selection-outcomes', async (c) => {
     logger.info('Fetching selection outcomes', { selectionWhereClause, params });
 
     let selections: any[];
-    if (useJwtAuth && jwtAuth?.jwtToken) {
+    // F-36: API-key auth produces a JWT with `id: api_key:N` which SurrealDB
+    // 3.x interprets as a record reference and rejects with "access method
+    // cannot be used". Skip JWT path for API-key auth and fall back to root
+    // creds + manual org_id filtering. Same pattern as routes/activities.ts.
+    if (useJwtAuth && jwtAuth?.jwtToken && jwtAuth.authType !== 'apikey') {
       selections = await queryWithAuth(jwtAuth.jwtToken, selectionsQuery, params);
     } else {
       selections = await surrealDB.query(selectionsQuery, params);
@@ -1965,7 +1977,11 @@ app.get('/selection-outcomes', async (c) => {
       `;
 
       let executions: any[];
-      if (useJwtAuth && jwtAuth?.jwtToken) {
+      // F-36: API-key auth produces a JWT with `id: api_key:N` which SurrealDB
+    // 3.x interprets as a record reference and rejects with "access method
+    // cannot be used". Skip JWT path for API-key auth and fall back to root
+    // creds + manual org_id filtering. Same pattern as routes/activities.ts.
+    if (useJwtAuth && jwtAuth?.jwtToken && jwtAuth.authType !== 'apikey') {
         executions = await queryWithAuth(jwtAuth.jwtToken, executionsQuery, { correlation_ids: correlationIds });
       } else {
         executions = await surrealDB.query(executionsQuery, { correlation_ids: correlationIds });
@@ -2030,7 +2046,11 @@ app.get('/selection-outcomes', async (c) => {
     `;
 
     let countResult: { total: number }[];
-    if (useJwtAuth && jwtAuth?.jwtToken) {
+    // F-36: API-key auth produces a JWT with `id: api_key:N` which SurrealDB
+    // 3.x interprets as a record reference and rejects with "access method
+    // cannot be used". Skip JWT path for API-key auth and fall back to root
+    // creds + manual org_id filtering. Same pattern as routes/activities.ts.
+    if (useJwtAuth && jwtAuth?.jwtToken && jwtAuth.authType !== 'apikey') {
       countResult = await queryWithAuth(jwtAuth.jwtToken, countQuery, params);
     } else {
       countResult = await surrealDB.query(countQuery, params);
@@ -2132,7 +2152,11 @@ app.get('/selection-calibration', async (c) => {
 
     let calibrationRaw: any[];
 
-    if (useJwtAuth && jwtAuth?.jwtToken) {
+    // F-36: API-key auth produces a JWT with `id: api_key:N` which SurrealDB
+    // 3.x interprets as a record reference and rejects with "access method
+    // cannot be used". Skip JWT path for API-key auth and fall back to root
+    // creds + manual org_id filtering. Same pattern as routes/activities.ts.
+    if (useJwtAuth && jwtAuth?.jwtToken && jwtAuth.authType !== 'apikey') {
       calibrationRaw = await queryWithAuth(jwtAuth.jwtToken, query, params);
     } else {
       calibrationRaw = await surrealDB.query(query, params);
@@ -2173,7 +2197,11 @@ app.get('/selection-calibration', async (c) => {
     `;
 
     let countResult: { total: number }[];
-    if (useJwtAuth && jwtAuth?.jwtToken) {
+    // F-36: API-key auth produces a JWT with `id: api_key:N` which SurrealDB
+    // 3.x interprets as a record reference and rejects with "access method
+    // cannot be used". Skip JWT path for API-key auth and fall back to root
+    // creds + manual org_id filtering. Same pattern as routes/activities.ts.
+    if (useJwtAuth && jwtAuth?.jwtToken && jwtAuth.authType !== 'apikey') {
       countResult = await queryWithAuth(jwtAuth.jwtToken, countQuery, params);
     } else {
       countResult = await surrealDB.query(countQuery, params);
@@ -2243,7 +2271,11 @@ app.get('/calibration-summary', async (c) => {
 
     let summaryRaw: any[];
 
-    if (useJwtAuth && jwtAuth?.jwtToken) {
+    // F-36: API-key auth produces a JWT with `id: api_key:N` which SurrealDB
+    // 3.x interprets as a record reference and rejects with "access method
+    // cannot be used". Skip JWT path for API-key auth and fall back to root
+    // creds + manual org_id filtering. Same pattern as routes/activities.ts.
+    if (useJwtAuth && jwtAuth?.jwtToken && jwtAuth.authType !== 'apikey') {
       summaryRaw = await queryWithAuth(jwtAuth.jwtToken, query, {});
     } else {
       summaryRaw = await surrealDB.query(query, {});
