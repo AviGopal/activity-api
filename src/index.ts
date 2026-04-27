@@ -76,7 +76,12 @@ app.use('/v2/*', async (c, next) => {
     return;
   }
   // JWT auth only (no Redis session fallback)
-  await jwtAuthMiddleware(c, next);
+  // F-44: must return the middleware's result so the Response from a 401
+  // c.json(...) propagates back to Hono. Without this, when
+  // jwtAuthMiddleware short-circuits (e.g. missing Authorization header on a
+  // protected path), Hono sees the wrapper finish without c.finalized=true
+  // and emits "Context is not finalized" (HTTP 500).
+  return jwtAuthMiddleware(c, next);
 });
 
 // ============================================================================

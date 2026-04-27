@@ -174,6 +174,19 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
       await next();
       return;
     }
+    // F-44: X-Internal-Api-Key is an alternative auth scheme used for
+    // vessel-to-vessel impulse storage (POST /v2/impulses, GET
+    // /v2/impulses/:id, GET /v2/impulses). The route handlers validate it
+    // themselves and 401 on miss. Without this passthrough, the middleware
+    // 401s before the handler ever runs — and minibob's pending-sync queue
+    // grows indefinitely while logs spam "Context is not finalized" 500s
+    // (the missing-return on the wrapper at index.ts compounded the bug).
+    const internalApiKey = c.req.header('X-Internal-Api-Key');
+    if (internalApiKey) {
+      c.set('jwtAuth', null);
+      await next();
+      return;
+    }
     logger.warn('Missing Authorization header on protected path', { path: c.req.path });
     return c.json(
       { error: { code: 'MISSING_AUTH', message: 'Authorization header required' } },
