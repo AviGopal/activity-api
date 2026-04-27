@@ -20,6 +20,8 @@ import {
   extractTaskImpulseIds,
   denormalizeCompositionChain,
   backfillChildCompositionChains,
+  walkCompositionChain,
+  applyChainFallback,
 } from './execution-traces';
 import { _internals as readInternals } from './execution-trace-with-signatures';
 import { surrealDB } from '../db/surreal';
@@ -861,5 +863,136 @@ describe('backfillChildCompositionChains (F-40 write-order race)', () => {
       backfillChildCompositionChains('parent-id', []),
     ).resolves.toBeUndefined();
     expect(queryMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ============================================================================
+// F-37/F-40 read-time fallback (2026-04-26): walkCompositionChain
+// ----------------------------------------------------------------------------
+// F-37 + F-40 are write-time fixes. Traces inserted before either landed, or
+// under pathological orderings F-40 can't reach, can still expose
+// `composition_chain: []` despite valid `parent_execution_id`. The helper
+// walks the parent chain on demand; read-only — never writes back.
+// ============================================================================
+
+describe('walkCompositionChain (F-37/F-40 read-time fallback)', () => {
+  let queryMock: ReturnType<typeof spyOn> | null = null;
+  afterEach(() => {
+    queryMock?.mockRestore();
+    queryMock = null;
+  });
+
+  // Helper: build a row payload for surrealDB.query mock
+  const row = (id: string, parent: string | null, chain: string[]) => [
+    { execution_id: id, parent_execution_id: parent, composition_chain: chain },
+  ];
+
+  test('empty input: returns [] without DB call', async () => {
+    queryMock = spyOn(surrealDB, 'query');
+    expect(await walkCompositionChain('')).toEqual([]);
+    expect(queryMock).not.toHaveBeenCalled();
+  });
+
+  test('single non-existent parent: returns []', async () => {
+    // Look-up finds nothing — stop walking, return [].
+    queryMock = spyOn(surrealDB, 'query').mockResolvedValueOnce([] as any);
+    expect(await walkCompositionChain('missing-id')).toEqual([]);
+  });
+
+  test('1-deep: parent has empty chain, no further parent → [parent.execution_id]', async () => {
+    queryMock = spyOn(surrealDB, 'query').mockResolvedValueOnce(
+      row('parent-id', null, []) as any,
+    );
+    expect(await walkCompositionChain('parent-id')).toEqual(['parent-id']);
+  });
+
+  test('2-deep: neither has chain → [grandparent, parent] root-first', async () => {
+    queryMock = spyOn(surrealDB, 'query')
+      .mockResolvedValueOnce(row('parent-id', 'grandparent-id', []) as any)
+      .mockResolvedValueOnce(row('grandparent-id', null, []) as any);
+    expect(await walkCompositionChain('parent-id')).toEqual([
+      'grandparent-id',
+      'parent-id',
+    ]);
+    expect(queryMock).toHaveBeenCalledTimes(2);
+  });
+
+  test('mid-walk encounters non-empty chain: prepends and early-exits', async () => {
+    // Grandparent already has a populated chain — the walk early-exits;
+    // result is grandparent.chain + grandparent.id + accumulator.
+    queryMock = spyOn(surrealDB, 'query')
+      .mockResolvedValueOnce(row('parent-id', 'grandparent-id', []) as any)
+      .mockResolvedValueOnce(row('grandparent-id', 'root-id', ['root-id']) as any);
+    expect(await walkCompositionChain('parent-id')).toEqual([
+      'root-id',
+      'grandparent-id',
+      'parent-id',
+    ]);
+    // Two queries — early-exit prevents a third (root-id is not looked up).
+    expect(queryMock).toHaveBeenCalledTimes(2);
+  });
+
+  test('cycle (A → B → A) capped: stops, returns partial', async () => {
+    // Pathological self-cycle. visited-set guard fires on re-visit; returns
+    // accumulated ids without infinite-looping or throwing.
+    queryMock = spyOn(surrealDB, 'query')
+      .mockResolvedValueOnce(row('A', 'B', []) as any)
+      .mockResolvedValueOnce(row('B', 'A', []) as any);
+    expect(await walkCompositionChain('A', 4)).toEqual(['B', 'A']);
+  });
+
+  test('DB throws: returns [] (graceful degradation)', async () => {
+    queryMock = spyOn(surrealDB, 'query').mockRejectedValueOnce(
+      new Error('boom: connection refused'),
+    );
+    expect(await walkCompositionChain('parent-id')).toEqual([]);
+  });
+});
+
+// ============================================================================
+// GET handler integration: applyChainFallback (used by both list + detail)
+// ----------------------------------------------------------------------------
+// Pins the contract: stored non-empty chain → trust; empty + parent → walk;
+// empty + no parent → no walk.
+// ============================================================================
+
+describe('applyChainFallback (GET handler integration)', () => {
+  let queryMock: ReturnType<typeof spyOn> | null = null;
+  afterEach(() => {
+    queryMock?.mockRestore();
+    queryMock = null;
+  });
+
+  test('composition_chain=[] + parent_execution_id set: response carries computed chain', async () => {
+    queryMock = spyOn(surrealDB, 'query').mockResolvedValueOnce([
+      { execution_id: 'parent-id', parent_execution_id: null, composition_chain: [] },
+    ] as any);
+    const trace = {
+      execution_id: 'child-id',
+      parent_execution_id: 'parent-id',
+      composition_chain: [],
+    };
+    expect((await applyChainFallback(trace)).composition_chain).toEqual(['parent-id']);
+  });
+
+  test('non-empty composition_chain: handler trusts existing chain (no walk)', async () => {
+    queryMock = spyOn(surrealDB, 'query');
+    const trace = {
+      execution_id: 'child-id',
+      parent_execution_id: 'parent-id',
+      composition_chain: ['root-id', 'parent-id'],
+    };
+    expect((await applyChainFallback(trace)).composition_chain).toEqual([
+      'root-id',
+      'parent-id',
+    ]);
+    expect(queryMock).not.toHaveBeenCalled();
+  });
+
+  test('no parent_execution_id: no walk, chain stays []', async () => {
+    queryMock = spyOn(surrealDB, 'query');
+    const trace = { execution_id: 'root-id', composition_chain: [] };
+    expect((await applyChainFallback(trace)).composition_chain).toEqual([]);
+    expect(queryMock).not.toHaveBeenCalled();
   });
 });

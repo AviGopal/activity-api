@@ -607,8 +607,14 @@ app.get('/', async (c) => {
       execution_id: trace.execution_id || trace.id?.toString().split(':')[1] || trace.id,
     }));
 
+    // F-37/F-40 read-time fallback (2026-04-26): when stored chain is empty
+    // but parent_execution_id is set, walk on the fly. Read-only.
+    const executionsWithChain = await Promise.all(
+      executionsNormalized.map((t: any) => applyChainFallback(t)),
+    );
+
     const response: ListExecutionTracesResponse = {
-      executions: executionsNormalized,
+      executions: executionsWithChain,
       total,
       limit,
       offset,
@@ -748,13 +754,16 @@ app.get('/:executionId', async (c) => {
 
     // Return trace with optional selection data
     // Ensure execution_id is populated (use SurrealDB id as fallback for legacy data)
-    const traceNormalized = {
+    const traceNormalized: any = {
       ...trace,
       execution_id: trace.execution_id || (trace as any).id?.toString().split(':')[1] || (trace as any).id,
       selection_attribution: selectionData,
     };
 
-    return c.json(traceNormalized);
+    // F-37/F-40 read-time fallback (2026-04-26): same contract as list handler.
+    const traceWithChain = await applyChainFallback(traceNormalized);
+
+    return c.json(traceWithChain);
 
   } catch (error) {
     logger.error('Failed to get execution trace', {
@@ -1011,6 +1020,105 @@ export async function backfillChildCompositionChains(
       error: err instanceof Error ? err.message : String(err),
     });
   }
+}
+
+/**
+ * Read-time fallback for F-37/F-40: walk `parent_execution_id` chain on the
+ * fly when the stored `composition_chain` is empty. F-37 + F-40 are write-time
+ * fixes; traces inserted before they landed can still expose
+ * `composition_chain: []` despite a valid `parent_execution_id`. This helper
+ * closes the audit-time gap (Phase 8 criterion 2 — recursive escalation
+ * auditing).
+ *
+ * Walks upward, prepending each step. On the first non-empty
+ * `composition_chain` encountered, prepends it as the base and stops
+ * (early-exit — parent's chain already covers everything above). Capped at
+ * `maxDepth` and guarded with a visited-set against cycles. Returns `[]` on
+ * any DB error. Read-only — never writes back. Cost is at most `maxDepth`
+ * queries; typically 1-3 for L3 trees.
+ *
+ * Exported for tests.
+ */
+export async function walkCompositionChain(
+  executionId: string,
+  maxDepth = 16,
+): Promise<string[]> {
+  if (!executionId || typeof executionId !== 'string') return [];
+  const accumulator: string[] = [];
+  let cursor: string | undefined = executionId;
+  const visited = new Set<string>();
+  try {
+    for (let depth = 0; depth < maxDepth && cursor; depth++) {
+      if (visited.has(cursor)) break; // cycle guard
+      visited.add(cursor);
+
+      const result = await surrealDB.query<{
+        execution_id?: string;
+        parent_execution_id?: string | null;
+        composition_chain?: string[] | null;
+      }>(
+        `
+          SELECT execution_id, parent_execution_id, composition_chain FROM activity_execution_traces
+          WHERE execution_id = $execution_id
+          LIMIT 1
+        `,
+        { execution_id: cursor },
+      );
+      if (!result || result.length === 0) return accumulator; // orphan/missing
+      const row = result[0] as {
+        execution_id?: string;
+        parent_execution_id?: string | null;
+        composition_chain?: string[] | null;
+      };
+      const rowChain: string[] = Array.isArray(row?.composition_chain)
+        ? (row.composition_chain as string[])
+        : [];
+      const rowExecId =
+        typeof row?.execution_id === 'string' && row.execution_id.length > 0
+          ? row.execution_id
+          : cursor;
+
+      if (rowChain.length > 0) {
+        // Early-exit: parent's chain covers everything above it.
+        return [...rowChain, rowExecId, ...accumulator];
+      }
+
+      accumulator.unshift(rowExecId);
+      cursor =
+        typeof row?.parent_execution_id === 'string' && row.parent_execution_id.length > 0
+          ? row.parent_execution_id
+          : undefined;
+    }
+    return accumulator;
+  } catch (err) {
+    logger.warn('[F-37/F-40 read-time] walkCompositionChain failed — returning []', {
+      execution_id: executionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
+}
+
+/**
+ * Apply the F-37/F-40 read-time fallback to a single trace: when the stored
+ * `composition_chain` is empty but a `parent_execution_id` is set, walk on
+ * the fly via `walkCompositionChain`. Returns the trace unchanged when the
+ * chain is already populated, when no parent reference exists, or when the
+ * walk yields nothing. Read-only — never writes back.
+ *
+ * Exported for tests.
+ */
+export async function applyChainFallback<T extends Record<string, any>>(trace: T): Promise<T> {
+  const storedChain: unknown = trace?.composition_chain;
+  if (Array.isArray(storedChain) && storedChain.length > 0) return trace;
+  const parentId =
+    typeof trace?.parent_execution_id === 'string' && trace.parent_execution_id.length > 0
+      ? (trace.parent_execution_id as string)
+      : null;
+  if (!parentId) return trace;
+  const computed = await walkCompositionChain(parentId);
+  if (computed.length === 0) return trace;
+  return { ...trace, composition_chain: computed };
 }
 
 /**
