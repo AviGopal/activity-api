@@ -609,8 +609,11 @@ app.get('/', async (c) => {
 
     // F-37/F-40 read-time fallback (2026-04-26): when stored chain is empty
     // but parent_execution_id is set, walk on the fly. Read-only.
+    // Per-request memoization cache: sibling rows with the same parent
+    // collapse to a single DB walk per distinct parent_execution_id.
+    const chainCache: CompositionChainCache = new Map();
     const executionsWithChain = await Promise.all(
-      executionsNormalized.map((t: any) => applyChainFallback(t)),
+      executionsNormalized.map((t: any) => applyChainFallback(t, chainCache)),
     );
 
     const response: ListExecutionTracesResponse = {
@@ -1064,7 +1067,20 @@ export async function walkCompositionChain(
         `,
         { execution_id: cursor },
       );
-      if (!result || result.length === 0) return accumulator; // orphan/missing
+      if (!result || result.length === 0) {
+        // Orphan / missing parent. Mid-walk this means we have an
+        // incomplete picture (real parent row never landed, or lives in a
+        // different store). Log once at warn level so the gap is visible
+        // but never throw — return whatever the walk accumulated so far.
+        if (accumulator.length > 0) {
+          logger.warn('[F-37/F-40 read-time] orphan parent mid-walk — returning partial chain', {
+            origin_execution_id: executionId,
+            missing_parent_execution_id: cursor,
+            partial_chain_length: accumulator.length,
+          });
+        }
+        return accumulator;
+      }
       const row = result[0] as {
         execution_id?: string;
         parent_execution_id?: string | null;
@@ -1100,15 +1116,54 @@ export async function walkCompositionChain(
 }
 
 /**
- * Apply the F-37/F-40 read-time fallback to a single trace: when the stored
- * `composition_chain` is empty but a `parent_execution_id` is set, walk on
- * the fly via `walkCompositionChain`. Returns the trace unchanged when the
- * chain is already populated, when no parent reference exists, or when the
- * walk yields nothing. Read-only — never writes back.
+ * In-request memoization cache for chain resolution. Use one cache per
+ * incoming HTTP request (see `applyChainFallback` callers in the GET list
+ * handler and `runExecutionTraceWithSignatures`); siblings with the same
+ * parent reuse the same walk. Out-of-band, the cache stays scoped to the
+ * promise graph that owns it — no cross-request leakage.
+ */
+export type CompositionChainCache = Map<string, Promise<string[]>>;
+
+/**
+ * Resolve the composition chain for a parent execution id with optional
+ * in-request memoization. Wraps `walkCompositionChain`; the cache is keyed
+ * by the executionId argument and stores the in-flight promise so concurrent
+ * calls share one DB walk. No global state — caller passes a fresh `Map`
+ * per request and discards it on response.
  *
  * Exported for tests.
  */
-export async function applyChainFallback<T extends Record<string, any>>(trace: T): Promise<T> {
+export async function resolveCompositionChain(
+  executionId: string,
+  cache?: CompositionChainCache,
+  maxDepth = 16,
+): Promise<string[]> {
+  if (!executionId || typeof executionId !== 'string') return [];
+  if (!cache) return walkCompositionChain(executionId, maxDepth);
+  const cached = cache.get(executionId);
+  if (cached) return cached;
+  const promise = walkCompositionChain(executionId, maxDepth);
+  cache.set(executionId, promise);
+  return promise;
+}
+
+/**
+ * Apply the F-37/F-40 read-time fallback to a single trace: when the stored
+ * `composition_chain` is empty but a `parent_execution_id` is set, walk on
+ * the fly via `resolveCompositionChain`. Returns the trace unchanged when the
+ * chain is already populated, when no parent reference exists, or when the
+ * walk yields nothing. Read-only — never writes back.
+ *
+ * Pass an optional `cache` (a fresh `Map` per request) to memoize repeated
+ * walks across siblings — large list responses with many traces sharing a
+ * common ancestor collapse to one DB walk per distinct parent.
+ *
+ * Exported for tests.
+ */
+export async function applyChainFallback<T extends Record<string, any>>(
+  trace: T,
+  cache?: CompositionChainCache,
+): Promise<T> {
   const storedChain: unknown = trace?.composition_chain;
   if (Array.isArray(storedChain) && storedChain.length > 0) return trace;
   const parentId =
@@ -1116,7 +1171,7 @@ export async function applyChainFallback<T extends Record<string, any>>(trace: T
       ? (trace.parent_execution_id as string)
       : null;
   if (!parentId) return trace;
-  const computed = await walkCompositionChain(parentId);
+  const computed = await resolveCompositionChain(parentId, cache);
   if (computed.length === 0) return trace;
   return { ...trace, composition_chain: computed };
 }
@@ -1591,7 +1646,18 @@ app.post('/', async (c) => {
           };
           if (owningTaskId) data.task_id = owningTaskId;
           if (shape) data.shape = shape;
-          if (resolvedBody !== undefined) data.body = resolvedBody;
+
+          // Include body for all shapes with 50 KB size guard
+          if (resolvedBody !== undefined) {
+            try {
+              const serialized = JSON.stringify(resolvedBody);
+              data.body = serialized.length > 50_000
+                ? { truncated: true, summary: (resolvedBody as Record<string, unknown>)?.summary ?? null }
+                : resolvedBody;
+            } catch {
+              // Non-serializable body — omit
+            }
+          }
 
           broadcaster.emit({
             type: 'impulse.resolved',
