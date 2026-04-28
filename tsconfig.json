@@ -27,7 +27,7 @@
     // WIP features that import a `Database` class abstraction not present
     // in this codebase. Files are orphans (no importers) and must be rewritten
     // to use surrealDB/queryWithAuth before being reincluded in typecheck.
-    "src/routes/state-aware-recommendations.ts",
+    // state-aware-recommendations.ts deleted in Phase B3b dead-code cleanup.
     "src/services/state-pattern-learner.ts"
   ]
 }

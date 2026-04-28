@@ -228,6 +228,13 @@ connections.post('/acquire', async (c) => {
 
     // Find API key by hash comparison
     // First, get all active API keys and verify hash
+    // TODO(account_id): table is `api_keys` (plural) — phantom; real table is
+    // `api_key` (singular, sql/schemas/049-api-key-direct-auth.surql). This
+    // endpoint always returns 401 ("invalid_api_key") in the current schema.
+    // Identity-vessel /v1/auth/exchange (called below) is the real validator;
+    // the Redis slot bookkeeping on `active_connections` still works once a
+    // matched key arrives. Fix in a future phase when the slot model is
+    // reconciled with identity-vessel.
     const apiKeys = await surrealDB.query<ApiKey>(
       `SELECT * FROM api_keys WHERE is_active = true AND status = 'active'`
     );
