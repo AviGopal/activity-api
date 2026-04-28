@@ -2375,6 +2375,7 @@ router.post('/resolve', async (c) => {
 
           const report = await runTemplateAuditReport(db, parsed, {
             orgId: jwtAuth.orgId,
+            accountId: jwtAuth.accountId ?? null,
             authType: jwtAuth.authType,
           });
 
@@ -2427,6 +2428,7 @@ router.post('/resolve', async (c) => {
             pointer as unknown,
             {
               orgId: jwtAuth.orgId,
+              accountId: jwtAuth.accountId ?? null,
               authType: jwtAuth.authType,
             },
           );

@@ -11,6 +11,7 @@ import { Hono } from 'hono';
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
 import { getJwtAuthFromContext } from '../middleware/jwtAuth';
+import { accountIdScopedWhere } from './activities';
 import Ajv from 'ajv';
 
 const app = new Hono();
@@ -250,6 +251,9 @@ app.post('/', async (c) => {
     }
 
     // Create shape definition
+    // Phase B3: dual-write account_id alongside org_id. Public shapes leave
+    // both null (visible to all tenants); private shapes carry both.
+    // account_id_version=1 marks this row as Phase B dual-written.
     const createQuery = `
       CREATE shape_definition CONTENT {
         name: $name,
@@ -260,6 +264,8 @@ app.post('/', async (c) => {
         tags: $tags,
         public: $public,
         org_id: $orgId,
+        account_id: $account_id,
+        account_id_version: $account_id_version,
         deprecated: false,
         breaking_changes: $breaking_changes,
         changelog: $changelog,
@@ -279,6 +285,8 @@ app.post('/', async (c) => {
       tags: body.tags || [],
       public: body.public !== undefined ? body.public : false,
       orgId: body.public ? null : auth.orgId,
+      account_id: body.public ? null : (auth.accountId ?? null),
+      account_id_version: 1,
       breaking_changes: body.breaking_changes || [],
       changelog: body.changelog || null,
       migration_from: body.migration_from || null,
@@ -333,17 +341,21 @@ app.get('/:name', async (c) => {
   const versionConstraint = c.req.query('version');
 
   try {
-    // Get all versions of this shape accessible to user
+    // Get all versions of this shape accessible to user.
+    // Phase B3: prefer account_id; legacy rows match via the org_id branch.
+    // Public shapes and NONE-scoped shapes remain visible regardless of tenant.
     const query = `
       SELECT * FROM shape_definition
       WHERE name = $name
-        AND (public = true OR org_id IS NONE OR org_id = $orgId)
+        AND (public = true OR org_id IS NONE OR ${accountIdScopedWhere()})
       ORDER BY version DESC;
     `;
 
     const shapes = await surrealDB.query<ShapeDefinition[]>(query, {
       name,
       orgId: auth.orgId,
+      org_id: auth.orgId,
+      account_id: auth.accountId ?? null,
     });
 
     if (shapes[0]?.length === 0) {
@@ -394,17 +406,20 @@ app.get('/:name/versions', async (c) => {
   const name = c.req.param('name');
 
   try {
+    // Phase B3: prefer account_id; legacy rows match via the org_id branch.
     const query = `
       SELECT version, created_at, breaking_changes, deprecated, deprecation_reason
       FROM shape_definition
       WHERE name = $name
-        AND (public = true OR org_id IS NONE OR org_id = $orgId)
+        AND (public = true OR org_id IS NONE OR ${accountIdScopedWhere()})
       ORDER BY version DESC;
     `;
 
     const versions = await surrealDB.query<ShapeVersionInfo[]>(query, {
       name,
       orgId: auth.orgId,
+      org_id: auth.orgId,
+      account_id: auth.accountId ?? null,
     });
 
     if (versions[0]?.length === 0) {
@@ -441,10 +456,11 @@ app.get('/', async (c) => {
   const publicOnly = c.req.query('public_only') === 'true';
 
   try {
+    // Phase B3: prefer account_id; legacy rows match via the org_id branch.
     let query = `
       SELECT name, version, description, tags, public, created_at
       FROM shape_definition
-      WHERE (public = true OR org_id IS NONE OR org_id = $orgId)
+      WHERE (public = true OR org_id IS NONE OR ${accountIdScopedWhere()})
     `;
 
     if (publicOnly) {
@@ -459,6 +475,8 @@ app.get('/', async (c) => {
 
     const shapes = await surrealDB.query<ShapeDefinition[]>(query, {
       orgId: auth.orgId,
+      org_id: auth.orgId,
+      account_id: auth.accountId ?? null,
       tag,
     });
 
@@ -505,12 +523,13 @@ app.get('/:name/migrations', async (c) => {
 
   try {
     // Get target version
+    // Phase B3: prefer account_id; legacy rows match via the org_id branch.
     const query = `
       SELECT breaking_changes, changelog, migration_from
       FROM shape_definition
       WHERE name = $name
         AND version = $toVersion
-        AND (public = true OR org_id IS NONE OR org_id = $orgId)
+        AND (public = true OR org_id IS NONE OR ${accountIdScopedWhere()})
       LIMIT 1;
     `;
 
@@ -518,6 +537,8 @@ app.get('/:name/migrations', async (c) => {
       name,
       toVersion,
       orgId: auth.orgId,
+      org_id: auth.orgId,
+      account_id: auth.accountId ?? null,
     });
 
     if (results[0]?.length === 0) {

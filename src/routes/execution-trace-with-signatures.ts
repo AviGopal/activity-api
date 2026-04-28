@@ -119,8 +119,12 @@ export interface ExecutionTraceWithSignaturesReport {
 
 export interface ExecutionTraceAuthContext {
   orgId: string;
+  /** Phase B3: account_id-first scoping. When present, the resolver matches
+   *  rows on `account_id = $account_id`; legacy rows (account_id IS NONE)
+   *  fall back to org_id. Pass through from the caller's JWT auth. */
+  accountId?: string | null;
   /** 'apikey' bypasses SurrealDB PERMISSIONS (self-signed JWT); for those
-   *  callers the resolver applies an app-side `org_id = $orgId` filter. */
+   *  callers the resolver applies an app-side dual-tenant filter. */
   authType?: 'jwt' | 'apikey' | 'minibob_token';
 }
 
@@ -361,8 +365,13 @@ async function queryExecutions(
   const where: string[] = ['executed_at >= type::datetime($since)'];
 
   if (auth.authType === 'apikey') {
-    where.push('org_id = $orgId');
+    // Phase B3: dual-tenant scoping. Match on account_id when present;
+    // legacy rows fall back to org_id via the disjunction.
+    where.push(
+      '(account_id = $account_id OR (account_id IS NONE AND org_id = $orgId))',
+    );
     params.orgId = auth.orgId;
+    params.account_id = auth.accountId ?? null;
   }
   if (input.activity_template_id) {
     where.push('activity_id = $activityId');
@@ -421,8 +430,11 @@ async function queryImpulseSignatures(
   const params: Record<string, unknown> = { ids: impulseIds };
   let whereOrg = '';
   if (auth.authType === 'apikey') {
-    whereOrg = ' AND org_id = $orgId';
+    // Phase B3: dual-tenant scoping (account_id with org_id fallback).
+    whereOrg =
+      ' AND (account_id = $account_id OR (account_id IS NONE AND org_id = $orgId))';
     params.orgId = auth.orgId;
+    params.account_id = auth.accountId ?? null;
   }
 
   const sql = `

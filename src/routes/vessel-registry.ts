@@ -10,6 +10,7 @@ import { surrealDB, queryWithAuth } from '../db/surreal';
 import { logger } from '../utils/logger';
 import { getJwtAuthFromContext } from '../middleware/jwtAuth';
 import { computeVesselHealthScore, getOrganizationVesselHealth } from '../services/vessel-health';
+import { accountIdScopedWhere } from './activities';
 
 const app = new Hono();
 
@@ -128,6 +129,9 @@ app.post('/register', async (c) => {
     const now = new Date().toISOString();
     const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
 
+    // Phase B3: dual-write account_id alongside org_id. account_id is null
+    // when caller has no accountId claim; account_id_version=1 marks this row
+    // as Phase B dual-written so Phase F backfill can identify legacy rows.
     const query = `
       UPDATE ${recordId} CONTENT {
         id: $vesselId,
@@ -142,6 +146,8 @@ app.post('/register', async (c) => {
         last_heartbeat: time::now(),
         expires_at: $expiresAt,
         org_id: $orgId,
+        account_id: $account_id,
+        account_id_version: $account_id_version,
         registered_at: $registeredAt
       }
       RETURN id, expires_at;
@@ -162,6 +168,8 @@ app.post('/register', async (c) => {
         ttl,
         expiresAt,
         orgId: auth.orgId,
+        account_id: auth.accountId ?? null,
+        account_id_version: 1,
         registeredAt: existingRegisteredAt || now,
       }
     );
@@ -227,11 +235,13 @@ app.get('/discover', async (c) => {
   try {
     // Lookup shape in registry to validate it exists
     // Use queryWithAuth so PERMISSIONS on shape_definition are respected
+    // Phase B3: prefer account_id; legacy rows match via the org_id branch
+    // of accountIdScopedWhere().
     const shapeQuery = `
       SELECT name, version, description
       FROM shape_definition
       WHERE name = $shape
-        AND (public = true OR org_id IS NONE OR org_id = $orgId)
+        AND (public = true OR org_id IS NONE OR ${accountIdScopedWhere()})
       ORDER BY version DESC
       LIMIT 1;
     `;
@@ -239,7 +249,12 @@ app.get('/discover', async (c) => {
     const shapeResults = await queryWithAuth<{ name: string; version: string; description: string }>(
       auth.jwtToken,
       shapeQuery,
-      { shape, orgId: auth.orgId }
+      {
+        shape,
+        orgId: auth.orgId,
+        org_id: auth.orgId,
+        account_id: auth.accountId ?? null,
+      }
     );
 
     const shapeDefinition = shapeResults?.[0];
@@ -253,10 +268,12 @@ app.get('/discover', async (c) => {
 
     // Find vessels advertising this shape
     // Use queryWithAuth so PERMISSIONS on vessel are respected
+    // Phase B3: dual-tenant scoping; legacy rows match via accountIdScopedWhere
+    // org_id branch.
     const vesselQuery = `
       SELECT * FROM vessel
       WHERE $shape IN shapes
-        AND org_id = $orgId
+        AND ${accountIdScopedWhere()}
         AND expires_at > time::now()
       ORDER BY last_heartbeat DESC;
     `;
@@ -264,7 +281,12 @@ app.get('/discover', async (c) => {
     const vessels = await queryWithAuth<VesselRecord>(
       auth.jwtToken,
       vesselQuery,
-      { shape, orgId: auth.orgId }
+      {
+        shape,
+        orgId: auth.orgId,
+        org_id: auth.orgId,
+        account_id: auth.accountId ?? null,
+      }
     );
 
     if (!vessels || vessels.length === 0) {
@@ -278,6 +300,7 @@ app.get('/discover', async (c) => {
     // Record routing trace
     // Use queryWithAuth so PERMISSIONS on routing_trace are respected
     // (routing_trace requires org_id = $auth.org_id for CREATE)
+    // Phase B3: dual-write account_id alongside org_id.
     const traceQuery = `
       CREATE routing_trace CONTENT {
         shape: $shape,
@@ -289,6 +312,8 @@ app.get('/discover', async (c) => {
         success: true,
         latency_ms: 0,
         org_id: $orgId,
+        account_id: $account_id,
+        account_id_version: $account_id_version,
         timestamp: time::now()
       };
     `;
@@ -306,6 +331,8 @@ app.get('/discover', async (c) => {
           last_heartbeat: v.last_heartbeat,
         })),
         orgId: auth.orgId,
+        account_id: auth.accountId ?? null,
+        account_id_version: 1,
       }
     );
 
@@ -348,9 +375,10 @@ app.get('/', async (c) => {
   const activeOnly = c.req.query('active_only') === 'true';
 
   try {
+    // Phase B3: dual-tenant scoping; legacy rows match via the org_id branch.
     let query = `
       SELECT * FROM vessel
-      WHERE org_id = $orgId
+      WHERE ${accountIdScopedWhere()}
     `;
 
     if (activeOnly) {
@@ -363,7 +391,11 @@ app.get('/', async (c) => {
     const vessels = await queryWithAuth<VesselRecord>(
       auth.jwtToken,
       query,
-      { orgId: auth.orgId }
+      {
+        orgId: auth.orgId,
+        org_id: auth.orgId,
+        account_id: auth.accountId ?? null,
+      }
     );
 
     const vesselList = vessels || [];
@@ -398,10 +430,11 @@ app.get('/:vesselId', async (c) => {
   const vesselId = c.req.param('vesselId');
 
   try {
+    // Phase B3: dual-tenant scoping.
     const query = `
       SELECT * FROM vessel
       WHERE id = $vesselId
-        AND org_id = $orgId
+        AND ${accountIdScopedWhere()}
       LIMIT 1;
     `;
 
@@ -409,7 +442,12 @@ app.get('/:vesselId', async (c) => {
     const vessels = await queryWithAuth<VesselRecord>(
       auth.jwtToken,
       query,
-      { vesselId, orgId: auth.orgId }
+      {
+        vesselId,
+        orgId: auth.orgId,
+        org_id: auth.orgId,
+        account_id: auth.accountId ?? null,
+      }
     );
 
     if (!vessels || vessels.length === 0) {
@@ -455,17 +493,23 @@ app.delete('/:vesselId', async (c) => {
   const vesselId = c.req.param('vesselId');
 
   try {
+    // Phase B3: dual-tenant scoping for DELETE.
     const query = `
       DELETE FROM vessel
       WHERE id = $vesselId
-        AND org_id = $orgId;
+        AND ${accountIdScopedWhere()};
     `;
 
     // Use queryWithAuth so PERMISSIONS on vessel table are respected
     await queryWithAuth(
       auth.jwtToken,
       query,
-      { vesselId, orgId: auth.orgId }
+      {
+        vesselId,
+        orgId: auth.orgId,
+        org_id: auth.orgId,
+        account_id: auth.accountId ?? null,
+      }
     );
 
     logger.info('Vessel unregistered', {
@@ -512,16 +556,22 @@ app.get('/:vesselId/health', async (c) => {
     let latencyMs = 0;
 
     if (checkEndpoint) {
+      // Phase B3: dual-tenant scoping.
       const vesselQuery = `
         SELECT endpoint FROM vessel
-        WHERE id = $vesselId AND org_id = $orgId
+        WHERE id = $vesselId AND ${accountIdScopedWhere()}
         LIMIT 1;
       `;
       // Use queryWithAuth so PERMISSIONS on vessel table are respected
       const vesselResults = await queryWithAuth<{ endpoint: string }>(
         auth.jwtToken,
         vesselQuery,
-        { vesselId, orgId: auth.orgId }
+        {
+          vesselId,
+          orgId: auth.orgId,
+          org_id: auth.orgId,
+          account_id: auth.accountId ?? null,
+        }
       );
 
       const vessel = vesselResults?.[0];

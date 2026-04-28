@@ -120,6 +120,10 @@ export interface TemplateAuditReport {
 
 export interface AuditAuthContext {
   orgId: string;
+  /** Phase B3: account_id-first scoping. When present, the audit reads match
+   *  rows on `account_id = $account_id`; legacy rows (account_id IS NONE)
+   *  fall back to org_id. Threaded through from JWT auth. */
+  accountId?: string | null;
   /** 'apikey' uses root SurrealDB + app-side org filter; 'jwt'/undefined relies
    *  on the passed `db` client honouring PERMISSIONS. */
   authType?: 'jwt' | 'apikey' | 'minibob_token';
@@ -451,18 +455,24 @@ async function queryTemplates(
   // that deployments where `activity_template` is a view over `activity`
   // don't report the same template twice.
   //
-  // For API-key auth we add `org_id = $orgId OR scope = 'global'` manually;
-  // for JWT auth the caller's db client already honours PERMISSIONS but the
-  // extra predicate is a safe no-op.
-
+  // For API-key auth we add a tenant predicate manually; for JWT auth the
+  // caller's db client already honours PERMISSIONS but the extra predicate
+  // is a safe no-op.
+  // Phase B3: dual-tenant scoping. Match on account_id first; fall back to
+  // org_id for legacy rows that pre-date the account_id migration.
+  const tenantClause =
+    '(account_id = $account_id OR (account_id IS NONE AND org_id = $orgId))';
   const orgPredicate =
     auth.authType === 'apikey'
-      ? `(org_id = $orgId OR scope = 'global')`
-      : `(org_id = $orgId OR scope = 'global' OR org_id IS NONE)`;
+      ? `(${tenantClause} OR scope = 'global')`
+      : `(${tenantClause} OR scope = 'global' OR org_id IS NONE)`;
 
   const scopePredicate = scope ? ` AND scope = $scope` : '';
   const whereClause = `WHERE ${orgPredicate}${scopePredicate}`;
-  const params: Record<string, unknown> = { orgId: auth.orgId };
+  const params: Record<string, unknown> = {
+    orgId: auth.orgId,
+    account_id: auth.accountId ?? null,
+  };
   if (scope) params.scope = scope;
 
   const fields =
