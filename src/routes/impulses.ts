@@ -1676,12 +1676,24 @@ router.post('/resolve', async (c) => {
         const impulseShape = extendedPointer.impulseShape;
         const limit = pointer.limit || 50;
 
-        logger.info('Resolving impulseRelevance', { activityId, impulseShape, limit });
+        logger.info('Resolving impulseRelevance', {
+          activityId,
+          impulseShape,
+          limit,
+          org_id: jwtAuthCtx.orgId,
+          account_id: jwtAuthCtx.accountId ?? null,
+        });
 
-        // Build query for impulse relevance metrics
+        // Build query for impulse relevance metrics.
+        // Phase E: tenant scoping. account_id wins; legacy rows
+        // (account_id IS NONE) match via org_id when no accountId is in scope.
         let whereClause = '';
-        const params: Record<string, any> = { limit };
-        const conditions: string[] = [];
+        const params: Record<string, any> = {
+          limit,
+          org_id: jwtAuthCtx.orgId,
+          account_id: jwtAuthCtx.accountId ?? null,
+        };
+        const conditions: string[] = [accountIdScopedWhere()];
 
         if (activityId) {
           conditions.push('activity_variant_id = $activity_id');
@@ -1694,9 +1706,7 @@ router.post('/resolve', async (c) => {
           params.impulse_shape = impulseShape;
         }
 
-        if (conditions.length > 0) {
-          whereClause = 'WHERE ' + conditions.join(' AND ');
-        }
+        whereClause = 'WHERE ' + conditions.join(' AND ');
 
         const query = `
           SELECT

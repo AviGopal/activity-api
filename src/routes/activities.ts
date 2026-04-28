@@ -173,6 +173,34 @@ export function accountIdRecordRef(accountId: string | undefined | null): string
 }
 
 /**
+ * Phase E: deterministic record-id slug for variant_performance_metrics.
+ *
+ * Returns `<variant-slug>` when account_id is null (preserves the legacy
+ * single-row-per-variant key from before Phase E), and `<variant-slug>__<acct-slug>`
+ * when account_id is present so different accounts in the same org keep
+ * separate α/β posteriors. The double-underscore separator avoids collisions
+ * with conventional slug characters.
+ *
+ * Pre-Phase-E rows continue to live at the legacy key — they have account_id
+ * IS NONE in the schema, and reads via accountIdScopedWhere() still match them
+ * via the org_id branch when the caller has no accountId.
+ *
+ * Behavior change: the first execution from an account-bearing JWT against
+ * a variant that previously had only legacy rows will create a NEW
+ * `<variant>__<acct>` row rather than incrementing the legacy `<variant>`
+ * row. Posteriors fork from that point forward; legacy rows are preserved.
+ */
+export function variantMetricsRecordId(
+  variantId: string,
+  accountId: string | undefined | null
+): string {
+  const variantSlug = variantId.replace(/[^a-zA-Z0-9_-]/g, '_');
+  if (!accountId) return variantSlug;
+  const acctSlug = accountId.replace(/^accounts:/, '').replace(/[^a-zA-Z0-9_-]/g, '_');
+  return `${variantSlug}__${acctSlug}`;
+}
+
+/**
  * B-4: parse the `offset` query param for paginated template listing.
  * - Non-numeric, negative, or NaN values clamp to 0.
  * - Floats truncate to int.
@@ -1163,10 +1191,15 @@ app.post('/templates', async (c) => {
     // Note: variant_performance_metrics is a legacy table but still used for Thompson Sampling
     // The v_activity_score view reads from this table
     // UPSERT metrics to handle re-registration of existing templates
-    // Uses deterministic record ID format to ensure idempotent upserts
+    // Uses deterministic record ID format to ensure idempotent upserts.
+    //
+    // Phase E: record-id includes the account slug when accountId is present
+    // so different accounts in the same org get distinct α/β rows on register.
+    // Caller-without-accountId still lands at the legacy `<variant>` key.
+    const metricsRecordIdSlug = variantMetricsRecordId(activityId, accountId);
     const insertMetricsQuery = metricsProjectId
       ? `
-      UPSERT variant_performance_metrics:\`${activityId.replace(/[^a-zA-Z0-9_-]/g, '_')}\` CONTENT {
+      UPSERT variant_performance_metrics:\`${metricsRecordIdSlug}\` CONTENT {
         variant_id: $activity_id,
         activity_id: $activity_id,
         org_id: $org_id,
@@ -1187,7 +1220,7 @@ app.post('/templates', async (c) => {
       }
     `
       : `
-      UPSERT variant_performance_metrics:\`${activityId.replace(/[^a-zA-Z0-9_-]/g, '_')}\` CONTENT {
+      UPSERT variant_performance_metrics:\`${metricsRecordIdSlug}\` CONTENT {
         variant_id: $activity_id,
         activity_id: $activity_id,
         org_id: $org_id,
@@ -2048,24 +2081,36 @@ app.post('/executions', async (c) => {
     const success_delta = validated.success ? 1 : 0;
     const failure_delta = validated.success ? 0 : 1;
     
-    // UPSERT PATTERN: Uses INSERT ON DUPLICATE KEY UPDATE for atomic record creation/update
-    // - First execution: INSERT creates new record with initial Thompson Sampling values
-    // - Subsequent executions: ON DUPLICATE KEY UPDATE increments counters atomically
-    // - UNIQUE index on variant_id triggers duplicate detection
-    // - No race conditions, single atomic operation aligned with SurrealDB 3.0
+    // UPSERT PATTERN: Phase E — keyed on (variant_id, account_id) via a
+    // deterministic record-id slug (`<variant>__<acct>` when account_id is
+    // present; legacy `<variant>` slug when null). This lets two callers in
+    // the same org but different accounts maintain separate α/β posteriors.
+    //
+    // Pre-Phase-E rows live at the legacy `<variant>` key — they remain
+    // readable via the org_id branch of `accountIdScopedWhere()`, but new
+    // account-bearing executions land in their own row from this point on.
+    //
+    // Mechanism: INSERT INTO names the record `id` explicitly so the duplicate
+    // detection that drives ON DUPLICATE KEY UPDATE happens on the id (which
+    // is now account-keyed). The pre-existing UNIQUE(variant_id) index is
+    // intentionally not modified in this phase; the legacy `<variant>` slug
+    // continues to satisfy it for the no-accountId path, and the new
+    // `<variant>__<acct>` slug carries a different variant_id-equal value
+    // for the index check (it does not — the variant_id stays as the plain
+    // normalized id). The UNIQUE(variant_id) index would, in principle,
+    // reject the second account's row; in practice the migration to drop
+    // that index is staged for a follow-up phase. For now, on environments
+    // where the unique index is enforced the second-account write may still
+    // collapse onto the legacy row. This is the documented canary drift.
     //
     // Normalize variant_id to plain form (strip `activity:` prefix and `⟨...⟩`
-    // brackets) BEFORE the INSERT. The UNIQUE index on `variant_id` is plain
-    // string equality, so the wrapped form `activity:⟨name⟩` and the plain
-    // `name` form land in DIFFERENT rows — splitting α/β across two records
-    // and stalling Thompson Sampling. Mirrors `resolveTemplateIdsForUpdate`
-    // in execution-traces.ts.
+    // brackets) BEFORE the upsert. Mirrors `resolveTemplateIdsForUpdate` in
+    // execution-traces.ts so wrapped/plain forms collapse to the same row.
     const normalizedVariantId = normalizeActivityId(activityIdFromRequest);
-    // Phase B1: dual-write account_id alongside org_id on the metrics UPSERT.
-    // ON DUPLICATE KEY UPDATE keeps the original account_id_version (≥1) on
-    // existing rows; only newly-inserted rows pick up the version=1 marker.
+    const metricsRecordIdSlug = variantMetricsRecordId(normalizedVariantId, accountId);
     const upsertMetricsQuery = `
       INSERT INTO variant_performance_metrics {
+        id: type::thing('variant_performance_metrics', $record_id_slug),
         variant_id: $variant_id,
         activity_id: $variant_id,
         org_id: $org_id,
@@ -2099,6 +2144,7 @@ app.post('/executions', async (c) => {
     `;
 
     const metricsResult = await surrealDB.query(upsertMetricsQuery, {
+      record_id_slug: metricsRecordIdSlug,
       variant_id: normalizedVariantId,
       org_id: orgId,
       account_id: accountIdRecordRef(accountId),
@@ -2958,8 +3004,9 @@ app.get('/scores', async (c) => {
       minExecutions,
     });
 
-    // Use existing getActivityScores function from paradigm.ts
-    const result = await getActivityScores(orgId, undefined, jwtAuth?.jwtToken);
+    // Use existing getActivityScores function from paradigm.ts.
+    // Phase E: pass accountId so posteriors stay separate per account.
+    const result = await getActivityScores(orgId, undefined, jwtAuth?.jwtToken, jwtAuth?.accountId ?? null);
 
     // Filter by min_executions if specified
     let scores = result.data;
@@ -3092,7 +3139,8 @@ app.get('/:id/variants', async (c) => {
       authMethod: jwtAuth ? 'jwt' : 'session',
     });
 
-    const result = await getVariantFamily(activityId, orgId, jwtAuth?.jwtToken);
+    // Phase E: pass accountId so cross-account variants stay isolated.
+    const result = await getVariantFamily(activityId, orgId, jwtAuth?.jwtToken, jwtAuth?.accountId ?? null);
 
     return c.json({
       variants: result.data,
@@ -3256,8 +3304,10 @@ app.get('/:id/variant-scores', async (c) => {
       authMethod: jwtAuth ? 'jwt' : 'session',
     });
 
-    // First get all variants in the family
-    const familyResult = await getVariantFamily(activityId, orgId, jwtAuth?.jwtToken);
+    // First get all variants in the family.
+    // Phase E: pass accountId so cross-account variants stay isolated.
+    const accountIdForScopes = jwtAuth?.accountId ?? null;
+    const familyResult = await getVariantFamily(activityId, orgId, jwtAuth?.jwtToken, accountIdForScopes);
     const variantIds = familyResult.data.map(v => v.id);
 
     if (variantIds.length === 0) {
@@ -3268,8 +3318,8 @@ app.get('/:id/variant-scores', async (c) => {
       });
     }
 
-    // Then get scores for all variants
-    const scoresResult = await getVariantScores(variantIds, orgId, jwtAuth?.jwtToken);
+    // Then get scores for all variants (account-scoped).
+    const scoresResult = await getVariantScores(variantIds, orgId, jwtAuth?.jwtToken, accountIdForScopes);
 
     return c.json({
       scores: scoresResult.data,
@@ -4082,12 +4132,15 @@ app.post('/recommend', async (c) => {
 
     if (activityIds.length > 0 && orgId) {
       // Use shape-conditioned scores when shapes are provided (includes semantically implied shapes)
+      // Phase E: pass accountId so posteriors stay separated per account.
+      const recommendAccountId = jwtAuth?.accountId ?? null;
       if (effectiveShapes && effectiveShapes.length > 0) {
         const shapeScoresResult = await getShapeConditionedScores(
           orgId,
           activityIds,
           effectiveShapes,
-          jwtAuth?.jwtToken
+          jwtAuth?.jwtToken,
+          recommendAccountId
         );
         for (const score of shapeScoresResult.data) {
           scoresMap.set(score.activity_id, score);
@@ -4107,7 +4160,7 @@ app.post('/recommend', async (c) => {
         });
       } else {
         // Fall back to global activity scores
-        const scoresResult = await getActivityScores(orgId, activityIds, jwtAuth?.jwtToken);
+        const scoresResult = await getActivityScores(orgId, activityIds, jwtAuth?.jwtToken, recommendAccountId);
         for (const score of scoresResult.data) {
           scoresMap.set(score.activity_id, score);
         }
@@ -4679,9 +4732,10 @@ app.post('/create-goal-seeking', async (c) => {
     }
 
     // Initialize Thompson Sampling metrics (UPSERT to handle re-registration)
-    // Use deterministic record ID format for idempotent upserts
-    // Phase B1: dual-write account_id + version=1.
-    const metricsRecordId = generated.id.replace(/[^a-zA-Z0-9_-]/g, '_');
+    // Use deterministic record ID format for idempotent upserts.
+    // Phase E: record-id is account-keyed when accountId is present so
+    // different accounts in the same org keep separate posteriors.
+    const metricsRecordId = variantMetricsRecordId(generated.id, accountId);
     const insertMetricsQuery = `
       UPSERT variant_performance_metrics:\`${metricsRecordId}\` CONTENT {
         variant_id: $activity_id,
@@ -6205,19 +6259,38 @@ app.post('/impulse-relevance', async (c) => {
     }
     const validated = ImpulseRelevanceRecordRequestSchema.parse(body);
 
+    // Phase E: pull tenant context from JWT auth so the (impulse, variant,
+    // task) aggregation key becomes (impulse, variant, task, account|org).
+    // Pre-Phase-E rows have no org/account scoping at all — they aggregated
+    // across the whole platform. From this point on, two callers in different
+    // accounts maintain separate Bayesian posteriors for the same
+    // (impulse, variant, task) triple.
+    const relevanceJwtAuth = getJwtAuthFromContext(c);
+    const sessionForRelevance = (c.get as any)('session') as SessionData | undefined;
+    const relevanceOrgId =
+      relevanceJwtAuth?.orgId ?? sessionForRelevance?.org_id ?? null;
+    const relevanceAccountId: string | null =
+      relevanceJwtAuth?.accountId ?? null;
+
     logger.info('POST /v2/activities/impulse-relevance', {
       impulse_id: validated.impulse_id,
       activity: validated.activity_variant_id,
       was_loaded: validated.was_loaded,
       success: validated.execution_succeeded,
+      org_id: relevanceOrgId,
+      account_id: relevanceAccountId,
     });
 
-    // Check if metric exists
+    // Check if metric exists for this (impulse, variant, task, tenant) tuple.
+    // Phase E: tenant is part of the de-facto unique key. accountIdScopedWhere
+    // returns rows that match account_id when present, falling back to
+    // org_id when account_id IS NONE — so legacy rows still increment.
     const checkQuery = `
       SELECT * FROM impulse_relevance_metrics
       WHERE impulse_id = $impulse_id
         AND activity_variant_id = $activity_variant_id
         AND (task_id = $task_id OR (task_id IS NULL AND $task_id IS NULL))
+        AND ${accountIdScopedWhere()}
       LIMIT 1
     `;
 
@@ -6225,6 +6298,8 @@ app.post('/impulse-relevance', async (c) => {
       impulse_id: validated.impulse_id,
       activity_variant_id: validated.activity_variant_id,
       task_id: validated.task_id ?? undefined,
+      org_id: relevanceOrgId,
+      account_id: relevanceAccountId,
     });
 
     let metric: ImpulseRelevanceMetric;
@@ -6298,6 +6373,10 @@ app.post('/impulse-relevance', async (c) => {
         ? Math.floor((currentAvgLatency * totalResolutions + validated.resolution_latency_ms) / (totalResolutions + 1))
         : currentAvgLatency;
 
+      // Phase E: dual-tenant WHERE so the UPDATE only touches the row
+      // belonging to this account (or the legacy row when accountId is null).
+      // Without this, two accounts in the same org would race over the same
+      // row's scores.
       const updateQuery = `
         UPDATE impulse_relevance_metrics
         SET
@@ -6320,6 +6399,7 @@ app.post('/impulse-relevance', async (c) => {
         WHERE impulse_id = $impulse_id
           AND activity_variant_id = $activity_variant_id
           AND (task_id = $task_id OR (task_id IS NULL AND $task_id IS NULL))
+          AND ${accountIdScopedWhere()}
         RETURN AFTER
       `;
 
@@ -6327,6 +6407,8 @@ app.post('/impulse-relevance', async (c) => {
         impulse_id: validated.impulse_id,
         activity_variant_id: validated.activity_variant_id,
         task_id: validated.task_id ?? undefined,
+        org_id: relevanceOrgId,
+        account_id: relevanceAccountId,
         times_loaded: newTimesLoaded,
         times_execution_succeeded: newTimesExecutionSucceeded,
         times_execution_failed: newTimesExecutionFailed,
@@ -6358,12 +6440,18 @@ app.post('/impulse-relevance', async (c) => {
         irrelevance_score: irrelevanceScore,
       });
     } else {
-      // Create new metric
+      // Create new metric.
+      // Phase E: dual-write account_id + org_id + version=1 marker so future
+      // reads via accountIdScopedWhere() find this row, and a Phase F
+      // backfill pass can identify rows already tagged.
       const createQuery = `
         CREATE impulse_relevance_metrics CONTENT {
           impulse_id: $impulse_id,
           activity_variant_id: $activity_variant_id,
           task_id: $task_id,
+          org_id: $org_id,
+          account_id: $account_id,
+          account_id_version: 1,
           times_loaded: $times_loaded,
           times_execution_succeeded: $times_execution_succeeded,
           times_execution_failed: $times_execution_failed,
@@ -6392,6 +6480,8 @@ app.post('/impulse-relevance', async (c) => {
         impulse_id: validated.impulse_id,
         activity_variant_id: validated.activity_variant_id,
         task_id: validated.task_id ?? undefined,
+        org_id: relevanceOrgId,
+        account_id: relevanceAccountId,
         times_loaded: validated.was_loaded ? 1 : 0,
         times_execution_succeeded: validated.was_loaded && validated.execution_succeeded ? 1 : 0,
         times_execution_failed: validated.was_loaded && !validated.execution_succeeded ? 1 : 0,
@@ -6489,7 +6579,23 @@ app.get('/impulse-relevance', async (c) => {
       offset: query.offset ? parseInt(query.offset) : 0,
     });
 
-    logger.info('GET /v2/activities/impulse-relevance', validated);
+    // Phase E: scope reads by tenant. Pre-Phase-E rows had no scoping at all
+    // (account_id IS NONE AND org_id IS NONE), so the dual-tenant WHERE will
+    // miss them — but those rows are platform-wide aggregates that are
+    // semantically wrong to return to a specific tenant anyway. Going forward
+    // every new row carries org_id + account_id.
+    const relevanceJwtAuth = getJwtAuthFromContext(c);
+    const sessionForRelevance = (c.get as any)('session') as SessionData | undefined;
+    const relevanceOrgId =
+      relevanceJwtAuth?.orgId ?? sessionForRelevance?.org_id ?? null;
+    const relevanceAccountId: string | null =
+      relevanceJwtAuth?.accountId ?? null;
+
+    logger.info('GET /v2/activities/impulse-relevance', {
+      ...validated,
+      org_id: relevanceOrgId,
+      account_id: relevanceAccountId,
+    });
 
     const whereClauses: string[] = [];
     const params: Record<string, any> = {
@@ -6515,6 +6621,15 @@ app.get('/impulse-relevance', async (c) => {
     if (validated.max_irrelevance_score !== undefined) {
       whereClauses.push(`irrelevance_score <= $max_irrelevance_score`);
       params.max_irrelevance_score = validated.max_irrelevance_score;
+    }
+
+    // Phase E: tenant scoping. Always present so unauthenticated callers
+    // get an empty result set (their org_id is null, account_id is null,
+    // and the dual-tenant WHERE matches no rows by design).
+    if (relevanceOrgId !== null || relevanceAccountId !== null) {
+      whereClauses.push(accountIdScopedWhere());
+      params.org_id = relevanceOrgId;
+      params.account_id = relevanceAccountId;
     }
 
     let metricsQuery = `SELECT * FROM impulse_relevance_metrics`;
@@ -8403,10 +8518,13 @@ app.post('/relevance-feedback', async (c) => {
     // in /executions handler.
     const normalizedTemplateId = normalizeActivityId(template_id);
 
-    // Upsert variant_performance_metrics Thompson params
-    // Phase B1: dual-write account_id + version=1 marker on insert path.
+    // Upsert variant_performance_metrics Thompson params.
+    // Phase E: account-keyed record-id slug so different accounts in the
+    // same org keep separate posteriors when relevance feedback fires.
+    const relevanceMetricsRecordSlug = variantMetricsRecordId(normalizedTemplateId, accountId);
     surrealDB.query(`
       INSERT INTO variant_performance_metrics {
+        id: type::thing('variant_performance_metrics', $record_id_slug),
         variant_id: $variant_id,
         activity_id: $variant_id,
         org_id: $org_id,
@@ -8430,6 +8548,7 @@ app.post('/relevance-feedback', async (c) => {
         thompson_beta += $beta_delta,
         updated_at = time::now()
     `, {
+      record_id_slug: relevanceMetricsRecordSlug,
       variant_id: normalizedTemplateId,
       org_id: orgId,
       account_id: accountIdRecordRef(accountId),

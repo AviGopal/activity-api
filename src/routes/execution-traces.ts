@@ -15,7 +15,7 @@ import { insertExecution, isDualWriteEnabled, normalizeActivityId, updateShapeAc
 // Phase B2: dual-tenant helpers (defined in routes/activities.ts in B1).
 // Reuse so we don't duplicate the `accountIdScopedWhere()` fragment or the
 // `accountIdRecordRef()` record-id formatter across route modules.
-import { accountIdScopedWhere } from './activities';
+import { accountIdScopedWhere, variantMetricsRecordId } from './activities';
 import {
   extractOutputShapes,
   validateOutputShapes,
@@ -2169,12 +2169,14 @@ app.post('/', async (c) => {
     // template's metrics row also needs the failure recorded — otherwise its
     // beta never moves.
     try {
-      // Phase B2: dual-write account_id + account_id_version=1 on the metrics
-      // INSERT path. The ON DUPLICATE KEY UPDATE branch keeps the original
-      // account_id_version on existing rows (no need to revisit it on every
-      // execution; Phase F backfill owns the final consolidation).
+      // Phase E: route the duplicate detection through a deterministic
+      // record-id slug keyed on (variant_id, account_id) so different
+      // accounts in the same org get separate posteriors. The id is bound
+      // per-candidate below — we intentionally do not bake it into the SQL
+      // template here so a single template handles all candidate ids.
       const variantMetricsUpsert = `
         INSERT INTO variant_performance_metrics {
+          id: type::thing('variant_performance_metrics', $record_id_slug),
           variant_id: $variant_id,
           activity_id: $variant_id,
           org_id: $org_id,
@@ -2214,6 +2216,9 @@ app.post('/', async (c) => {
 
       for (const candidateId of metricsCandidateIds) {
         const variantMetricsParams = {
+          // Phase E: account-keyed record-id slug; legacy `<variant>` slug
+          // when account_id is null so pre-Phase-E rows keep their key.
+          record_id_slug: variantMetricsRecordId(candidateId, traceAccountId),
           variant_id: candidateId,
           org_id: traceOrgId,
           // Phase B2: account_id propagated from the request's auth context.

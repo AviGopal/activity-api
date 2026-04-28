@@ -392,11 +392,17 @@ export async function insertExecution(
  * Falls back to variant_performance_metrics on failure (unless no-fallback mode)
  *
  * P5.1/P5.2: Respects PARADIGM_READ_PERCENTAGE for gradual rollout
+ *
+ * Phase E: account_id-aware scoping. When `accountId` is non-null, posteriors
+ * are read for that account first; legacy rows (`account_id IS NONE`) still
+ * match via the org_id branch so callers without an accountId — and all
+ * pre-Phase-B rows — keep returning data.
  */
 export async function getActivityScores(
   orgId: string,
   activityIds?: string[],
-  jwtToken?: string | null
+  jwtToken?: string | null,
+  accountId: string | null = null
 ): Promise<QueryPathResult<ActivityScore>> {
   const startTime = Date.now();
   const useParadigm = shouldUseParadigmRead();
@@ -408,10 +414,13 @@ export async function getActivityScores(
       // org_id format: Support both plain strings and record ID format
       // execution table may store either "public" or "organizations:public"
       const plainOrgId = orgId.replace(/^organizations:/, '');
-      let query = `SELECT * FROM v_activity_score WHERE (org_id = $org_id OR org_id = $plain_org_id)`;
+      // Phase E: account_id wins; legacy rows (account_id IS NONE) match via
+      // either org_id form. Both binds are always present so the SQL is stable.
+      let query = `SELECT * FROM v_activity_score WHERE ((account_id = $account_id) OR (account_id IS NONE AND (org_id = $org_id OR org_id = $plain_org_id)))`;
       const params: Record<string, any> = {
         org_id: orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`,
         plain_org_id: plainOrgId,
+        account_id: accountId,
       };
 
       if (activityIds && activityIds.length > 0) {
@@ -488,11 +497,14 @@ export async function getActivityScores(
     const params: Record<string, any> = {};
 
     if (orgId) {
-      query += ` WHERE org_id = $org_id`;
+      // Phase E: dual-tenant scoping on the legacy fallback. account_id wins;
+      // legacy rows (account_id IS NONE) match via org_id. Both params bound.
+      query += ` WHERE ((account_id = $account_id) OR (account_id IS NONE AND org_id = $org_id))`;
       // Legacy table (variant_performance_metrics) may have existing data with plain strings
       // TODO: After migrating existing data to record format, use orgId directly
       // For backward compatibility, strip organizations: prefix if present
       params.org_id = orgId.startsWith('organizations:') ? orgId.replace('organizations:', '') : orgId;
+      params.account_id = accountId;
     }
 
     if (activityIds && activityIds.length > 0) {
@@ -813,13 +825,14 @@ export async function getShapeConditionedScores(
   orgId: string,
   activityIds: string[],
   inputShapes: string[],
-  jwtToken?: string | null
+  jwtToken?: string | null,
+  accountId: string | null = null
 ): Promise<QueryPathResult<ShapeConditionedScore>> {
   const startTime = Date.now();
 
   if (!inputShapes || inputShapes.length === 0) {
     // No shapes provided - fall back to global scores
-    const globalResult = await getActivityScores(orgId, activityIds, jwtToken);
+    const globalResult = await getActivityScores(orgId, activityIds, jwtToken, accountId);
     return {
       data: globalResult.data.map(score => ({
         ...score,
@@ -835,17 +848,18 @@ export async function getShapeConditionedScores(
   const fullOrgId = orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`;
 
   try {
-    // Query shape-conditioned scores
-    // Note: We look for exact match on shape_signature
+    // Phase E: dual-tenant scoping. account_id wins; legacy rows
+    // (account_id IS NONE) match via org_id. Both binds are present.
     const query = `
       SELECT * FROM v_shape_conditioned_score
-      WHERE org_id = $org_id
+      WHERE ((account_id = $account_id) OR (account_id IS NONE AND org_id = $org_id))
         AND activity_id IN $activity_ids
         AND shape_signature = $signature
     `;
 
     const params = {
       org_id: fullOrgId,
+      account_id: accountId,
       activity_ids: activityIds,
       signature,
     };
@@ -871,10 +885,11 @@ export async function getShapeConditionedScores(
 
     // No exact match - try partial match (shapes that are subsets)
     // This handles the case where the activity has been used with similar
-    // but not identical shape combinations
+    // but not identical shape combinations.
+    // Phase E: same dual-tenant scoping.
     const subsetQuery = `
       SELECT * FROM v_shape_conditioned_score
-      WHERE org_id = $org_id
+      WHERE ((account_id = $account_id) OR (account_id IS NONE AND org_id = $org_id))
         AND activity_id IN $activity_ids
         AND shape_signature ALLINSIDE $signature
       ORDER BY total_executions DESC
@@ -912,7 +927,7 @@ export async function getShapeConditionedScores(
   }
 
   // Fallback to global activity scores
-  const globalResult = await getActivityScores(orgId, activityIds, jwtToken);
+  const globalResult = await getActivityScores(orgId, activityIds, jwtToken, accountId);
   return {
     data: globalResult.data.map(score => ({
       ...score,
@@ -1391,7 +1406,8 @@ export function normalizeActivityId(rawId: unknown): string {
 export async function getVariantFamily(
   baseId: string,
   orgId: string,
-  jwtToken?: string | null
+  jwtToken?: string | null,
+  accountId: string | null = null
 ): Promise<QueryPathResult<VariantInfo>> {
   const startTime = Date.now();
   // The activity table stores org_id as a plain string in some records and as
@@ -1413,12 +1429,16 @@ export async function getVariantFamily(
     //
     // For descendants, the schema field `variant_of` is plain string
     // (see 020-paradigm-core-tables.surql:168), so direct equality is fine.
+    //
+    // Phase E: account_id-aware scoping. When accountId is non-null, prefer
+    // account_id matches; legacy rows (account_id IS NONE) still match via
+    // org_id. scope='global' rows are visible regardless of tenancy.
     const query = `
       LET $base = (
         SELECT id, name, variant_of, created_at
         FROM activity
         WHERE meta::id(id) = $base_id
-          AND (org_id = $org_id OR org_id = $plain_org_id OR scope = 'global')
+          AND ((account_id = $account_id) OR (account_id IS NONE AND (org_id = $org_id OR org_id = $plain_org_id)) OR scope = 'global')
         LIMIT 1
       )[0];
 
@@ -1426,7 +1446,7 @@ export async function getVariantFamily(
         SELECT id, name, variant_of, created_at
         FROM activity
         WHERE variant_of = $base_id
-          AND (org_id = $org_id OR org_id = $plain_org_id OR scope = 'global')
+          AND ((account_id = $account_id) OR (account_id IS NONE AND (org_id = $org_id OR org_id = $plain_org_id)) OR scope = 'global')
       );
 
       -- Get second-level variants (children of variants)
@@ -1434,7 +1454,7 @@ export async function getVariantFamily(
         SELECT id, name, variant_of, created_at
         FROM activity
         WHERE variant_of IN $variants.id
-          AND (org_id = $org_id OR org_id = $plain_org_id OR scope = 'global')
+          AND ((account_id = $account_id) OR (account_id IS NONE AND (org_id = $org_id OR org_id = $plain_org_id)) OR scope = 'global')
       );
 
       -- Get third-level variants (children of second-level)
@@ -1442,7 +1462,7 @@ export async function getVariantFamily(
         SELECT id, name, variant_of, created_at
         FROM activity
         WHERE variant_of IN $second_level.id
-          AND (org_id = $org_id OR org_id = $plain_org_id OR scope = 'global')
+          AND ((account_id = $account_id) OR (account_id IS NONE AND (org_id = $org_id OR org_id = $plain_org_id)) OR scope = 'global')
       );
 
       -- Combine all levels
@@ -1462,6 +1482,7 @@ export async function getVariantFamily(
       base_id: baseId,
       org_id: fullOrgId,
       plain_org_id: plainOrgId,
+      account_id: accountId,
     };
 
     const result = jwtToken
@@ -1553,7 +1574,8 @@ export async function getVariantFamily(
 export async function getVariantScores(
   variantIds: string[],
   orgId: string,
-  jwtToken?: string | null
+  jwtToken?: string | null,
+  accountId: string | null = null
 ): Promise<QueryPathResult<VariantScore>> {
   const startTime = Date.now();
 
@@ -1568,7 +1590,9 @@ export async function getVariantScores(
   const fullOrgId = orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`;
 
   try {
-    // Query from v_activity_score view (computed from execution table)
+    // Query from v_activity_score view (computed from execution table).
+    // Phase E: account_id wins; legacy rows (account_id IS NONE) match via
+    // org_id. Both binds always present.
     const query = `
       SELECT
         activity_id,
@@ -1580,12 +1604,13 @@ export async function getVariantScores(
         avg_cost_usd
       FROM v_activity_score
       WHERE activity_id IN $variant_ids
-        AND org_id = $org_id
+        AND ((account_id = $account_id) OR (account_id IS NONE AND org_id = $org_id))
     `;
 
     const params = {
       variant_ids: variantIds,
       org_id: fullOrgId,
+      account_id: accountId,
     };
 
     let result = jwtToken
@@ -1596,6 +1621,8 @@ export async function getVariantScores(
     if (!result || result.length === 0) {
       logger.debug('[paradigm] getVariantScores: falling back to variant_performance_metrics');
 
+      // Phase E: dual-tenant scoping on the legacy fallback. account_id wins;
+      // legacy rows (account_id IS NONE) match via org_id.
       const fallbackQuery = `
         SELECT
           variant_id AS activity_id,
@@ -1607,7 +1634,7 @@ export async function getVariantScores(
           avg_cost_usd
         FROM variant_performance_metrics
         WHERE variant_id IN $variant_ids
-          AND org_id = $org_id
+          AND ((account_id = $account_id) OR (account_id IS NONE AND org_id = $org_id))
       `;
 
       // Legacy table may have org_id without prefix
@@ -1618,6 +1645,7 @@ export async function getVariantScores(
       result = await surrealDB.query<VariantScore>(fallbackQuery, {
         variant_ids: variantIds,
         org_id: legacyOrgId,
+        account_id: accountId,
       });
     }
 
