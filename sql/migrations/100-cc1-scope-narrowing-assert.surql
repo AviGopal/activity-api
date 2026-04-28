@@ -1,0 +1,72 @@
+-- =============================================================================
+-- Migration 100: Phase G — CC1 scope-narrowing + variant_performance UNIQUE
+-- =============================================================================
+-- Created: 2026-04-28
+-- Related OpenSpec: activity-api-account-id-migration-2026-04-28
+-- Depends on: 001 (init UNIQUE on variant_id), 003 (goal_execution_paths
+--             schema), 095 (account_id additive on 32 tables incl
+--             variant_performance_metrics), 099 (account_id PERMISSIONS).
+--
+-- §G2. CC1 SCOPE-NARROWING — NOT IMPLEMENTED AS DB ASSERT
+-- ----------------------------------------------------------------------------
+-- The CC1 hardening item (CLAUDE.md "Security Hardening Roadmap"): "Child
+-- task outputShapes MUST be a subset of the parent's endpoint_output_shapes
+-- on the goal_execution_paths table." Originally specified as a SurrealDB
+-- row-level ASSERT on goal_execution_paths.endpoint_output_shapes. After
+-- auditing the schema, a row-level ASSERT is impractical:
+--
+--   1. goal_execution_paths has NO parent_path_signature (or any other
+--      parent reference) field. Without a parent pointer in the row, a
+--      row-level ASSERT cannot reference parent state.
+--   2. The "parent → child" relationship for goal-shape sub-goals lives in
+--      the impulse layer (a `create-shape-provider-goal` impulse declares
+--      a `target_shape` which must be in the parent goal's
+--      endpoint_output_shapes), not in goal_execution_paths rows directly.
+--   3. Adding a parent reference field would be a breaking change mixing
+--      path-execution stats with goal-decomposition lineage.
+--
+-- CHOSEN APPROACH (per Phase G spec "fall back to a soft validator at the
+-- route handler level instead" — route-handler validator, NOT a DB
+-- ASSERT): the check lives in src/routes/goal-paths.ts
+-- POST handler. When the request includes an optional `parent_path_signature`
+-- field, the handler looks up the parent row by goal_hash + path_signature,
+-- validates the new path's endpoint_output_shapes is a subset of the
+-- parent's, and rejects with 400 on violation. Legacy rows
+-- (parent_path_signature absent OR parent has IS NONE endpoint_output_shapes)
+-- bypass the check — preserves backward compat.
+--
+-- DEFERRED: if a future schema change adds parent_path_signature to
+-- goal_execution_paths, this migration can be revisited to add a SurrealQL
+-- ASSERT array::all(...) clause.
+--
+-- §G3. variant_performance_metrics UNIQUE INDEX REPLACEMENT
+-- ----------------------------------------------------------------------------
+-- Phase E (commit ef26c0f) introduced per-account record IDs for
+-- variant_performance_metrics: when a request carries an account_id, the row
+-- id slug becomes `<variant>__<account>` instead of `<variant>`. The legacy
+-- UNIQUE INDEX from 001-init-schema.surql:198 is on variant_id ONLY:
+--
+--   DEFINE INDEX idx_variant_performance_variant_id
+--     ON variant_performance_metrics FIELDS variant_id UNIQUE;
+--
+-- That index REJECTS a per-account row whose variant_id matches an existing
+-- legacy row's variant_id, even though (variant_id, account_id) is genuinely
+-- distinct. Fix: composite UNIQUE on (variant_id, account_id). Legacy rows
+-- have account_id IS NONE; new rows carry the account record reference (or
+-- NONE for unscoped flows). The composite tuple is unique in both cases.
+--
+-- REMOVE + DEFINE OVERWRITE is idempotent — re-running this migration is a
+-- no-op once the composite is in place. Existing rows are NOT dropped:
+-- REMOVE INDEX deletes only the index definition.
+-- =============================================================================
+
+-- Drop legacy single-column UNIQUE; IF EXISTS makes re-runs safe.
+REMOVE INDEX IF EXISTS idx_variant_performance_variant_id ON variant_performance_metrics;
+
+-- Composite UNIQUE on (variant_id, account_id); OVERWRITE makes re-runs safe.
+DEFINE INDEX OVERWRITE idx_variant_performance_variant_id
+  ON variant_performance_metrics FIELDS variant_id, account_id UNIQUE;
+
+-- =============================================================================
+-- END MIGRATION 100
+-- =============================================================================

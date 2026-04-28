@@ -662,6 +662,14 @@ export const PathRecordRequestSchema = z.object({
   token_usage: z.number().int().optional(),
   files_modified: z.array(z.string()).optional(),
   tools_used: z.array(z.string()).optional(),
+  // Phase G2 (CC1 scope-narrowing, 2026-04-28): when this path is a child
+  // sub-goal spawned via `create-shape-provider-goal`, callers may declare
+  // the parent path's signature so the handler can enforce that the new
+  // path's `endpoint_output_shapes` is a subset of the parent's. Optional
+  // — legacy callers that don't supply it bypass the check entirely.
+  // See sql/migrations/100-cc1-scope-narrowing-assert.surql §G2.
+  parent_path_signature: z.string().optional(),
+  parent_goal_hash: z.string().optional(),
 });
 
 export const PathQuerySchema = z.object({

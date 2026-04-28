@@ -1595,6 +1595,14 @@ app.post('/', async (c) => {
     if (body.execution_trace?.tasks && Array.isArray(body.execution_trace.tasks)) {
       const { broadcaster } = await import('../websocket/broadcaster');
 
+      // Phase G1 (2026-04-28): denormalize tenancy fields onto each event so
+      // downstream consumers (workbench, activity-dashboard, concept-db
+      // ExecutionObserver) can filter by tenant without re-fetching the row.
+      // Sourced from the just-built `trace` object — `traceAccountId` is the
+      // resolved value (body.account_id ?? jwtAuth?.accountId ?? null).
+      const broadcastAccountId: string | null = traceAccountId;
+      const broadcastOrgId: string = traceOrgId;
+
       for (let taskIndex = 0; taskIndex < body.execution_trace.tasks.length; taskIndex++) {
         const task = body.execution_trace.tasks[taskIndex];
         const taskId = task.id || task.taskId || `task-${taskIndex}`;
@@ -1609,6 +1617,8 @@ app.post('/', async (c) => {
             task_index: taskIndex,
             description: task.description || '',
             started_at: new Date().toISOString(),
+            org_id: broadcastOrgId,
+            account_id: broadcastAccountId,
           },
         });
 
@@ -1626,6 +1636,8 @@ app.post('/', async (c) => {
                 latency_ms: toolCall.duration_ms || 0,
                 cost_usd: toolCall.cost_usd || 0,
                 timestamp: new Date().toISOString(),
+                org_id: broadcastOrgId,
+                account_id: broadcastAccountId,
               },
             });
           }
@@ -1652,6 +1664,8 @@ app.post('/', async (c) => {
             error: taskSuccess ? undefined : (task.result?.error || task.error),
             input_impulse_ids,
             output_impulse_ids,
+            org_id: broadcastOrgId,
+            account_id: broadcastAccountId,
           },
         });
       }
@@ -1735,6 +1749,7 @@ app.post('/', async (c) => {
 
           // Canonical flat payload — see ImpulseResolvedMessage in
           // src/websocket/types.ts for the formal contract.
+          // Phase G1 (2026-04-28): tenancy fields denormalized from `trace`.
           const data: Record<string, unknown> = {
             execution_id: trace.execution_id,
             impulse_id: impulseId,
@@ -1744,6 +1759,8 @@ app.post('/', async (c) => {
             latency_ms: latencyMs,
             cost_usd: costUsd,
             timestamp: new Date().toISOString(),
+            org_id: broadcastOrgId,
+            account_id: broadcastAccountId,
           };
           if (owningTaskId) data.task_id = owningTaskId;
           if (shape) data.shape = shape;

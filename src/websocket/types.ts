@@ -63,6 +63,13 @@ export interface TaskStartedMessage extends WebSocketMessage {
     task_index: number;
     description: string;
     started_at: string;
+    // Phase G1 (2026-04-28): tenancy fields surfaced on broadcast so
+    // downstream consumers (workbench, activity-dashboard, concept-db
+    // ExecutionObserver) can filter by tenant. `account_id` is preferred
+    // (Phase B+ rows); `org_id` is the legacy fallback. Both are
+    // optional — null when caller has no claim or row predates Phase B.
+    org_id?: string | null;
+    account_id?: string | null;
   };
 }
 
@@ -82,6 +89,9 @@ export interface TaskCompletedMessage extends WebSocketMessage {
     // the persisted row. See docs/specs/broadcaster-per-task-grouping.md.
     input_impulse_ids: string[];
     output_impulse_ids: string[];
+    // Phase G1 (2026-04-28): tenancy fields — see TaskStartedMessage docs.
+    org_id?: string | null;
+    account_id?: string | null;
   };
 }
 
@@ -96,6 +106,9 @@ export interface ToolCallMessage extends WebSocketMessage {
     latency_ms: number;
     cost_usd: number;
     timestamp: string;
+    // Phase G1 (2026-04-28): tenancy fields — see TaskStartedMessage docs.
+    org_id?: string | null;
+    account_id?: string | null;
   };
 }
 
@@ -145,5 +158,8 @@ export interface ImpulseResolvedMessage extends WebSocketMessage {
      */
     body?: unknown;
     timestamp: string;
+    // Phase G1 (2026-04-28): tenancy fields — see TaskStartedMessage docs.
+    org_id?: string | null;
+    account_id?: string | null;
   };
 }

@@ -1905,11 +1905,14 @@ app.post('/executions', async (c) => {
     }
 
     // Emit execution_started event via WebSocket
+    // Phase G1 (2026-04-28): tenancy fields surfaced for downstream filtering.
     const executionStartedData: any = {
       execution_id: executionId,
       activity_id: activityIdFromRequest,
       // Legacy field for backward compatibility
       variant_id: activityIdFromRequest,
+      org_id: orgId ?? null,
+      account_id: accountId ?? null,
     };
     // Add pod_name if available (MiniBob execution context)
     if ((validated as any).pod_name) {
@@ -2186,6 +2189,7 @@ app.post('/executions', async (c) => {
     const updatedMetrics = metricsResult.length > 0 ? metricsResult[0] : undefined;
 
     // Emit execution_completed event via WebSocket
+    // Phase G1 (2026-04-28): tenancy fields surfaced for downstream filtering.
     broadcaster.emit({
       type: 'execution_completed',
       timestamp: new Date().toISOString(),
@@ -2198,6 +2202,8 @@ app.post('/executions', async (c) => {
         duration_ms: validated.duration_ms,
         cost: validated.cost,
         completed_at: new Date().toISOString(),
+        org_id: orgId ?? null,
+        account_id: accountId ?? null,
       },
     });
 
@@ -2217,6 +2223,8 @@ app.post('/executions', async (c) => {
             thompson_alpha: updatedMetrics.thompson_alpha || 1,
             thompson_beta: updatedMetrics.thompson_beta || 1,
           },
+          org_id: orgId ?? null,
+          account_id: accountId ?? null,
         },
       });
     }
@@ -2236,6 +2244,7 @@ app.post('/executions', async (c) => {
             });
 
             // Emit variant_created event via WebSocket
+            // Phase G1 (2026-04-28): tenancy fields surfaced for filtering.
             broadcaster.emit({
               type: 'variant_created',
               timestamp: new Date().toISOString(),
@@ -2245,6 +2254,8 @@ app.post('/executions', async (c) => {
                 variant_generation: variantResult.variantGeneration,
                 reason: variantResult.reason,
                 modifications: variantResult.modifications,
+                org_id: orgId ?? null,
+                account_id: accountId ?? null,
               },
             });
           }
@@ -2267,12 +2278,15 @@ app.post('/executions', async (c) => {
             });
 
             // Emit template_retired event via WebSocket
+            // Phase G1 (2026-04-28): tenancy fields surfaced for filtering.
             broadcaster.emit({
               type: 'template_retired',
               timestamp: new Date().toISOString(),
               data: {
                 activity_id: activityIdFromRequest,
                 reason: 'poor_performance',
+                org_id: orgId ?? null,
+                account_id: accountId ?? null,
               },
             });
 
@@ -3242,6 +3256,7 @@ app.post('/:id/variants', async (c) => {
     }
 
     // Emit variant_created event via WebSocket
+    // Phase G1 (2026-04-28): tenancy fields surfaced for filtering.
     broadcaster.emit({
       type: 'variant_created',
       timestamp: new Date().toISOString(),
@@ -3251,6 +3266,8 @@ app.post('/:id/variants', async (c) => {
         variant_generation: variantResult.variantGeneration,
         reason: variantResult.reason,
         modifications: variantResult.modifications,
+        org_id: orgId ?? null,
+        account_id: accountId ?? null,
       },
     });
 
@@ -3662,6 +3679,7 @@ app.post('/feedback', async (c) => {
     }
 
     // Emit WebSocket event for dashboard updates
+    // Phase G1 (2026-04-28): account_id surfaced alongside org_id for filtering.
     try {
       broadcaster.emit({
         type: 'feedback_recorded',
@@ -3673,6 +3691,7 @@ app.post('/feedback', async (c) => {
           multiplier,
           affected_activities: affectedActivities,
           org_id: orgId,
+          account_id: accountId ?? null,
         },
       });
     } catch (wsError) {

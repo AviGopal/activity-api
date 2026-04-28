@@ -261,7 +261,7 @@ app.post('/', async (c) => {
   try {
     const body = await c.req.json();
     const validated = PathRecordRequestSchema.parse(body);
-    
+
     const goalHash = hashGoal(validated.goal_text);
     const pathSignature = hashPath(validated.path_activities);
 
@@ -271,6 +271,78 @@ app.post('/', async (c) => {
     // returns [] on error, the field is nullable, and the read-time
     // fallback in predictEndpointState recomputes for legacy rows.
     const endpointOutputShapes = await accumulateEndpointShapes(validated.path_activities);
+
+    // Phase G2 — CC1 scope-narrowing validator (2026-04-28).
+    // When the caller declares a parent path (sub-goal lineage), enforce
+    // that this child's terminal output shapes are a SUBSET of the
+    // parent's. Prevents sub-goal chains from producing shapes outside
+    // their original scope. Documented in
+    // sql/migrations/100-cc1-scope-narrowing-assert.surql §G2.
+    //
+    // Bypass conditions (preserve backward compat):
+    //   - parent_path_signature absent (legacy caller path)
+    //   - parent row not found (e.g. cross-org isolation; surface as 404
+    //     so callers learn the parent ref is invalid)
+    //   - parent has no endpoint_output_shapes (legacy row predating mig 092)
+    //   - new path has no endpoint_output_shapes (nothing to constrain)
+    if (validated.parent_path_signature) {
+      const parentGoalHash: string = validated.parent_goal_hash ?? goalHash;
+      try {
+        const parentRows = await surrealDB.query<GoalExecutionPath[]>(
+          `SELECT endpoint_output_shapes FROM goal_execution_paths
+            WHERE goal_hash = $parent_goal_hash
+              AND path_signature = $parent_path_signature
+            LIMIT 1`,
+          {
+            parent_goal_hash: parentGoalHash,
+            parent_path_signature: validated.parent_path_signature,
+          }
+        );
+        const parentRow = Array.isArray(parentRows) && parentRows.length > 0 ? parentRows[0] : null;
+        if (!parentRow) {
+          return c.json({
+            error: 'Parent path not found',
+            message: `No goal_execution_paths row matches parent_goal_hash=${parentGoalHash}, parent_path_signature=${validated.parent_path_signature}`,
+          }, 404);
+        }
+        const parentShapes = (parentRow as any).endpoint_output_shapes;
+        // Only enforce the constraint when the parent has a declared scope.
+        // IS NONE / empty array is treated as "unbounded" (legacy rows).
+        if (Array.isArray(parentShapes) && parentShapes.length > 0 && endpointOutputShapes.length > 0) {
+          const parentSet = new Set<string>(parentShapes);
+          const violations = endpointOutputShapes.filter((s) => !parentSet.has(s));
+          if (violations.length > 0) {
+            logger.warn('CC1 scope-narrowing violation', {
+              parent_path_signature: validated.parent_path_signature,
+              parent_goal_hash: parentGoalHash,
+              parent_shapes: parentShapes,
+              child_shapes: endpointOutputShapes,
+              violations,
+            });
+            return c.json({
+              error: 'Scope-narrowing violation (CC1)',
+              message: `Child path produces shapes [${violations.join(', ')}] not in parent's endpoint_output_shapes [${parentShapes.join(', ')}]. Sub-goals MUST narrow scope, never expand it.`,
+              parent_path_signature: validated.parent_path_signature,
+              parent_endpoint_output_shapes: parentShapes,
+              child_endpoint_output_shapes: endpointOutputShapes,
+              violations,
+            }, 400);
+          }
+        }
+      } catch (cc1Error) {
+        // Surface query errors as 500 — silent skip would defeat the
+        // hardening guarantee. Distinguish from "parent not found" 404.
+        logger.error('CC1 scope-narrowing check failed', {
+          error: cc1Error instanceof Error ? cc1Error.message : String(cc1Error),
+          parent_path_signature: validated.parent_path_signature,
+          parent_goal_hash: parentGoalHash,
+        });
+        return c.json({
+          error: 'Scope-narrowing check failed',
+          message: cc1Error instanceof Error ? cc1Error.message : String(cc1Error),
+        }, 500);
+      }
+    }
 
     logger.info('Recording goal path', {
       goal: validated.goal_text,

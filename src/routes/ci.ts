@@ -295,6 +295,8 @@ router.post('/ci-result', async (c) => {
     }
 
     // Broadcast CI result via WebSocket for live updates
+    // Phase G1 (2026-04-28): tenancy fields included for shape parity with
+    // other broadcasts; CI webhooks don't carry auth context, so both nulls.
     broadcaster.emit({
       type: 'ci_result',
       data: {
@@ -308,6 +310,8 @@ router.post('/ci-result', async (c) => {
         workflow_name: request.workflow_name,
         run_url: request.run_url,
         timestamp: now,
+        org_id: null,
+        account_id: null,
       },
     });
 
