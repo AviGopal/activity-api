@@ -38,6 +38,21 @@ export interface Config {
   auth: {
     requireAuth: boolean;  // Set to false for development
     jwtSecret: string;     // JWT signing secret
+    /**
+     * Phase A account_id rollout flag (OpenSpec
+     * activity-api-account-id-migration-2026-04-28).
+     *
+     * - false (default): legacy org_id behavior. Phase B handlers may also
+     *   read/write `account_id`, but JWT contexts WITHOUT an `account_id`
+     *   claim are still accepted and routed via `org_id`.
+     * - true: PERMISSIONS clauses (post-Phase C) and route-level checks
+     *   require `$token.account_id`. Requests carrying only `org_id` are
+     *   rejected. Flips to `true` in Phase D after the data migration in
+     *   Phase F completes.
+     *
+     * Override via env var: `ACCOUNT_ID_REQUIRED=true`.
+     */
+    accountIdRequired: boolean;
   };
 
   // Logging
@@ -179,6 +194,9 @@ export function loadConfig(): Config {
     auth: {
       requireAuth: parseEnvBool('REQUIRE_AUTH', false),
       jwtSecret: resolveJwtSecret(),
+      // Phase A: default false. Override via env var ACCOUNT_ID_REQUIRED=true.
+      // Will flip to true in Phase D after Phase F backfill completes.
+      accountIdRequired: parseEnvBool('ACCOUNT_ID_REQUIRED', false),
     },
     
     logLevel: (process.env.LOG_LEVEL || 'info') as Config['logLevel'],
@@ -241,3 +259,18 @@ export function loadConfig(): Config {
 }
 
 export const config = loadConfig();
+
+/**
+ * Singleton accessor for the loaded config. Handlers that prefer a function
+ * form (and tests that need to stub config in isolation) should call this
+ * instead of importing the `config` const directly. Currently a pass-through
+ * to the module-level singleton; reserved as the single insertion point if
+ * we ever add per-request config overrides (e.g. tenant-scoped flags).
+ *
+ * Used by Phase B handlers (OpenSpec
+ * activity-api-account-id-migration-2026-04-28) to consult
+ * `auth.accountIdRequired` per request.
+ */
+export function getConfig(): Config {
+  return config;
+}

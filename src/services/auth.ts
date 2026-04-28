@@ -39,6 +39,13 @@ export interface JwtPayload {
 export interface AuthContext {
   authenticated: boolean;
   orgId?: string;
+  /**
+   * Phase A: canonical multi-tenant key emitted by identity-vessel post
+   * `identity-vessel-account-id-upgrade` (commit 134246a, 2026-04-28). When
+   * absent, callers fall back to org_id paths. See OpenSpec change
+   * activity-api-account-id-migration-2026-04-28 (Phase A.5).
+   */
+  accountId?: string;
   userId?: string;
   /** API key ID - REQUIRED for api_key authType, used for audit trails */
   keyId?: string;
@@ -277,6 +284,10 @@ async function tryIdentityVesselValidation(
       data?: {
         authenticated: boolean;
         orgId: string;
+        // Phase A: identity-vessel post-account-id-upgrade emits accountId.
+        // Older identity-vessel deploys may omit it — the field is optional
+        // and downstream code falls back to org_id paths when absent.
+        accountId?: string;
         userId: string;
         keyId: string;
         scopes: string[];
@@ -294,11 +305,13 @@ async function tryIdentityVesselValidation(
     logger.info('[auth] Identity vessel validated key', {
       url: identityVesselUrl,
       userId: result.data.userId,
+      hasAccountId: result.data.accountId !== undefined,
     });
 
     return {
       authenticated: true,
       orgId: result.data.orgId,
+      accountId: result.data.accountId,
       userId: result.data.userId,
       keyId: result.data.keyId,
       scopes: result.data.scopes,
@@ -472,6 +485,8 @@ async function validateApiKeyViaDiscovery(apiKey: string): Promise<AuthContext> 
       data?: {
         authenticated: boolean;
         orgId: string;
+        // Phase A — see tryIdentityVesselValidation for rationale.
+        accountId?: string;
         userId: string;
         keyId: string;
         scopes: string[];
@@ -489,6 +504,7 @@ async function validateApiKeyViaDiscovery(apiKey: string): Promise<AuthContext> 
     return {
       authenticated: true,
       orgId: result.data.orgId,
+      accountId: result.data.accountId,
       userId: result.data.userId,
       keyId: result.data.keyId,
       scopes: result.data.scopes,

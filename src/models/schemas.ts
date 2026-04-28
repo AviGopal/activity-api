@@ -130,6 +130,10 @@ export const ActivityTemplateSchema = z.object({
   // Public templates are discoverable by all orgs (ribosome-generated templates)
   public: z.boolean().default(false),
   org_id: z.string().nullable(),
+  // Phase A: optional account_id alongside org_id. Phase B handlers dual-write,
+  // Phase D drops org_id. See OpenSpec activity-api-account-id-migration-2026-04-28.
+  account_id: z.string().nullable().optional(),
+  account_id_version: z.number().int().optional(),
   project_id: z.string().nullable(),
   // Input/output shapes for paradigm alignment
   // input_shapes: Optional - activities can work with any input
@@ -184,6 +188,8 @@ export const CreateTemplateRequestSchema = z.object({
   // Public templates are discoverable by all orgs (ribosome-generated templates)
   public: z.boolean().default(false),
   org_id: z.string().nullable().optional(),
+  // Phase A: optional account_id; populated by Phase B handlers from JWT $token.account_id.
+  account_id: z.string().nullable().optional(),
   project_id: z.string().nullable().optional(),
   // Canonical field: 'variant_of' (also accept legacy 'genealogy')
   variant_of: z.string().optional(),
@@ -344,6 +350,8 @@ export const ImpulseCreateRequestSchema = z.object({
   project_id: z.string().optional(), // Optional for MiniBob instances without projects
   impulse_data: ImpulseDataSchema,
   org_id: z.string().optional(), // Optional, inferred from auth context if not provided
+  // Phase A: optional account_id; populated by Phase B handlers from JWT $token.account_id.
+  account_id: z.string().optional(),
 });
 
 export const ImpulseResponseSchema = z.object({
@@ -946,6 +954,11 @@ export const StoreExecutionTraceRequestSchema = z.object({
   // Failure mode taxonomy (sibling spec 2026-04-26-validators-and-failure-modes).
   // Metadata only — Thompson updates uniform; future learners may stratify by type.
   failure_mode: FailureModeSchema.optional(),
+  // Phase A: optional account_id (OpenSpec
+  // activity-api-account-id-migration-2026-04-28). Phase B handlers populate
+  // it from JWT $token.account_id; legacy callers omit and the handler falls
+  // back to org_id derivation.
+  account_id: z.string().optional(),
 });
 
 export const StoreExecutionTraceResponseSchema = z.object({
@@ -1171,6 +1184,8 @@ export type CIResultsListResponse = z.infer<typeof CIResultsListResponseSchema>;
 export const ActivityScoreSchema = z.object({
   activity_id: z.string(),
   org_id: z.string(),
+  // Phase A: optional account_id alongside org_id.
+  account_id: z.string().optional(),
   total_executions: z.number().int(),
   alpha: z.number(), // Thompson: successes + 1
   beta: z.number(), // Thompson: failures + 1
@@ -1275,6 +1290,8 @@ export const ToolArgumentPatternSchema = z.object({
   avg_execution_ms: z.number().optional(),
   last_used_at: z.union([z.string(), z.object({}).passthrough()]).optional(),
   org_id: z.string().optional(),
+  // Phase A: optional account_id alongside org_id.
+  account_id: z.string().optional(),
   // Failure statistics (goal-execution-foundation-alignment)
   failure_rate: z.number().optional(),
   times_succeeded: z.number().int().optional(),
@@ -1313,6 +1330,8 @@ export const CompositionImpulseFlowSchema = z.object({
   shape: z.string(),
   execution_succeeded: z.boolean(),
   org_id: z.string().optional(),
+  // Phase A: optional account_id alongside org_id.
+  account_id: z.string().optional(),
   project_id: z.string().optional(),
   created_at: z.union([z.string(), z.object({}).passthrough()]).optional(),
 });
@@ -1391,6 +1410,8 @@ export const FailurePatternSchema = z.object({
   validation_error: z.string().optional(),
   failure_counts: z.record(z.number()).optional(),
   org_id: z.string().optional(),
+  // Phase A: optional account_id alongside org_id.
+  account_id: z.string().optional(),
 });
 
 /**
@@ -1552,6 +1573,11 @@ export const ShapeScoreUpdateRequestSchema = z.object({
   success: z.boolean(),
   /** Organization ID (optional, inferred from auth context if not provided) */
   org_id: z.string().optional(),
+  /**
+   * Phase A account_id (optional, inferred from JWT $token.account_id if not provided).
+   * See OpenSpec activity-api-account-id-migration-2026-04-28.
+   */
+  account_id: z.string().optional(),
 });
 
 /**
@@ -1573,6 +1599,8 @@ export const ImpulseShapeActivityScoreSchema = z.object({
   shape: z.string(),
   activity_id: z.string(),
   org_id: z.string(),
+  // Phase A: optional account_id alongside org_id.
+  account_id: z.string().optional(),
   success_count: z.number().int(),
   failure_count: z.number().int(),
   alpha: z.number().int(), // success_count + 1

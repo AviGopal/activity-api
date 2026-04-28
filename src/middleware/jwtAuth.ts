@@ -34,6 +34,24 @@ import { logger } from '../utils/logger';
 export interface JwtAuthContext {
   jwtToken: string;
   orgId: string;
+  /**
+   * Phase A: canonical multi-tenant key from `$token.account_id` (JWT) or the
+   * `accountId` field in identity-vessel's API-key validation response.
+   *
+   * Optional during Phase A — only populated when:
+   *   * the JWT carries an `account_id` claim, OR
+   *   * identity-vessel's `/v1/auth/resolve` payload includes `accountId`
+   *     (post identity-vessel-account-id-upgrade, commit 134246a).
+   *
+   * Phase B handlers should consult this first and fall back to `orgId`
+   * when undefined. Phase C PERMISSIONS clauses dual-check
+   * (`account_id = $token.account_id OR (account_id IS NONE AND
+   * org_id = $auth.org_id)`). When `config.auth.accountIdRequired === true`
+   * (Phase D), requests with this field undefined are rejected upstream.
+   *
+   * See OpenSpec change activity-api-account-id-migration-2026-04-28.
+   */
+  accountId?: string;
   // For MiniBob instances: single project assignment
   projectId?: string;
   // For API key users: array of accessible projects (from project_members)
@@ -140,6 +158,9 @@ async function validateApiKey(apiKey: string): Promise<JwtAuthContext | null> {
     return {
       jwtToken: jwtToken || '',
       orgId: result.orgId!,
+      // Phase A: pass through if identity-vessel emitted it. Older identity-vessel
+      // deployments leave this undefined — Phase B handlers fall back to orgId.
+      accountId: result.accountId,
       keyId: result.keyId,
       userId: result.userId,
       authType: 'apikey',
@@ -257,6 +278,12 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
         const jwtAuth: JwtAuthContext = {
           jwtToken: token,
           orgId: decoded.orgId,
+          // Phase A: minibob simple-token may not yet carry accountId.
+          // When present (post-MiniBob upgrade), pass it through; otherwise
+          // leave undefined so Phase B handlers fall back to orgId.
+          accountId: typeof (decoded as { accountId?: unknown }).accountId === 'string'
+            ? (decoded as { accountId: string }).accountId
+            : undefined,
           projectId: decoded.projectId,
           instanceId: decoded.instanceId,
           authType: 'minibob_token',
@@ -291,9 +318,15 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
 
     // Query $auth to get claims
     // NOTE: SELECT * FROM $auth doesn't work in SurrealDB - must use RETURN with explicit fields
+    // Phase A: also pull $token.account_id (JWT claim, separate from $auth row).
+    // SurrealDB binds JWT claims to $token; the access method may or may not
+    // populate $auth.account_id depending on the access definition. Reading
+    // both lets Phase B handlers consult $token.account_id directly via the
+    // returned context without re-querying.
     const result = await db.query<[{
       id: string;
       org_id?: string;
+      account_id?: string;
       user_id?: string;
       scopes?: string[];
       project_ids?: string[];
@@ -303,6 +336,7 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
     }]>(`RETURN {
       id: $auth.id,
       org_id: $auth.org_id,
+      account_id: $token.account_id,
       user_id: $auth.user_id,
       scopes: $auth.scopes,
       project_ids: $auth.project_ids,
@@ -327,6 +361,13 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
     const jwtAuth: JwtAuthContext = {
       jwtToken: token,
       orgId: String(auth.org_id || '').replace(/^organizations:/, ''),
+      // Phase A: account_id is optional during the rollout. Strip the
+      // record-id prefix if present (e.g. "accounts:abc" -> "abc"); leave
+      // undefined when the JWT claim is missing so Phase B handlers can
+      // fall back to org_id.
+      accountId: auth.account_id
+        ? String(auth.account_id).replace(/^accounts:/, '')
+        : undefined,
       // MiniBob instances: singular project assignment
       projectId: auth.project_id ? String(auth.project_id).replace(/^projects:/, '') : undefined,
       // API key users: array of accessible projects from project_members
@@ -346,6 +387,7 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
 
     logger.debug('JWT authentication successful', {
       orgId: jwtAuth.orgId,
+      hasAccountId: jwtAuth.accountId !== undefined,
       projectId: jwtAuth.projectId,
       projectIds: jwtAuth.projectIds,
       instanceId: jwtAuth.instanceId,
