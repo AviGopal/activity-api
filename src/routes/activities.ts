@@ -126,6 +126,52 @@ const TEMPLATE_CACHE_TTL = 3600; // 1 hour in seconds
 const CACHE_KEY_PREFIX = 'activity:template:';
 const CACHE_LIST_KEY = 'activity:templates:list';
 
+// =============================================================================
+// Phase B1: account_id dual-write helpers
+// =============================================================================
+// See OpenSpec change activity-api-account-id-migration-2026-04-28.
+//
+// Reads: prefer account_id when caller carries one; fall back to org_id for
+// legacy rows (account_id IS NONE). Bind both as separate params.
+//
+// Writes: set account_id alongside org_id (null when caller has no accountId,
+// schema is option<string>). Bump account_id_version = 1 to mark this row as
+// Phase B dual-written. Phase D will flip the flag and treat <1 as legacy.
+// =============================================================================
+
+/**
+ * Dual-tenant WHERE clause factory for the account_id migration.
+ *
+ * Returns a SurrealQL fragment that matches rows on `account_id` first and
+ * falls back to `org_id` when the row predates Phase B (account_id IS NONE).
+ *
+ * Caller MUST bind both `$account_id` and `$org_id` as params; pass
+ * `accountId ?? null` so option<string> stays satisfied when the JWT has no
+ * `account_id` claim.
+ *
+ * Example:
+ *   const where = accountIdScopedWhere();
+ *   // -> "(account_id = $account_id OR (account_id IS NONE AND org_id = $org_id))"
+ *   await surrealDB.query(`SELECT * FROM activity WHERE ${where}`, {
+ *     account_id: jwtAuth?.accountId ?? null,
+ *     org_id: jwtAuth?.orgId,
+ *   });
+ */
+export function accountIdScopedWhere(): string {
+  return '(account_id = $account_id OR (account_id IS NONE AND org_id = $org_id))';
+}
+
+/**
+ * Account_id record-id form, matching the org_id record-ref convention used
+ * elsewhere in this file (`organizations:${orgId}`). Returns null when
+ * accountId is undefined so callers can pass it straight into
+ * `option<string>` schema fields.
+ */
+export function accountIdRecordRef(accountId: string | undefined | null): string | null {
+  if (!accountId) return null;
+  return accountId.startsWith('accounts:') ? accountId : `accounts:${accountId}`;
+}
+
 /**
  * B-4: parse the `offset` query param for paginated template listing.
  * - Non-numeric, negative, or NaN values clamp to 0.
@@ -535,7 +581,8 @@ async function listAllTemplatesFromDB(
   jwtToken?: string | null,
   scopeFilter?: string | null,
   executionType?: string | null, // T8: Allow filtering by execution_type
-  offset: number = 0 // B-4: Pagination offset (operator audit / shadow-template enumeration)
+  offset: number = 0, // B-4: Pagination offset (operator audit / shadow-template enumeration)
+  accountId?: string | null // Phase B1: prefer account_id, fall back to org_id
 ): Promise<ActivityTemplate[]> {
   let query: string;
   let params: Record<string, any>;
@@ -598,6 +645,9 @@ async function listAllTemplatesFromDB(
   }
 
   if (orgId) {
+    // Phase B1: scope by account_id when available; legacy rows (account_id IS NONE)
+    // still match via org_id. Both bind params are always passed.
+    const orgScope = `(scope = 'org' AND ${accountIdScopedWhere()})`;
     if (projectId) {
       // User has both org_id and project_id: return global + org + project activities
       query = `
@@ -606,13 +656,13 @@ async function listAllTemplatesFromDB(
         AND (retired = false OR retired IS NONE)
         AND (
           (scope = 'global' AND public = true)
-          OR (scope = 'org' AND org_id = $org_id)
+          OR ${orgScope}
           OR (scope = 'project' AND project_id = $project_id)
         ) ${scopeClause}
         ORDER BY created_at DESC
         LIMIT $limit START $offset
       `;
-      params = { limit, offset, org_id: orgId, project_id: projectId, execution_type: effectiveExecutionType };
+      params = { limit, offset, org_id: orgId, account_id: accountId ?? null, project_id: projectId, execution_type: effectiveExecutionType };
     } else {
       // User has org_id but no project_id: return global + org activities
       query = `
@@ -622,12 +672,12 @@ async function listAllTemplatesFromDB(
         AND (
           scope IS NULL
           OR scope = 'global'
-          OR (scope = 'org' AND org_id = $org_id)
+          OR ${orgScope}
         ) ${scopeClause}
         ORDER BY created_at DESC
         LIMIT $limit START $offset
       `;
-      params = { limit, offset, org_id: orgId, execution_type: effectiveExecutionType };
+      params = { limit, offset, org_id: orgId, account_id: accountId ?? null, execution_type: effectiveExecutionType };
     }
   } else {
     // No org_id: return only global activities
@@ -677,6 +727,7 @@ async function countAllTemplatesFromDB(
   jwtToken?: string | null,
   scopeFilter?: string | null,
   executionType?: string | null,
+  accountId?: string | null, // Phase B1: prefer account_id, fall back to org_id
 ): Promise<number> {
   const effectiveExecutionType = executionType || 'template';
 
@@ -721,6 +772,8 @@ async function countAllTemplatesFromDB(
   }
 
   if (orgId) {
+    // Phase B1: dual-scope by account_id (preferred) or org_id (legacy fallback).
+    const orgScope = `(scope = 'org' AND ${accountIdScopedWhere()})`;
     if (projectId) {
       query = `
         SELECT count() AS total FROM activity
@@ -728,12 +781,12 @@ async function countAllTemplatesFromDB(
         AND (retired = false OR retired IS NONE)
         AND (
           (scope = 'global' AND public = true)
-          OR (scope = 'org' AND org_id = $org_id)
+          OR ${orgScope}
           OR (scope = 'project' AND project_id = $project_id)
         ) ${scopeClause}
         GROUP ALL
       `;
-      params = { org_id: orgId, project_id: projectId, execution_type: effectiveExecutionType };
+      params = { org_id: orgId, account_id: accountId ?? null, project_id: projectId, execution_type: effectiveExecutionType };
     } else {
       query = `
         SELECT count() AS total FROM activity
@@ -742,11 +795,11 @@ async function countAllTemplatesFromDB(
         AND (
           scope IS NULL
           OR scope = 'global'
-          OR (scope = 'org' AND org_id = $org_id)
+          OR ${orgScope}
         ) ${scopeClause}
         GROUP ALL
       `;
-      params = { org_id: orgId, execution_type: effectiveExecutionType };
+      params = { org_id: orgId, account_id: accountId ?? null, execution_type: effectiveExecutionType };
     }
   } else {
     query = `
@@ -815,6 +868,7 @@ app.post('/templates', async (c) => {
   let jwtAuth: any;
   let orgId: string | null = null;
   let projectId: string | null = null;
+  let accountId: string | null = null; // Phase B1
 
   try {
     // Check for JWT auth first (MiniBob instances)
@@ -832,6 +886,8 @@ app.post('/templates', async (c) => {
     // Use JWT auth claims if available, otherwise fall back to session
     orgId = jwtAuth?.orgId || session?.org_id || null;
     projectId = jwtAuth?.projectId || session?.project_id || null;
+    // Phase B1: account_id only flows from JWT auth context — sessions don't carry one.
+    accountId = jwtAuth?.accountId ?? null;
 
     // Parse and validate request body
     body = await c.req.json();
@@ -920,6 +976,12 @@ app.post('/templates', async (c) => {
     if (validated.org_id || orgId) {
       activityRecord.org_id = validated.org_id || orgId;
     }
+
+    // Phase B1: dual-write account_id alongside org_id. Schema is option<string>,
+    // so null is accepted and indicates a Phase B row written without an
+    // account_id-bearing JWT. account_id_version=1 marks this as Phase B.
+    activityRecord.account_id = accountId;
+    activityRecord.account_id_version = 1;
 
     // Add tasks using canonical field name
     if (activityTasks && activityTasks.length > 0) {
@@ -1108,6 +1170,8 @@ app.post('/templates', async (c) => {
         variant_id: $activity_id,
         activity_id: $activity_id,
         org_id: $org_id,
+        account_id: $account_id,
+        account_id_version: 1,
         project_id: $project_id,
         total_executions: 0,
         successful_executions: 0,
@@ -1127,6 +1191,8 @@ app.post('/templates', async (c) => {
         variant_id: $activity_id,
         activity_id: $activity_id,
         org_id: $org_id,
+        account_id: $account_id,
+        account_id_version: 1,
         total_executions: 0,
         successful_executions: 0,
         failed_executions: 0,
@@ -1144,6 +1210,8 @@ app.post('/templates', async (c) => {
     await surrealDB.query(insertMetricsQuery, {
       activity_id: activityId,
       org_id: metricsOrgId,
+      // Phase B1: dual-write account_id (record-id form, mirroring metricsOrgId).
+      account_id: accountIdRecordRef(accountId),
       ...(metricsProjectId ? { project_id: metricsProjectId } : {}),
     });
 
@@ -1424,7 +1492,8 @@ app.get('/templates', async (c) => {
             useRbacJwtQuery ? (jwtAuth?.jwtToken || null) : null,
             scopeFilter,
             executionType, // T8: Pass execution_type filter
-            offset
+            offset,
+            jwtAuth?.accountId ?? null // Phase B1: account_id-aware scoping
           );
 
           // Populate Redis cache only when application-level filtering produced
@@ -1523,6 +1592,7 @@ app.get('/templates', async (c) => {
         useRbacJwtQuery ? (jwtAuth?.jwtToken || null) : null,
         scopeFilter,
         executionType,
+        jwtAuth?.accountId ?? null, // Phase B1
       );
     } catch (countErr: any) {
       // Defensive: total is informational; never fail the list response on count failure.
@@ -1722,6 +1792,8 @@ app.post('/executions', async (c) => {
     // org_id is a string field (not a record), project_id is record<projects>
     const orgId = jwtAuth?.orgId || session?.org_id || null;
     const rawProjectId = jwtAuth?.projectId || session?.project_id || null;
+    // Phase B1: account_id flows from JWT auth only.
+    const accountId: string | null = jwtAuth?.accountId ?? null;
 
     // Only project_id needs record format (record<projects>)
     const projectId = rawProjectId
@@ -1765,6 +1837,7 @@ app.post('/executions', async (c) => {
 
       try {
         // Create minimal template with auto-created tag
+        // Phase B1: dual-write account_id alongside org_id.
         await surrealDB.query(`
           INSERT INTO activity {
             id: $id,
@@ -1775,13 +1848,16 @@ app.post('/executions', async (c) => {
             execution_type: "template",
             scope: "org",
             org_id: $org_id,
+            account_id: $account_id,
+            account_id_version: 1,
             created_at: time::now(),
             updated_at: time::now()
           }
         `, {
           id: activityIdFromRequest,
           name: activityIdFromRequest.replace(/^activity:/, '').replace(/[⟨⟩`]/g, ''),
-          org_id: orgId
+          org_id: orgId,
+          account_id: accountId,
         });
 
         logger.info('[template] Successfully auto-created base template', {
@@ -1834,6 +1910,9 @@ app.post('/executions', async (c) => {
     if (projectId) {
       executionRecord.project_id = projectId;
     }
+    // Phase B1: dual-write account_id (option<string>; null is acceptable).
+    executionRecord.account_id = accountId;
+    executionRecord.account_id_version = 1;
     if (validated.error_message) {
       executionRecord.error_message = validated.error_message;
     }
@@ -1909,13 +1988,16 @@ app.post('/executions', async (c) => {
         tokens_in: validated.tokens.input,
         tokens_out: validated.tokens.output,
         org_id: orgId || undefined,
+        // Phase B1: dual-write account_id alongside org_id.
+        account_id: accountId ?? undefined,
+        account_id_version: 1,
         project_id: projectId || undefined,
         // Edge learning fields
         ...(validated.improvisation && { improvisation: validated.improvisation }),
         ...(validated.input_impulse_shapes && { input_impulse_shapes: validated.input_impulse_shapes }),
         ...(validated.output_impulse_shapes && { output_impulse_shapes: validated.output_impulse_shapes }),
         ...(validated.metadata && { metadata: validated.metadata }),
-      };
+      } as any;
 
       const paradigmResult = await insertExecution(paradigmExecution, jwtAuth?.jwtToken);
       if (paradigmResult) {
@@ -1977,11 +2059,16 @@ app.post('/executions', async (c) => {
     // and stalling Thompson Sampling. Mirrors `resolveTemplateIdsForUpdate`
     // in execution-traces.ts.
     const normalizedVariantId = normalizeActivityId(activityIdFromRequest);
+    // Phase B1: dual-write account_id alongside org_id on the metrics UPSERT.
+    // ON DUPLICATE KEY UPDATE keeps the original account_id_version (≥1) on
+    // existing rows; only newly-inserted rows pick up the version=1 marker.
     const upsertMetricsQuery = `
       INSERT INTO variant_performance_metrics {
         variant_id: $variant_id,
         activity_id: $variant_id,
         org_id: $org_id,
+        account_id: $account_id,
+        account_id_version: 1,
         total_executions: 1,
         successful_executions: $success_delta,
         failed_executions: $failure_delta,
@@ -2012,6 +2099,7 @@ app.post('/executions', async (c) => {
     const metricsResult = await surrealDB.query(upsertMetricsQuery, {
       variant_id: normalizedVariantId,
       org_id: orgId,
+      account_id: accountIdRecordRef(accountId),
       success_delta,
       failure_delta,
       duration_ms: validated.duration_ms,
@@ -2205,8 +2293,11 @@ app.get('/executions', async (c) => {
   try {
     // Extract session from context for multi-tenant filtering
     const session = (c.get as any)('session') as SessionData | undefined;
-    const orgId = session?.org_id || null;
-    const projectId = session?.project_id || null;
+    // Phase B1: account_id from JWT auth context if present.
+    const jwtAuth = getJwtAuthFromContext(c);
+    const orgId = jwtAuth?.orgId || session?.org_id || null;
+    const accountId: string | null = jwtAuth?.accountId ?? null;
+    const projectId = jwtAuth?.projectId || session?.project_id || null;
 
     // Parse query parameters
     const variantId = c.req.query('variant_id') || null;
@@ -2262,9 +2353,11 @@ app.get('/executions', async (c) => {
     const params: Record<string, any> = {};
     
     // Multi-tenant filtering (same as templates)
+    // Phase B1: prefer account_id; legacy rows match via org_id fallback.
     if (orgId) {
-      query += ' AND (org_id = $org_id OR org_id = NONE)';
+      query += ` AND (org_id = NONE OR ${accountIdScopedWhere()})`;
       params.org_id = orgId;
+      params.account_id = accountId;
     }
     if (projectId) {
       query += ' AND (project_id = $project_id OR project_id = NONE OR org_id = $org_id)';
@@ -4007,14 +4100,20 @@ app.post('/recommend', async (c) => {
     }
 
     // Lookup per-bucket Thompson scores (Spec 3)
+    // Phase B1: dual-scope by account_id; legacy rows match via org_id.
     let contextScoresMap = new Map<string, { alpha: number; beta: number; n_observations: number }>();
     if (contextBucket && activityIds.length > 0) {
       try {
         const ctxResult = await surrealDB.query<any>(`
           SELECT template_id, alpha, beta, n_observations
           FROM context_thompson_scores
-          WHERE org_id = $org_id AND context_bucket = $bucket AND template_id IN $ids
-        `, { org_id: orgId, bucket: contextBucket, ids: activityIds });
+          WHERE ${accountIdScopedWhere()} AND context_bucket = $bucket AND template_id IN $ids
+        `, {
+          org_id: orgId,
+          account_id: jwtAuth?.accountId ?? null,
+          bucket: contextBucket,
+          ids: activityIds,
+        });
 
         for (const row of (ctxResult || [])) {
           contextScoresMap.set(row.template_id, {
@@ -4360,6 +4459,7 @@ app.post('/recommend', async (c) => {
       // Insert selection logs (fire-and-forget for performance)
       // Use FOR loop to handle array inserts properly
       // NOTE: org_id is STRING type in schema, not a record
+      // Phase B1: dual-write account_id + account_id_version on each log row.
       surrealDB.query(`
         FOR $log IN $logs {
           CREATE thompson_selection_log CONTENT {
@@ -4373,26 +4473,35 @@ app.post('/recommend', async (c) => {
             candidates_count: $log.candidates_count,
             exploration_slot: $log.exploration_slot,
             org_id: $org_name,
+            account_id: $account_id,
+            account_id_version: 1,
             project_id: IF $project_name IS NOT NONE AND $project_name IS NOT NULL THEN type::record('projects', $project_name) ELSE NONE END
           }
         }
       `, {
         logs: selectionLogs,
         org_name: orgId, // Plain string org_id
+        account_id: jwtAuth?.accountId ?? null,
         project_name: projectId, // project_id can be record or string
       }).catch((err: any) => {
         logger.warn('Failed to log Thompson selections', { error: err.message });
       });
 
       // Increment total_selections for recommended activities
+      // Phase B1: dual-scope WHERE — match account_id-tagged rows first, fall
+      // back to legacy org_id-only rows.
       const activityIds = finalRecommendations.map((r: any) => r.template_id);
       surrealDB.query(`
         UPDATE variant_performance_metrics
         SET total_selections = total_selections + 1,
             updated_at = time::now()
         WHERE variant_id IN $activity_ids
-          AND org_id = $org_id
-      `, { activity_ids: activityIds, org_id: orgId }).catch((err: any) => {
+          AND ${accountIdScopedWhere()}
+      `, {
+        activity_ids: activityIds,
+        org_id: orgId,
+        account_id: accountIdRecordRef(jwtAuth?.accountId ?? null),
+      }).catch((err: any) => {
         logger.warn('Failed to update total_selections', { error: err.message });
       });
 
@@ -4484,8 +4593,11 @@ app.post('/create-goal-seeking', async (c) => {
 
     // Get session data for multi-tenant support
     const sessionData = (c.get as any)('session') as SessionData | undefined;
-    const orgId = sessionData?.org_id || null;
-    const projectId = sessionData?.project_id || null;
+    // Phase B1: account_id flows from JWT auth context.
+    const goalSeekingJwtAuth = getJwtAuthFromContext(c);
+    const orgId = goalSeekingJwtAuth?.orgId || sessionData?.org_id || null;
+    const accountId: string | null = goalSeekingJwtAuth?.accountId ?? null;
+    const projectId = goalSeekingJwtAuth?.projectId || sessionData?.project_id || null;
 
     // Generate activity template
     const generated = await generateActivity({
@@ -4519,6 +4631,9 @@ app.post('/create-goal-seeking', async (c) => {
     if (projectId) {
       templateRecord.project_id = projectId;
     }
+    // Phase B1: dual-write account_id + version=1 marker on the new template.
+    templateRecord.account_id = accountId;
+    templateRecord.account_id_version = 1;
 
     const fields = Object.keys(templateRecord).map(k => `${k}: $${k}`).join(',\n        ');
     // Use UPSERT to handle re-registration and orphaned index entries
@@ -4542,11 +4657,14 @@ app.post('/create-goal-seeking', async (c) => {
 
     // Initialize Thompson Sampling metrics (UPSERT to handle re-registration)
     // Use deterministic record ID format for idempotent upserts
+    // Phase B1: dual-write account_id + version=1.
     const metricsRecordId = generated.id.replace(/[^a-zA-Z0-9_-]/g, '_');
     const insertMetricsQuery = `
       UPSERT variant_performance_metrics:\`${metricsRecordId}\` CONTENT {
         variant_id: $activity_id,
         activity_id: $activity_id,
+        account_id: $account_id,
+        account_id_version: 1,
         total_executions: 0,
         successful_executions: 0,
         failed_executions: 0,
@@ -4563,6 +4681,7 @@ app.post('/create-goal-seeking', async (c) => {
 
     await surrealDB.query(insertMetricsQuery, {
       activity_id: generated.id,
+      account_id: accountIdRecordRef(accountId),
     });
 
     logger.info('Created improvised activity template', {
@@ -4605,6 +4724,10 @@ app.post('/composition', async (c) => {
     const body = await c.req.json();
     const validated = CompositionRecordRequestSchema.parse(body);
 
+    // Phase B1: pull account_id from JWT auth context for dual-write.
+    const compositionJwtAuth = getJwtAuthFromContext(c);
+    const compositionAccountId: string | null = compositionJwtAuth?.accountId ?? null;
+
     logger.info('POST /v2/activities/composition', {
       parent: validated.parent_activity_id,
       child: validated.child_activity_id,
@@ -4640,6 +4763,8 @@ app.post('/composition', async (c) => {
       const newWeight = newSuccessCount / newExecutionCount;
 
       // Build SET clauses dynamically to avoid SCHEMAFULL field errors
+      // Phase B1: refresh account_id_version on every update so legacy rows
+      // get tagged on first write, and re-stamp account_id when caller carries one.
       const setClauses: string[] = [
         'execution_count = $execution_count',
         'success_count = $success_count',
@@ -4647,6 +4772,8 @@ app.post('/composition', async (c) => {
         'updated_at = time::now()',
         'input_impulse_shapes = $input_impulse_shapes',
         'output_impulse_shapes = $output_impulse_shapes',
+        'account_id = $account_id',
+        'account_id_version = 1',
       ];
 
       const updateParams: Record<string, any> = {
@@ -4657,6 +4784,7 @@ app.post('/composition', async (c) => {
         weight: newWeight,
         input_impulse_shapes: validated.input_impulse_shapes || [],
         output_impulse_shapes: validated.output_impulse_shapes || [],
+        account_id: compositionAccountId,
       };
 
       // Add optional fields only if they have values
@@ -4706,6 +4834,7 @@ app.post('/composition', async (c) => {
     } else {
       // Create new edge with impulse flow fields
       // Build params object dynamically to avoid SCHEMAFULL field errors
+      // Phase B1: dual-write account_id + version=1 marker on the new edge.
       const params: Record<string, any> = {
         parent_activity_id: validated.parent_activity_id,
         child_activity_id: validated.child_activity_id,
@@ -4716,6 +4845,8 @@ app.post('/composition', async (c) => {
         weight: validated.success ? 1.0 : 0.0,
         input_impulse_shapes: validated.input_impulse_shapes || [],
         output_impulse_shapes: validated.output_impulse_shapes || [],
+        account_id: compositionAccountId,
+        account_id_version: 1,
       };
 
       // Add optional fields only if they have values
@@ -5405,13 +5536,16 @@ app.post('/composition/edges', async (c) => {
         });
 
         // Fallback: Direct insert into composition_edge table
+        // Phase B1: dual-scope match on existing row (account_id preferred,
+        // fall back to org_id), and dual-write account_id + version=1 on
+        // both UPDATE and CREATE branches.
         const fallbackQuery = `
           LET $existing = (
             SELECT * FROM composition_edge
             WHERE from_activity = $from_activity
               AND to_activity = $to_activity
               AND shape_produced = $shape
-              AND org_id = $org_id
+              AND ${accountIdScopedWhere()}
             LIMIT 1
           );
 
@@ -5422,11 +5556,13 @@ app.post('/composition/edges', async (c) => {
               total_count = total_count + 1,
               alpha = IF($success, alpha + 1, alpha),
               beta = IF($success, beta, beta + 1),
+              account_id = $account_id,
+              account_id_version = 1,
               updated_at = time::now()
             WHERE from_activity = $from_activity
               AND to_activity = $to_activity
               AND shape_produced = $shape
-              AND org_id = $org_id
+              AND ${accountIdScopedWhere()}
             RETURN AFTER
           ) ELSE (
             CREATE composition_edge SET
@@ -5440,6 +5576,8 @@ app.post('/composition/edges', async (c) => {
               failure_count = IF($success, 0, 1),
               total_count = 1,
               org_id = $org_id,
+              account_id = $account_id,
+              account_id_version = 1,
               public = false
             RETURN AFTER
           ) END;
@@ -5452,6 +5590,7 @@ app.post('/composition/edges', async (c) => {
             shape: shape,
             success: validated.success,
             org_id: jwtAuth.orgId,
+            account_id: jwtAuth.accountId ?? null,
           });
 
           recordedEdges.push({
@@ -5470,6 +5609,7 @@ app.post('/composition/edges', async (c) => {
 
     // Also record to activity_composition_graph for backward compatibility
     // (existing queries may use that table)
+    // Phase B1: dual-write account_id + version=1 on both UPDATE/CREATE branches.
     try {
       const compatQuery = `
         LET $existing = (
@@ -5483,6 +5623,8 @@ app.post('/composition/edges', async (c) => {
             execution_count = execution_count + 1,
             success_count = IF($success, success_count + 1, success_count),
             weight = (IF($success, success_count + 1, success_count)) / (execution_count + 1),
+            account_id = $account_id,
+            account_id_version = 1,
             updated_at = time::now()
           WHERE parent_activity_id = $parent AND child_activity_id = $child
         ) ELSE (
@@ -5492,6 +5634,8 @@ app.post('/composition/edges', async (c) => {
             execution_count = 1,
             success_count = IF($success, 1, 0),
             weight = IF($success, 1.0, 0.0),
+            account_id = $account_id,
+            account_id_version = 1,
             created_at = time::now(),
             updated_at = time::now()
         ) END;
@@ -5501,6 +5645,7 @@ app.post('/composition/edges', async (c) => {
         parent: validated.parent_activity_id,
         child: validated.child_activity_id,
         success: validated.success,
+        account_id: jwtAuth.accountId ?? null,
       });
     } catch (compatError: any) {
       // Non-critical - log and continue
@@ -5573,6 +5718,8 @@ app.get('/composition/edges/successors/:activityId', async (c) => {
 
     // Query composition_edge for successors
     // Note: SurrealDB 2.x does not support HAVING clause, using subquery with WHERE instead
+    // Phase B1: dual-scope by account_id (preferred) or org_id (legacy fallback);
+    // public edges remain visible across tenants.
     let query = `
       SELECT * FROM (
         SELECT
@@ -5585,12 +5732,13 @@ app.get('/composition/edges/successors/:activityId', async (c) => {
           math::mean(beta) as avg_beta
         FROM composition_edge
         WHERE from_activity = $activity_id
-          AND (org_id = $org_id OR public = true)
+          AND (${accountIdScopedWhere()} OR public = true)
     `;
 
     const params: Record<string, any> = {
       activity_id: activityId,
       org_id: jwtAuth.orgId,
+      account_id: jwtAuth.accountId ?? null,
     };
 
     // Add state signature filter if provided
@@ -8104,6 +8252,8 @@ app.post('/relevance-feedback', async (c) => {
     const jwtAuth = getJwtAuthFromContext(c);
     const session = (c.get as any)('session') as SessionData | undefined;
     const orgId = jwtAuth?.orgId || session?.org_id || null;
+    // Phase B1: account_id flows from JWT auth.
+    const accountId: string | null = jwtAuth?.accountId ?? null;
 
     if (!orgId) {
       return c.json({ error: 'Unauthorized', message: 'Missing organization context' }, 401);
@@ -8132,11 +8282,14 @@ app.post('/relevance-feedback', async (c) => {
     const normalizedTemplateId = normalizeActivityId(template_id);
 
     // Upsert variant_performance_metrics Thompson params
+    // Phase B1: dual-write account_id + version=1 marker on insert path.
     surrealDB.query(`
       INSERT INTO variant_performance_metrics {
         variant_id: $variant_id,
         activity_id: $variant_id,
         org_id: $org_id,
+        account_id: $account_id,
+        account_id_version: 1,
         total_executions: 0,
         successful_executions: 0,
         failed_executions: 0,
@@ -8154,16 +8307,25 @@ app.post('/relevance-feedback', async (c) => {
         thompson_alpha += $alpha_delta,
         thompson_beta += $beta_delta,
         updated_at = time::now()
-    `, { variant_id: normalizedTemplateId, org_id: orgId, alpha_delta, beta_delta }).catch((err: any) => {
+    `, {
+      variant_id: normalizedTemplateId,
+      org_id: orgId,
+      account_id: accountIdRecordRef(accountId),
+      alpha_delta,
+      beta_delta,
+    }).catch((err: any) => {
       logger.warn('relevance-feedback: variant_performance_metrics upsert failed', { error: err.message });
     });
 
     // Upsert context_thompson_scores when context_bucket is provided
+    // Phase B1: dual-write account_id alongside org_id.
     if (context_bucket && typeof context_bucket === 'string') {
       surrealDB.query(`
         INSERT INTO context_thompson_scores {
           template_id: $template_id,
           org_id: $org_id,
+          account_id: $account_id,
+          account_id_version: 1,
           context_bucket: $bucket,
           alpha: $alpha_delta + 1,
           beta: $beta_delta + 1,
@@ -8176,7 +8338,14 @@ app.post('/relevance-feedback', async (c) => {
           beta += $beta_delta,
           n_observations += 1,
           last_updated_at = time::now()
-      `, { template_id, org_id: orgId, bucket: context_bucket, alpha_delta, beta_delta }).catch((err: any) => {
+      `, {
+        template_id,
+        org_id: orgId,
+        account_id: accountId,
+        bucket: context_bucket,
+        alpha_delta,
+        beta_delta,
+      }).catch((err: any) => {
         logger.warn('relevance-feedback: context_thompson_scores upsert failed', { error: err.message });
       });
     }
@@ -8184,10 +8353,13 @@ app.post('/relevance-feedback', async (c) => {
     // Persist the feedback record for audit / future learning
     // SurrealDB 3.x distinguishes NONE (undefined) from NULL; `none | string` fields
     // reject JavaScript null. Pass undefined so the driver sends NONE.
+    // Phase B1: dual-write account_id (undefined when absent so driver sends NONE).
     surrealDB.query(`
       CREATE relevance_feedback CONTENT {
         template_id: $template_id,
         org_id: $org_id,
+        account_id: $account_id,
+        account_id_version: 1,
         was_selected: $was_selected,
         context_bucket: $context_bucket,
         reason: $reason,
@@ -8197,6 +8369,7 @@ app.post('/relevance-feedback', async (c) => {
     `, {
       template_id,
       org_id: orgId,
+      account_id: accountId ?? undefined,
       was_selected,
       context_bucket: context_bucket ?? undefined,
       reason: reason ?? undefined,
