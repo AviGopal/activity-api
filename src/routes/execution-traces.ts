@@ -484,11 +484,13 @@ app.get('/', async (c) => {
 
     let total = countResult?.[0]?.total || 0;
 
-    // L-4: When parent_execution_id is provided and activity_execution_traces returns
-    // nothing, fall back to the paradigm execution table. Leaf activities dispatched
-    // by slot-binding / validator-dispatch carry exec_ IDs and are dual-written to
-    // this table, not to activity_execution_traces.
-    if (parentExecutionId && (executions?.length ?? 0) === 0) {
+    // L-8: Always union the paradigm execution table when parent_execution_id is set.
+    // activity_execution_traces stores wrappers (aexec_, act_); the paradigm
+    // execution table stores lifecycle hook executions (exec_). Both can have
+    // children of the same parent — querying only one table silently drops the other.
+    // Deduplication key is execution_id; activity_execution_traces version takes
+    // precedence when the same ID appears in both tables (it's more complete).
+    if (parentExecutionId) {
       try {
         const bareId = params.parent_execution_id as string;
         const paradigmQuery = `
@@ -508,27 +510,43 @@ app.get('/', async (c) => {
           limit,
         });
         if (paradigmRows && paradigmRows.length > 0) {
-          logger.info('[L-4] Parent ID found in paradigm execution table', {
-            count: paradigmRows.length,
-            parentExecutionId,
-          });
-          executions = paradigmRows.map((row: any) => {
-            const rowId = typeof row.id === 'string'
-              ? row.id.includes(':') ? row.id.split(':').pop()! : row.id
-              : String(row.id ?? '');
-            return {
-              ...row,
-              execution_id: row.execution_id || rowId,
-              activity_name: row.activity_id || 'Unknown Activity',
-              created_at: row.created_at || row.executed_at || new Date().toISOString(),
-              error_message: row.error?.message ?? row.error_message,
-              tasks: row.trace?.tasks ?? row.tasks ?? [],
-            } as ExecutionTrace;
-          });
-          total = paradigmRows.length;
+          // Build set of execution_ids already in primary results
+          const existingIds = new Set((executions ?? []).map((e: any) =>
+            e.execution_id || e.id?.toString().split(':').pop() || ''
+          ).filter(Boolean));
+
+          const newRows = paradigmRows
+            .map((row: any) => {
+              const rowId = typeof row.id === 'string'
+                ? (row.id.includes(':') ? row.id.split(':').pop()! : row.id)
+                : String(row.id ?? '');
+              return {
+                ...row,
+                execution_id: row.execution_id || rowId,
+                activity_name: row.activity_id || 'Unknown Activity',
+                created_at: row.created_at || row.executed_at || new Date().toISOString(),
+                error_message: row.error?.message ?? row.error_message,
+                tasks: row.trace?.tasks ?? row.tasks ?? [],
+              } as ExecutionTrace;
+            })
+            .filter((row: any) => {
+              const eid = row.execution_id || '';
+              return eid && !existingIds.has(eid);
+            });
+
+          if (newRows.length > 0) {
+            logger.info('[L-8] Merged paradigm execution table results', {
+              primaryCount: executions?.length ?? 0,
+              paradigmCount: paradigmRows.length,
+              newCount: newRows.length,
+              parentExecutionId,
+            });
+            executions = [...(executions ?? []), ...newRows] as ExecutionTrace[];
+            total = executions.length;
+          }
         }
       } catch (paradigmError) {
-        logger.warn('[L-4] Paradigm execution fallback query failed', {
+        logger.warn('[L-8] Paradigm execution union query failed', {
           error: paradigmError instanceof Error ? paradigmError.message : String(paradigmError),
           parentExecutionId,
         });
