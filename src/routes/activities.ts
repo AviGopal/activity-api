@@ -2174,9 +2174,10 @@ app.post('/executions', async (c) => {
     }
 
     // Step 4: Auto-create variant if needed (after consecutive failures)
-    // Non-blocking: don't await, fire and forget
+    // Non-blocking: don't await, fire and forget.
+    // Phase B4a: thread accountId through (already in scope at this site).
     if (orgId) {
-      autoCreateVariantIfNeeded(activityIdFromRequest, orgId, validated.success)
+      autoCreateVariantIfNeeded(activityIdFromRequest, orgId, validated.success, accountId)
         .then((variantResult) => {
           if (variantResult) {
             logger.info('Auto-created variant from consecutive failures', {
@@ -2208,8 +2209,9 @@ app.post('/executions', async (c) => {
         });
 
       // Step 5: Check and retire template if needed (after enough executions)
-      // Non-blocking: don't await, fire and forget
-      checkAndRetireTemplate(activityIdFromRequest, orgId)
+      // Non-blocking: don't await, fire and forget.
+      // Phase B4a: thread accountId for dual-tenant scoping on the read.
+      checkAndRetireTemplate(activityIdFromRequest, orgId, accountId)
         .then((wasRetired) => {
           if (wasRetired) {
             logger.info('Template retired due to poor performance', {
@@ -3131,6 +3133,9 @@ app.post('/:id/variants', async (c) => {
     const jwtAuth = getJwtAuthFromContext(c);
     const session = (c.get as any)('session') as SessionData | undefined;
     const orgId = jwtAuth?.orgId || session?.org_id || null;
+    // Phase B4a: account_id only flows from JWT auth context (sessions
+    // don't carry one). Null is valid; reads/writes fall back to org_id.
+    const accountId: string | null = jwtAuth?.accountId ?? null;
 
     if (!orgId) {
       return c.json({ error: 'Organization ID required' }, 401);
@@ -3158,7 +3163,8 @@ app.post('/:id/variants', async (c) => {
     const { createVariant, shouldCreateVariant } = await import('../services/variant-creator');
 
     // Check current failure pattern to provide context
-    const failurePattern = await shouldCreateVariant(activityId, orgId);
+    // Phase B4a: dual-tenant scoping; pass accountId.
+    const failurePattern = await shouldCreateVariant(activityId, orgId, accountId);
 
     // Create variant even if no failure pattern (manual improvement)
     const defaultFailurePattern = failurePattern || {
@@ -3174,7 +3180,8 @@ app.post('/:id/variants', async (c) => {
       activityId,
       defaultFailurePattern,
       orgId,
-      reason
+      reason,
+      accountId
     );
 
     if (!variantResult) {

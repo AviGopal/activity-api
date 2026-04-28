@@ -8,6 +8,7 @@
 
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
+import { accountIdScopedWhere } from '../routes/activities';
 
 export interface VariantCreationResult {
   variantId: string;
@@ -28,10 +29,15 @@ export interface FailurePattern {
 /**
  * Check if a template should have a variant created
  * Returns failure pattern if variant creation is warranted
+ *
+ * Phase B4a: dual-tenant scoping. Prefer account_id; legacy execution rows
+ * (account_id IS NONE) match via the org_id branch. accountId optional —
+ * legacy callers passing only orgId still resolve through the org_id branch.
  */
 export async function shouldCreateVariant(
   templateId: string,
-  orgId: string
+  orgId: string,
+  accountId?: string | null
 ): Promise<FailurePattern | null> {
   try {
     // Get recent execution history (last 10 executions)
@@ -39,12 +45,13 @@ export async function shouldCreateVariant(
       SELECT success, error, created_at
       FROM execution
       WHERE activity_id = $template_id
-        AND org_id = $org_id
+        AND ${accountIdScopedWhere()}
       ORDER BY created_at DESC
       LIMIT 10
     `, {
       template_id: templateId,
       org_id: orgId,
+      account_id: accountId ?? null,
     });
 
     if (!recentExecutions || recentExecutions.length === 0) {
@@ -78,10 +85,11 @@ export async function shouldCreateVariant(
         array::group(error.task_id) AS failed_task_ids
       FROM execution
       WHERE activity_id = $template_id
-        AND org_id = $org_id
+        AND ${accountIdScopedWhere()}
     `, {
       template_id: templateId,
       org_id: orgId,
+      account_id: accountId ?? null,
     });
 
     const statData = stats[0]?.[0];
@@ -214,23 +222,28 @@ Please be especially careful to avoid these issues.
 
 /**
  * Create a variant of an activity template
+ *
+ * Phase B4a: dual-tenant scoping on reads + dual-write account_id on the new
+ * variant row. accountId optional for legacy callers.
  */
 export async function createVariant(
   parentTemplateId: string,
   failurePattern: FailurePattern,
   orgId: string,
-  reason: string = 'consecutive_failures'
+  reason: string = 'consecutive_failures',
+  accountId?: string | null
 ): Promise<VariantCreationResult | null> {
   try {
     // Get parent template
     const parentResult = await surrealDB.query<any[]>(`
       SELECT * FROM activity
       WHERE id = $template_id
-        AND org_id = $org_id
+        AND ${accountIdScopedWhere()}
       LIMIT 1
     `, {
       template_id: parentTemplateId,
       org_id: orgId,
+      account_id: accountId ?? null,
     });
 
     const parentTemplate = parentResult[0]?.[0];
@@ -247,10 +260,11 @@ export async function createVariant(
       SELECT count() AS count
       FROM activity
       WHERE variant_of = $parent_id
-        AND org_id = $org_id
+        AND ${accountIdScopedWhere()}
     `, {
       parent_id: parentTemplateId,
       org_id: orgId,
+      account_id: accountId ?? null,
     });
 
     const variantCount = existingVariants[0]?.[0]?.count || 0;
@@ -278,6 +292,9 @@ export async function createVariant(
     // Create variant in database
     const variantName = `${parentTemplate.name} (Variant ${variantGeneration})`;
 
+    // Phase B4a: dual-write account_id alongside org_id. account_id is
+    // option<string>; null is valid when caller has no accountId claim.
+    // account_id_version=1 marks this row as Phase B dual-written.
     await surrealDB.query(`
       CREATE activity:⟨$variant_id⟩ SET
         name = $name,
@@ -287,6 +304,8 @@ export async function createVariant(
         tasks = $tasks,
         scope = $scope,
         org_id = $org_id,
+        account_id = $account_id,
+        account_id_version = $account_id_version,
         project_id = $project_id,
         input_shapes = $input_shapes,
         output_shapes = $output_shapes,
@@ -304,6 +323,8 @@ export async function createVariant(
       tasks: modifiedTemplate.tasks || [],
       scope: parentTemplate.scope,
       org_id: orgId,
+      account_id: accountId ?? null,
+      account_id_version: 1,
       project_id: parentTemplate.project_id,
       input_shapes: modifiedTemplate.input_shapes || [],
       output_shapes: modifiedTemplate.output_shapes || [],
@@ -339,10 +360,15 @@ export async function createVariant(
 /**
  * Check and retire poorly performing templates
  * Retirement criteria: Success rate < 30% over last 20 executions
+ *
+ * Phase B4a: dual-tenant scoping on reads. The UPDATE on activity:⟨id⟩ is
+ * a record-id targeted update with no org_id WHERE clause, so no change
+ * needed there.
  */
 export async function checkAndRetireTemplate(
   templateId: string,
-  orgId: string
+  orgId: string,
+  accountId?: string | null
 ): Promise<boolean> {
   try {
     // Get last 20 executions
@@ -350,12 +376,13 @@ export async function checkAndRetireTemplate(
       SELECT success
       FROM execution
       WHERE activity_id = $template_id
-        AND org_id = $org_id
+        AND ${accountIdScopedWhere()}
       ORDER BY created_at DESC
       LIMIT 20
     `, {
       template_id: templateId,
       org_id: orgId,
+      account_id: accountId ?? null,
     });
 
     const executions = recentExecutions[0] || [];
@@ -401,11 +428,14 @@ export async function checkAndRetireTemplate(
 
 /**
  * Auto-create variant after recording execution if needed
+ *
+ * Phase B4a: thread accountId through to inner reads + create.
  */
 export async function autoCreateVariantIfNeeded(
   templateId: string,
   orgId: string,
-  executionSuccess: boolean
+  executionSuccess: boolean,
+  accountId?: string | null
 ): Promise<VariantCreationResult | null> {
   // Only check after failures
   if (executionSuccess) {
@@ -413,7 +443,7 @@ export async function autoCreateVariantIfNeeded(
   }
 
   // Check if variant should be created
-  const failurePattern = await shouldCreateVariant(templateId, orgId);
+  const failurePattern = await shouldCreateVariant(templateId, orgId, accountId);
   if (!failurePattern) {
     return null;
   }
@@ -423,12 +453,13 @@ export async function autoCreateVariantIfNeeded(
     SELECT created_at
     FROM activity
     WHERE variant_of = $parent_id
-      AND org_id = $org_id
+      AND ${accountIdScopedWhere()}
       AND created_at > time::now() - 1h
     LIMIT 1
   `, {
     parent_id: templateId,
     org_id: orgId,
+    account_id: accountId ?? null,
   });
 
   if (recentVariants[0] && recentVariants[0].length > 0) {
@@ -443,6 +474,7 @@ export async function autoCreateVariantIfNeeded(
     templateId,
     failurePattern,
     orgId,
-    'consecutive_failures'
+    'consecutive_failures',
+    accountId
   );
 }
