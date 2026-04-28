@@ -31,7 +31,7 @@ import {
 } from '../services/impulse-formatters';
 import { getJwtAuthFromContext, type JwtAuthContext } from '../middleware/jwtAuth';
 import { normalizeRecordId } from '../utils/surrealdb-types';
-import activitiesRouter from './activities';
+import activitiesRouter, { accountIdScopedWhere } from './activities';
 import executionTracesRouter from './execution-traces';
 import { runTemplateAuditReport, type TemplateAuditInput } from './template-audit';
 import { runExecutionTraceWithSignatures } from './execution-trace-with-signatures';
@@ -142,21 +142,33 @@ async function emitUpkeepAudit(payload: {
   count: number;
   performed_by: string;
   org_id: string;
+  // Phase B2: account_id flows from the calling JWT auth context. null when
+  // caller has no accountId claim (legacy callers); option<string> in schema.
+  account_id?: string | null;
   reason?: string;
   diff?: Record<string, unknown>;
 }): Promise<string | null> {
   const auditId = `upkeep-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
   const audit = { ...payload, performed_at: new Date().toISOString() };
   try {
+    // Phase B2: dual-write account_id alongside org_id. account_id_version=1
+    // marks this row as Phase B dual-written.
     await surrealDB.query(
       `INSERT INTO impulse {
         id: $id,
         shape: 'upkeepAuditLog',
         pointer: $pointer,
         org_id: $org_id,
+        account_id: $account_id,
+        account_id_version: 1,
         created_at: time::now()
       }`,
-      { id: auditId, pointer: audit, org_id: payload.org_id },
+      {
+        id: auditId,
+        pointer: audit,
+        org_id: payload.org_id,
+        account_id: payload.account_id ?? null,
+      },
     );
     return auditId;
   } catch (err) {
@@ -307,6 +319,12 @@ router.post('/', async (c) => {
 
     // Build query params dynamically to avoid sending null for optional fields
     // SurrealDB's option<T> expects either a value or the field to be omitted, not null
+    //
+    // Phase B2 (account_id migration): dual-write account_id alongside org_id.
+    // Schema is option<string>; null is acceptable when caller has no
+    // accountId claim. account_id_version=1 marks this row as Phase B
+    // dual-written.
+    const accountId = jwtAuth?.accountId ?? null;
     const params: Record<string, any> = {
       impulse_id,
       pointer,
@@ -315,6 +333,8 @@ router.post('/', async (c) => {
       metadata: impulse_data.metadata || {},
       token_estimate: impulse_data.budget || 0,
       org_id,
+      account_id: accountId,
+      account_id_version: 1,
       // Note: created_at will be set via time::now() in SQL query (not passed as parameter)
       // JavaScript Date objects serialize to ISO strings which SurrealDB can't coerce to datetime
     };
@@ -342,6 +362,10 @@ router.post('/', async (c) => {
     // Use INSERT for impulse creation
     // INSERT works with root credentials (no org_id permission checks required)
     // Use time::now() instead of Date parameter to avoid datetime coercion errors
+    //
+    // Phase B2: dual-write `account_id` (option<string>; null is acceptable
+    // when caller has no accountId claim) and `account_id_version` (=1) so
+    // Phase D and later can flip the canonical scoping field.
     const insertQuery = `
       INSERT INTO impulse {
         id: $impulse_id,
@@ -352,6 +376,8 @@ router.post('/', async (c) => {
         metadata: $metadata,
         token_estimate: $token_estimate,
         org_id: $org_id,
+        account_id: $account_id,
+        account_id_version: $account_id_version,
         ${projectIdField}
         ${createdByField}
         created_at: time::now()
@@ -501,8 +527,11 @@ router.get('/:impulseId', async (c) => {
     let query = `SELECT * FROM impulse WHERE record::id(id) = $impulse_id`;
     const params: Record<string, any> = { impulse_id };
     if (jwtAuth?.orgId) {
-      query += ` AND org_id = $org_id`;
+      // Phase B2: prefer account_id; legacy rows (account_id IS NONE) match
+      // via the org_id branch in accountIdScopedWhere().
+      query += ` AND ${accountIdScopedWhere()}`;
       params.org_id = jwtAuth.orgId;
+      params.account_id = jwtAuth.accountId ?? null;
     }
 
     // Add optional project_id filter
@@ -620,8 +649,10 @@ router.get('/', async (c) => {
     const whereParts: string[] = [];
     const params: Record<string, any> = { limit, offset };
     if (jwtAuth?.orgId) {
-      whereParts.push('org_id = $org_id');
+      // Phase B2: prefer account_id; legacy rows match via org_id branch.
+      whereParts.push(accountIdScopedWhere());
       params.org_id = jwtAuth.orgId;
+      params.account_id = jwtAuth.accountId ?? null;
     }
     if (project_id) {
       whereParts.push('project_id = $project_id');
@@ -743,16 +774,23 @@ router.post('/resolve', async (c) => {
         let queryPath: 'new' | 'legacy' = 'legacy';
 
         try {
+          // Phase B2: dual-tenant scoping. The accountIdScopedWhere() helper
+          // emits `(account_id = $account_id OR (account_id IS NONE AND org_id = $org_id))`
+          // which matches both Phase B+ rows and legacy rows on the same query.
+          // Bind `org_id` (alias of $orgId) alongside `account_id` for both
+          // arms of the disjunction.
           const newQuery = `
             SELECT * FROM execution
             WHERE id = $execution_id
-            AND org_id = $orgId
+            AND ${accountIdScopedWhere()}
             LIMIT 1
           `;
 
           const newResult = await executeAsAuth<any>(jwtAuthCtx, newQuery, {
             execution_id: pointer.executionId,
             orgId: jwtAuthCtx.orgId,
+            org_id: jwtAuthCtx.orgId,
+            account_id: jwtAuthCtx.accountId ?? null,
           });
 
           if (newResult && newResult.length > 0) {
@@ -764,11 +802,13 @@ router.post('/resolve', async (c) => {
               const impulseQuery = `
                 SELECT id, shape, summary, content FROM impulse
                 WHERE id IN $impulse_ids
-                AND org_id = $orgId
+                AND ${accountIdScopedWhere()}
               `;
               const impulses = await executeAsAuth<any>(jwtAuthCtx, impulseQuery, {
                 impulse_ids: trace.input_impulses,
                 orgId: jwtAuthCtx.orgId,
+                org_id: jwtAuthCtx.orgId,
+                account_id: jwtAuthCtx.accountId ?? null,
               });
               trace.resolved_impulses = impulses;
             }
@@ -788,16 +828,19 @@ router.post('/resolve', async (c) => {
 
         // Fall back to legacy activity_execution_traces table
         if (!trace) {
+          // Phase B2: dual-tenant scoping for activity_execution_traces.
           const legacyQuery = `
             SELECT * FROM activity_execution_traces
             WHERE execution_id = $execution_id
-            AND org_id = $orgId
+            AND ${accountIdScopedWhere()}
             LIMIT 1
           `;
 
           const legacyResult = await executeAsAuth<any>(jwtAuthCtx, legacyQuery, {
             execution_id: pointer.executionId,
             orgId: jwtAuthCtx.orgId,
+            org_id: jwtAuthCtx.orgId,
+            account_id: jwtAuthCtx.accountId ?? null,
           });
 
           if (legacyResult && legacyResult.length > 0) {
@@ -837,16 +880,20 @@ router.post('/resolve', async (c) => {
         // since callers pass the bare id. Matches the pattern used by the
         // *_update/_deprecate write resolvers.
         // Org scoping: allow caller's org templates OR global/system templates.
+        // Phase B2: prefer account_id; legacy rows match via the org_id branch.
+        // Global / NONE-scoped templates remain visible regardless of tenant.
         const query = `
           SELECT * FROM activity
           WHERE record::id(id) = $activity_id
-          AND (org_id = $orgId OR scope = 'global' OR org_id IS NONE)
+          AND (${accountIdScopedWhere()} OR scope = 'global' OR org_id IS NONE)
           LIMIT 1
         `;
 
         const result = await executeAsAuth<any>(jwtAuthCtx, query, {
           activity_id: pointer.templateId,
           orgId: jwtAuthCtx.orgId,
+          org_id: jwtAuthCtx.orgId,
+          account_id: jwtAuthCtx.accountId ?? null,
         });
 
         if (result.length === 0) {
@@ -871,17 +918,21 @@ router.post('/resolve', async (c) => {
           } as ImpulseResolveResponse, 400);
         }
 
-        // Load metrics for all variants of activity — org scoped
+        // Load metrics for all variants of activity — org scoped.
+        // Phase B2: prefer account_id; legacy / global rows (org_id IS NONE)
+        // remain visible.
         const query = `
           SELECT * FROM variant_performance_metrics
           WHERE activity_id = $activity_id
-          AND (org_id = $orgId OR org_id IS NONE)
+          AND (${accountIdScopedWhere()} OR org_id IS NONE)
           ORDER BY success_rate DESC
         `;
 
         const result = await executeAsAuth<any>(jwtAuthCtx, query, {
           activity_id: pointer.activityId,
           orgId: jwtAuthCtx.orgId,
+          org_id: jwtAuthCtx.orgId,
+          account_id: jwtAuthCtx.accountId ?? null,
         });
 
         if (result.length === 0) {
@@ -905,9 +956,17 @@ router.post('/resolve', async (c) => {
         const since = pointer.since;
         const limit = pointer.limit || 50;
 
-        // Build WHERE clause dynamically — always include org_id scoping
-        const conditions: string[] = ['org_id = $orgId'];
-        const params: Record<string, any> = { limit, orgId: jwtAuthCtx.orgId };
+        // Build WHERE clause dynamically — always include tenant scoping.
+        // Phase B2: dual-tenant. Prefer account_id; legacy rows fall back via
+        // org_id. Bind both as separate params (account_id may be null when
+        // caller has no accountId claim).
+        const conditions: string[] = [accountIdScopedWhere()];
+        const params: Record<string, any> = {
+          limit,
+          orgId: jwtAuthCtx.orgId,
+          org_id: jwtAuthCtx.orgId,
+          account_id: jwtAuthCtx.accountId ?? null,
+        };
 
         if (filter === 'successful') {
           conditions.push('success = true');
@@ -1012,6 +1071,7 @@ router.post('/resolve', async (c) => {
 
         // Query execution table directly and compute per-variant metrics
         // Note: v_activity_score groups by activity_id only, not variant_id
+        // Phase B2: dual-tenant scoping on the execution-table aggregate.
         const query = `
           SELECT
             activity_id,
@@ -1025,7 +1085,7 @@ router.post('/resolve', async (c) => {
             math::mean(<float> cost_usd) AS avg_cost_usd
           FROM execution
           WHERE activity_id CONTAINS $activityId
-          AND org_id = $orgId
+          AND ${accountIdScopedWhere()}
           GROUP BY activity_id
           ORDER BY success_rate DESC
         `;
@@ -1033,6 +1093,8 @@ router.post('/resolve', async (c) => {
         const variants = await executeAsAuth<any>(jwtAuthCtx, query, {
           activityId: pointer.activityId,
           orgId: jwtAuthCtx.orgId,
+          org_id: jwtAuthCtx.orgId,
+          account_id: jwtAuthCtx.accountId ?? null,
         });
 
         if (variants.length === 0) {
@@ -1183,11 +1245,13 @@ router.post('/resolve', async (c) => {
 
         // First get metrics for top-performing templates
         const orderField = sortBy === 'success_rate' ? 'success_rate' : 'total_executions';
+        // Phase B2: dual-tenant scoping. Legacy/global rows (org_id IS NONE)
+        // remain visible.
         const metricsQuery = `
           SELECT variant_id, total_executions, success_rate, avg_duration_ms, avg_cost_usd
           FROM variant_performance_metrics
           WHERE total_executions >= $min_executions
-          AND (org_id = $orgId OR org_id IS NONE)
+          AND (${accountIdScopedWhere()} OR org_id IS NONE)
           ORDER BY ${orderField} DESC
           LIMIT $limit
         `;
@@ -1196,6 +1260,8 @@ router.post('/resolve', async (c) => {
           min_executions: minExecutions,
           limit,
           orgId: jwtAuthCtx.orgId,
+          org_id: jwtAuthCtx.orgId,
+          account_id: jwtAuthCtx.accountId ?? null,
         });
 
         if (metrics.length === 0) {
@@ -1286,11 +1352,15 @@ router.post('/resolve', async (c) => {
 
         logger.info('Resolving executionTraces', { templateId, success, limit });
 
-        let whereClause = 'WHERE variant_id = $template_id AND org_id = $orgId';
+        // Phase B2: dual-tenant scoping. Bind both account_id and org_id;
+        // accountIdScopedWhere() emits the OR-fallback clause.
+        let whereClause = `WHERE variant_id = $template_id AND ${accountIdScopedWhere()}`;
         const params: Record<string, any> = {
           template_id: templateId,
           limit,
           orgId: jwtAuthCtx.orgId,
+          org_id: jwtAuthCtx.orgId,
+          account_id: jwtAuthCtx.accountId ?? null,
         };
 
         if (success === true) {
@@ -1363,14 +1433,17 @@ router.post('/resolve', async (c) => {
         let impulseShapes: string[] = [];
         if (impulseRefs.length > 0) {
           try {
+            // Phase B2: dual-tenant scoping for impulse context lookup.
             const contextQuery = `
               SELECT id, shape, summary FROM impulse
               WHERE id IN $impulse_ids
-              AND org_id = $orgId
+              AND ${accountIdScopedWhere()}
             `;
             impulseContext = await executeAsAuth(jwtAuthCtx, contextQuery, {
               impulse_ids: impulseRefs,
               orgId: jwtAuthCtx.orgId,
+              org_id: jwtAuthCtx.orgId,
+              account_id: jwtAuthCtx.accountId ?? null,
             });
             impulseShapes = impulseContext.map((i: any) => i.shape).filter(Boolean);
             logger.debug('Loaded impulse context for goal', {
@@ -1995,10 +2068,21 @@ router.post('/resolve', async (c) => {
             return c.json({ success: false, error: 'Forbidden: template belongs to a different org' } as ImpulseResolveResponse, 403);
           }
 
+          // Phase B2: dual-tenant scoping in the UPDATE WHERE clause. Mirror
+          // the read-time scope so account-bearing callers can update both
+          // their account-scoped rows and any legacy org-scoped rows that
+          // predate the migration.
           const after = await executeAsAuth<any>(
             jwtAuth,
-            `UPDATE activity MERGE $updates WHERE record::id(id) = $id AND (org_id = $orgId OR (scope = 'global' AND $isAdmin = true)) RETURN AFTER`,
-            { id: templateId, updates, orgId: jwtAuth.orgId, isAdmin },
+            `UPDATE activity MERGE $updates WHERE record::id(id) = $id AND (${accountIdScopedWhere()} OR (scope = 'global' AND $isAdmin = true)) RETURN AFTER`,
+            {
+              id: templateId,
+              updates,
+              orgId: jwtAuth.orgId,
+              org_id: jwtAuth.orgId,
+              account_id: jwtAuth.accountId ?? null,
+              isAdmin,
+            },
           );
           const afterRow = (after || [])[0];
 
@@ -2016,6 +2100,9 @@ router.post('/resolve', async (c) => {
             count: 1,
             performed_by: jwtAuth.keyId || jwtAuth.userId || 'unknown',
             org_id: jwtAuth.orgId,
+            // Phase B2: thread accountId into the audit row so the upkeep
+            // log dual-writes alongside its target.
+            account_id: jwtAuth.accountId ?? null,
             diff,
           });
 
@@ -2076,10 +2163,17 @@ router.post('/resolve', async (c) => {
             return c.json({ success: false, error: 'Forbidden: template belongs to a different org' } as ImpulseResolveResponse, 403);
           }
 
+          // Phase B2: dual-tenant scoping in deprecate UPDATE.
           const after = await executeAsAuth<any>(
             jwtAuth,
-            `UPDATE activity SET deprecated = true, updated_at = time::now() WHERE record::id(id) = $id AND (org_id = $orgId OR (scope = 'global' AND $isAdmin = true)) RETURN AFTER`,
-            { id: templateId, orgId: jwtAuth.orgId, isAdmin: isAdminDep },
+            `UPDATE activity SET deprecated = true, updated_at = time::now() WHERE record::id(id) = $id AND (${accountIdScopedWhere()} OR (scope = 'global' AND $isAdmin = true)) RETURN AFTER`,
+            {
+              id: templateId,
+              orgId: jwtAuth.orgId,
+              org_id: jwtAuth.orgId,
+              account_id: jwtAuth.accountId ?? null,
+              isAdmin: isAdminDep,
+            },
           );
           const afterRow = (after || [])[0];
 
@@ -2092,6 +2186,7 @@ router.post('/resolve', async (c) => {
             count: 1,
             performed_by: jwtAuth.keyId || jwtAuth.userId || 'unknown',
             org_id: jwtAuth.orgId,
+            account_id: jwtAuth.accountId ?? null,
             reason,
           });
 
@@ -2133,8 +2228,17 @@ router.post('/resolve', async (c) => {
         // SurrealDB ACCESS validation), so we must add org_id scoping ourselves.
         // For real JWT auth PERMISSIONS handle it but the extra predicate is
         // a no-op since the row will already be scoped.
-        const conditions = ['org_id = $orgId', 'executed_at < type::datetime($olderThan)'];
-        const params: Record<string, unknown> = { olderThan, lim: limit, orgId: jwtAuth.orgId };
+        // Phase B2: dual-tenant scoping. The delete WHERE clause must match
+        // legacy org-scoped rows AND new account-scoped rows so cleanup
+        // operations work across both cohorts during the migration.
+        const conditions = [accountIdScopedWhere(), 'executed_at < type::datetime($olderThan)'];
+        const params: Record<string, unknown> = {
+          olderThan,
+          lim: limit,
+          orgId: jwtAuth.orgId,
+          org_id: jwtAuth.orgId,
+          account_id: jwtAuth.accountId ?? null,
+        };
         if (successFilter !== undefined) {
           conditions.push(`success = ${successFilter ? 'true' : 'false'}`);
         }
@@ -2164,7 +2268,19 @@ router.post('/resolve', async (c) => {
             } as ImpulseResolveResponse, 200);
           }
 
-          await executeAsAuth<any>(jwtAuth, `DELETE FROM activity_execution_traces WHERE id IN $ids AND org_id = $orgId`, { ids: targetIds, orgId: jwtAuth.orgId });
+          // Phase B2: dual-tenant filter on the DELETE itself, so legacy rows
+          // (account_id IS NONE) selected via the SELECT above can also be
+          // hard-deleted. Without this, the DELETE silently affects 0 rows.
+          await executeAsAuth<any>(
+            jwtAuth,
+            `DELETE FROM activity_execution_traces WHERE id IN $ids AND ${accountIdScopedWhere()}`,
+            {
+              ids: targetIds,
+              orgId: jwtAuth.orgId,
+              org_id: jwtAuth.orgId,
+              account_id: jwtAuth.accountId ?? null,
+            },
+          );
 
           const auditId = await emitUpkeepAudit({
             operation: 'delete',
@@ -2175,6 +2291,7 @@ router.post('/resolve', async (c) => {
             count: targetIds.length,
             performed_by: jwtAuth.keyId || jwtAuth.userId || 'unknown',
             org_id: jwtAuth.orgId,
+            account_id: jwtAuth.accountId ?? null,
           });
 
           return c.json({
