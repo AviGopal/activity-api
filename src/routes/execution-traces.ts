@@ -2266,8 +2266,16 @@ app.post('/', async (c) => {
       || [];
 
     if (inputShapes.length > 0 && trace.variant_id && traceOrgId) {
-      // Fire and forget - don't block the response
-      updateShapeActivityScores(trace.variant_id, inputShapes, trace.success, traceOrgId)
+      // Fire and forget - don't block the response.
+      // Phase B-followup: thread accountId so dual-write fires.
+      updateShapeActivityScores(
+        trace.variant_id,
+        inputShapes,
+        trace.success,
+        traceOrgId,
+        jwtAuth?.jwtToken ?? null,
+        traceAccountId
+      )
         .catch(err => logger.warn('[paradigm] Shape score update failed (non-blocking)', {
           execution_id: trace.execution_id,
           error: err instanceof Error ? err.message : String(err),

@@ -2019,6 +2019,7 @@ app.post('/executions', async (c) => {
     // Step 1b: Update shape-based Thompson Sampling scores
     // If input_impulse_shapes are provided, update impulse_shape_activity_score table
     // This enables shape-conditioned activity selection
+    // Phase B-followup: thread accountId so dual-write fires.
     if (validated.input_impulse_shapes && validated.input_impulse_shapes.length > 0 && orgId) {
       // Non-blocking: don't await, just fire and forget
       updateShapeScoresFromExecution(
@@ -2026,7 +2027,8 @@ app.post('/executions', async (c) => {
         validated.input_impulse_shapes,
         validated.success,
         orgId,
-        jwtAuth?.jwtToken
+        jwtAuth?.jwtToken,
+        jwtAuth?.accountId ?? null
       ).catch((error) => {
         logger.warn('Shape score update failed (non-blocking)', {
           activity_id: activityIdFromRequest,
@@ -3378,6 +3380,8 @@ app.post('/feedback', async (c) => {
 
     // Use JWT auth claims if available, otherwise fall back to session
     const orgId = jwtAuth?.orgId || session?.org_id || null;
+    // Phase B-followup: account_id only flows from JWT auth.
+    const accountId: string | null = jwtAuth?.accountId ?? null;
 
     if (!orgId) {
       return c.json({
@@ -3397,6 +3401,7 @@ app.post('/feedback', async (c) => {
       include_adjacent: validated.include_adjacent,
       reason: validated.reason,
       orgId,
+      accountId,
     });
 
     // Map intensity to multiplier (0=1.5x, 1=2x, 2=2.5x, 3=3x)
@@ -3451,10 +3456,12 @@ app.post('/feedback', async (c) => {
     const inputShapes = activity.input_shapes || [];
 
     // Find all shape scores for this activity
+    // Phase B-followup: dual-tenant scoping; legacy rows match via the
+    // org_id branch of accountIdScopedWhere().
     const shapesQuery = await surrealDB.query<ImpulseShapeActivityScore>(
       `SELECT * FROM impulse_shape_activity_score
-       WHERE org_id = $org_id AND activity_id = $activity_id`,
-      { org_id: orgId, activity_id: validated.activity_id }
+       WHERE ${accountIdScopedWhere()} AND activity_id = $activity_id`,
+      { org_id: orgId, account_id: accountId, activity_id: validated.activity_id }
     );
 
     const existingScores = shapesQuery || [];
@@ -3473,11 +3480,14 @@ app.post('/feedback', async (c) => {
       });
 
       for (const shape of inputShapes) {
+        // Phase B-followup: dual-write account_id + version on CREATE.
         await surrealDB.query(
           `CREATE impulse_shape_activity_score CONTENT {
             shape: $shape,
             activity_id: $activity_id,
             org_id: $org_id,
+            account_id: $account_id,
+            account_id_version: $account_id_version,
             success_count: 0,
             failure_count: 0,
             alpha: 1,
@@ -3488,6 +3498,8 @@ app.post('/feedback', async (c) => {
             shape,
             activity_id: validated.activity_id,
             org_id: orgId,
+            account_id: accountId,
+            account_id_version: 1,
           }
         );
       }
@@ -3495,8 +3507,8 @@ app.post('/feedback', async (c) => {
       // Re-fetch scores
       const refreshedScores = await surrealDB.query<ImpulseShapeActivityScore>(
         `SELECT * FROM impulse_shape_activity_score
-         WHERE org_id = $org_id AND activity_id = $activity_id`,
-        { org_id: orgId, activity_id: validated.activity_id }
+         WHERE ${accountIdScopedWhere()} AND activity_id = $activity_id`,
+        { org_id: orgId, account_id: accountId, activity_id: validated.activity_id }
       );
       existingScores.push(...(refreshedScores || []));
     }
@@ -3510,15 +3522,17 @@ app.post('/feedback', async (c) => {
         const currentAlpha = score.alpha || 1;
         const newAlpha = Math.ceil(currentAlpha * multiplier);
 
+        // Phase B-followup: dual-tenant WHERE on UPDATE.
         await surrealDB.query(
           `UPDATE impulse_shape_activity_score
            SET alpha = $new_alpha, updated_at = time::now()
-           WHERE org_id = $org_id
+           WHERE ${accountIdScopedWhere()}
              AND shape = $shape
              AND activity_id = $activity_id`,
           {
             new_alpha: newAlpha,
             org_id: orgId,
+            account_id: accountId,
             shape: score.shape,
             activity_id: validated.activity_id,
           }
@@ -3548,15 +3562,17 @@ app.post('/feedback', async (c) => {
         const currentBeta = score.beta || 1;
         const newBeta = Math.ceil(currentBeta * multiplier);
 
+        // Phase B-followup: dual-tenant WHERE on UPDATE.
         await surrealDB.query(
           `UPDATE impulse_shape_activity_score
            SET beta = $new_beta, updated_at = time::now()
-           WHERE org_id = $org_id
+           WHERE ${accountIdScopedWhere()}
              AND shape = $shape
              AND activity_id = $activity_id`,
           {
             new_beta: newBeta,
             org_id: orgId,
+            account_id: accountId,
             shape: score.shape,
             activity_id: validated.activity_id,
           }
@@ -6568,28 +6584,43 @@ app.get('/impulse-relevance', async (c) => {
 app.post('/tool-usage', async (c) => {
   try {
     const body = await c.req.json();
-    
+
+    // Phase B-followup: pull tenant context from JWT/session. tool_usage_patterns
+    // historically had NO org_id field; migration 097 added option<string>
+    // org_id + account_id so this route can dual-write going forward.
+    const jwtAuth = getJwtAuthFromContext(c);
+    const session = (c.get as any)('session') as SessionData | undefined;
+    const orgId = jwtAuth?.orgId || session?.org_id || null;
+    const accountId: string | null = jwtAuth?.accountId ?? null;
+
     // Validate request body
     const validated = ToolUsageRecordRequestSchema.parse(body);
-    logger.info('Recording tool usage', { 
+    logger.info('Recording tool usage', {
       tool: validated.tool_name,
       activity: validated.activity_variant_id,
       execution: validated.execution_id,
+      orgId,
+      accountId,
     });
-    
-    // Check if pattern exists
+
+    // Check if pattern exists.
+    // Phase B-followup: dual-tenant scoping; legacy rows (no org_id) match
+    // when both bound params are NONE/null via accountIdScopedWhere().
     const checkQuery = `
       SELECT * FROM tool_usage_patterns
       WHERE activity_variant_id = $activity_variant_id
         AND tool_name = $tool_name
         ${validated.task_id ? 'AND task_id = $task_id' : 'AND task_id IS NONE'}
+        AND ${accountIdScopedWhere()}
       LIMIT 1
     `;
-    
+
     const existing = await surrealDB.query<ToolUsagePattern[]>(checkQuery, {
       activity_variant_id: validated.activity_variant_id,
       tool_name: validated.tool_name,
       task_id: validated.task_id ?? undefined,
+      org_id: orgId,
+      account_id: accountId,
     });
     
     let pattern: ToolUsagePattern;
@@ -6636,9 +6667,11 @@ app.post('/tool-usage', async (c) => {
       
       const typicalErrorRate = newTimesUsed > 0 ? newTimesFailed / newTimesUsed : 0;
       
+      // Phase B-followup: dual-tenant WHERE; sticky-write account_id + org_id
+      // so legacy rows (NONE/NONE) get backfilled on first touch.
       const updateQuery = `
         UPDATE tool_usage_patterns
-        SET 
+        SET
           times_used = $times_used,
           times_succeeded = $times_succeeded,
           times_failed = $times_failed,
@@ -6649,17 +6682,24 @@ app.post('/tool-usage', async (c) => {
           is_optional = $is_optional,
           avg_params_complexity = $avg_params_complexity,
           typical_error_rate = $typical_error_rate,
+          org_id = $org_id,
+          account_id = $account_id,
+          account_id_version = $account_id_version,
           updated_at = time::now()
         WHERE activity_variant_id = $activity_variant_id
           AND tool_name = $tool_name
           ${validated.task_id ? 'AND task_id = $task_id' : 'AND task_id IS NONE'}
+          AND ${accountIdScopedWhere()}
         RETURN AFTER
       `;
-      
+
       const updated = await surrealDB.query<ToolUsagePattern[]>(updateQuery, {
         activity_variant_id: validated.activity_variant_id,
         tool_name: validated.tool_name,
         task_id: validated.task_id ?? undefined,
+        org_id: orgId,
+        account_id: accountId,
+        account_id_version: 1,
         times_used: newTimesUsed,
         times_succeeded: newTimesSucceeded,
         times_failed: newTimesFailed,
@@ -6688,6 +6728,8 @@ app.post('/tool-usage', async (c) => {
       const isOptional = false; // Not optional yet (only 1 execution)
       const successCorrelation = validated.tool_succeeded && validated.activity_succeeded ? 1.0 : 0.0;
       
+      // Phase B-followup: dual-write account_id + version (and org_id, the
+      // first multi-tenant key for this table) on CREATE.
       const createQuery = `
         CREATE tool_usage_patterns CONTENT {
           tool_name: $tool_name,
@@ -6704,11 +6746,14 @@ app.post('/tool-usage', async (c) => {
           is_optional: $is_optional,
           avg_params_complexity: $avg_params_complexity,
           typical_error_rate: $typical_error_rate,
+          org_id: $org_id,
+          account_id: $account_id,
+          account_id_version: $account_id_version,
           created_at: time::now(),
           updated_at: time::now()
         }
       `;
-      
+
       const created = await surrealDB.query<ToolUsagePattern[]>(createQuery, {
         tool_name: validated.tool_name,
         activity_variant_id: validated.activity_variant_id,
@@ -6722,6 +6767,9 @@ app.post('/tool-usage', async (c) => {
         is_optional: isOptional,
         avg_params_complexity: validated.params_complexity || 0,
         typical_error_rate: validated.tool_succeeded ? 0 : 1,
+        org_id: orgId,
+        account_id: accountId,
+        account_id_version: 1,
       });
       
       // @ts-ignore - SurrealDB query typing issue
@@ -6790,7 +6838,14 @@ app.post('/tool-usage', async (c) => {
 app.get('/tool-usage', async (c) => {
   try {
     const query = c.req.query();
-    
+
+    // Phase B-followup: pull tenant context so we can dual-bind the
+    // tool_usage_patterns read alongside org_id (added by migration 097).
+    const jwtAuth = getJwtAuthFromContext(c);
+    const session = (c.get as any)('session') as SessionData | undefined;
+    const orgId = jwtAuth?.orgId || session?.org_id || null;
+    const accountId: string | null = jwtAuth?.accountId ?? null;
+
     // Validate query params
     const validated = ToolUsageQuerySchema.parse({
       tool_name: query.tool_name,
@@ -6800,41 +6855,44 @@ app.get('/tool-usage', async (c) => {
       limit: query.limit ? parseInt(query.limit) : 100,
       offset: query.offset ? parseInt(query.offset) : 0,
     });
-    
+
     logger.info('GET /v2/activities/tool-usage', validated);
-    
-    const whereClauses: string[] = [];
+
+    // Phase B-followup: always dual-bind tenant context.
+    const whereClauses: string[] = [accountIdScopedWhere()];
     const params: Record<string, any> = {
       limit: validated.limit,
       offset: validated.offset,
+      org_id: orgId,
+      account_id: accountId,
     };
-    
+
     if (validated.tool_name) {
       whereClauses.push(`tool_name = $tool_name`);
       params.tool_name = validated.tool_name;
     }
-    
+
     if (validated.activity_variant_id) {
       whereClauses.push(`activity_variant_id = $activity_variant_id`);
       params.activity_variant_id = validated.activity_variant_id;
     }
-    
+
     if (validated.is_required !== undefined) {
       whereClauses.push(`is_required = $is_required`);
       params.is_required = validated.is_required;
     }
-    
+
     if (validated.min_usage_probability !== undefined) {
       whereClauses.push(`usage_probability >= $min_usage_probability`);
       params.min_usage_probability = validated.min_usage_probability;
     }
-    
+
     let patternsQuery = `SELECT * FROM tool_usage_patterns`;
     if (whereClauses.length > 0) {
       patternsQuery += ` WHERE ${whereClauses.join(' AND ')}`;
     }
     patternsQuery += ` ORDER BY usage_probability DESC LIMIT $limit START $offset`;
-    
+
     let countQuery = `SELECT count() as total FROM tool_usage_patterns`;
     if (whereClauses.length > 0) {
       countQuery += ` WHERE ${whereClauses.join(' AND ')}`;
@@ -7246,6 +7304,13 @@ app.post('/tool-argument-patterns', async (c) => {
   try {
     const body = await c.req.json();
 
+    // Phase B-followup: pull tenant context from JWT/session so we can
+    // dual-bind account_id alongside the existing org_id-derived scope.
+    const jwtAuth = getJwtAuthFromContext(c);
+    const session = (c.get as any)('session') as SessionData | undefined;
+    const orgId = jwtAuth?.orgId || session?.org_id || null;
+    const accountId: string | null = jwtAuth?.accountId ?? null;
+
     // Validate request body
     const validated = ToolArgumentPatternRecordRequestSchema.parse(body);
     logger.info('Recording tool argument pattern', {
@@ -7255,17 +7320,23 @@ app.post('/tool-argument-patterns', async (c) => {
       hash: validated.argument_hash.substring(0, 16) + '...',
       succeeded: validated.execution_succeeded,
       failureType: validated.failure_type,
+      orgId,
+      accountId,
     });
 
-    // Check if pattern exists
+    // Check if pattern exists.
+    // Phase B-followup: dual-tenant scoping; legacy rows match via the
+    // org_id branch of accountIdScopedWhere().
     const checkQuery = `
       SELECT * FROM tool_argument_pattern
-      WHERE argument_hash = $hash AND org_id = <string>$auth.org_id
+      WHERE argument_hash = $hash AND ${accountIdScopedWhere()}
       LIMIT 1
     `;
 
     const existing = await surrealDB.query<any[]>(checkQuery, {
       hash: validated.argument_hash,
+      org_id: orgId,
+      account_id: accountId,
     });
 
     let pattern: any;
@@ -7285,6 +7356,8 @@ app.post('/tool-argument-patterns', async (c) => {
         currentFailureCounts[validated.failure_type] = (currentFailureCounts[validated.failure_type] || 0) + 1;
       }
 
+      // Phase B-followup: dual-tenant WHERE; account_id stays sticky on the
+      // row but is also explicitly written to bring legacy rows forward.
       const updateQuery = `
         UPDATE tool_argument_pattern
         SET
@@ -7298,13 +7371,18 @@ app.post('/tool-argument-patterns', async (c) => {
           failure_reason = $failure_reason,
           tool_succeeded = $tool_succeeded,
           validation_error = $validation_error,
-          failure_counts = $failure_counts
-        WHERE argument_hash = $hash AND org_id = <string>$auth.org_id
+          failure_counts = $failure_counts,
+          account_id = $account_id,
+          account_id_version = $account_id_version
+        WHERE argument_hash = $hash AND ${accountIdScopedWhere()}
         RETURN AFTER
       `;
 
       const updateResult = await surrealDB.query<any[]>(updateQuery, {
         hash: validated.argument_hash,
+        org_id: orgId,
+        account_id: accountId,
+        account_id_version: 1,
         success_increment: successIncrement,
         failure_increment: failureIncrement,
         current_times_used: currentTimesUsed,
@@ -7332,6 +7410,9 @@ app.post('/tool-argument-patterns', async (c) => {
         initialFailureCounts[validated.failure_type] = 1;
       }
 
+      // Phase B-followup: dual-write account_id + version on CREATE; org_id
+      // is also written explicitly so the row is no longer dependent on
+      // SurrealDB-level $auth defaulting.
       const createQuery = `
         CREATE tool_argument_pattern SET
           activity_id = $activity_id,
@@ -7348,7 +7429,10 @@ app.post('/tool-argument-patterns', async (c) => {
           failure_reason = $failure_reason,
           tool_succeeded = $tool_succeeded,
           validation_error = $validation_error,
-          failure_counts = $failure_counts
+          failure_counts = $failure_counts,
+          org_id = $org_id,
+          account_id = $account_id,
+          account_id_version = $account_id_version
       `;
 
       const createResult = await surrealDB.query<any[]>(createQuery, {
@@ -7365,6 +7449,9 @@ app.post('/tool-argument-patterns', async (c) => {
         tool_succeeded: validated.tool_succeeded ?? undefined,
         validation_error: validated.validation_error || undefined,
         failure_counts: initialFailureCounts,
+        org_id: orgId,
+        account_id: accountId,
+        account_id_version: 1,
       });
 
       pattern = createResult && createResult.length > 0 ? createResult[0] : {
@@ -7542,6 +7629,13 @@ app.get('/failure-patterns', async (c) => {
   try {
     const query = c.req.query();
 
+    // Phase B-followup: pull tenant context so we can dual-bind the
+    // tool_argument_pattern read alongside org_id.
+    const jwtAuth = getJwtAuthFromContext(c);
+    const session = (c.get as any)('session') as SessionData | undefined;
+    const orgId = jwtAuth?.orgId || session?.org_id || null;
+    const accountId: string | null = jwtAuth?.accountId ?? null;
+
     const activityId = query.activity_id;
     const toolName = query.tool_name;
     const failureType = query.failure_type as 'validation' | 'execution' | 'tool_failure' | 'timeout' | undefined;
@@ -7556,6 +7650,8 @@ app.get('/failure-patterns', async (c) => {
       min_failures: minFailures,
       limit,
       offset,
+      orgId,
+      accountId,
     });
 
     const whereClauses: string[] = ['times_failed >= $min_failures'];
@@ -7563,6 +7659,8 @@ app.get('/failure-patterns', async (c) => {
       min_failures: minFailures,
       limit,
       offset,
+      org_id: orgId,
+      account_id: accountId,
     };
 
     if (activityId) {
@@ -7601,7 +7699,7 @@ app.get('/failure-patterns', async (c) => {
         org_id
       FROM tool_argument_pattern
       WHERE ${whereClauses.join(' AND ')}
-        AND org_id = <string>$auth.org_id
+        AND ${accountIdScopedWhere()}
       ORDER BY times_failed DESC, failure_rate DESC
       LIMIT $limit START $offset
     `;
@@ -7610,7 +7708,7 @@ app.get('/failure-patterns', async (c) => {
     const countQuery = `
       SELECT count() as total FROM tool_argument_pattern
       WHERE ${whereClauses.join(' AND ')}
-        AND org_id = <string>$auth.org_id
+        AND ${accountIdScopedWhere()}
     `;
 
     const [patternsResult, countResult] = await Promise.all([
@@ -7882,6 +7980,8 @@ app.post('/shape-scores', async (c) => {
 
     // Use JWT auth claims if available, otherwise fall back to session
     const orgId = jwtAuth?.orgId || session?.org_id || null;
+    // Phase B-followup: account_id only flows from JWT auth.
+    const accountId: string | null = jwtAuth?.accountId ?? null;
 
     // Parse and validate request body
     const body = await c.req.json();
@@ -7903,6 +8003,7 @@ app.post('/shape-scores', async (c) => {
       shapes: validated.shapes,
       success: validated.success,
       org_id: effectiveOrgId,
+      account_id: accountId,
     });
 
     // Update shape scores atomically using UPSERT
@@ -7917,12 +8018,18 @@ app.post('/shape-scores', async (c) => {
 
         // UPSERT: Create if not exists, otherwise update atomically
         // SurrealDB UPSERT with ON DUPLICATE KEY semantics using MERGE
+        //
+        // Phase B-followup: dual-write account_id + version on the MERGE.
+        // Record id stays keyed on (org_id, shape, activity_id) so legacy
+        // and dual-tenant rows continue to map to the same composite slot.
         const upsertQuery = `
           UPSERT impulse_shape_activity_score:[$org_id, $shape, $activity_id]
           MERGE {
             shape: $shape,
             activity_id: $activity_id,
             org_id: $org_id,
+            account_id: $account_id,
+            account_id_version: $account_id_version,
             success_count: (
               SELECT VALUE success_count FROM ONLY impulse_shape_activity_score:[$org_id, $shape, $activity_id]
             ) ?? 0 + $success_increment,
@@ -7943,6 +8050,8 @@ app.post('/shape-scores', async (c) => {
           shape,
           activity_id: validated.activity_id,
           org_id: effectiveOrgId,
+          account_id: accountId,
+          account_id_version: 1,
           success_increment: successIncrement,
           failure_increment: failureIncrement,
         });
@@ -8019,7 +8128,8 @@ async function updateShapeScoresFromExecution(
   shapes: string[],
   success: boolean,
   orgId: string,
-  jwtToken?: string | null
+  jwtToken?: string | null,
+  accountId: string | null = null
 ): Promise<void> {
   if (!shapes || shapes.length === 0) {
     return; // No shapes to update
@@ -8031,12 +8141,15 @@ async function updateShapeScoresFromExecution(
 
     for (const shape of shapes) {
       try {
+        // Phase B-followup: dual-write account_id + version on the MERGE.
         const upsertQuery = `
           UPSERT impulse_shape_activity_score:[$org_id, $shape, $activity_id]
           MERGE {
             shape: $shape,
             activity_id: $activity_id,
             org_id: $org_id,
+            account_id: $account_id,
+            account_id_version: $account_id_version,
             success_count: (
               SELECT VALUE success_count FROM ONLY impulse_shape_activity_score:[$org_id, $shape, $activity_id]
             ) ?? 0 + $success_increment,
@@ -8057,6 +8170,8 @@ async function updateShapeScoresFromExecution(
           shape,
           activity_id: activityId,
           org_id: orgId,
+          account_id: accountId,
+          account_id_version: 1,
           success_increment: successIncrement,
           failure_increment: failureIncrement,
         };

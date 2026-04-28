@@ -1785,11 +1785,22 @@ router.post('/resolve', async (c) => {
           skipThreshold,
         });
 
-        // Query matching patterns from tool_argument_pattern table
-        let whereClause = 'WHERE tool_name = $tool_name AND activity_id = $activity_id';
+        // Phase B-followup: pull tenant context so we can dual-bind the
+        // tool_argument_pattern read. Legacy rows (no account_id, no org_id)
+        // still match when both bound params are NONE/null.
+        const preValAuth = getJwtAuthFromContext(c);
+        const preValOrgId: string | null = preValAuth?.orgId ?? null;
+        const preValAccountId: string | null = preValAuth?.accountId ?? null;
+
+        // Query matching patterns from tool_argument_pattern table.
+        let whereClause =
+          `WHERE tool_name = $tool_name AND activity_id = $activity_id` +
+          ` AND ${accountIdScopedWhere()}`;
         const params: Record<string, any> = {
           tool_name: toolName,
           activity_id: activityId,
+          org_id: preValOrgId,
+          account_id: preValAccountId,
         };
 
         // If argument hash provided, look for exact match

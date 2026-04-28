@@ -637,7 +637,12 @@ app.post('/heartbeat', async (c) => {
     const { HealthScoringService } = await import('../services/health-scoring');
 
     // Record heartbeat and update health score
-    const metrics = await HealthScoringService.recordHeartbeat(body.vesselId, auth.orgId);
+    // Phase B-followup: thread account_id so getMetrics CREATE dual-writes.
+    const metrics = await HealthScoringService.recordHeartbeat(
+      body.vesselId,
+      auth.orgId,
+      auth.accountId ?? null,
+    );
 
     logger.debug('Vessel heartbeat recorded', {
       vesselId: body.vesselId,

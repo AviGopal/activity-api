@@ -68,8 +68,16 @@ export interface CircuitBreakerTransition {
 export class CircuitBreakerService {
   /**
    * Get or create circuit breaker state for a vessel
+   *
+   * Phase B-followup: dual-write account_id alongside org_id on CREATE
+   * (table now has the field via migration 097). SELECT-by-record-id stays
+   * unchanged — recordId already targets a single row, no scoping needed.
    */
-  static async getState(vesselId: string, orgId: string): Promise<CircuitBreakerState> {
+  static async getState(
+    vesselId: string,
+    orgId: string,
+    accountId?: string | null
+  ): Promise<CircuitBreakerState> {
     const recordId = `vessel_circuit_breaker:${vesselId}`;
 
     try {
@@ -86,6 +94,8 @@ export class CircuitBreakerService {
         CREATE ${recordId} CONTENT {
           vessel_id: $vesselId,
           org_id: $orgId,
+          account_id: $account_id,
+          account_id_version: $account_id_version,
           state: 'closed',
           state_changed_at: time::now(),
           consecutive_failures: 0,
@@ -108,6 +118,8 @@ export class CircuitBreakerService {
       const created = await surrealDB.query<CircuitBreakerState[]>(createQuery, {
         vesselId,
         orgId,
+        account_id: accountId ?? null,
+        account_id_version: 1,
       });
 
       return created[0][0];
@@ -132,7 +144,7 @@ export class CircuitBreakerService {
     latencyMs: number,
     accountId?: string | null
   ): Promise<{ state: CircuitBreakerState; transitioned: boolean }> {
-    const current = await this.getState(vesselId, orgId);
+    const current = await this.getState(vesselId, orgId, accountId);
     const recordId = `vessel_circuit_breaker:${vesselId}`;
 
     // Reset failure window if it's been more than window_seconds
@@ -209,7 +221,7 @@ export class CircuitBreakerService {
     activityExecutionId?: string,
     accountId?: string | null
   ): Promise<{ state: CircuitBreakerState; transitioned: boolean }> {
-    const current = await this.getState(vesselId, orgId);
+    const current = await this.getState(vesselId, orgId, accountId);
     const recordId = `vessel_circuit_breaker:${vesselId}`;
 
     // Can't fail in OPEN state (requests are blocked)
@@ -355,7 +367,7 @@ export class CircuitBreakerService {
     orgId: string,
     accountId?: string | null
   ): Promise<{ state: CircuitBreakerState; transitioned: boolean }> {
-    const current = await this.getState(vesselId, orgId);
+    const current = await this.getState(vesselId, orgId, accountId);
 
     if (current.state !== 'open' || !current.next_probe_at) {
       return { state: current, transitioned: false };
@@ -406,7 +418,7 @@ export class CircuitBreakerService {
     orgId: string,
     accountId?: string | null
   ): Promise<boolean> {
-    const current = await this.getState(vesselId, orgId);
+    const current = await this.getState(vesselId, orgId, accountId);
 
     if (current.state === 'closed') {
       return true;
@@ -521,16 +533,19 @@ export class CircuitBreakerService {
 
   /**
    * Get circuit states for multiple vessels
+   *
+   * Phase B-followup: thread accountId for getState CREATE path.
    */
   static async getStates(
     vesselIds: string[],
-    orgId: string
+    orgId: string,
+    accountId?: string | null
   ): Promise<Record<string, CircuitBreakerState>> {
     const states: Record<string, CircuitBreakerState> = {};
 
     await Promise.all(
       vesselIds.map(async (vesselId) => {
-        states[vesselId] = await this.getState(vesselId, orgId);
+        states[vesselId] = await this.getState(vesselId, orgId, accountId);
       })
     );
 

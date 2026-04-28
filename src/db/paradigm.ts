@@ -1197,7 +1197,8 @@ export async function updateShapeActivityScores(
   shapes: string[],
   success: boolean,
   orgId: string,
-  jwtToken?: string | null
+  jwtToken?: string | null,
+  accountId: string | null = null
 ): Promise<void> {
   if (!shapes || shapes.length === 0) return;
 
@@ -1209,12 +1210,16 @@ export async function updateShapeActivityScores(
     for (const shape of shapes) {
       // UPSERT pattern using record ID-based syntax (SurrealDB 3.0)
       // Use composite record ID for multi-field key matching
+      //
+      // Phase B-followup: dual-write account_id + version on the MERGE.
       const query = `
         UPSERT impulse_shape_activity_score:[$org_id, $shape, $activity_id]
         MERGE {
           shape: $shape,
           activity_id: $activity_id,
           org_id: $org_id,
+          account_id: $account_id,
+          account_id_version: $account_id_version,
           success_count: (
             SELECT VALUE success_count FROM ONLY impulse_shape_activity_score:[$org_id, $shape, $activity_id]
           ) ?? 0 + ${success ? 1 : 0},
@@ -1235,6 +1240,8 @@ export async function updateShapeActivityScores(
         shape,
         activity_id: activityId,
         org_id: orgId,
+        account_id: accountId,
+        account_id_version: 1,
       };
 
       // Use authenticated connection if JWT token provided, otherwise use root connection

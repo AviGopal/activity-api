@@ -9,6 +9,7 @@
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
 import beta from '@stdlib/random-base-beta';
+import { accountIdScopedWhere } from '../routes/activities';
 
 // =============================================================================
 // TYPES
@@ -73,23 +74,28 @@ export interface ChainCandidate {
 export class CompositionGraphService {
   /**
    * Find activity chains that can transform current shapes to target shapes
+   *
+   * Phase B-followup: dual-tenant scoping. Prefer account_id; legacy rows
+   * (account_id IS NONE) match via the org_id branch. accountId optional.
    */
   async findChains(
     currentShapes: string[],
     targetShapes: string[],
     orgId: string,
-    maxDepth: number = 5
+    maxDepth: number = 5,
+    accountId?: string | null
   ): Promise<ChainCandidate[]> {
     try {
       // Find activities that can run with current shapes
       const candidatesQuery = `
         SELECT * FROM composition_node WHERE
-          (org_id = $org_id OR public = true) AND
+          (${accountIdScopedWhere()} OR public = true) AND
           array::intersect(input_shapes, $current_shapes) = input_shapes
       `;
 
       const candidatesResult = await surrealDB.query(candidatesQuery, {
         org_id: orgId,
+        account_id: accountId ?? null,
         current_shapes: currentShapes,
       });
 
@@ -137,11 +143,15 @@ export class CompositionGraphService {
 
   /**
    * Select next activity using Thompson Sampling
+   *
+   * Phase B-followup: dual-tenant scoping. accountId optional; legacy rows
+   * match via accountIdScopedWhere()'s org_id fallback.
    */
   async selectNext(
     currentShapes: string[],
     candidates: string[],
-    orgId: string
+    orgId: string,
+    accountId?: string | null
   ): Promise<string | null> {
     try {
       if (candidates.length === 0) {
@@ -153,12 +163,13 @@ export class CompositionGraphService {
       // In a full implementation, we'd consider edges from the current activity
       const nodesQuery = `
         SELECT * FROM composition_node WHERE
-          (org_id = $org_id OR public = true) AND
+          (${accountIdScopedWhere()} OR public = true) AND
           activity_id INSIDE $candidates
       `;
 
       const nodesResult = await surrealDB.query(nodesQuery, {
         org_id: orgId,
+        account_id: accountId ?? null,
         candidates,
       });
 
@@ -230,8 +241,14 @@ export class CompositionGraphService {
 
   /**
    * Record a composition chain from an orchestration execution
+   *
+   * Phase B-followup: dual-write account_id alongside org_id on CREATE
+   * (table now has the field via migration 097). accountId optional.
    */
-  async recordChain(chain: Omit<CompositionChain, 'id' | 'created_at'>): Promise<void> {
+  async recordChain(
+    chain: Omit<CompositionChain, 'id' | 'created_at'>,
+    accountId?: string | null
+  ): Promise<void> {
     try {
       const createQuery = `
         CREATE composition_chain SET
@@ -244,10 +261,16 @@ export class CompositionGraphService {
           target_shapes_missing = $target_shapes_missing,
           total_duration_ms = $total_duration_ms,
           total_cost_usd = $total_cost_usd,
-          org_id = $org_id;
+          org_id = $org_id,
+          account_id = $account_id,
+          account_id_version = $account_id_version;
       `;
 
-      await surrealDB.query(createQuery, chain);
+      await surrealDB.query(createQuery, {
+        ...chain,
+        account_id: accountId ?? null,
+        account_id_version: 1,
+      });
 
       logger.info(`Recorded composition chain for execution ${chain.execution_id}`, {
         orchestrator: chain.orchestrator_id,
@@ -271,6 +294,10 @@ export class CompositionGraphService {
 
   /**
    * Update or create a composition node for an activity
+   *
+   * Phase B-followup: dual-tenant scoping for the lookup; dual-write
+   * account_id + version on CREATE. accountId optional; legacy rows
+   * match via accountIdScopedWhere()'s org_id fallback.
    */
   async updateNode(
     activityId: string,
@@ -278,20 +305,22 @@ export class CompositionGraphService {
     outputShapes: string[],
     success: boolean,
     durationMs: number,
-    orgId: string
+    orgId: string,
+    accountId?: string | null
   ): Promise<void> {
     try {
       // Check if node exists
       const existsQuery = `
         SELECT * FROM composition_node WHERE
           activity_id = $activity_id AND
-          org_id = $org_id
+          ${accountIdScopedWhere()}
         LIMIT 1;
       `;
 
       const existsResult = await surrealDB.query(existsQuery, {
         activity_id: activityId,
         org_id: orgId,
+        account_id: accountId ?? null,
       });
 
       const existing = (existsResult[0] as CompositionNode[])?.[0];
@@ -330,6 +359,8 @@ export class CompositionGraphService {
             avg_duration_ms = $avg_duration_ms,
             total_executions = 1,
             org_id = $org_id,
+            account_id = $account_id,
+            account_id_version = $account_id_version,
             public = false;
         `;
 
@@ -340,6 +371,8 @@ export class CompositionGraphService {
           success_rate: success ? 1.0 : 0.0,
           avg_duration_ms: durationMs,
           org_id: orgId,
+          account_id: accountId ?? null,
+          account_id_version: 1,
         });
       }
 
@@ -352,17 +385,21 @@ export class CompositionGraphService {
 
   /**
    * Get recent composition chains for an orchestrator
+   *
+   * Phase B-followup: dual-tenant scoping. accountId optional; legacy rows
+   * match via accountIdScopedWhere()'s org_id fallback.
    */
   async getRecentChains(
     orchestratorId: string,
     orgId: string,
-    limit: number = 10
+    limit: number = 10,
+    accountId?: string | null
   ): Promise<CompositionChain[]> {
     try {
       const query = `
         SELECT * FROM composition_chain WHERE
           orchestrator_id = $orchestrator_id AND
-          org_id = $org_id
+          ${accountIdScopedWhere()}
         ORDER BY created_at DESC
         LIMIT $limit;
       `;
@@ -370,6 +407,7 @@ export class CompositionGraphService {
       const result = await surrealDB.query(query, {
         orchestrator_id: orchestratorId,
         org_id: orgId,
+        account_id: accountId ?? null,
         limit,
       });
 

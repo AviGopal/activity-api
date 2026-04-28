@@ -103,14 +103,18 @@ export class VesselRouter {
       }
 
       // Step 2: Get health scores and circuit breaker states
+      // Phase B-followup: thread account_id so getMetrics/getState CREATE
+      // paths dual-write account_id when the row doesn't yet exist.
       const vesselIds = vessels.map((v) => v.id);
       const healthMetrics = await HealthScoringService.getMultipleMetrics(
         vesselIds,
-        options.org_id
+        options.org_id,
+        options.account_id ?? null
       );
       const circuitStates = await CircuitBreakerService.getStates(
         vesselIds,
-        options.org_id
+        options.org_id,
+        options.account_id ?? null
       );
 
       // Step 3: Build candidates with health and circuit info
@@ -335,7 +339,8 @@ export class VesselRouter {
   ): Promise<void> {
     try {
       // Update health metrics
-      await HealthScoringService.recordSuccess(vesselId, orgId, latencyMs);
+      // Phase B-followup: pass accountId so getMetrics CREATE dual-writes.
+      await HealthScoringService.recordSuccess(vesselId, orgId, latencyMs, accountId ?? null);
 
       // Update circuit breaker
       await CircuitBreakerService.recordSuccess(vesselId, orgId, latencyMs, accountId ?? null);
@@ -368,7 +373,8 @@ export class VesselRouter {
   ): Promise<void> {
     try {
       // Update health metrics
-      await HealthScoringService.recordFailure(vesselId, orgId, latencyMs);
+      // Phase B-followup: pass accountId so getMetrics CREATE dual-writes.
+      await HealthScoringService.recordFailure(vesselId, orgId, latencyMs, accountId ?? null);
 
       // Update circuit breaker
       await CircuitBreakerService.recordFailure(

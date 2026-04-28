@@ -18,6 +18,7 @@
 
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
+import { accountIdScopedWhere } from '../routes/activities';
 
 // =============================================================================
 // TYPES
@@ -72,8 +73,16 @@ export class HealthScoringService {
 
   /**
    * Get or create health metrics for a vessel
+   *
+   * Phase B-followup: dual-write account_id alongside org_id on CREATE
+   * (table now has the field via migration 097). SELECT-by-record-id stays
+   * unchanged — recordId already targets a single row, no scoping needed.
    */
-  static async getMetrics(vesselId: string, orgId: string): Promise<HealthMetrics> {
+  static async getMetrics(
+    vesselId: string,
+    orgId: string,
+    accountId?: string | null
+  ): Promise<HealthMetrics> {
     const recordId = `vessel_health_metrics:${vesselId}`;
 
     try {
@@ -90,6 +99,8 @@ export class HealthScoringService {
         CREATE ${recordId} CONTENT {
           vessel_id: $vesselId,
           org_id: $orgId,
+          account_id: $account_id,
+          account_id_version: $account_id_version,
           success_count: 0,
           total_count: 0,
           success_rate: 1.0,
@@ -112,6 +123,8 @@ export class HealthScoringService {
       const created = await surrealDB.query<HealthMetrics[]>(createQuery, {
         vesselId,
         orgId,
+        account_id: accountId ?? null,
+        account_id_version: 1,
       });
 
       return created[0][0];
@@ -126,13 +139,17 @@ export class HealthScoringService {
 
   /**
    * Record a successful request and update health score
+   *
+   * Phase B-followup: thread accountId so the record CREATE inside
+   * getMetrics() dual-writes when the row doesn't exist yet.
    */
   static async recordSuccess(
     vesselId: string,
     orgId: string,
-    latencyMs: number
+    latencyMs: number,
+    accountId?: string | null
   ): Promise<HealthMetrics> {
-    const current = await this.getMetrics(vesselId, orgId);
+    const current = await this.getMetrics(vesselId, orgId, accountId);
     const recordId = `vessel_health_metrics:${vesselId}`;
 
     // Sliding window: keep last 100 requests
@@ -212,13 +229,17 @@ export class HealthScoringService {
 
   /**
    * Record a failed request and update health score
+   *
+   * Phase B-followup: thread accountId so the record CREATE inside
+   * getMetrics() dual-writes when the row doesn't exist yet.
    */
   static async recordFailure(
     vesselId: string,
     orgId: string,
-    latencyMs: number
+    latencyMs: number,
+    accountId?: string | null
   ): Promise<HealthMetrics> {
-    const current = await this.getMetrics(vesselId, orgId);
+    const current = await this.getMetrics(vesselId, orgId, accountId);
     const recordId = `vessel_health_metrics:${vesselId}`;
 
     // Sliding window: keep last 100 requests
@@ -284,9 +305,15 @@ export class HealthScoringService {
 
   /**
    * Record a heartbeat and update availability
+   *
+   * Phase B-followup: thread accountId for getMetrics CREATE path.
    */
-  static async recordHeartbeat(vesselId: string, orgId: string): Promise<HealthMetrics> {
-    const current = await this.getMetrics(vesselId, orgId);
+  static async recordHeartbeat(
+    vesselId: string,
+    orgId: string,
+    accountId?: string | null
+  ): Promise<HealthMetrics> {
+    const current = await this.getMetrics(vesselId, orgId, accountId);
     const recordId = `vessel_health_metrics:${vesselId}`;
 
     // Track last 10 heartbeat periods
@@ -336,9 +363,15 @@ export class HealthScoringService {
 
   /**
    * Record a missed heartbeat (expected but not received)
+   *
+   * Phase B-followup: thread accountId for getMetrics CREATE path.
    */
-  static async recordMissedHeartbeat(vesselId: string, orgId: string): Promise<HealthMetrics> {
-    const current = await this.getMetrics(vesselId, orgId);
+  static async recordMissedHeartbeat(
+    vesselId: string,
+    orgId: string,
+    accountId?: string | null
+  ): Promise<HealthMetrics> {
+    const current = await this.getMetrics(vesselId, orgId, accountId);
     const recordId = `vessel_health_metrics:${vesselId}`;
 
     // Heartbeat was expected but not received
@@ -430,16 +463,19 @@ export class HealthScoringService {
 
   /**
    * Get health metrics for multiple vessels
+   *
+   * Phase B-followup: thread accountId so getMetrics CREATE path dual-writes.
    */
   static async getMultipleMetrics(
     vesselIds: string[],
-    orgId: string
+    orgId: string,
+    accountId?: string | null
   ): Promise<Record<string, HealthMetrics>> {
     const metrics: Record<string, HealthMetrics> = {};
 
     await Promise.all(
       vesselIds.map(async (vesselId) => {
-        metrics[vesselId] = await this.getMetrics(vesselId, orgId);
+        metrics[vesselId] = await this.getMetrics(vesselId, orgId, accountId);
       })
     );
 
@@ -448,16 +484,19 @@ export class HealthScoringService {
 
   /**
    * Get health scores only (lightweight)
+   *
+   * Phase B-followup: thread accountId for getMetrics CREATE path.
    */
   static async getHealthScores(
     vesselIds: string[],
-    orgId: string
+    orgId: string,
+    accountId?: string | null
   ): Promise<Record<string, number>> {
     const scores: Record<string, number> = {};
 
     await Promise.all(
       vesselIds.map(async (vesselId) => {
-        const metrics = await this.getMetrics(vesselId, orgId);
+        const metrics = await this.getMetrics(vesselId, orgId, accountId);
         scores[vesselId] = metrics.health_score;
       })
     );
@@ -467,16 +506,19 @@ export class HealthScoringService {
 
   /**
    * Filter vessels by health threshold
+   *
+   * Phase B-followup: thread accountId for getMetrics CREATE path.
    */
   static async getEligibleVessels(
     vesselIds: string[],
-    orgId: string
+    orgId: string,
+    accountId?: string | null
   ): Promise<string[]> {
     const eligible: string[] = [];
 
     await Promise.all(
       vesselIds.map(async (vesselId) => {
-        const metrics = await this.getMetrics(vesselId, orgId);
+        const metrics = await this.getMetrics(vesselId, orgId, accountId);
         if (metrics.eligible_for_routing) {
           eligible.push(vesselId);
         }
