@@ -76,9 +76,10 @@ app.post('/query', async (c) => {
       offset,
     });
 
-    // Query patterns
+    // Query patterns (Phase B4b: dual-tenant binding)
     const result = await queryPatterns({
       orgId: jwtAuth.orgId!,
+      accountId: jwtAuth.accountId ?? null,
       inputShapes,
       outputShapes,
       minExecutions,
@@ -153,9 +154,10 @@ app.get('/', async (c) => {
       offset,
     });
 
-    // Query patterns
+    // Query patterns (Phase B4b: dual-tenant binding)
     const result = await queryPatterns({
       orgId: jwtAuth.orgId!,
+      accountId: jwtAuth.accountId ?? null,
       inputShapes,
       outputShapes,
       minExecutions,

@@ -12,6 +12,7 @@
 
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
+import { accountIdScopedWhere } from '../routes/activities';
 import type { Surreal } from 'surrealdb';
 
 export interface SequencePattern {
@@ -32,6 +33,8 @@ export interface PatternMiningOptions {
   maxSequenceLength?: number;       // Max activities in sequence (default: 5)
   minCompositionWeight?: number;    // Min edge weight (default: 0.7)
   orgId?: string;                   // Optional org filter (for root queries)
+  /** Phase B4b: optional account_id; null when caller has no claim. */
+  accountId?: string | null;
 }
 
 /**
@@ -49,7 +52,8 @@ export async function discoverSequencePatterns(
     minSequenceLength = 2,
     maxSequenceLength = 5,
     minCompositionWeight = 0.7,
-    orgId
+    orgId,
+    accountId = null,
   } = options;
 
   logger.info('Discovering sequence patterns', {
@@ -66,7 +70,8 @@ export async function discoverSequencePatterns(
     minSuccessRate,
     minSequenceLength,
     maxSequenceLength,
-    orgId
+    orgId,
+    accountId
   );
 
   logger.info('Found frequent sequences', {
@@ -80,7 +85,8 @@ export async function discoverSequencePatterns(
   // Step 2: Enrich with composition graph edge weights
   const enrichedPatterns = await enrichWithCompositionWeights(
     frequentSequences,
-    orgId
+    orgId,
+    accountId
   );
 
   // Step 3: Filter patterns where all edges meet minimum weight threshold
@@ -115,11 +121,13 @@ async function queryFrequentSequences(
   minSuccessRate: number,
   minLength: number,
   maxLength: number,
-  orgId?: string
+  orgId?: string,
+  accountId: string | null = null
 ): Promise<SequencePattern[]> {
 
-  // Build query with proper WHERE clause for org_id if provided
-  const orgFilter = orgId ? `AND org_id = type::record('organizations', '${orgId}')` : '';
+  // Phase B4b: dual-tenant scoping. Prefer account_id; legacy rows
+  // (account_id IS NONE) match via the org_id branch.
+  const tenantFilter = orgId ? `AND ${accountIdScopedWhere()}` : '';
 
   const query = `
     SELECT
@@ -133,7 +141,7 @@ async function queryFrequentSequences(
     WHERE
       array::len(activity_ids) >= ${minLength}
       AND array::len(activity_ids) <= ${maxLength}
-      ${orgFilter}
+      ${tenantFilter}
     GROUP BY activity_ids
     ORDER BY frequency DESC
   `;
@@ -150,7 +158,10 @@ async function queryFrequentSequences(
       source_execution_ids: string[];
     };
 
-    const queryResults = await surrealDB.query<SequenceQueryResult[]>(query);
+    const queryResults = await surrealDB.query<SequenceQueryResult[]>(query, {
+      org_id: orgId ?? null,
+      account_id: accountId,
+    });
     const results = queryResults[0] || [];
 
     if (!results || !Array.isArray(results) || results.length === 0) {
@@ -197,7 +208,8 @@ async function queryFrequentSequences(
  */
 async function enrichWithCompositionWeights(
   patterns: SequencePattern[],
-  orgId?: string
+  orgId?: string,
+  accountId: string | null = null
 ): Promise<SequencePattern[]> {
 
   logger.info('Enriching patterns with composition weights', {
@@ -212,7 +224,7 @@ async function enrichWithCompositionWeights(
       const parent = pattern.activityIds[i];
       const child = pattern.activityIds[i + 1];
 
-      const weight = await getCompositionEdgeWeight(parent, child, orgId);
+      const weight = await getCompositionEdgeWeight(parent, child, orgId, accountId);
       weights.push(weight);
     }
 
@@ -239,12 +251,13 @@ async function enrichWithCompositionWeights(
 async function getCompositionEdgeWeight(
   parentActivityId: string,
   childActivityId: string,
-  orgId?: string
+  orgId?: string,
+  accountId: string | null = null
 ): Promise<number> {
 
-  const orgFilter = orgId
-    ? `AND org_id = type::record('organizations', '${orgId}')`
-    : '';
+  // Phase B4b: dual-tenant scoping. Prefer account_id; legacy rows
+  // (account_id IS NONE) match via the org_id branch.
+  const tenantFilter = orgId ? `AND ${accountIdScopedWhere()}` : '';
 
   const query = `
     SELECT weight, success_count, execution_count
@@ -252,7 +265,7 @@ async function getCompositionEdgeWeight(
     WHERE
       parent_activity_id = $parent
       AND child_activity_id = $child
-      ${orgFilter}
+      ${tenantFilter}
     LIMIT 1
   `;
 
@@ -265,7 +278,9 @@ async function getCompositionEdgeWeight(
 
     const queryResults = await surrealDB.query<CompositionEdgeResult[]>(query, {
       parent: parentActivityId,
-      child: childActivityId
+      child: childActivityId,
+      org_id: orgId ?? null,
+      account_id: accountId,
     });
     const results = queryResults[0] || [];
 
@@ -322,23 +337,28 @@ export function hashActivityIds(activityIds: string[]): string {
  */
 export async function isPatternExtracted(
   activityIds: string[],
-  orgId?: string
+  orgId?: string,
+  accountId: string | null = null
 ): Promise<boolean> {
   const signature = hashActivityIds(activityIds);
 
-  const orgFilter = orgId
-    ? `AND org_id = type::record('organizations', '${orgId}')`
-    : '';
+  // Phase B4b: dual-tenant scoping. Prefer account_id; legacy rows
+  // (account_id IS NONE) match via the org_id branch.
+  const tenantFilter = orgId ? `AND ${accountIdScopedWhere()}` : '';
 
   const query = `
     SELECT id FROM composite_sequence_patterns
     WHERE pattern_signature = $signature
-    ${orgFilter}
+    ${tenantFilter}
     LIMIT 1
   `;
 
   try {
-    const results = await surrealDB.query<any[]>(query, { signature });
+    const results = await surrealDB.query<any[]>(query, {
+      signature,
+      org_id: orgId ?? null,
+      account_id: accountId,
+    });
     return results && results.length > 0;
   } catch (error) {
     logger.error('Error checking if pattern extracted', { error, signature });

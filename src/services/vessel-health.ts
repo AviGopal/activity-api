@@ -7,6 +7,7 @@
 
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
+import { accountIdScopedWhere } from '../routes/activities';
 
 export interface VesselHealthScore {
   vesselId: string;
@@ -30,19 +31,20 @@ export interface VesselHealthScore {
  */
 export async function computeVesselHealthScore(
   vesselId: string,
-  orgId: string
+  orgId: string,
+  accountId: string | null = null
 ): Promise<VesselHealthScore> {
   try {
     // Get vessel heartbeat status
     const vesselQuery = `
       SELECT last_heartbeat, expires_at
       FROM vessel
-      WHERE id = $vesselId AND org_id = $orgId
+      WHERE id = $vesselId AND ${accountIdScopedWhere()}
       LIMIT 1;
     `;
     const vesselResults = await surrealDB.query<
       { last_heartbeat: string; expires_at: string }[]
-    >(vesselQuery, { vesselId, orgId });
+    >(vesselQuery, { vesselId, org_id: orgId, account_id: accountId });
 
     const vessel = vesselResults[0]?.[0];
     if (!vessel) {
@@ -73,13 +75,13 @@ export async function computeVesselHealthScore(
     const circuitQuery = `
       SELECT state, failure_count
       FROM circuit_breaker_trace
-      WHERE vessel_id = $vesselId AND org_id = $orgId
+      WHERE vessel_id = $vesselId AND ${accountIdScopedWhere()}
       ORDER BY timestamp DESC
       LIMIT 1;
     `;
     const circuitResults = await surrealDB.query<
       { state: string; failure_count: number }[]
-    >(circuitQuery, { vesselId, orgId });
+    >(circuitQuery, { vesselId, org_id: orgId, account_id: accountId });
 
     const circuit = circuitResults[0]?.[0];
     let circuitFactor = 1.0;
@@ -104,13 +106,13 @@ export async function computeVesselHealthScore(
     const routingQuery = `
       SELECT success
       FROM routing_trace
-      WHERE selected_vessel_id = $vesselId AND org_id = $orgId
+      WHERE selected_vessel_id = $vesselId AND ${accountIdScopedWhere()}
       ORDER BY timestamp DESC
       LIMIT 10;
     `;
     const routingResults = await surrealDB.query<{ success: boolean }[]>(
       routingQuery,
-      { vesselId, orgId }
+      { vesselId, org_id: orgId, account_id: accountId }
     );
 
     let routingFactor = 1.0;
@@ -176,25 +178,26 @@ export async function computeVesselHealthScore(
  * Get health scores for all vessels in an organization
  */
 export async function getOrganizationVesselHealth(
-  orgId: string
+  orgId: string,
+  accountId: string | null = null
 ): Promise<VesselHealthScore[]> {
   try {
     // Get all active vessels
     const vesselsQuery = `
       SELECT id FROM vessel
-      WHERE org_id = $orgId AND expires_at > time::now()
+      WHERE ${accountIdScopedWhere()} AND expires_at > time::now()
       ORDER BY last_heartbeat DESC;
     `;
     const vesselsResults = await surrealDB.query<{ id: string }[]>(
       vesselsQuery,
-      { orgId }
+      { org_id: orgId, account_id: accountId }
     );
 
     const vessels = vesselsResults[0] || [];
     const healthScores: VesselHealthScore[] = [];
 
     for (const vessel of vessels) {
-      const score = await computeVesselHealthScore(vessel.id, orgId);
+      const score = await computeVesselHealthScore(vessel.id, orgId, accountId);
       healthScores.push(score);
     }
 

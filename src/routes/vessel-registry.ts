@@ -545,7 +545,7 @@ app.get('/:vesselId/health', async (c) => {
 
   try {
     // Compute health score
-    const healthScore = await computeVesselHealthScore(vesselId, auth.orgId);
+    const healthScore = await computeVesselHealthScore(vesselId, auth.orgId, auth.accountId ?? null);
 
     if (healthScore.score === 0 && healthScore.details.lastHeartbeat === 'never') {
       return c.json({ error: 'Vessel not found' }, 404);
@@ -674,7 +674,7 @@ app.get('/health/organization', async (c) => {
   }
 
   try {
-    const healthScores = await getOrganizationVesselHealth(auth.orgId);
+    const healthScores = await getOrganizationVesselHealth(auth.orgId, auth.accountId ?? null);
 
     return c.json({
       vessels: healthScores,

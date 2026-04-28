@@ -8,6 +8,7 @@
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
 import { inferShapesFromTemplate } from '../utils/shape-inference';
+import { accountIdScopedWhere } from '../routes/activities';
 
 /**
  * Extract pattern from an execution trace and upsert pattern record.
@@ -35,6 +36,8 @@ export async function extractAndUpsertPattern(params: {
   tokensIn: number;
   tokensOut: number;
   orgId: string;
+  /** Phase B4b: optional account_id; null when caller has no JWT claim. */
+  accountId?: string | null;
   projectId?: string | null;
 }): Promise<void> {
   const {
@@ -48,6 +51,7 @@ export async function extractAndUpsertPattern(params: {
     tokensIn,
     tokensOut,
     orgId,
+    accountId,
     projectId,
   } = params;
 
@@ -82,6 +86,7 @@ export async function extractAndUpsertPattern(params: {
       tokensIn,
       tokensOut,
       orgId,
+      accountId: accountId ?? null,
       projectId: projectId || null,
       executedAt: new Date().toISOString(),
     });
@@ -153,6 +158,8 @@ async function upsertPattern(params: {
   tokensIn: number;
   tokensOut: number;
   orgId: string;
+  /** Phase B4b: optional account_id; null when caller has no claim. */
+  accountId: string | null;
   projectId: string | null;
   executedAt: string;
 }): Promise<void> {
@@ -166,14 +173,15 @@ async function upsertPattern(params: {
     tokensIn,
     tokensOut,
     orgId,
+    accountId,
     projectId,
     executedAt,
   } = params;
 
-  // Find existing pattern
+  // Find existing pattern (dual-tenant scoped)
   const findQuery = `
     SELECT * FROM execution_pattern
-    WHERE org_id = $orgId
+    WHERE ${accountIdScopedWhere()}
       AND input_shapes = $inputShapes
       AND output_shapes = $outputShapes
     LIMIT 1
@@ -189,7 +197,8 @@ async function upsertPattern(params: {
     avg_tokens_out: number;
     activity_templates: string[];
   }>>(findQuery, {
-    orgId,
+    org_id: orgId,
+    account_id: accountId,
     inputShapes,
     outputShapes,
   });
@@ -226,8 +235,10 @@ async function upsertPattern(params: {
         avg_tokens_out = $avgTokensOut,
         activity_templates = $activityTemplates,
         last_executed_at = $executedAt,
+        account_id = $account_id,
+        account_id_version = 1,
         updated_at = time::now()
-      WHERE org_id = $orgId
+      WHERE ${accountIdScopedWhere()}
         AND input_shapes = $inputShapes
         AND output_shapes = $outputShapes
     `;
@@ -243,7 +254,8 @@ async function upsertPattern(params: {
       avgTokensOut: newAvgTokensOut,
       activityTemplates,
       executedAt,
-      orgId,
+      org_id: orgId,
+      account_id: accountId,
       inputShapes,
       outputShapes,
     });
@@ -255,7 +267,7 @@ async function upsertPattern(params: {
       successRate: newSuccessRate,
     });
   } else {
-    // Create new pattern
+    // Create new pattern (Phase B4b: dual-write account_id alongside org_id)
     const insertQuery = `
       CREATE execution_pattern CONTENT {
         input_shapes: $inputShapes,
@@ -269,7 +281,9 @@ async function upsertPattern(params: {
         avg_duration_ms: $durationMs,
         avg_tokens_in: $tokensIn,
         avg_tokens_out: $tokensOut,
-        org_id: $orgId,
+        org_id: $org_id,
+        account_id: $account_id,
+        account_id_version: 1,
         project_id: $projectId,
         last_executed_at: $executedAt,
         created_at: time::now(),
@@ -288,7 +302,8 @@ async function upsertPattern(params: {
       durationMs,
       tokensIn,
       tokensOut,
-      orgId,
+      org_id: orgId,
+      account_id: accountId,
       projectId,
       executedAt,
     });
@@ -313,6 +328,8 @@ async function upsertPattern(params: {
  */
 export async function queryPatterns(params: {
   orgId: string;
+  /** Phase B4b: optional account_id; null when caller has no claim. */
+  accountId?: string | null;
   inputShapes?: string[];
   outputShapes?: string[];
   minExecutions?: number;
@@ -333,6 +350,7 @@ export async function queryPatterns(params: {
 }> {
   const {
     orgId,
+    accountId,
     inputShapes,
     outputShapes,
     minExecutions = 1,
@@ -341,8 +359,14 @@ export async function queryPatterns(params: {
     offset = 0,
   } = params;
 
-  let whereClause = 'WHERE org_id = $orgId';
-  const queryParams: Record<string, any> = { orgId, minExecutions, limit, offset };
+  let whereClause = `WHERE ${accountIdScopedWhere()}`;
+  const queryParams: Record<string, any> = {
+    org_id: orgId,
+    account_id: accountId ?? null,
+    minExecutions,
+    limit,
+    offset,
+  };
 
   if (inputShapes && inputShapes.length > 0) {
     whereClause += ' AND input_shapes ALLINSIDE $inputShapes';

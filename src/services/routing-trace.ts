@@ -14,6 +14,7 @@
 
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
+import { accountIdScopedWhere } from '../routes/activities';
 
 // =============================================================================
 // TYPES
@@ -23,6 +24,11 @@ export interface RoutingTraceInput {
   impulse_id: string;
   shape: string;
   org_id: string;
+  /**
+   * Phase B4b: optional account_id (null when caller has no JWT
+   * `account_id` claim). Dual-written to routing_trace alongside org_id.
+   */
+  account_id?: string | null;
   correlation_id?: string;
   activity_execution_id?: string;
   discovery_query_duration_ms: number;
@@ -115,6 +121,8 @@ export class RoutingTraceService {
           correlation_id: $correlationId,
           activity_execution_id: $activityExecutionId,
           org_id: $orgId,
+          account_id: $accountId,
+          account_id_version: $accountIdVersion,
           impulse_id: $impulseId,
           shape: $shape,
           discovery_query_duration_ms: $discoveryQueryDurationMs,
@@ -144,6 +152,8 @@ export class RoutingTraceService {
         correlationId: trace.correlation_id || null,
         activityExecutionId: trace.activity_execution_id || null,
         orgId: trace.org_id,
+        accountId: trace.account_id ?? null,
+        accountIdVersion: 1,
         impulseId: trace.impulse_id,
         shape: trace.shape,
         discoveryQueryDurationMs: trace.discovery_query_duration_ms,
@@ -207,6 +217,8 @@ export class RoutingTraceService {
           correlation_id: ${trace.correlation_id ? `"${trace.correlation_id}"` : 'NONE'},
           activity_execution_id: ${trace.activity_execution_id ? `"${trace.activity_execution_id}"` : 'NONE'},
           org_id: "${trace.org_id}",
+          account_id: ${trace.account_id ? `"${trace.account_id}"` : 'NONE'},
+          account_id_version: 1,
           impulse_id: "${trace.impulse_id}",
           shape: "${trace.shape}",
           discovery_query_duration_ms: ${trace.discovery_query_duration_ms},
@@ -282,6 +294,8 @@ export class RoutingTraceService {
    */
   static async queryTraces(params: {
     org_id: string;
+    /** Phase B4b: optional account_id; null when caller has no claim. */
+    account_id?: string | null;
     shape?: string;
     outcome?: string;
     start_time?: string;
@@ -289,7 +303,7 @@ export class RoutingTraceService {
     limit?: number;
   }): Promise<RoutingTrace[]> {
     try {
-      let whereConditions = [`org_id = $orgId`];
+      let whereConditions = [accountIdScopedWhere()];
 
       if (params.shape) {
         whereConditions.push(`shape = $shape`);
@@ -315,7 +329,8 @@ export class RoutingTraceService {
       `;
 
       const result = await surrealDB.query<RoutingTrace[]>(query, {
-        orgId: params.org_id,
+        org_id: params.org_id,
+        account_id: params.account_id ?? null,
         shape: params.shape,
         outcome: params.outcome,
         startTime: params.start_time,
@@ -337,7 +352,8 @@ export class RoutingTraceService {
   static async getShapeStats(
     orgId: string,
     shape: string,
-    windowHours: number = 24
+    windowHours: number = 24,
+    accountId: string | null = null
   ): Promise<{
     total_requests: number;
     success_rate: number;
@@ -353,14 +369,15 @@ export class RoutingTraceService {
           math::mean(latency_ms) AS avg_latency_ms,
           array::group(selected_vessel_id) AS vessel_distribution
         FROM routing_trace
-        WHERE org_id = $orgId
+        WHERE ${accountIdScopedWhere()}
           AND shape = $shape
           AND timestamp >= $startTime
           AND outcome = 'success';
       `;
 
       const result = await surrealDB.query<any[]>(query, {
-        orgId,
+        org_id: orgId,
+        account_id: accountId,
         shape,
         startTime,
       });
