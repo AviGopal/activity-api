@@ -2025,6 +2025,95 @@ router.post('/resolve', async (c) => {
       }
 
       // =============================================================================
+      // goal_verification_label_write: insert a ground-truth label into the oracle
+      // corpus (migration 101). No existing REST endpoint — writes directly to
+      // goal_verification_labels via executeAsAuth with org_id scoping.
+      // =============================================================================
+
+      case 'goal_verification_label_write': {
+        const authCheck = requireAuthenticated(c);
+        if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
+
+        const gvlPointer = pointer as typeof pointer & {
+          goal?: string;
+          execution_id?: string;
+          activity_id?: string;
+          verdict?: string;
+          confidence?: number;
+          notes?: string;
+          labeler?: string;
+        };
+
+        if (!gvlPointer.goal || !gvlPointer.execution_id || !gvlPointer.activity_id ||
+            !gvlPointer.verdict || gvlPointer.confidence === undefined || !gvlPointer.labeler) {
+          return c.json({
+            success: false,
+            error: 'goal, execution_id, activity_id, verdict, confidence, and labeler are required for goal_verification_label_write',
+          } as ImpulseResolveResponse, 400);
+        }
+
+        const validVerdicts = ['achieved', 'not_achieved', 'partial'];
+        if (!validVerdicts.includes(gvlPointer.verdict)) {
+          return c.json({
+            success: false,
+            error: `verdict must be one of: ${validVerdicts.join(', ')}`,
+          } as ImpulseResolveResponse, 400);
+        }
+
+        const validLabelers = ['human', 'automated'];
+        if (!validLabelers.includes(gvlPointer.labeler)) {
+          return c.json({
+            success: false,
+            error: `labeler must be one of: ${validLabelers.join(', ')}`,
+          } as ImpulseResolveResponse, 400);
+        }
+
+        const jwtAuth = getJwtAuthFromContext(c)!;
+
+        try {
+          const created = await executeAsAuth<any>(
+            jwtAuth,
+            `CREATE goal_verification_labels CONTENT {
+              org_id: $org_id,
+              goal: $goal,
+              execution_id: $execution_id,
+              activity_id: $activity_id,
+              verdict: $verdict,
+              confidence: $confidence,
+              notes: $notes,
+              labeler: $labeler,
+              created_at: time::now()
+            }`,
+            {
+              org_id: jwtAuth.orgId,
+              goal: gvlPointer.goal,
+              execution_id: gvlPointer.execution_id,
+              activity_id: gvlPointer.activity_id,
+              verdict: gvlPointer.verdict,
+              confidence: gvlPointer.confidence,
+              notes: gvlPointer.notes ?? null,
+              labeler: gvlPointer.labeler,
+            },
+          );
+
+          const row = (created || [])[0];
+          const recordId = row ? String(row.id) : null;
+
+          return c.json({
+            success: true,
+            content: JSON.stringify({ id: recordId }),
+            metadata: {
+              shape: 'goal_verification_label',
+              summary: `goal verification label created: verdict=${gvlPointer.verdict}, labeler=${gvlPointer.labeler}`,
+            },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          logger.error('goal_verification_label_write failed', { error: err?.message });
+          return c.json({ success: false, error: err?.message || 'insert failed' } as ImpulseResolveResponse, 500);
+        }
+      }
+
+      // =============================================================================
       // Destructive resolvers: DELETE, UPDATE, DEPRECATE. RBAC is enforced at the
       // SurrealDB PERMISSIONS layer (`$auth.role = 'admin'` on UPDATE/DELETE).
       // Each successful destructive op emits an upkeepAuditLog impulse so the

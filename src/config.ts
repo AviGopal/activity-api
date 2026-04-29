@@ -253,6 +253,11 @@ export function loadConfig(): Config {
         // route. Meta-activities reach this through the generic `impulse-resolve`
         // resolver in minibob — no source changes in the integrating vessel.
         'discoverByShapesQuery',
+        // goal_verification_label (migration 101, 2026-04-29): oracle corpus
+        // write shape. Resolves via goal_verification_label_write case in
+        // impulses.ts — direct INSERT into goal_verification_labels table.
+        // Read-side access not yet exposed; write-only corpus entry point.
+        'goal_verification_label',
       ],
     },
   };
