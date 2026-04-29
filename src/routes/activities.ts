@@ -1005,10 +1005,13 @@ app.post('/templates', async (c) => {
       activityRecord.org_id = validated.org_id || orgId;
     }
 
-    // Phase B1: dual-write account_id alongside org_id. Schema is option<string>,
-    // so null is accepted and indicates a Phase B row written without an
-    // account_id-bearing JWT. account_id_version=1 marks this as Phase B.
-    activityRecord.account_id = accountId;
+    // Phase B1: dual-write account_id alongside org_id. Only set when non-null —
+    // SurrealDB 3.x `option<string>` rejects JSON `null`; omitting the field
+    // lets SurrealDB treat it as NONE (the correct absent-value sentinel).
+    // account_id_version=1 marks this as Phase B regardless.
+    if (accountId != null) {
+      activityRecord.account_id = accountId;
+    }
     activityRecord.account_id_version = 1;
 
     // Add tasks using canonical field name
@@ -1240,11 +1243,13 @@ app.post('/templates', async (c) => {
       }
     `;
 
+    // Phase B1: only bind account_id when non-null — SurrealDB 3.x option<string>
+    // rejects JSON null; omitting the param lets the field default to NONE.
+    const metricsAccountId = accountIdRecordRef(accountId);
     await surrealDB.query(insertMetricsQuery, {
       activity_id: activityId,
       org_id: metricsOrgId,
-      // Phase B1: dual-write account_id (record-id form, mirroring metricsOrgId).
-      account_id: accountIdRecordRef(accountId),
+      ...(metricsAccountId != null ? { account_id: metricsAccountId } : {}),
       ...(metricsProjectId ? { project_id: metricsProjectId } : {}),
     });
 
@@ -1890,7 +1895,8 @@ app.post('/executions', async (c) => {
           id: activityIdFromRequest,
           name: activityIdFromRequest.replace(/^activity:/, '').replace(/[⟨⟩`]/g, ''),
           org_id: orgId,
-          account_id: accountId,
+          // Phase B1: omit when null — SurrealDB 3.x option<string> rejects JSON null.
+          ...(accountId != null ? { account_id: accountId } : {}),
         });
 
         logger.info('[template] Successfully auto-created base template', {
@@ -4727,7 +4733,10 @@ app.post('/create-goal-seeking', async (c) => {
       templateRecord.project_id = projectId;
     }
     // Phase B1: dual-write account_id + version=1 marker on the new template.
-    templateRecord.account_id = accountId;
+    // Only set when non-null — SurrealDB 3.x option<string> rejects JSON null.
+    if (accountId != null) {
+      templateRecord.account_id = accountId;
+    }
     templateRecord.account_id_version = 1;
 
     const fields = Object.keys(templateRecord).map(k => `${k}: $${k}`).join(',\n        ');
@@ -4775,9 +4784,10 @@ app.post('/create-goal-seeking', async (c) => {
       }
     `;
 
+    const generatedMetricsAccountId = accountIdRecordRef(accountId);
     await surrealDB.query(insertMetricsQuery, {
       activity_id: generated.id,
-      account_id: accountIdRecordRef(accountId),
+      ...(generatedMetricsAccountId != null ? { account_id: generatedMetricsAccountId } : {}),
     });
 
     logger.info('Created improvised activity template', {
