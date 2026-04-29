@@ -20,7 +20,8 @@ DEFINE INDEX OVERWRITE idx_aet_parent_execution_id
   ON activity_execution_traces
   FIELDS parent_execution_id;
 
--- Cover activity_template_id + executed_at for template-scoped history views
-DEFINE INDEX OVERWRITE idx_aet_template_executed_at
+-- Cover activity_id + executed_at for template-scoped history views
+-- (field is activity_id in this table, not activity_template_id)
+DEFINE INDEX OVERWRITE idx_aet_activity_id_executed_at
   ON activity_execution_traces
-  FIELDS activity_template_id, executed_at;
+  FIELDS activity_id, executed_at;

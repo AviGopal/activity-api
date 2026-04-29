@@ -442,8 +442,21 @@ app.get('/', async (c) => {
       : '';
 
     // Query execution traces (ordered by most recent first)
+    // Perf: project only summary fields for the list view — avoids loading
+    // multi-KB tasks[], impulse_resolutions[], and composition_chain[] arrays
+    // per row. Individual traces are fetched fully on demand via the single-
+    // trace endpoint. This is the primary contributor to OOMKills when the
+    // table grows large (SELECT * scans all JSONB columns into memory).
     const query = `
-      SELECT * FROM activity_execution_traces
+      SELECT
+        id, execution_id, activity_id, variant_id, org_id, account_id,
+        status, success, error, executed_at, duration_ms, cost_usd,
+        parent_execution_id, composition_chain,
+        vessel_id, vessel_version,
+        failure_mode,
+        array::len(tasks) AS task_count,
+        array::len(impulse_resolutions) AS impulse_count
+      FROM activity_execution_traces
       ${whereClause}
       ORDER BY executed_at DESC
       LIMIT $limit
