@@ -6874,6 +6874,10 @@ app.post('/tool-usage', async (c) => {
       
       // Phase B-followup: dual-write account_id + version (and org_id, the
       // first multi-tenant key for this table) on CREATE.
+      // tool_usage_patterns.account_id is option<string> per the deployed
+      // schema; SurrealDB 3.x rejects JSON `null` against `TYPE none | string`.
+      // Use IF..THEN..ELSE..END to coerce null → NONE on the SQL side so we
+      // don't have to branch the CREATE template here.
       const createQuery = `
         CREATE tool_usage_patterns CONTENT {
           tool_name: $tool_name,
@@ -6891,7 +6895,7 @@ app.post('/tool-usage', async (c) => {
           avg_params_complexity: $avg_params_complexity,
           typical_error_rate: $typical_error_rate,
           org_id: $org_id,
-          account_id: $account_id,
+          account_id: IF $account_id IS NULL THEN NONE ELSE $account_id END,
           account_id_version: $account_id_version,
           created_at: time::now(),
           updated_at: time::now()

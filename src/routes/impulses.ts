@@ -159,7 +159,7 @@ async function emitUpkeepAudit(payload: {
         shape: 'upkeepAuditLog',
         pointer: $pointer,
         org_id: $org_id,
-        account_id: $account_id,
+        account_id: IF $account_id IS NULL THEN NONE ELSE $account_id END,
         account_id_version: 1,
         created_at: time::now()
       }`,
@@ -363,9 +363,11 @@ router.post('/', async (c) => {
     // INSERT works with root credentials (no org_id permission checks required)
     // Use time::now() instead of Date parameter to avoid datetime coercion errors
     //
-    // Phase B2: dual-write `account_id` (option<string>; null is acceptable
-    // when caller has no accountId claim) and `account_id_version` (=1) so
-    // Phase D and later can flip the canonical scoping field.
+    // Phase B2: dual-write `account_id` alongside org_id. Schema field is
+    // `TYPE none | string` per the deployed migration — SurrealDB 3.x rejects
+    // JSON `null` against `none | string` (the value coerces to NULL, not
+    // NONE). Use IF..THEN..ELSE..END so the same param shape from the JS side
+    // (`accountId ?? null`) can be re-used unchanged.
     const insertQuery = `
       INSERT INTO impulse {
         id: $impulse_id,
@@ -376,7 +378,7 @@ router.post('/', async (c) => {
         metadata: $metadata,
         token_estimate: $token_estimate,
         org_id: $org_id,
-        account_id: $account_id,
+        account_id: IF $account_id IS NULL THEN NONE ELSE $account_id END,
         account_id_version: $account_id_version,
         ${projectIdField}
         ${createdByField}

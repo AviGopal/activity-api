@@ -127,7 +127,11 @@ describe('Phase B2: POST /v2/impulses dual-writes account_id', () => {
     expect(res.status).toBeLessThan(400);
     const insert = findInsertImpulse()!;
     expect(insert).toBeDefined();
-    expect(insert.sql).toContain('account_id: $account_id');
+    // SurrealDB 3.x rejects JSON `null` against `TYPE none | string`, so the
+    // INSERT wraps the bind in `IF $account_id IS NULL THEN NONE ELSE $account_id END`.
+    // The literal substring `$account_id` still appears (in the THEN branch
+    // and the ELSE branch); just match the wrapper instead of the bare bind.
+    expect(insert.sql).toMatch(/account_id:\s+IF\s+\$account_id\s+IS\s+NULL/);
     expect(insert.sql).toContain('account_id_version: $account_id_version');
     expect(insert.params.org_id).toBe('org-acme');
     expect(insert.params.account_id).toBe('acc-acme-001');

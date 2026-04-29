@@ -1516,13 +1516,21 @@ app.post('/', async (c) => {
     if ((trace as any).impulse_resolutions) optionalFields.push('impulse_resolutions: $impulse_resolutions');
     // Project ID - only include if set (MiniBob instances may not have projects)
     if (trace.project_id) optionalFields.push('project_id: $project_id');
+    // Phase B2: account_id is option<string> per the deployed schema —
+    // SurrealDB 3.x rejects JSON `null` against `TYPE none | string` (the
+    // value coercion produces NULL, not NONE). Only emit the SET clause when
+    // the caller actually provided an accountId; otherwise let the field
+    // default to NONE. account_id_version is paired with account_id (only
+    // meaningful when the field is written), so guard the same way.
+    if ((trace as any).account_id) {
+      optionalFields.push('account_id: $account_id');
+      optionalFields.push('account_id_version: $account_id_version');
+    }
 
     const optionalFieldsStr = optionalFields.length > 0 ? `,\n        ${optionalFields.join(',\n        ')}` : '';
 
     // NOTE: org_id is a STRING field in schema (not a record link)
     // project_id is optional - only included in query if set (handled in optionalFields)
-    // Phase B2: account_id and account_id_version are always dual-written
-    // (account_id is option<string>, accepts null; account_id_version=1).
     const query = `
       INSERT INTO activity_execution_traces {
         execution_id: $execution_id,
@@ -1536,8 +1544,6 @@ app.post('/', async (c) => {
         tokens_output: $tokens_output,
         tokens_cache: $tokens_cache,
         org_id: $org_id,
-        account_id: $account_id,
-        account_id_version: $account_id_version,
         executed_at: $executed_at,
         created_at: $created_at,
         stored_at: $stored_at${optionalFieldsStr}
