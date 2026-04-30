@@ -8,33 +8,47 @@
 -- /v2/activities/templates returns `ev: 0` for α=1, β=1 rows where the
 -- expected mean is 0.5.
 --
--- A naive `UPDATE … SET <field> = <field>` triggers SCHEMAFULL re-
--- validation of ALL fields on the row — and on legacy pre-Phase-B
--- rows the `account_id_version` field is NONE while the schema
--- requires `int`. The first attempt at this migration got rejected
--- with "Expected `int` but found `NONE`" on 3 tables. We coerce
--- `account_id_version` to 1 in the same SET clause so the
--- validation passes; rows that already have a version keep theirs
--- via the `?? account_id_version` fallback.
+-- Prior versions:
+--   v1: `UPDATE … SET <field> = <field>` triggered SCHEMAFULL re-validation
+--       which caught NONE values on the account_id_version field and
+--       failed for variant_performance_metrics, activity, and
+--       impulse_shape_activity_score.
+--   v2: added `account_id_version = account_id_version ?? 1` to coerce
+--       legacy NONE values, but failed on tables that don't carry the
+--       account_id_version field at all (activity_template, etc).
 --
--- Each table runs as its own statement so a failure on one (e.g. a
--- table that doesn't carry account_id_version) doesn't block the
--- others. RETURN NONE so the migration log stays compact.
+-- v3 (current): use `updated_at = time::now()` as the universal touch.
+-- Every posterior table has updated_at as a datetime field; setting it
+-- to time::now() triggers the row-level UPDATE that makes the VALUE
+-- clause on `ev` recompute. This avoids referencing tenancy fields
+-- whose presence varies by table.
 --
--- Idempotent: re-running re-touches every row, recomputes ev to the
--- same value, and converges account_id_version to 1 where it was
--- still NONE.
+-- For composition_edge / context_thompson_scores etc that also lack
+-- updated_at, fall back to a self-assignment of one of their declared
+-- fields. Each statement runs independently so a failure on one
+-- doesn't block the others. RETURN NONE keeps the migration log
+-- compact.
+--
+-- Idempotent: re-running just sets updated_at to a new time::now() and
+-- recomputes ev to the same value.
 
-UPDATE activity_template SET thompson_alpha = thompson_alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
-UPDATE goal_execution_paths SET thompson_alpha = thompson_alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
-UPDATE variant_performance_metrics SET thompson_alpha = thompson_alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
-UPDATE activity SET thompson_alpha = thompson_alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
-UPDATE prerequisite_patterns SET thompson_alpha = thompson_alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
-UPDATE goal_paths SET thompson_alpha = thompson_alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
+-- thompson_alpha/thompson_beta family (all have updated_at).
+UPDATE activity_template SET updated_at = time::now() RETURN NONE;
+UPDATE goal_execution_paths SET updated_at = time::now() RETURN NONE;
+UPDATE variant_performance_metrics SET updated_at = time::now() RETURN NONE;
+UPDATE activity SET updated_at = time::now() RETURN NONE;
+UPDATE prerequisite_patterns SET updated_at = time::now() RETURN NONE;
+UPDATE goal_paths SET updated_at = time::now() RETURN NONE;
 
-UPDATE impulse_shape_activity_score SET alpha = alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
-UPDATE composition_edge SET alpha = alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
-UPDATE context_thompson_scores SET alpha = alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
-UPDATE discovered_state_pattern SET alpha = alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
-UPDATE activity_state_affinity SET alpha = alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
-UPDATE thompson_selection_log SET alpha = alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
+-- alpha/beta family. impulse_shape_activity_score has updated_at;
+-- the others may not — fall back to self-assignment of `alpha`. If
+-- a particular table also enforces account_id_version: int, those
+-- rows will need a manual operator pass. For the immediate 10.S2
+-- acceptance the activity_template + goal_execution_paths +
+-- variant_performance_metrics paths above are the hot ones.
+UPDATE impulse_shape_activity_score SET updated_at = time::now() RETURN NONE;
+UPDATE composition_edge SET alpha = alpha RETURN NONE;
+UPDATE context_thompson_scores SET alpha = alpha RETURN NONE;
+UPDATE discovered_state_pattern SET alpha = alpha RETURN NONE;
+UPDATE activity_state_affinity SET alpha = alpha RETURN NONE;
+UPDATE thompson_selection_log SET alpha = alpha RETURN NONE;
