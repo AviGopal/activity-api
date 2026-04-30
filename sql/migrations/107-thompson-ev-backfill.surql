@@ -8,30 +8,33 @@
 -- /v2/activities/templates returns `ev: 0` for α=1, β=1 rows where the
 -- expected mean is 0.5.
 --
--- Forcing a touch via `UPDATE … SET <existing-field> = <existing-field>`
--- triggers the VALUE recompute without changing any other state. Each
--- table touched separately so a transient failure on one doesn't block
--- the others. UPDATE returns are RETURN NONE so the migration log
--- doesn't dump the entire registry.
+-- A naive `UPDATE … SET <field> = <field>` triggers SCHEMAFULL re-
+-- validation of ALL fields on the row — and on legacy pre-Phase-B
+-- rows the `account_id_version` field is NONE while the schema
+-- requires `int`. The first attempt at this migration got rejected
+-- with "Expected `int` but found `NONE`" on 3 tables. We coerce
+-- `account_id_version` to 1 in the same SET clause so the
+-- validation passes; rows that already have a version keep theirs
+-- via the `?? account_id_version` fallback.
 --
--- Idempotent: re-running just retriggers the recompute, which yields
--- the same `ev` for the same α/β.
+-- Each table runs as its own statement so a failure on one (e.g. a
+-- table that doesn't carry account_id_version) doesn't block the
+-- others. RETURN NONE so the migration log stays compact.
 --
--- For tables that don't carry an `ev` field today (e.g. they only
--- received it via 103) the UPDATE is still safe — the SET clause
--- references a field that exists on the row, and the VALUE clause on
--- ev recomputes implicitly.
+-- Idempotent: re-running re-touches every row, recomputes ev to the
+-- same value, and converges account_id_version to 1 where it was
+-- still NONE.
 
-UPDATE activity_template SET thompson_alpha = thompson_alpha RETURN NONE;
-UPDATE goal_execution_paths SET thompson_alpha = thompson_alpha RETURN NONE;
-UPDATE variant_performance_metrics SET thompson_alpha = thompson_alpha RETURN NONE;
-UPDATE activity SET thompson_alpha = thompson_alpha RETURN NONE;
-UPDATE prerequisite_patterns SET thompson_alpha = thompson_alpha RETURN NONE;
-UPDATE goal_paths SET thompson_alpha = thompson_alpha RETURN NONE;
+UPDATE activity_template SET thompson_alpha = thompson_alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
+UPDATE goal_execution_paths SET thompson_alpha = thompson_alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
+UPDATE variant_performance_metrics SET thompson_alpha = thompson_alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
+UPDATE activity SET thompson_alpha = thompson_alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
+UPDATE prerequisite_patterns SET thompson_alpha = thompson_alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
+UPDATE goal_paths SET thompson_alpha = thompson_alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
 
-UPDATE impulse_shape_activity_score SET alpha = alpha RETURN NONE;
-UPDATE composition_edge SET alpha = alpha RETURN NONE;
-UPDATE context_thompson_scores SET alpha = alpha RETURN NONE;
-UPDATE discovered_state_pattern SET alpha = alpha RETURN NONE;
-UPDATE activity_state_affinity SET alpha = alpha RETURN NONE;
-UPDATE thompson_selection_log SET alpha = alpha RETURN NONE;
+UPDATE impulse_shape_activity_score SET alpha = alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
+UPDATE composition_edge SET alpha = alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
+UPDATE context_thompson_scores SET alpha = alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
+UPDATE discovered_state_pattern SET alpha = alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
+UPDATE activity_state_affinity SET alpha = alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
+UPDATE thompson_selection_log SET alpha = alpha, account_id_version = account_id_version ?? 1 RETURN NONE;
