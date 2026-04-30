@@ -481,22 +481,14 @@ app.get('/', async (c) => {
     if (useJwtAuth && jwtAuth?.jwtToken && jwtAuth.authType !== 'apikey') {
       // JWT AUTH PATH: Use RBAC-enforced query
       executions = await queryWithAuth<ExecutionTrace>(jwtAuth.jwtToken, query, params);
-      const countQuery = `
-        SELECT count() as total FROM activity_execution_traces
-        ${whereClause}
-        GROUP ALL
-      `;
-      countResult = await queryWithAuth<{ total: number }>(jwtAuth.jwtToken, countQuery, params);
     } else {
       // LEGACY PATH: Direct query with application-level filtering
       executions = await surrealDB.query<ExecutionTrace>(query, params);
-      const countQuery = `
-        SELECT count() as total FROM activity_execution_traces
-        ${whereClause}
-        GROUP ALL
-      `;
-      countResult = await surrealDB.query<{ total: number }>(countQuery, params);
     }
+    // COUNT query omitted — full table scan with GROUP ALL causes OOMKills on
+    // tables >25k rows. Clients receive the page size via executions.length;
+    // total is returned as -1 to signal "unknown count" without an extra scan.
+    countResult = [{ total: -1 }];
 
     logger.info('Raw executions result from SurrealDB', {
       executionsType: typeof executions,
