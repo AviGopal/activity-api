@@ -6482,13 +6482,16 @@ app.post('/impulse-relevance', async (c) => {
       // Phase E: dual-write account_id + org_id + version=1 marker so future
       // reads via accountIdScopedWhere() find this row, and a Phase F
       // backfill pass can identify rows already tagged.
+      // I2.4 sibling guard: account_id is option<string> per the deployed
+      // schema; SurrealDB 3.x rejects JSON `null` (see I2.4 + I2.4 followup).
+      // Coerce on the SQL side so the JS-side `?? null` shape stays unchanged.
       const createQuery = `
         CREATE impulse_relevance_metrics CONTENT {
           impulse_id: $impulse_id,
           activity_variant_id: $activity_variant_id,
           task_id: $task_id,
           org_id: $org_id,
-          account_id: $account_id,
+          account_id: IF $account_id IS NULL THEN NONE ELSE $account_id END,
           account_id_version: 1,
           times_loaded: $times_loaded,
           times_execution_succeeded: $times_execution_succeeded,
@@ -7570,6 +7573,9 @@ app.post('/tool-argument-patterns', async (c) => {
       // Phase B-followup: dual-write account_id + version on CREATE; org_id
       // is also written explicitly so the row is no longer dependent on
       // SurrealDB-level $auth defaulting.
+      // I2.4 sibling guard: account_id is option<string> per the deployed
+      // schema; SurrealDB 3.x rejects JSON `null` (see I2.4 + I2.4 followup).
+      // Coerce on the SQL side so the JS-side `?? null` shape stays unchanged.
       const createQuery = `
         CREATE tool_argument_pattern SET
           activity_id = $activity_id,
@@ -7588,7 +7594,7 @@ app.post('/tool-argument-patterns', async (c) => {
           validation_error = $validation_error,
           failure_counts = $failure_counts,
           org_id = $org_id,
-          account_id = $account_id,
+          account_id = IF $account_id IS NULL THEN NONE ELSE $account_id END,
           account_id_version = $account_id_version
       `;
 
