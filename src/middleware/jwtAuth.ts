@@ -127,17 +127,17 @@ async function validateApiKey(apiKey: string): Promise<JwtAuthContext | null> {
       expirySeconds: 900, // 15 minutes
     });
 
-    // L-3 (2026-04-27): Do NOT reject the request when generateJwtToken returns
-    // null. The API key has already been validated by identity-vessel, so the
-    // caller IS authenticated — they just can't get a SurrealDB-issued JWT
-    // (typically because JWT_SECRET is misaligned between this process and the
-    // ACCESS schema, see CLAUDE.md §"JWT Secret"). Returning null here makes
-    // the downstream `requireAuthenticated()` gate (F-32) reject every API-key
+    // Do NOT reject the request when generateJwtToken returns null. The API
+    // key has already been validated by identity-vessel, so the caller IS
+    // authenticated — they just can't get a SurrealDB-issued JWT (typically
+    // because JWT_SECRET is misaligned between this process and the ACCESS
+    // schema, see CLAUDE.md §"JWT Secret"). Returning null here would make
+    // the downstream `requireAuthenticated()` gate reject every API-key
     // POST /v2/impulses/resolve as 401 — even read-only resolves work fine via
     // the executeAsAuth root-credentials fallback when authType==='apikey' and
     // an empty jwtToken is propagated.
     //
-    // Falling through with `jwtToken: ''` makes F-32's per-route gate fire as
+    // Falling through with `jwtToken: ''` makes the per-route gate fire as
     // intended (it accepts any JwtAuthContext, regardless of jwtToken). Per-
     // case destructive resolvers (`*_write`, `*_update`, `*_delete`,
     // `*_deprecate`, `templateAuditReport`) still gate writes properly via
@@ -149,7 +149,7 @@ async function validateApiKey(apiKey: string): Promise<JwtAuthContext | null> {
     // queries are unavailable, valid API-key holders can still hit read-side
     // resolves through the root-creds fallback path.
     if (!jwtToken) {
-      logger.warn('JWT generation failed for API key — falling through with empty jwtToken (L-3)', {
+      logger.warn('JWT generation failed for API key — falling through with empty jwtToken', {
         orgId: result.orgId,
         keyId: result.keyId,
       });
@@ -213,7 +213,7 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
       await next();
       return;
     }
-    // F-44: X-Internal-Api-Key is an alternative auth scheme used for
+    // X-Internal-Api-Key is an alternative auth scheme used for
     // vessel-to-vessel impulse storage (POST /v2/impulses, GET
     // /v2/impulses/:id, GET /v2/impulses). The route handlers validate it
     // themselves and 401 on miss. Without this passthrough, the middleware

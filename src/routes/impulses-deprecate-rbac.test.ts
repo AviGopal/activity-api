@@ -1,12 +1,12 @@
 /**
  * /v2/impulses/resolve → activityTemplate_deprecate (and _update)
  *
- * Locks in B-2-fix (2026-04-26): the deprecate / update handlers used to
- * combine the existence check and the RBAC admin/org gate into a single
- * SurrealQL WHERE clause. When the caller lacked permission for an existing
- * row, the query returned 0 rows and the handler emitted `404 Template not
- * found` — indistinguishable from "row doesn't exist". This information leak
- * caused the iter-26 11.1 retry to chase phantom id-format issues.
+ * The deprecate / update handlers used to combine the existence check and
+ * the RBAC admin/org gate into a single SurrealQL WHERE clause. When the
+ * caller lacked permission for an existing row, the query returned 0 rows and
+ * the handler emitted `404 Template not found` — indistinguishable from "row
+ * doesn't exist". This information leak caused callers to chase phantom
+ * id-format issues.
  *
  * The fix splits the check: a permissionless existence query first, then an
  * application-level admin/org check. Tests below verify:
@@ -136,7 +136,7 @@ function withExistenceRow(row: Record<string, any> | null) {
 // activityTemplate_deprecate
 // ---------------------------------------------------------------------------
 
-describe('POST /v2/impulses/resolve → activityTemplate_deprecate (B-2-fix)', () => {
+describe('POST /v2/impulses/resolve → activityTemplate_deprecate (404 vs 403)', () => {
   beforeEach(resetQueryLog);
 
   test('genuinely missing id returns 404 Template not found', async () => {
@@ -225,7 +225,7 @@ describe('POST /v2/impulses/resolve → activityTemplate_deprecate (B-2-fix)', (
 // activityTemplate_update — same anti-pattern, fixed in lockstep.
 // ---------------------------------------------------------------------------
 
-describe('POST /v2/impulses/resolve → activityTemplate_update (B-2-fix)', () => {
+describe('POST /v2/impulses/resolve → activityTemplate_update (404 vs 403)', () => {
   beforeEach(resetQueryLog);
 
   test('genuinely missing id returns 404', async () => {

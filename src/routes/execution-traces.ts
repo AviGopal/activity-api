@@ -474,7 +474,7 @@ app.get('/', async (c) => {
     let executions: ExecutionTrace[];
     let countResult: { total: number }[];
 
-    // F-36: API-key auth produces a JWT with `id: api_key:N` which SurrealDB
+    // API-key auth produces a JWT with `id: api_key:N` which SurrealDB
     // 3.x interprets as a record reference and rejects with "access method
     // cannot be used". Skip JWT path for API-key auth and fall back to root
     // creds + manual org_id filtering. Same pattern as routes/activities.ts.
@@ -508,7 +508,7 @@ app.get('/', async (c) => {
 
     let total = countResult?.[0]?.total || 0;
 
-    // L-8: Always union the paradigm execution table when parent_execution_id is set.
+    // Always union the paradigm execution table when parent_execution_id is set.
     // activity_execution_traces stores wrappers (aexec_, act_); the paradigm
     // execution table stores lifecycle hook executions (exec_). Both can have
     // children of the same parent — querying only one table silently drops the other.
@@ -559,7 +559,7 @@ app.get('/', async (c) => {
             });
 
           if (newRows.length > 0) {
-            logger.info('[L-8] Merged paradigm execution table results', {
+            logger.info('[paradigm-union] Merged paradigm execution table results', {
               primaryCount: executions?.length ?? 0,
               paradigmCount: paradigmRows.length,
               newCount: newRows.length,
@@ -570,7 +570,7 @@ app.get('/', async (c) => {
           }
         }
       } catch (paradigmError) {
-        logger.warn('[L-8] Paradigm execution union query failed', {
+        logger.warn('[paradigm-union] Paradigm execution union query failed', {
           error: paradigmError instanceof Error ? paradigmError.message : String(paradigmError),
           parentExecutionId,
         });
@@ -709,10 +709,10 @@ app.get('/', async (c) => {
       execution_id: trace.execution_id || trace.id?.toString().split(':')[1] || trace.id,
     }));
 
-    // F-37/F-40 read-time fallback (2026-04-26): when stored chain is empty
-    // but parent_execution_id is set, walk on the fly. Read-only.
-    // Per-request memoization cache: sibling rows with the same parent
-    // collapse to a single DB walk per distinct parent_execution_id.
+    // Read-time fallback: when stored chain is empty but parent_execution_id
+    // is set, walk on the fly. Read-only. Per-request memoization cache:
+    // sibling rows with the same parent collapse to a single DB walk per
+    // distinct parent_execution_id.
     const chainCache: CompositionChainCache = new Map();
     const executionsWithChain = await Promise.all(
       executionsNormalized.map((t: any) => applyChainFallback(t, chainCache)),
@@ -865,7 +865,7 @@ app.get('/:executionId', async (c) => {
       selection_attribution: selectionData,
     };
 
-    // F-37/F-40 read-time fallback (2026-04-26): same contract as list handler.
+    // Read-time fallback: same contract as list handler.
     const traceWithChain = await applyChainFallback(traceNormalized);
 
     return c.json(traceWithChain);
@@ -945,7 +945,7 @@ app.get('/selection-events', async (c) => {
     let events: any[];
     let countResult: { total: number }[];
 
-    // F-36: API-key auth produces a JWT with `id: api_key:N` which SurrealDB
+    // API-key auth produces a JWT with `id: api_key:N` which SurrealDB
     // 3.x interprets as a record reference and rejects with "access method
     // cannot be used". Skip JWT path for API-key auth and fall back to root
     // creds + manual org_id filtering. Same pattern as routes/activities.ts.
@@ -996,14 +996,13 @@ app.get('/selection-events', async (c) => {
 /**
  * Denormalize the composition_chain at trace-insert time.
  *
- * F-37 fix (2026-04-26): every execution trace on canary had
+ * Background: previously, every execution trace on canary had
  * `composition_chain: []` despite `parent_execution_id` being set
  * correctly. The denormalization step that should compute the chain by
  * reading the parent's chain at insert time was missing entirely; clients
  * (minibob) compute it for L3 template runs but L1/L2 meta-traces fall
- * through without populating it. Phase 8 criterion 2 (recursive escalation
- * auditing) was effectively blind because chain-depth queries always
- * returned 0 traces.
+ * through without populating it. Recursive-escalation auditing was
+ * effectively blind because chain-depth queries always returned 0 traces.
  *
  * Strategy: when a parent is referenced, look it up and compute
  *   composition_chain = parent.composition_chain.concat(parent.execution_id)
@@ -1052,7 +1051,7 @@ export async function denormalizeCompositionChain(
         : parentExecutionId;
     return [...parentChain, parentId];
   } catch (err) {
-    logger.warn('[F-37] Failed to denormalize composition_chain — leaving empty', {
+    logger.warn('[composition-chain] Failed to denormalize composition_chain — leaving empty', {
       parent_execution_id: parentExecutionId,
       error: err instanceof Error ? err.message : String(err),
     });
@@ -1062,15 +1061,14 @@ export async function denormalizeCompositionChain(
 
 /**
  * Backfill `composition_chain` on already-inserted children of a just-inserted
- * trace. Closes the write-order race in F-37.
+ * trace. Closes the write-order race in the insert-time helper.
  *
- * F-40 (2026-04-26): F-37 computes the chain at insert time by reading the
- * parent. That works for L3 template runs but breaks for minibob's L1/L2
- * synthetic meta-traces (`emitMetaTrace` for `_goal_resolve` /
- * `_activity_execute`) which insert AFTER their children — the meta-trace
- * wraps the entire goal flow and emits at the end. F-37's parent-lookup at
- * child-insert time finds nothing, the child lands with empty chain, and
- * Phase 8 chain-depth audits stay blind.
+ * The insert-time helper computes the chain by reading the parent. That works
+ * for L3 template runs but breaks for minibob's L1/L2 synthetic meta-traces
+ * (`emitMetaTrace` for `_goal_resolve` / `_activity_execute`) which insert
+ * AFTER their children — the meta-trace wraps the entire goal flow and emits
+ * at the end. The parent-lookup at child-insert time finds nothing, the child
+ * lands with empty chain, and chain-depth audits stay blind.
  *
  * Strategy: after a successful insert, run a single best-effort UPDATE that
  * sets `composition_chain` on every existing row whose `parent_execution_id`
@@ -1106,7 +1104,7 @@ export async function backfillChildCompositionChains(
     // The `composition_chain IS NONE OR array::len(composition_chain) = 0`
     // clause is the idempotency guard — we never overwrite a populated
     // chain (those children already had a parent at their insert time and
-    // the F-37 helper resolved them correctly).
+    // the insert-time helper resolved them correctly).
     await surrealDB.query(
       `
         UPDATE activity_execution_traces
@@ -1120,7 +1118,7 @@ export async function backfillChildCompositionChains(
       },
     );
   } catch (err) {
-    logger.warn('[F-40] Failed to backfill child composition_chains — leaving empty', {
+    logger.warn('[composition-chain] Failed to backfill child composition_chains — leaving empty', {
       inserted_execution_id: insertedExecutionId,
       error: err instanceof Error ? err.message : String(err),
     });
@@ -1128,12 +1126,11 @@ export async function backfillChildCompositionChains(
 }
 
 /**
- * Read-time fallback for F-37/F-40: walk `parent_execution_id` chain on the
- * fly when the stored `composition_chain` is empty. F-37 + F-40 are write-time
- * fixes; traces inserted before they landed can still expose
- * `composition_chain: []` despite a valid `parent_execution_id`. This helper
- * closes the audit-time gap (Phase 8 criterion 2 — recursive escalation
- * auditing).
+ * Read-time fallback: walk `parent_execution_id` chain on the fly when the
+ * stored `composition_chain` is empty. The insert-time helper and child
+ * backfill above are write-time fixes; traces inserted before they landed can
+ * still expose `composition_chain: []` despite a valid
+ * `parent_execution_id`. This helper closes the audit-time gap.
  *
  * Walks upward, prepending each step. On the first non-empty
  * `composition_chain` encountered, prepends it as the base and stops
@@ -1175,7 +1172,7 @@ export async function walkCompositionChain(
         // different store). Log once at warn level so the gap is visible
         // but never throw — return whatever the walk accumulated so far.
         if (accumulator.length > 0) {
-          logger.warn('[F-37/F-40 read-time] orphan parent mid-walk — returning partial chain', {
+          logger.warn('[composition-chain read-time] orphan parent mid-walk — returning partial chain', {
             origin_execution_id: executionId,
             missing_parent_execution_id: cursor,
             partial_chain_length: accumulator.length,
@@ -1209,7 +1206,7 @@ export async function walkCompositionChain(
     }
     return accumulator;
   } catch (err) {
-    logger.warn('[F-37/F-40 read-time] walkCompositionChain failed — returning []', {
+    logger.warn('[composition-chain read-time] walkCompositionChain failed — returning []', {
       execution_id: executionId,
       error: err instanceof Error ? err.message : String(err),
     });
@@ -1250,7 +1247,7 @@ export async function resolveCompositionChain(
 }
 
 /**
- * Apply the F-37/F-40 read-time fallback to a single trace: when the stored
+ * Apply the read-time composition-chain fallback to a single trace: when the stored
  * `composition_chain` is empty but a `parent_execution_id` is set, walk on
  * the fly via `resolveCompositionChain`. Returns the trace unchanged when the
  * chain is already populated, when no parent reference exists, or when the
@@ -1318,7 +1315,7 @@ app.post('/', async (c) => {
       final_org_id: traceOrgId,
     });
 
-    // F-37 (2026-04-26): denormalize composition_chain when client didn't.
+    // Denormalize composition_chain when client didn't.
     // When a parent is referenced but the client didn't supply a chain (or
     // supplied an empty one), look the parent up and compute
     //   chain = parent.composition_chain.concat(parent.execution_id)
@@ -1601,10 +1598,10 @@ app.post('/', async (c) => {
       db_result: result[0],
     });
 
-    // F-40 (2026-04-26): backfill composition_chain on any already-inserted
-    // children of this trace. Handles minibob's L1/L2 meta-trace write-order
-    // race where children land before parent. Single best-effort UPDATE — we
-    // never fail the just-succeeded insert on a backfill error.
+    // Backfill composition_chain on any already-inserted children of this
+    // trace. Handles minibob's L1/L2 meta-trace write-order race where
+    // children land before parent. Single best-effort UPDATE — we never fail
+    // the just-succeeded insert on a backfill error.
     await backfillChildCompositionChains(
       trace.execution_id,
       resolvedCompositionChain,
@@ -1690,8 +1687,8 @@ app.post('/', async (c) => {
       }
 
       // Emit impulse.resolved events — one per impulse_resolutions[] entry.
-      // F-9 resolution (2026-04-26): formalises the broadcaster contract so
-      // workbench's `routeValidationResultImpulse` no longer has to defend
+      // The broadcaster contract is formalised so workbench's
+      // `routeValidationResultImpulse` no longer has to defend
       // against an undocumented event body. Canonical fields ride flat;
       // `body` is optional (sourced from a matching output_impulses[] entry
       // when minibob included one — typically validation_result shapes).
@@ -1835,8 +1832,8 @@ app.post('/', async (c) => {
         tokens_in: trace.tokens_input,
         tokens_out: trace.tokens_output,
         parent_execution_id: body.parent_execution_id,
-        // F-37: prefer the denormalized chain (computed above) so the
-        // paradigm dual-write also lands with a populated chain.
+        // Prefer the denormalized chain (computed above) so the paradigm
+        // dual-write also lands with a populated chain.
         composition_chain: resolvedCompositionChain.length > 0
           ? resolvedCompositionChain
           : undefined,
@@ -2455,7 +2452,7 @@ app.get('/selection-outcomes', async (c) => {
     logger.info('Fetching selection outcomes', { selectionWhereClause, params });
 
     let selections: any[];
-    // F-36: API-key auth produces a JWT with `id: api_key:N` which SurrealDB
+    // API-key auth produces a JWT with `id: api_key:N` which SurrealDB
     // 3.x interprets as a record reference and rejects with "access method
     // cannot be used". Skip JWT path for API-key auth and fall back to root
     // creds + manual org_id filtering. Same pattern as routes/activities.ts.
@@ -2489,7 +2486,7 @@ app.get('/selection-outcomes', async (c) => {
       `;
 
       let executions: any[];
-      // F-36: API-key auth produces a JWT with `id: api_key:N` which SurrealDB
+      // API-key auth produces a JWT with `id: api_key:N` which SurrealDB
     // 3.x interprets as a record reference and rejects with "access method
     // cannot be used". Skip JWT path for API-key auth and fall back to root
     // creds + manual org_id filtering. Same pattern as routes/activities.ts.
@@ -2558,7 +2555,7 @@ app.get('/selection-outcomes', async (c) => {
     `;
 
     let countResult: { total: number }[];
-    // F-36: API-key auth produces a JWT with `id: api_key:N` which SurrealDB
+    // API-key auth produces a JWT with `id: api_key:N` which SurrealDB
     // 3.x interprets as a record reference and rejects with "access method
     // cannot be used". Skip JWT path for API-key auth and fall back to root
     // creds + manual org_id filtering. Same pattern as routes/activities.ts.
@@ -2664,7 +2661,7 @@ app.get('/selection-calibration', async (c) => {
 
     let calibrationRaw: any[];
 
-    // F-36: API-key auth produces a JWT with `id: api_key:N` which SurrealDB
+    // API-key auth produces a JWT with `id: api_key:N` which SurrealDB
     // 3.x interprets as a record reference and rejects with "access method
     // cannot be used". Skip JWT path for API-key auth and fall back to root
     // creds + manual org_id filtering. Same pattern as routes/activities.ts.
@@ -2709,7 +2706,7 @@ app.get('/selection-calibration', async (c) => {
     `;
 
     let countResult: { total: number }[];
-    // F-36: API-key auth produces a JWT with `id: api_key:N` which SurrealDB
+    // API-key auth produces a JWT with `id: api_key:N` which SurrealDB
     // 3.x interprets as a record reference and rejects with "access method
     // cannot be used". Skip JWT path for API-key auth and fall back to root
     // creds + manual org_id filtering. Same pattern as routes/activities.ts.
@@ -2783,7 +2780,7 @@ app.get('/calibration-summary', async (c) => {
 
     let summaryRaw: any[];
 
-    // F-36: API-key auth produces a JWT with `id: api_key:N` which SurrealDB
+    // API-key auth produces a JWT with `id: api_key:N` which SurrealDB
     // 3.x interprets as a record reference and rejects with "access method
     // cannot be used". Skip JWT path for API-key auth and fall back to root
     // creds + manual org_id filtering. Same pattern as routes/activities.ts.

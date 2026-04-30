@@ -5,7 +5,7 @@
  * exercised end-to-end by `routes/discover-by-shapes.test.ts` (REST) and
  * `routes/impulses-discover-by-shapes-shape.test.ts` (shape).
  *
- * F-6 corrected (2026-04-26): the helper is the single source of truth for both
+ * The helper is the single source of truth for both
  * the REST route and the `discoverByShapesQuery` impulse-resolve shape, so that
  * adding a new caller does not require duplicating SQL or composition-score
  * augmentation.

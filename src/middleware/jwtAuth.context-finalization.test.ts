@@ -1,5 +1,5 @@
 /**
- * F-44: POST /v2/impulses returned HTTP 500 with Hono's
+ * Background: POST /v2/impulses returned HTTP 500 with Hono's
  * "Context is not finalized. Did you forget to return a Response object or
  * `await next()`?" error for every minibob impulse-storage call.
  *
@@ -31,8 +31,8 @@ import { jwtAuthMiddleware } from './jwtAuth';
 function appWithMiddleware(): Hono {
   const app = new Hono();
   // Mirror the wrapper in src/index.ts (the wrapper that USED to drop the
-  // Response). After F-44, the wrapper returns the middleware's result so
-  // 401 short-circuits propagate to the client.
+  // Response). The wrapper now returns the middleware's result so 401
+  // short-circuits propagate to the client.
   app.use('/v2/*', async (c, next) => {
     if (c.req.path.startsWith('/v2/auth/')) {
       await next();
@@ -44,7 +44,7 @@ function appWithMiddleware(): Hono {
   return app;
 }
 
-describe('jwtAuthMiddleware F-44', () => {
+describe('jwtAuthMiddleware context finalization', () => {
   test('passes through X-Internal-Api-Key requests with jwtAuth=null', async () => {
     const app = appWithMiddleware();
     const res = await app.request('/v2/impulses', {
@@ -83,7 +83,7 @@ describe('jwtAuthMiddleware F-44', () => {
     expect(res.status).toBe(200);
   });
 
-  test('regression: pre-F-44 wrapper (no return) reproduces unfinalized-context 500', async () => {
+  test('regression: wrapper without return reproduces unfinalized-context 500', async () => {
     // Demonstrates the bug. The wrapper in src/index.ts USED to do
     //   await jwtAuthMiddleware(c, next);
     // discarding the Response from the middleware's c.json(401) short-circuit.
@@ -99,7 +99,7 @@ describe('jwtAuthMiddleware F-44', () => {
       );
     });
     app.use('/v2/*', async (c, next) => {
-      // ⛔ Pre-F-44 buggy form: no `return` — Response is discarded.
+      // ⛔ Buggy form: no `return` — Response is discarded.
       await jwtAuthMiddleware(c, next);
     });
     app.post('/v2/impulses', (c) => c.json({ ok: true }));

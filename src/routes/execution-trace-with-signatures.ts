@@ -539,7 +539,7 @@ export async function runExecutionTraceWithSignatures(
     };
   });
 
-  // F-37/F-40 read-time fallback (2026-04-26): when stored chain is empty
+  // Read-time fallback: when stored chain is empty
   // but parent_execution_id is set, walk on the fly. Read-only — never
   // writes back. Per-request memoization cache: sibling traces sharing a
   // parent collapse to one DB walk per distinct parent. The walk reads

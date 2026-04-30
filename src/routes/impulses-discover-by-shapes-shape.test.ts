@@ -1,8 +1,8 @@
 /**
  * /v2/impulses/resolve → discoverByShapesQuery
  *
- * F-6 corrected (2026-04-26): activity-api advertises the `discoverByShapesQuery`
- * shape so meta-activities reach POST /v2/activities/discover-by-shapes through
+ * activity-api advertises the `discoverByShapesQuery` shape so
+ * meta-activities reach POST /v2/activities/discover-by-shapes through
  * the existing generic `impulse-resolve` resolver in minibob — no source changes
  * in the integrating vessel.
  *

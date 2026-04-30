@@ -595,7 +595,7 @@ describe('broadcaster.task.completed payload symmetry', () => {
 });
 
 // ============================================================================
-// F-37 (2026-04-26): denormalizeCompositionChain server-side helper
+// denormalizeCompositionChain server-side helper
 // ----------------------------------------------------------------------------
 // Every trace on canary had `composition_chain: []` despite
 // `parent_execution_id` being correctly set. The denormalization step that
@@ -609,7 +609,7 @@ describe('broadcaster.task.completed payload symmetry', () => {
 // the helper itself.
 // ============================================================================
 
-describe('denormalizeCompositionChain (F-37 server-side denormalization)', () => {
+describe('denormalizeCompositionChain (server-side denormalization)', () => {
   let queryMock: ReturnType<typeof spyOn> | null = null;
 
   afterEach(() => {
@@ -726,14 +726,15 @@ describe('denormalizeCompositionChain (F-37 server-side denormalization)', () =>
 });
 
 // ============================================================================
-// F-40 (2026-04-26): backfillChildCompositionChains — write-order race fix
+// backfillChildCompositionChains — write-order race fix
 // ----------------------------------------------------------------------------
-// F-37 computes composition_chain at child-insert time by reading the parent.
-// minibob's L1/L2 meta-traces (`emitMetaTrace` for `_goal_resolve` /
-// `_activity_execute`) wrap an entire goal flow and emit AFTER their
-// children, so the F-37 lookup finds nothing. F-40 closes the race: after a
-// successful insert, run a best-effort UPDATE on already-inserted children
-// whose chain is still empty. These tests are a behavioural simulation of
+// The insert-time helper computes composition_chain at child-insert time by
+// reading the parent. minibob's L1/L2 meta-traces (`emitMetaTrace` for
+// `_goal_resolve` / `_activity_execute`) wrap an entire goal flow and emit
+// AFTER their children, so the parent lookup finds nothing. The backfill
+// closes the race: after a successful insert, run a best-effort UPDATE on
+// already-inserted children whose chain is still empty. These tests are a
+// behavioural simulation of
 // the round-trip: child inserts first (chain stays []), then parent inserts
 // and the backfill rewrites the child's chain.
 //
@@ -743,7 +744,7 @@ describe('denormalizeCompositionChain (F-37 server-side denormalization)', () =>
 // not propagate.
 // ============================================================================
 
-describe('backfillChildCompositionChains (F-40 write-order race)', () => {
+describe('backfillChildCompositionChains (write-order race)', () => {
   let queryMock: ReturnType<typeof spyOn> | null = null;
 
   afterEach(() => {
@@ -754,21 +755,21 @@ describe('backfillChildCompositionChains (F-40 write-order race)', () => {
   });
 
   test('late parent: child inserted first lands with [], parent insert backfills to [parent.id]', async () => {
-    // Round-trip simulation. Step 1: child inserts before parent → F-37
-    // helper finds no parent and returns []. Step 2: parent inserts → F-40
-    // backfill runs an UPDATE that sets the child's chain to
+    // Round-trip simulation. Step 1: child inserts before parent → the
+    // insert-time helper finds no parent and returns []. Step 2: parent
+    // inserts → backfill runs an UPDATE that sets the child's chain to
     // [...parent.chain, parent.id]. Parent itself is a root, so its chain
     // is [] → child's new chain is [parent.id].
 
-    // Step 1: child-insert path. F-37 helper finds nothing for missing
-    // parent and returns []. (This piece is already covered upstream; we
-    // pin it here to lock the round-trip.)
+    // Step 1: child-insert path. Insert-time helper finds nothing for
+    // missing parent and returns []. (This piece is already covered upstream;
+    // we pin it here to lock the round-trip.)
     queryMock = spyOn(surrealDB, 'query').mockResolvedValueOnce([] as any);
     const childInitialChain = await denormalizeCompositionChain('parent-id');
     expect(childInitialChain).toEqual([]);
     queryMock.mockRestore();
 
-    // Step 2: parent-insert path. F-40 backfill runs. We capture the
+    // Step 2: parent-insert path. Backfill runs. We capture the
     // arguments and assert the parameter shape — that's all a real DB
     // would need to produce the right post-condition.
     const updateMock = spyOn(surrealDB, 'query').mockResolvedValueOnce(
@@ -794,7 +795,7 @@ describe('backfillChildCompositionChains (F-40 write-order race)', () => {
 
   test('late grandparent (mid-tree backfill): parent insert with chain=[root] backfills children to [root, parent]', async () => {
     // The parent itself is a mid-tree node — its chain is already populated
-    // by F-37 at its own insert time (because the grandparent inserted
+    // by the insert-time helper at its own insert time (because the grandparent inserted
     // first, which is the common L3-template case). When this mid-tree
     // parent inserts, any already-inserted children get backfilled with
     // [...parent.chain, parent.id] = [root, parent].
@@ -869,15 +870,16 @@ describe('backfillChildCompositionChains (F-40 write-order race)', () => {
 });
 
 // ============================================================================
-// F-37/F-40 read-time fallback (2026-04-26): walkCompositionChain
+// Read-time fallback: walkCompositionChain
 // ----------------------------------------------------------------------------
-// F-37 + F-40 are write-time fixes. Traces inserted before either landed, or
-// under pathological orderings F-40 can't reach, can still expose
-// `composition_chain: []` despite valid `parent_execution_id`. The helper
-// walks the parent chain on demand; read-only — never writes back.
+// The denormalize and backfill helpers are write-time fixes. Traces inserted
+// before either landed, or under pathological orderings the backfill can't
+// reach, can still expose `composition_chain: []` despite a valid
+// `parent_execution_id`. The helper walks the parent chain on demand;
+// read-only — never writes back.
 // ============================================================================
 
-describe('walkCompositionChain (F-37/F-40 read-time fallback)', () => {
+describe('walkCompositionChain (read-time fallback)', () => {
   let queryMock: ReturnType<typeof spyOn> | null = null;
   afterEach(() => {
     queryMock?.mockRestore();

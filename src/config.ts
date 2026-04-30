@@ -246,7 +246,7 @@ export function loadConfig(): Config {
         // The resolver is still wired so consumers can fan out to activity-api
         // without 4xx-ing; it returns an empty tool list. See impulses.ts.
         'mcpTool',
-        // discoverByShapesQuery (F-6 corrected, 2026-04-26): pure-vessel shape
+        // discoverByShapesQuery: pure-vessel shape
         // wrapping POST /v2/activities/discover-by-shapes. Pointer fields
         // (required_shapes, mode, output_shapes, current_shapes, limit,
         // predecessor_activity_id) feed the same shared helper as the REST

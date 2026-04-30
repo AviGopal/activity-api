@@ -76,7 +76,7 @@ app.use('/v2/*', async (c, next) => {
     return;
   }
   // JWT auth only (no Redis session fallback)
-  // F-44: must return the middleware's result so the Response from a 401
+  // Must return the middleware's result so the Response from a 401
   // c.json(...) propagates back to Hono. Without this, when
   // jwtAuthMiddleware short-circuits (e.g. missing Authorization header on a
   // protected path), Hono sees the wrapper finish without c.finalized=true
@@ -177,7 +177,7 @@ app.route('/v2/auth', authRoutes);
 // Activity routes (GET /v2/activities/templates, etc.)
 app.route('/v2/activities', activitiesRoutes);
 
-// Goal paths routes (Phase 1.7: Thompson Sampling over paths)
+// Goal paths routes (Thompson Sampling over paths)
 app.route('/v2/goal-paths', goalPathsRoutes);
 
 // Impulse routes (POST /v2/impulses, GET /v2/impulses/:id, GET /v2/impulses)

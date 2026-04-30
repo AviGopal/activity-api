@@ -1,5 +1,5 @@
 -- ============================================================================
--- Migration 004: Execution Traces Storage (Phase 1.8)
+-- Migration 004: Execution Traces Storage
 -- ============================================================================
 -- Purpose: Store execution traces for debugging-as-activity workflow
 --

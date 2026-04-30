@@ -117,7 +117,7 @@ export interface ToolCallMessage extends WebSocketMessage {
  * trace ingestion (sourced from the trace's `impulse_resolutions[]` array
  * symmetric with the persisted shape; see migration 086).
  *
- * **Contract (formalised 2026-04-26 — design F-9 resolution).**
+ * **Contract.**
  * All canonical fields ride FLAT on `data`. The legacy/defensive nested-
  * `impulse` envelope variant is no longer emitted by activity-api; consumers
  * may keep tolerating both for forward-compat with other vessels (e.g.

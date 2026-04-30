@@ -1,5 +1,5 @@
 /**
- * F-43 coercion test: POST /v2/activities/impulse-relevance accepts both
+ * Legacy-field coercion: POST /v2/activities/impulse-relevance accepts both
  * `activity_id` (legacy, used by minibob mcp.ts:2469) and the canonical
  * `activity_variant_id`. The schema continues to require
  * `activity_variant_id`; the handler maps the legacy field at the entry
@@ -25,7 +25,7 @@ const basePayload = {
   execution_succeeded: true,
 };
 
-describe('POST /v2/activities/impulse-relevance — F-43 activity_id coercion', () => {
+describe('POST /v2/activities/impulse-relevance — activity_id coercion', () => {
   let queryMock: ReturnType<typeof spyOn> | null = null;
   let warnMock: ReturnType<typeof spyOn> | null = null;
 
@@ -34,7 +34,7 @@ describe('POST /v2/activities/impulse-relevance — F-43 activity_id coercion', 
     if (warnMock) { warnMock.mockRestore(); warnMock = null; }
   });
 
-  test('canonical activity_variant_id only: accepted, no F-43 warn log', async () => {
+  test('canonical activity_variant_id only: accepted, no coercion warn log', async () => {
     queryMock = spyOn(surrealDB, 'query').mockResolvedValue([] as any);
     warnMock = spyOn(logger, 'warn');
 
@@ -45,13 +45,13 @@ describe('POST /v2/activities/impulse-relevance — F-43 activity_id coercion', 
     });
 
     expect(response.status).toBe(200);
-    const f43Warns = (warnMock.mock.calls as unknown[][]).filter(
-      (c) => typeof c[0] === 'string' && (c[0] as string).includes('F-43 coercion applied'),
+    const coercionWarns = (warnMock.mock.calls as unknown[][]).filter(
+      (c) => typeof c[0] === 'string' && (c[0] as string).includes('Coercion applied'),
     );
-    expect(f43Warns.length).toBe(0);
+    expect(coercionWarns.length).toBe(0);
   });
 
-  test('legacy activity_id only: accepted, F-43 warn log emitted', async () => {
+  test('legacy activity_id only: accepted, coercion warn log emitted', async () => {
     queryMock = spyOn(surrealDB, 'query').mockResolvedValue([] as any);
     warnMock = spyOn(logger, 'warn');
 
@@ -62,10 +62,10 @@ describe('POST /v2/activities/impulse-relevance — F-43 activity_id coercion', 
     });
 
     expect(response.status).toBe(200);
-    const f43Warns = (warnMock.mock.calls as unknown[][]).filter(
-      (c) => typeof c[0] === 'string' && (c[0] as string).includes('F-43 coercion applied'),
+    const coercionWarns = (warnMock.mock.calls as unknown[][]).filter(
+      (c) => typeof c[0] === 'string' && (c[0] as string).includes('Coercion applied'),
     );
-    expect(f43Warns.length).toBe(1);
+    expect(coercionWarns.length).toBe(1);
     // The mapped value must reach the DB call.
     const queryCalls = queryMock.mock.calls as unknown[][];
     const checkCall = queryCalls.find(
@@ -90,10 +90,10 @@ describe('POST /v2/activities/impulse-relevance — F-43 activity_id coercion', 
     });
 
     expect(response.status).toBe(200);
-    const f43Warns = (warnMock.mock.calls as unknown[][]).filter(
-      (c) => typeof c[0] === 'string' && (c[0] as string).includes('F-43 coercion applied'),
+    const coercionWarns = (warnMock.mock.calls as unknown[][]).filter(
+      (c) => typeof c[0] === 'string' && (c[0] as string).includes('Coercion applied'),
     );
-    expect(f43Warns.length).toBe(0);
+    expect(coercionWarns.length).toBe(0);
     const queryCalls = queryMock.mock.calls as unknown[][];
     const checkCall = queryCalls.find(
       (c) => typeof c[1] === 'object' && c[1] !== null && 'activity_variant_id' in (c[1] as Record<string, unknown>),

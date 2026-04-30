@@ -7,9 +7,10 @@
 --          maintenance entirely through impulse resolution.
 --
 -- DEPRECATED 2026-04-27 — INSERT INTO activity_template / variant_performance_metrics
--- blocks removed. Reason: post-F-35 init-db re-runs were re-INSERTing rows on
--- every redeploy (no explicit ids → SurrealDB generated new record ids each
--- time → duplicate rows, consistent with F-49's "doubly-wrapped corrupted
--- rows" symptom). Templates are now owned by minibob's EMBEDDED_TEMPLATE_FILES
--- + the upcoming ribosome meta-activity. The migration is retained as a
--- numbered no-op so the migration ledger stays contiguous.
+-- blocks removed. Reason: after the migration-runner fix landed, init-db
+-- re-runs were re-INSERTing rows on every redeploy (no explicit ids →
+-- SurrealDB generated new record ids each time → duplicate rows, consistent
+-- with the "doubly-wrapped corrupted rows" symptom seen in template ids).
+-- Templates are now owned by minibob's EMBEDDED_TEMPLATE_FILES + the
+-- ribosome meta-activity. The migration is retained as a numbered no-op so
+-- the migration ledger stays contiguous.

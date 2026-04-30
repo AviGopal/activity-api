@@ -1,5 +1,5 @@
 /**
- * F-49 regression coverage (2026-04-27): the canary registry surfaced
+ * Regression coverage: the canary registry surfaced
  * three templates whose record id was doubled-wrapped, e.g.
  * `activity:⟨activity:⟨hello-world-minimal⟩⟩` instead of the canonical
  * `activity:⟨hello-world-minimal⟩`. This was reproducible end-to-end:
@@ -62,7 +62,7 @@ app.route('/v2/activities', activitiesRouter);
 
 const baseTemplate = {
   name: 'Test Template',
-  description: 'F-49 regression fixture',
+  description: 'doubled-prefix regression fixture',
   category: 'tool',
   tasks: [
     { id: 't1', description: 'one', prompt: { template: 'do thing' } },
@@ -90,7 +90,7 @@ function resetCapturedQueries(): void {
   surrealQueries.length = 0;
 }
 
-describe('POST /v2/activities/templates — F-49 activity id normalization', () => {
+describe('POST /v2/activities/templates — activity id normalization', () => {
   test('bare id passes through unchanged (regression: must still work)', async () => {
     resetCapturedQueries();
     const response = await app.request('/v2/activities/templates', {
@@ -103,7 +103,7 @@ describe('POST /v2/activities/templates — F-49 activity id normalization', () 
     expect(findActivityUpsertId()).toBe('hello-world-minimal');
   });
 
-  test('prefixed `activity:name` form is stripped before upsert (F-49 canary symptom)', async () => {
+  test('prefixed `activity:name` form is stripped before upsert (doubled-prefix canary symptom)', async () => {
     resetCapturedQueries();
     const response = await app.request('/v2/activities/templates', {
       method: 'POST',

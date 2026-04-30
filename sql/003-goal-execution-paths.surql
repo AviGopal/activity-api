@@ -1,5 +1,5 @@
 -- =============================================================================
--- Learning System Phase 1.7: Goal Execution Paths
+-- Goal Execution Paths
 -- =============================================================================
 -- Aggregates activity execution sequences by goal for path-level recommendations
 -- Implements Thompson Sampling over paths instead of individual activities

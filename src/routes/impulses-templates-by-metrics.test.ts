@@ -1,7 +1,6 @@
 /**
- * F-NN-D regression coverage (2026-04-27): the
- * `activityTemplatesByMetrics` resolver renders markdown for the top-N
- * templates by execution metrics. The merge between
+ * Regression coverage: the `activityTemplatesByMetrics` resolver renders
+ * markdown for the top-N templates by execution metrics. The merge between
  * `variant_performance_metrics` (where `variant_id` is a plain `string`)
  * and the `activity_template` view (where `variant_id` is aliased from
  * the `activity` table's record id, so the JS driver returns a
@@ -125,7 +124,7 @@ async function resolve(app: Hono, pointer: Record<string, unknown>) {
   return { status: res.status, body: await res.json() };
 }
 
-describe('F-NN-D: activityTemplatesByMetrics merges RecordId variant_id correctly', () => {
+describe('activityTemplatesByMetrics merges RecordId variant_id correctly', () => {
   beforeEach(() => {
     queryCallIndex = 0;
   });
@@ -198,7 +197,7 @@ describe('F-NN-D: activityTemplatesByMetrics merges RecordId variant_id correctl
 });
 
 // ============================================================================
-// F-NN-D hot-fix regression — polymorphic variant_id (string + RecordId mix)
+// Hot-fix regression — polymorphic variant_id (string + RecordId mix)
 // ============================================================================
 // Symptom (canary post-caa86b5): hard 500 on
 //   POST /v2/impulses/resolve { pointer: { type: "activityTemplatesByMetrics" } }
@@ -218,7 +217,7 @@ describe('F-NN-D: activityTemplatesByMetrics merges RecordId variant_id correctl
 // `$variant_ids` (already in bare-name form on the JS side).
 // ============================================================================
 
-describe('F-NN-D hot-fix: activityTemplatesByMetrics handles mixed string + RecordId variant_id', () => {
+describe('activityTemplatesByMetrics handles mixed string + RecordId variant_id', () => {
   test('merges template details when activity_template returns MIXED string and RecordId variant_ids', async () => {
     // Reset module cache so we can re-mock with a different templateRows
     // shape than the top-level mock used above. We rebuild the surreal

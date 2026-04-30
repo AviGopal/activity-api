@@ -237,7 +237,7 @@ describe('WebSocket Event Types', () => {
     expect(message.data).toHaveProperty('cost_usd');
   });
 
-  // F-9 resolution (2026-04-26): impulse.resolved event body contract.
+  // impulse.resolved event body contract.
   // The flat-payload form is canonical; `body` is OPTIONAL and present only
   // when the broadcaster could source resolved-impulse content from the
   // matching output_impulses[] entry. See src/websocket/types.ts
@@ -288,7 +288,7 @@ describe('WebSocket Event Types', () => {
   });
 
   test('impulse.resolved event omits body when content not available', () => {
-    // F-9 contract: `body` is optional. When the trace doesn't carry
+    // Contract: `body` is optional. When the trace doesn't carry
     // matching content (e.g. file-pointer impulses where content lives on
     // disk only), the field is omitted. Consumers MUST treat absent body as
     // a non-error — the impulse is still considered resolved.

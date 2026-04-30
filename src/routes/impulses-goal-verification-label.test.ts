@@ -1,5 +1,5 @@
 /**
- * Tests for goal_verification_label_write resolver (T5.2, migration 101)
+ * Tests for goal_verification_label_write resolver (migration 101)
  *
  * Verifies:
  *   - Valid payload → 200 with record ID

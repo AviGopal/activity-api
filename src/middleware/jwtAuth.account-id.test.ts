@@ -12,7 +12,7 @@
  *   2. identity-vessel does NOT emit `accountId` (older deploy)
  *      → JwtAuthContext.accountId is undefined; orgId is still populated and
  *        downstream code falls back to org_id paths (Phase B handlers' contract).
- *   3. The L-3 fall-through (generateJwtToken returns null) still propagates
+ *   3. The fall-through path (generateJwtToken returns null) still propagates
  *      `accountId` so the apikey-with-empty-jwtToken context can still be
  *      account-scoped.
  *
@@ -108,7 +108,7 @@ describe('Phase A: jwtAuthMiddleware passes accountId from identity-vessel', () 
     expect(body.jwtAuth.accountId).toBeUndefined();
   });
 
-  test('L-3 fall-through path still carries accountId when generateJwtToken returns null', async () => {
+  test('fall-through path still carries accountId when generateJwtToken returns null', async () => {
     validateApiKeyWithFallbackImpl.mockImplementation(async () => ({
       authenticated: true,
       orgId: 'org-test',
@@ -118,7 +118,7 @@ describe('Phase A: jwtAuthMiddleware passes accountId from identity-vessel', () 
       scopes: ['read', 'write'],
       authMethod: 'identity-vessel',
     }));
-    // L-3 simulation: JWT generation fails (e.g. JWT_SECRET drift) but the
+    // Fall-through simulation: JWT generation fails (e.g. JWT_SECRET drift) but the
     // API key was already validated by identity-vessel.
     generateJwtTokenImpl.mockImplementation(async () => null);
 
@@ -132,7 +132,7 @@ describe('Phase A: jwtAuthMiddleware passes accountId from identity-vessel', () 
     expect(body.jwtAuth).not.toBeNull();
     expect(body.jwtAuth.orgId).toBe('org-test');
     expect(body.jwtAuth.accountId).toBe('acc-test-002');
-    expect(body.jwtAuth.jwtToken).toBe(''); // L-3 marker: empty jwtToken
+    expect(body.jwtAuth.jwtToken).toBe(''); // Fall-through marker: empty jwtToken
     expect(body.jwtAuth.authType).toBe('apikey');
   });
 });

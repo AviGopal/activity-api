@@ -1,10 +1,10 @@
 /**
- * /v2/impulses/resolve top-level auth gate (F-32, 2026-04-26)
+ * /v2/impulses/resolve top-level auth gate
  *
- * Locks in the F-32 fix: the top-level `requireAuthenticated` guard at the
- * head of the `/resolve` handler used to check `jwtAuth?.jwtToken`. On canary
- * with a misaligned `JWT_SECRET`, API-key auth produces a `JwtAuthContext`
- * with `authType: 'apikey'` but an *empty* `jwtToken` (because
+ * The top-level `requireAuthenticated` guard at the head of the `/resolve`
+ * handler used to check `jwtAuth?.jwtToken`. On canary with a misaligned
+ * `JWT_SECRET`, API-key auth produces a `JwtAuthContext` with
+ * `authType: 'apikey'` but an *empty* `jwtToken` (because
  * `generateJwtToken` failed silently — see jwtAuth.ts:112-119). That left
  * read-only resolves like `executionTraceList` rejecting valid API-key
  * traffic with 401 "Authentication required for destructive operations" —
@@ -48,7 +48,7 @@ async function callResolve(app: Hono, pointer: Record<string, unknown>) {
   return { status: res.status, body: await res.json() };
 }
 
-describe('POST /v2/impulses/resolve auth gate (F-32)', () => {
+describe('POST /v2/impulses/resolve auth gate', () => {
   test('rejects when jwtAuth is null (no auth context)', async () => {
     const app = appWithAuth(null);
     const { status, body } = await callResolve(app, { type: 'executionTraceList', limit: 3 });
@@ -84,17 +84,17 @@ describe('POST /v2/impulses/resolve auth gate (F-32)', () => {
   });
 
   // -----------------------------------------------------------------------
-  // L-3 (2026-04-27): regression coverage at the route level. The middleware
-  // fix in jwtAuth.ts:103-130 propagates a JwtAuthContext with empty
-  // `jwtToken` when generateJwtToken returns null. These tests verify that
-  // the route handler honors that context for both read and write shapes.
+  // Regression coverage at the route level. The middleware in jwtAuth.ts
+  // propagates a JwtAuthContext with empty `jwtToken` when generateJwtToken
+  // returns null. These tests verify that the route handler honors that
+  // context for both read and write shapes.
   // -----------------------------------------------------------------------
 
-  test('L-3: API-key with empty jwtToken accepted on read-side resolves (activityTemplate)', async () => {
+  test('API-key with empty jwtToken accepted on read-side resolves (activityTemplate)', async () => {
     const app = appWithAuth({
       orgId: 'org-test',
       authType: 'apikey',
-      jwtToken: '', // L-3: generateJwtToken returned null
+      jwtToken: '', // generateJwtToken returned null
       keyId: 'test-key',
       scopes: ['read'],
     });
@@ -109,7 +109,7 @@ describe('POST /v2/impulses/resolve auth gate (F-32)', () => {
     expect(body.error || '').not.toContain('Authentication required');
   });
 
-  test('L-3: API-key with empty jwtToken accepted on activityMetrics read', async () => {
+  test('API-key with empty jwtToken accepted on activityMetrics read', async () => {
     const app = appWithAuth({
       orgId: 'org-test',
       authType: 'apikey',
@@ -125,12 +125,12 @@ describe('POST /v2/impulses/resolve auth gate (F-32)', () => {
     expect(body.error || '').not.toContain('Authentication required');
   });
 
-  test('L-3: API-key with empty jwtToken passes route gate on destructive shape (then deeper checks gate writes)', async () => {
+  test('API-key with empty jwtToken passes route gate on destructive shape (then deeper checks gate writes)', async () => {
     // Destructive shapes (e.g. activityTemplate_deprecate) call the SAME
-    // requireAuthenticated() gate at the head of their case. With L-3,
-    // empty jwtToken is OK at this layer — the per-case admin/org checks
-    // (downstream of requireAuthenticated) decide whether to permit the
-    // write. We only assert that the gate itself doesn't reject.
+    // requireAuthenticated() gate at the head of their case. Empty jwtToken
+    // is OK at this layer — the per-case admin/org checks (downstream of
+    // requireAuthenticated) decide whether to permit the write. We only
+    // assert that the gate itself doesn't reject.
     const app = appWithAuth({
       orgId: 'org-test',
       authType: 'apikey',
@@ -150,7 +150,7 @@ describe('POST /v2/impulses/resolve auth gate (F-32)', () => {
     expect(body.error || '').not.toContain('Authentication required for destructive operations');
   });
 
-  test('L-3: bearer JWT auth still works on destructive shapes (audit-trail invariant)', async () => {
+  test('bearer JWT auth still works on destructive shapes (audit-trail invariant)', async () => {
     const app = appWithAuth({
       orgId: 'org-test',
       authType: 'jwt',
@@ -169,9 +169,9 @@ describe('POST /v2/impulses/resolve auth gate (F-32)', () => {
     expect(body.error || '').not.toContain('Authentication required for destructive operations');
   });
 
-  test('L-3: null jwtAuth (no auth at all) still rejected at route gate', async () => {
-    // Sanity: the L-3 fix only relaxes the EMPTY-jwtToken case; absent any
-    // auth context whatsoever, we still reject. This covers the case where
+  test('null jwtAuth (no auth at all) still rejected at route gate', async () => {
+    // Sanity: the fix only relaxes the EMPTY-jwtToken case; absent any auth
+    // context whatsoever, we still reject. This covers the case where
     // identity-vessel rejects the API key (jwtAuth=null in middleware).
     const app = appWithAuth(null);
     const { status, body } = await callResolve(app, {

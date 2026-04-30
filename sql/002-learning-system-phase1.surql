@@ -1,16 +1,16 @@
 -- =============================================================================
--- Learning System Phase 1.1-1.6 Schema Migration
+-- Learning System Schema Migration
 -- =============================================================================
 -- Creates tables for:
---   - Activity composition graph (Phase 1.1-1.2)
---   - Impulse relevance metrics (Phase 1.3)
---   - Tool usage patterns (Phase 1.5)
--- 
--- Phase 1.6 uses existing activity_executions table (no migration needed)
+--   - Activity composition graph
+--   - Impulse relevance metrics
+--   - Tool usage patterns
+--
+-- Activity executions reuse the existing activity_executions table.
 -- =============================================================================
 
 -- =============================================================================
--- Table: activity_composition_graph (Phase 1.1-1.2)
+-- Table: activity_composition_graph
 -- =============================================================================
 -- Tracks parent-child relationships between activities (aggregated metrics)
 -- Supports multi-activity workflows and composition learning
@@ -69,7 +69,7 @@ DEFINE INDEX idx_composition_execution
 
 
 -- =============================================================================
--- Table: impulse_relevance_metrics (Phase 1.3)
+-- Table: impulse_relevance_metrics
 -- =============================================================================
 -- Tracks aggregated impulse relevance metrics
 -- Enables impulse recommendation and lazy loading optimization
@@ -144,7 +144,7 @@ DEFINE INDEX idx_impulse_relevance_combo
 
 
 -- =============================================================================
--- Table: tool_usage_patterns (Phase 1.5)
+-- Table: tool_usage_patterns
 -- =============================================================================
 -- Tracks aggregated tool usage metrics
 -- Enables tool recommendation and pattern learning

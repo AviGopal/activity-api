@@ -1,4 +1,4 @@
--- Migration 094: F-51 follow-up — DEFINE FIELD OVERWRITE for impulse_resolutions.*
+-- Migration 094: DEFINE FIELD OVERWRITE for impulse_resolutions.*
 --
 -- Migration 093's REMOVE+DEFINE pattern (matching 045's precedent for tasks.*)
 -- proved insufficient on SurrealDB 3.0 in production. Verified 2026-04-27 via
@@ -11,7 +11,7 @@
 -- object FLEXIBLE`) returned `ERR: The field 'impulse_resolutions.*' already
 -- exists` — the parent's FLEXIBLE auto-creates an implicit `.*` subfield, and
 -- the explicit DEFINE collides. init-db's "already exists" filter swallows it
--- as non-critical, but this is the statement that closes F-51.
+-- as non-critical, but this is the statement that closes the issue.
 --
 -- Fix: DEFINE FIELD OVERWRITE — SurrealDB 3.0 syntax that doesn't conflict
 -- with auto-created subfields.

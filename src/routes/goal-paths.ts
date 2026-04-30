@@ -1,6 +1,6 @@
 /**
- * Goal Execution Paths Routes (Phase 1.7)
- * 
+ * Goal Execution Paths Routes
+ *
  * Implements goal-based path tracking and Thompson Sampling recommendations:
  * - POST /goal-paths - Record path execution
  * - GET /goal-paths - Query paths for a goal

@@ -2,13 +2,13 @@
 -- Migration 093: Re-assert impulse_resolutions[*] is FLEXIBLE
 -- =============================================================================
 -- Date: 2026-04-26
--- Related: F-51, migrations 045 (precedent), 084 (table OVERWRITE), 086 (origin)
+-- Related migrations: 045 (precedent), 084 (table OVERWRITE), 086 (origin)
 --
 -- Symptom: Every POST /v2/activities/execution-traces returned 500 with:
 --   "Found field 'impulse_resolutions[N].cost_usd', but no such field
 --    exists for table 'activity_execution_traces'"
 -- Learning signals from minibob were never persisting, blocking
--- ribosome convergence (Phase 8 criterion 4).
+-- ribosome convergence.
 --
 -- Root cause: minibob's per-impulse-resolution wire shape grew over time
 -- (currently 6 fields per the SerializedImpulseResolution interface in
@@ -20,7 +20,8 @@
 --      SCHEMAFULL ... PERMISSIONS ...) ran AFTER 086 in some path; in
 --      SurrealDB, DEFINE TABLE OVERWRITE drops the previously-declared
 --      field set, dropping the FLEXIBLE clause along with it.
---   2. Or migrations were silently skipped pre-F-35 fix on this instance,
+--   2. Or migrations were silently skipped on this instance before the
+--      migration-runner fix landed,
 --      so 086's FLEXIBLE never landed on the live table.
 --
 -- Either way: a tracking-metadata array whose nested shape evolves with

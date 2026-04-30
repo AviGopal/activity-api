@@ -201,7 +201,7 @@ export function variantMetricsRecordId(
 }
 
 /**
- * B-4: parse the `offset` query param for paginated template listing.
+ * Parse the `offset` query param for paginated template listing.
  * - Non-numeric, negative, or NaN values clamp to 0.
  * - Floats truncate to int.
  * - Positive integers pass through.
@@ -608,9 +608,9 @@ async function listAllTemplatesFromDB(
   projectId?: string | null,
   jwtToken?: string | null,
   scopeFilter?: string | null,
-  executionType?: string | null, // T8: Allow filtering by execution_type
-  offset: number = 0, // B-4: Pagination offset (operator audit / shadow-template enumeration)
-  accountId?: string | null // Phase B1: prefer account_id, fall back to org_id
+  executionType?: string | null, // Allow filtering by execution_type
+  offset: number = 0, // Pagination offset (operator audit / shadow-template enumeration)
+  accountId?: string | null // Prefer account_id, fall back to org_id
 ): Promise<ActivityTemplate[]> {
   let query: string;
   let params: Record<string, any>;
@@ -740,7 +740,7 @@ async function listAllTemplatesFromDB(
 }
 
 /**
- * B-4: Count templates visible to caller, respecting the same RBAC + scope/exec-type
+ * Count templates visible to caller, respecting the same RBAC + scope/exec-type
  * filter as listAllTemplatesFromDB. Used by GET /v2/activities/templates to return
  * a `total` field so paginating callers (operator audit) know when they've walked
  * the full set.
@@ -923,7 +923,7 @@ app.post('/templates', async (c) => {
 
     // Normalize to canonical field names (accept both legacy and canonical)
     //
-    // F-49 (2026-04-27): clients sometimes round-trip a previously-fetched
+    // Clients sometimes round-trip a previously-fetched
     // template id back into POST /templates without unwrapping the
     // SurrealDB record-id form (e.g. `"activity:hello-world-minimal"` or
     // `"activity:⟨hello-world-minimal⟩"`). The downstream
@@ -1425,11 +1425,11 @@ app.get('/templates', async (c) => {
     }
     limit = Math.min(limit, 100);
 
-    // B-4: pagination offset for operator audit / shadow-template enumeration.
+    // Pagination offset for operator audit / shadow-template enumeration.
     // Limit is still capped at 100/request — operators iterate via offset.
     const offsetStr = c.req.query('offset') || '0';
     const offset = parsePaginationOffset(offsetStr);
-    // B-4: when paginating (offset > 0) we bypass Redis cache since the cache
+    // When paginating (offset > 0) we bypass Redis cache since the cache
     // holds the top-N list under one shared key; mid-page slices must hit DB.
     const paginating = offset > 0;
 
@@ -1463,7 +1463,7 @@ app.get('/templates', async (c) => {
 
     // CACHE-ASIDE PATTERN
     // Step 1: Check Redis cache for template list
-    // B-4: paginated requests (offset > 0) bypass the cache because the cache
+    // Paginated requests (offset > 0) bypass the cache because the cache
     // holds only the top window populated on a previous limit*2 prefetch — it
     // can't satisfy mid-page slices and would silently truncate operator audits.
     const redis = RedisClient.getInstance();
@@ -1520,7 +1520,7 @@ app.get('/templates', async (c) => {
           // JWTs are intentionally NOT passed here — they'd trip the
           // "access method cannot be used" error. Multi-tenant filtering for those
           // callers is enforced application-side via orgId/projectId below.
-          // B-4: when paginating, request exactly `limit` rows starting at
+          // When paginating, request exactly `limit` rows starting at
           // `offset`. For un-paginated requests we keep the existing limit*2
           // prefetch (used by the cache-population path).
           const dbTemplates = await listAllTemplatesFromDB(
@@ -1619,7 +1619,7 @@ app.get('/templates', async (c) => {
     logger.debug('Template enrichment point reached', { count: templates.length });
     logger.info('Templates enriched with metrics', { templatesWithMetrics: templates.filter(t => t.metrics).length });
 
-    // B-4: query a real total count (respects same RBAC + scope/exec-type filter
+    // Query a real total count (respects same RBAC + scope/exec-type filter
     // as the list query) so paginating callers know when they've walked the full
     // visible set. category is filtered application-side; reflect that in total.
     let total: number;
@@ -2486,7 +2486,7 @@ app.get('/executions', async (c) => {
  * 
  * Store execution trace for reuse as impulse in debugging-as-activity workflow.
  * 
- * Architecture (Phase 1.8 - Unified Impulse-Driven):
+ * Architecture (Unified Impulse-Driven):
  * - MiniBob executes activity with state capture enabled
  * - After completion (success OR failure), MiniBob calls this endpoint
  * - Trace stored in execution_traces table with full context
@@ -6275,13 +6275,14 @@ app.post('/similar-state', async (c) => {
 app.post('/impulse-relevance', async (c) => {
   try {
     const body = await c.req.json();
-    // F-43 coercion: legacy callers (e.g. minibob mcp.ts) send `activity_id`,
-    // but the schema requires `activity_variant_id`. Map the legacy field to
-    // the canonical one when the canonical one is absent. Explicit
-    // `activity_variant_id` always wins. Remove once all callers are updated.
+    // Legacy-field coercion: legacy callers (e.g. minibob mcp.ts) send
+    // `activity_id`, but the schema requires `activity_variant_id`. Map the
+    // legacy field to the canonical one when the canonical one is absent.
+    // Explicit `activity_variant_id` always wins. Remove once all callers are
+    // updated.
     if (body && body.activity_id && !body.activity_variant_id) {
       logger.warn(
-        "[impulse-relevance] caller using deprecated 'activity_id' field; use 'activity_variant_id'. F-43 coercion applied.",
+        "[impulse-relevance] caller using deprecated 'activity_id' field; use 'activity_variant_id'. Coercion applied.",
         { activity_id: body.activity_id },
       );
       body.activity_variant_id = body.activity_id;

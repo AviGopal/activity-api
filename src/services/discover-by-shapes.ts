@@ -6,7 +6,7 @@
  * (`discoverByShapesQuery` in routes/impulses.ts) without duplicating the SQL or
  * the composition-score augmentation.
  *
- * Architectural note (F-6 corrected, 2026-04-26):
+ * Architectural note:
  * The vessel-integration constraint says integrating with another vessel MUST
  * NOT require source changes in the integrating vessel. Activity-api advertises
  * the `discoverByShapesQuery` shape; meta-activities call it through the existing

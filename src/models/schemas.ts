@@ -616,7 +616,7 @@ export type ExecutionSequence = z.infer<typeof ExecutionSequenceSchema>;
 export type ExecutionSequenceRecordRequest = z.infer<typeof ExecutionSequenceRecordRequestSchema>;
 export type ExecutionSequenceQuery = z.infer<typeof ExecutionSequenceQuerySchema>;
 export type ExecutionSequenceResponse = z.infer<typeof ExecutionSequenceResponseSchema>;
-// Goal Execution Paths schemas (Phase 1.7)
+// Goal Execution Paths schemas
 export const GoalExecutionPathSchema = z.object({
   goal_hash: z.string(),
   goal_text: z.string(),

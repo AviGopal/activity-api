@@ -722,7 +722,7 @@ router.get('/', async (c) => {
  * 
  * This endpoint enables MiniBob to delegate non-local impulse resolution to the backend.
  * 
- * Architecture (Phase 1.8 - Unified Impulse-Driven):
+ * Architecture (Unified Impulse-Driven):
  * - MiniBob handles local pointers: memo, file
  * - Backend handles all others: activityExecutionTrace, activityTemplate, activityMetrics, etc.
  * - This enables backend to add new pointer types without MiniBob code changes
@@ -1271,15 +1271,15 @@ router.post('/resolve', async (c) => {
         } else {
           // Fetch template details for the top performers.
           //
-          // F-NN-D (2026-04-27): `activity_template` is queried polymorphically
-          // on canary — depending on which schema migrations have been applied,
-          // `variant_id` may be a plain `string` (schemafull table at
-          // `sql/001-init-schema.surql:46`) OR a SurrealDB `RecordId` object
-          // (paradigm view `v_paradigm_activity_template` at
+          // `activity_template` is queried polymorphically on canary — depending
+          // on which schema migrations have been applied, `variant_id` may be a
+          // plain `string` (schemafull table at `sql/001-init-schema.surql:46`)
+          // OR a SurrealDB `RecordId` object (paradigm view
+          // `v_paradigm_activity_template` at
           // `sql/migrations/069-paradigm-compat-views.surql:23-46`, which
           // aliases `id AS variant_id`).
           //
-          // Hot-fix (caa86b5 follow-up): the prior fix used
+          // The prior fix used
           // `meta::id(variant_id) IN $variant_ids` unconditionally, which
           // throws `Incorrect arguments for function meta::id(). Argument 1
           // was the wrong type. Expected record but found '<id>'` whenever a
@@ -2155,12 +2155,12 @@ router.post('/resolve', async (c) => {
           // SurrealDB stores record ids as `table:`id`` composites. Use
           // record::id(id) to extract the string part for matching, matching
           // the pattern used elsewhere (execution-traces.ts:1063).
-          // Spec 6: global templates may only be modified by admin callers.
+          // Global templates may only be modified by admin callers.
           //
-          // B-2-fix (2026-04-26): Split existence check from RBAC check so we
-          // can return 404 vs 403 distinctly. The previous combined query
-          // returned 404 both for missing rows AND for rows excluded by the
-          // admin/org gate, which leaked no info but also misled callers.
+          // Existence check is split from the RBAC check so we can return 404
+          // vs 403 distinctly. A combined query returned 404 both for missing
+          // rows AND for rows excluded by the admin/org gate, which leaked no
+          // info but also misled callers.
           const existing = await executeAsAuth<any>(
             jwtAuth,
             `SELECT * FROM activity WHERE record::id(id) = $id LIMIT 1`,
@@ -2250,12 +2250,12 @@ router.post('/resolve', async (c) => {
           (Array.isArray(jwtAuth.scopes) && jwtAuth.scopes.includes('admin'));
 
         try {
-          // B-2-fix (2026-04-26): Split existence check from RBAC check so we
-          // can return distinct status codes. Returning 404 on RBAC denial
-          // leaks no info about whether the row exists, but it also confused
-          // the iter-26 11.1 retry into chasing phantom id-format issues
-          // before realizing the real cause was admin-scope RBAC. Now: row
-          // missing → 404; row present but caller lacks permission → 403.
+          // Split existence check from RBAC check so we can return distinct
+          // status codes. Returning 404 on RBAC denial leaks no info about
+          // whether the row exists, but it also confuses callers chasing
+          // phantom id-format issues when the real cause is admin-scope RBAC.
+          // Now: row missing → 404; row present but caller lacks permission →
+          // 403.
           const existing = await executeAsAuth<any>(
             jwtAuth,
             `SELECT id, scope, org_id FROM activity WHERE record::id(id) = $id LIMIT 1`,
@@ -2611,7 +2611,7 @@ router.post('/resolve', async (c) => {
         );
       }
 
-      // discoverByShapesQuery (F-6 corrected, 2026-04-26): pure-vessel shape
+      // discoverByShapesQuery: pure-vessel shape
       // wrapping POST /v2/activities/discover-by-shapes. Activity-api advertises
       // this shape via discovery-vessel; meta-activities reach it through the
       // existing generic `impulse-resolve` resolver in minibob — zero source
@@ -3206,10 +3206,10 @@ function formatTemplateListAsMarkdown(templates: any[], heading: string): string
  * Used by activityTemplatesByMetrics resolver
  */
 function formatTemplateListWithMetricsAsMarkdown(templates: any[]): string {
-  // F-NN-D defense in depth: variant_id may arrive as a SurrealDB RecordId
-  // object from view-aliased columns. Coerce via normalizeRecordId so the
-  // markdown never renders "[object Object]" or "undefined" for ids that
-  // came back wrapped.
+  // Defense in depth: variant_id may arrive as a SurrealDB RecordId object
+  // from view-aliased columns. Coerce via normalizeRecordId so the markdown
+  // never renders "[object Object]" or "undefined" for ids that came back
+  // wrapped.
   const idStr = (v: unknown): string => {
     const s = normalizeRecordId(v);
     return s.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '') || s;

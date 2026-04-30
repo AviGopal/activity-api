@@ -1,5 +1,5 @@
 /**
- * B-4: Pagination tests for GET /v2/activities/templates
+ * Pagination tests for GET /v2/activities/templates
  *
  * Pins the pagination contract added so operators can enumerate beyond the
  * previous 100-row cap (per the 11.1 retry findings: ~10 hidden shadow
@@ -18,7 +18,7 @@
 import { describe, test, expect } from 'bun:test';
 import { parsePaginationOffset } from './activities';
 
-describe('B-4: parsePaginationOffset', () => {
+describe('parsePaginationOffset', () => {
   test('returns 0 for missing input', () => {
     expect(parsePaginationOffset(undefined)).toBe(0);
     expect(parsePaginationOffset(null)).toBe(0);
@@ -55,7 +55,7 @@ describe('B-4: parsePaginationOffset', () => {
   });
 });
 
-describe('B-4: GET /v2/activities/templates pagination response contract', () => {
+describe('GET /v2/activities/templates pagination response contract', () => {
   /**
    * The contract operator scripts depend on. Each test pins one invariant.
    * The handler returns:
@@ -158,7 +158,7 @@ describe('B-4: GET /v2/activities/templates pagination response contract', () =>
   });
 });
 
-describe('B-4: pagination respects RBAC scoping', () => {
+describe('pagination respects RBAC scoping', () => {
   /**
    * Documentation test: total reflects what the caller can SEE, not the
    * global table size. countAllTemplatesFromDB mirrors the same WHERE
