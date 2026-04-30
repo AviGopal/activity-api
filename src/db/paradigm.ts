@@ -942,9 +942,12 @@ export async function getShapeConditionedScores(
  * Query activities using full-text search on name and description.
  * Uses BM25 scoring from the idx_activity_name_fts and idx_activity_description_fts indexes.
  *
- * The search uses the @@ operator for FTS matching with score indices:
- * - @0@@ binds to name index (search::score(0))
- * - @1@@ binds to description index (search::score(1))
+ * The search uses the @N@ operator for FTS matching with score indices:
+ * - @0@ binds to name index (search::score(0))
+ * - @1@ binds to description index (search::score(1))
+ *
+ * SurrealDB 3.x note: triple-@ (@N@@) is a parser bug — it splits as
+ * `@@ @` and rejects the RHS literal. Use single-@ (@N@).
  *
  * Name matches are weighted 2x higher than description matches to prioritize
  * activities where the search term appears in the title.
@@ -1014,7 +1017,7 @@ export async function queryActivitiesByFTS(
       });
       return { data: [], path: 'new', latency_ms: latencyMs };
     }
-    whereClauses.push(`(name @0@@ '${ftsLiteral}' OR description @1@@ '${ftsLiteral}')`);
+    whereClauses.push(`(name @0@ '${ftsLiteral}' OR description @1@ '${ftsLiteral}')`);
 
     // Multi-tenant filtering: include global scope OR org-specific activities
     if (orgId) {
