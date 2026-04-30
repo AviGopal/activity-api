@@ -1145,6 +1145,73 @@ router.post('/resolve', async (c) => {
         break;
       }
 
+      case 'shape_gap_resolution': {
+        // Phase 10 P4.5: routable shape for cached gap-resolution lookups.
+        // Slot-binding consults this before triggering create-shape-
+        // provider-goal escalation. Pointer fields:
+        //   shape (required)
+        //   account_id (optional; falls back to caller's JWT accountId)
+        // Returns up to 50 most-recent matching rows, ordered by
+        // last_used_at DESC, times_used DESC. Defence-in-depth WHERE
+        // mirrors the GET endpoint (multi-tenant scoping is primarily
+        // enforced by the table's PERMISSIONS clause from migration 105).
+        const sgPointer = pointer as typeof pointer & {
+          shape?: string;
+          account_id?: string;
+        };
+        if (!sgPointer.shape || typeof sgPointer.shape !== 'string') {
+          return c.json({ success: false, error: 'shape is required for shape_gap_resolution' } as ImpulseResolveResponse, 400);
+        }
+        try {
+          const jwtAuth = getJwtAuthFromContext(c);
+          const session = (c.get as any)('session') as SessionData | undefined;
+          const orgId = jwtAuth?.orgId || session?.org_id || null;
+          const callerAccountId: string | null = jwtAuth?.accountId ?? null;
+          if (!orgId) {
+            return c.json({ success: false, error: 'Unauthorized: missing org context' } as ImpulseResolveResponse, 401);
+          }
+          const filterAccountId = sgPointer.account_id ?? callerAccountId;
+          const lookupQuery = `
+            SELECT
+              record::id(id) AS id,
+              shape, account_id, resolved_by, required_scope,
+              resolution_type, escalation_depth, cost_usd, times_used,
+              first_seen_at, last_used_at
+            FROM shape_gap_resolution
+            WHERE shape = $shape
+              AND org_id = $org_id
+              AND (account_id IS NONE OR account_id = $account_id_filter)
+            ORDER BY last_used_at DESC, times_used DESC
+            LIMIT 50
+          `;
+          const sgParams = {
+            shape: sgPointer.shape,
+            org_id: orgId,
+            account_id_filter: filterAccountId,
+          };
+          const sgResult = jwtAuth?.jwtToken
+            ? await queryWithAuth<any[]>(jwtAuth.jwtToken, lookupQuery, sgParams)
+            : await surrealDB.query<any[]>(lookupQuery, sgParams);
+          const sgRows = (sgResult || []).flat?.() || sgResult || [];
+          return c.json({
+            success: true,
+            content: JSON.stringify({
+              shape: sgPointer.shape,
+              account_id: filterAccountId,
+              resolutions: sgRows,
+              total: Array.isArray(sgRows) ? sgRows.length : 0,
+            }),
+            metadata: {
+              shape: 'shape_gap_resolution',
+              summary: `${Array.isArray(sgRows) ? sgRows.length : 0} cached resolution(s) for ${sgPointer.shape}`,
+            },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          logger.error('shape_gap_resolution resolve failed', { error: err?.message });
+          return c.json({ success: false, error: err?.message || 'shape_gap_resolution lookup failed' } as ImpulseResolveResponse, 500);
+        }
+      }
+
       case 'thompson_posterior': {
         // Phase 9: routable shape for per-variant Thompson posteriors. Lifts
         // the implicit Thompson vessel inside activity-api into the standard

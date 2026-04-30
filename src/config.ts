@@ -231,6 +231,15 @@ export function loadConfig(): Config {
         // Summary aggregates across variants; thompson_posterior is per-
         // variant precise). See docs/impulse-types/thompson_posterior.md.
         'thompson_posterior',
+        // Phase 10 P4.5 (2026-04-30): cached resolutions for previously
+        // missing impulse shapes. Slot-binding consults this shape
+        // before triggering create-shape-provider-goal escalation —
+        // when prior resolution data exists the cached entry tells the
+        // dispatcher which activity / vessel / sub-goal to use,
+        // skipping a full recursive cycle. Pointer fields: shape
+        // (required), account_id (opt). Response carries the same
+        // row layout as GET /v2/activities/shape-gap-resolution.
+        'shape_gap_resolution',
         'activityTemplateRecommendation',
         'activityTemplatesByMetrics',
         'executionTraces',
