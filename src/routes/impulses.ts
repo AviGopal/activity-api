@@ -1145,6 +1145,111 @@ router.post('/resolve', async (c) => {
         break;
       }
 
+      case 'thompson_posterior': {
+        // Phase 9: routable shape for per-variant Thompson posteriors. Lifts
+        // the implicit Thompson vessel inside activity-api into the standard
+        // impulse → resolver dispatch path so other vessels can read α/β/
+        // sample_count via `POST /v2/impulses/resolve` without bouncing
+        // through the REST surface (`GET /v2/activities/:id/variant-scores`).
+        //
+        // Pointer fields:
+        //   activity_variant_id (or activity_id) — required. The canonical
+        //     variant id whose posteriors we're reading. Both names accepted
+        //     so callers can pass either the historical `activity_id` or the
+        //     newer `activity_variant_id` (which is the variant-level id post
+        //     v1.8.0 normalization).
+        //   shape_signature — optional filter on (input_shapes, output_shapes)
+        //     signature. When present, restricts the posterior to executions
+        //     whose first task's input/output shapes match. Defers strict
+        //     parsing — pass-through to the SQL filter below.
+        //   context_bucket — optional filter on goal-context bucketing
+        //     (UCB-style stratification, used by exploration-slot-ucb-ranking).
+        //
+        // Response payload:
+        //   { alpha, beta, sample_count, success_count, failure_count,
+        //     activity_variant_id }
+        // Confidence interval is left to the caller (workbench computes it
+        // from α/β client-side); the resolver returns the raw posterior so
+        // selection-resolvers downstream can apply their own decision rule.
+        const variantId =
+          (pointer as any).activity_variant_id || (pointer as any).activity_id;
+        if (!variantId || typeof variantId !== 'string') {
+          return c.json(
+            {
+              success: false,
+              error:
+                'thompson_posterior requires activity_variant_id (or activity_id)',
+            } as ImpulseResolveResponse,
+            400,
+          );
+        }
+
+        const shapeSig = (pointer as any).shape_signature;
+        const contextBucket = (pointer as any).context_bucket;
+
+        // Reuse the same execution-table aggregate that variantMetricsSummary
+        // uses, narrowed to a single variant. activity_id is the variant-level
+        // id post v1.8.0 normalization (see normalizeActivityId in execution-
+        // traces.ts); we filter by exact match rather than CONTAINS so the
+        // posterior is variant-precise, not parent-aggregate.
+        let query = `
+          SELECT
+            count() AS total_executions,
+            count(success = true) AS success_count,
+            count(success = false) AS failure_count,
+            count(success = true) + 1 AS alpha,
+            count(success = false) + 1 AS beta
+          FROM execution
+          WHERE activity_id = $variant_id
+          AND ${accountIdScopedWhere()}
+        `;
+        const params: Record<string, unknown> = {
+          variant_id: variantId,
+          orgId: jwtAuthCtx.orgId,
+          org_id: jwtAuthCtx.orgId,
+          account_id: jwtAuthCtx.accountId ?? null,
+        };
+        if (typeof shapeSig === 'string' && shapeSig.length > 0) {
+          query += ` AND shape_signature = $shape_signature`;
+          params.shape_signature = shapeSig;
+        }
+        if (typeof contextBucket === 'string' && contextBucket.length > 0) {
+          query += ` AND context_bucket = $context_bucket`;
+          params.context_bucket = contextBucket;
+        }
+
+        const rows = await executeAsAuth<any>(jwtAuthCtx, query, params);
+        const row = rows[0] || {
+          total_executions: 0,
+          success_count: 0,
+          failure_count: 0,
+          alpha: 1,
+          beta: 1,
+        };
+
+        content = JSON.stringify(
+          {
+            loaded: true,
+            metadata: {
+              activity_variant_id: variantId,
+              ...(shapeSig ? { shape_signature: shapeSig } : {}),
+              ...(contextBucket ? { context_bucket: contextBucket } : {}),
+            },
+            content: {
+              activity_variant_id: variantId,
+              alpha: row.alpha,
+              beta: row.beta,
+              sample_count: row.total_executions,
+              success_count: row.success_count,
+              failure_count: row.failure_count,
+            },
+          },
+          null,
+          2,
+        );
+        break;
+      }
+
       // =============================================================================
       // ANALYSIS API POINTER TYPES (M3 - Impulse Bridge) [DEPRECATED]
       // TODO: These cases violate "Resolvers live WHERE THE DATA IS"

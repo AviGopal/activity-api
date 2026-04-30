@@ -221,6 +221,16 @@ export function loadConfig(): Config {
         'activityMetrics',
         'executionTraceList',
         'variantMetricsSummary',
+        // Phase 9 (2026-04-30): per-variant Thompson posteriors as a routable
+        // shape. Lifts the implicit Thompson vessel inside activity-api into
+        // the standard impulse → resolver dispatch path. Pointer fields:
+        // activity_variant_id (required), shape_signature (opt), context_bucket
+        // (opt). Response: { alpha, beta, sample_count, success_count,
+        // failure_count }. Existing REST handler at GET /v2/activities/:id/
+        // variant-scores remains for backward compatibility (variantMetrics-
+        // Summary aggregates across variants; thompson_posterior is per-
+        // variant precise). See docs/impulse-types/thompson_posterior.md.
+        'thompson_posterior',
         'activityTemplateRecommendation',
         'activityTemplatesByMetrics',
         'executionTraces',
