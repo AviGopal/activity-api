@@ -2241,7 +2241,7 @@ app.post('/', async (c) => {
           variant_id: $variant_id,
           activity_id: $variant_id,
           org_id: $org_id,
-          account_id: $account_id,
+          account_id: IF $account_id IS NULL THEN NONE ELSE $account_id END,
           account_id_version: 1,
           total_executions: 1,
           successful_executions: $success_delta,
