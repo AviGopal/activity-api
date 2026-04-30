@@ -1360,6 +1360,95 @@ app.post('/templates', async (c) => {
  * Returns patterns of validation failures that occur frequently,
  * enabling auto-detection of schema drift and field naming mismatches.
  */
+/**
+ * GET /v2/activities/shape-gap-resolution
+ *
+ * Phase 10 P4.5 of 2026-04-26-impulse-activity-loop. Returns cached
+ * resolutions for a missing impulse shape so MiniBob's slot-binding
+ * meta-activity can short-circuit `create-shape-provider-goal`
+ * escalation when the gap has been bridged before.
+ *
+ * Query params:
+ *   shape       — required; the missing impulse shape
+ *   account_id  — optional; when present, filter to rows owned by that
+ *                 account OR cross-account rows (account_id IS NONE).
+ *                 When absent, only cross-account rows are returned.
+ *
+ * Response: { resolutions: [{ resolved_by, resolution_type, escalation_depth, cost_usd, times_used, last_used_at }, ...], total }
+ *
+ * Multi-tenant: SurrealDB PERMISSIONS on `shape_gap_resolution` (migration
+ * 105) enforce org + account scoping at the row level when callers
+ * authenticate with JWT. The application-level WHERE here is a
+ * defence-in-depth filter — same pattern other GETs in this route use.
+ */
+app.get('/shape-gap-resolution', async (c) => {
+  try {
+    const jwtAuth = getJwtAuthFromContext(c);
+    const session = (c.get as any)('session') as SessionData | undefined;
+    const orgId = jwtAuth?.orgId || session?.org_id || null;
+    const accountId: string | null = jwtAuth?.accountId ?? null;
+
+    if (!orgId) {
+      return c.json({
+        error: 'Unauthorized',
+        message: 'Missing organization context',
+      }, 401);
+    }
+
+    const shape = c.req.query('shape');
+    if (!shape || typeof shape !== 'string' || shape.length === 0) {
+      return c.json({ error: 'shape query parameter is required' }, 400);
+    }
+
+    const filterAccountId = c.req.query('account_id') || accountId;
+
+    // Sort by recency × usage so the hottest entries surface first; cap
+    // returned rows to keep payload small and deterministic.
+    const query = `
+      SELECT
+        record::id(id) AS id,
+        shape,
+        account_id,
+        resolved_by,
+        required_scope,
+        resolution_type,
+        escalation_depth,
+        cost_usd,
+        times_used,
+        first_seen_at,
+        last_used_at
+      FROM shape_gap_resolution
+      WHERE shape = $shape
+        AND org_id = $org_id
+        AND (account_id IS NONE OR account_id = $account_id_filter)
+      ORDER BY last_used_at DESC, times_used DESC
+      LIMIT 50
+    `;
+    const params = {
+      shape,
+      org_id: orgId,
+      account_id_filter: filterAccountId,
+    };
+
+    const result = jwtAuth?.jwtToken
+      ? await queryWithAuth<any[]>(jwtAuth.jwtToken, query, params)
+      : await surrealDB.query<any[]>(query, params);
+
+    const rows = (result || []).flat?.() || result || [];
+    return c.json({
+      shape,
+      account_id: filterAccountId,
+      resolutions: rows,
+      total: Array.isArray(rows) ? rows.length : 0,
+    });
+  } catch (error: any) {
+    logger.error('GET /v2/activities/shape-gap-resolution failed', {
+      error: error.message,
+    });
+    return c.json({ error: error.message }, 500);
+  }
+});
+
 app.get('/validation-patterns', async (c) => {
   try {
     const { detectValidationPatterns } = await import('../utils/validation-traces');
