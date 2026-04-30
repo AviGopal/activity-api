@@ -463,7 +463,7 @@ app.get('/', async (c) => {
         status, success, error, executed_at, duration_ms, cost_usd,
         parent_execution_id, composition_chain,
         vessel_id, vessel_version,
-        failure_mode,
+        failure_mode, metadata,
         array::len(tasks ?? []) AS task_count,
         array::len(impulse_resolutions ?? []) AS impulse_count
       FROM activity_execution_traces
