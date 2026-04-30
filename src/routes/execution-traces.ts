@@ -376,16 +376,13 @@ app.get('/', async (c) => {
     // without it the query fetches all orgs then filters in application code,
     // which causes full-table scans and OOMKills (F-N-perf, 2026-04-30).
     const needsWhereOrgFilter = !useJwtAuth || jwtAuth?.authType === 'apikey';
+    // For API-key auth, session is never populated (org_id: null). Fall back
+    // to jwtAuth.orgId which carries the org from identity-vessel validation.
+    const effectiveOrgId = session.org_id || jwtAuth?.orgId || null;
     if (needsWhereOrgFilter) {
-      if (session.org_id) {
-        // Phase B2: prefer account_id; legacy/unscoped rows still match.
-        // accountIdScopedWhere() emits the canonical disjunction; we OR in
-        // `org_id = NULL` to preserve the prior behaviour where unscoped
-        // session-fed rows were visible.
+      if (effectiveOrgId) {
         whereConditions.push(`(${accountIdScopedWhere()} OR org_id = NULL)`);
-        params.org_id = session.org_id;
-        // Sessions don't carry an accountId today, so bind null. When
-        // session.account_id is plumbed through (Phase D), prefer that here.
+        params.org_id = effectiveOrgId;
         params.account_id = (session as any).account_id ?? null;
       }
 
@@ -2209,7 +2206,7 @@ app.post('/', async (c) => {
       // template here so a single template handles all candidate ids.
       const variantMetricsUpsert = `
         INSERT INTO variant_performance_metrics {
-          id: type::thing('variant_performance_metrics', $record_id_slug),
+          id: type::record('variant_performance_metrics', $record_id_slug),
           variant_id: $variant_id,
           activity_id: $variant_id,
           org_id: $org_id,
