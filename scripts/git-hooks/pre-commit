@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+#
+# metabob-activity-api pre-commit hook.
+#
+# Mirrors the metabob-devbob super-repo hook (scripts/git-hooks/pre-commit
+# there) with vessel-specific allowlists for this TypeScript / Bun / Hono
+# backend (trace store + Thompson Sampling learner). Runs two layers in
+# order:
+#
+#   1. Placement check — rejects newly-added or renamed-into entries that
+#      violate the placement rules (only ADDED files are checked; modifying
+#      existing tracked files is never blocked).
+#   2. Secrets scan — gitleaks protect --staged, using the repo-local
+#      .gitleaks.toml ruleset.
+#
+# Bypass: `git commit --no-verify`.
+#
+# Layout this hook expects:
+#   src/                    — TypeScript source (Hono routes, services, models)
+#   test/ tests/            — test suites
+#   docs/                   — stateless reference documentation
+#   scripts/                — operational scripts (migrations, smoke tests)
+#   sql/ migrations/        — SurrealDB schema migrations
+#   activities/             — activity templates that ship with the vessel
+#   packages/               — shared packages (if any)
+#   .github/                — CI workflows
+#   .minibob/               — MiniBob vessel config
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+RED=$'\033[0;31m'
+YELLOW=$'\033[1;33m'
+GREEN=$'\033[0;32m'
+DIM=$'\033[2m'
+NC=$'\033[0m'
+
+# Allowed files at the vessel root (basename match, exact).
+ROOT_ALLOWLIST=(
+  CLAUDE.md
+  README.md
+  LICENSE
+  LICENSE.md
+  CHANGELOG.md
+  .gitignore
+  .gitmodules
+  .gitattributes
+  .editorconfig
+  .nvmrc
+  .tool-versions
+  .prettierrc
+  .prettierrc.js
+  .prettierrc.json
+  .prettierignore
+  .eslintrc
+  .eslintrc.js
+  .eslintrc.json
+  .eslintrc.cjs
+  .eslintignore
+  .gitleaks.toml
+  .sops.yaml
+  .dockerignore
+  .env.example
+  package.json
+  package-lock.json
+  bun.lock
+  bunfig.toml
+  tsconfig.json
+  tsconfig.build.json
+  tsconfig.test.json
+  jsconfig.json
+  vitest.config.ts
+  playwright.config.ts
+  components.json
+  postcss.config.js
+  tailwind.config.ts
+  Dockerfile
+  Dockerfile.dev
+  Dockerfile.prod
+  vessel.json
+  index.js
+  index.ts
+)
+
+# Allowed top-level directories for newly-added files.
+ALLOWED_TOPLEVEL_DIRS=(
+  src
+  test
+  tests
+  docs
+  scripts
+  sql
+  migrations
+  activities
+  packages
+  public
+  .github
+  .minibob
+  .archive
+)
+
+ARTEFACT_EXTENSIONS='png|jpg|jpeg|gif|webp|svg|bmp|ico|mp4|mov|webm|pdf|zip|tar|gz|tgz'
+
+mapfile -t STAGED < <(git diff --cached --name-only --diff-filter=AR)
+
+if [[ ${#STAGED[@]} -eq 0 ]]; then
+  exit 0
+fi
+
+violations=()
+
+is_root_allowlisted() {
+  local name="$1"
+  for entry in "${ROOT_ALLOWLIST[@]}"; do
+    [[ "$name" == "$entry" ]] && return 0
+  done
+  # Pattern: any .env template (e.g. .env.local.example).
+  [[ "$name" == .env.*.example || "$name" == .env.example ]] && return 0
+  # Pattern: tsconfig variants (tsconfig.<name>.json).
+  [[ "$name" == tsconfig.*.json ]] && return 0
+  # Pattern: Dockerfile variants (Dockerfile.<name>).
+  [[ "$name" == Dockerfile.* ]] && return 0
+  return 1
+}
+
+is_under_allowed_toplevel() {
+  local path="$1"
+  local first="${path%%/*}"
+  for dir in "${ALLOWED_TOPLEVEL_DIRS[@]}"; do
+    [[ "$first" == "$dir" ]] && return 0
+  done
+  return 1
+}
+
+flag() {
+  local file="$1" reason="$2" remedy="$3"
+  violations+=("${file}|${reason}|${remedy}")
+}
+
+for file in "${STAGED[@]}"; do
+  base="$(basename "$file")"
+  ext="${base##*.}"
+  ext_lower="${ext,,}"
+
+  if [[ "$file" == */* ]]; then
+    if ! is_under_allowed_toplevel "$file"; then
+      flag "$file" \
+        "new file in unrecognised top-level directory" \
+        "move under src/, test/, docs/, scripts/, sql/, migrations/, activities/, packages/, .github/"
+      continue
+    fi
+  else
+    # Vessel root.
+    if ! is_root_allowlisted "$base"; then
+      case "$base" in
+        *.md)
+          flag "$file" \
+            "new markdown file at vessel root" \
+            "stateless reference docs go in docs/; one-off writeups (status, fix-complete, investigation) go in commit messages, not the tree"
+          ;;
+        *.sh|*.ts|*.tsx|*.js|*.mjs|*.cjs|*.py)
+          flag "$file" \
+            "new script/source file at vessel root" \
+            "source goes in src/; operational scripts go in scripts/; tests go in test/ or tests/"
+          ;;
+        test-*|*-test.*|*.test.*|tests-*|verify-*|validate-*)
+          flag "$file" \
+            "new test/verify/validate file at vessel root" \
+            "tests live in test/ or tests/; one-off verify/validate scripts belong in scripts/ if they're durable, or shouldn't be committed"
+          ;;
+        *.yaml|*.yml)
+          flag "$file" \
+            "new yaml file at vessel root" \
+            "CI configs in .github/workflows/; helm/k8s manifests live in the deployment repo, not here"
+          ;;
+        *.html|*.txt|*.json|*.toml|*.surql|*.sql)
+          flag "$file" \
+            "new data/config file at vessel root" \
+            "move under the owning area (src/, sql/, migrations/, scripts/, docs/) — the root holds project metadata only"
+          ;;
+        *)
+          if [[ "$ext_lower" =~ ^($ARTEFACT_EXTENSIONS)$ ]]; then
+            flag "$file" \
+              "new binary/artefact at vessel root" \
+              "binary assets go in docs/assets/<topic>/; build outputs and screenshots should be gitignored"
+          else
+            flag "$file" \
+              "new file at vessel root not in allowlist" \
+              "extend ROOT_ALLOWLIST in scripts/git-hooks/pre-commit only if the file is genuinely vessel-wide metadata"
+          fi
+          ;;
+      esac
+      continue
+    fi
+  fi
+
+  # Cross-cutting rules.
+
+  # No screenshots / images / artefacts outside docs/assets/.
+  if [[ "$ext_lower" =~ ^($ARTEFACT_EXTENSIONS)$ ]]; then
+    if [[ "$file" != docs/assets/* && "$file" != docs/*/assets/* && "$file" != public/* ]]; then
+      flag "$file" \
+        "binary/artefact outside docs/assets/ or public/" \
+        "screenshots are session artefacts (gitignore them); illustrative assets go in docs/assets/<topic>/; runtime static assets in public/"
+    fi
+  fi
+
+  # No one-off test files outside test/ or tests/ or src/**/__tests__.
+  if [[ "$base" =~ ^test- || "$base" =~ -test\. || "$base" =~ \.test\. || "$base" =~ ^tests- ]]; then
+    if [[ "$file" != test/* && "$file" != tests/* && "$file" != src/**/__tests__/* && "$file" != src/*/test/* && "$file" != packages/*/test/* && "$file" != packages/*/tests/* ]]; then
+      flag "$file" \
+        "test file outside a recognised test suite" \
+        "tests go in test/, tests/, src/**/__tests__/, or packages/<name>/test{,s}/"
+    fi
+  fi
+done
+
+if [[ ${#violations[@]} -gt 0 ]]; then
+  printf '%s\n' "${RED}━━━ activity-api placement check failed ━━━${NC}"
+  printf '%s\n\n' "${DIM}rules: scripts/git-hooks/README.md${NC}"
+
+  for v in "${violations[@]}"; do
+    IFS='|' read -r file reason remedy <<<"$v"
+    printf '  %s%s%s\n' "${YELLOW}✗${NC} " "$file" ""
+    printf '      %sreason:%s %s\n' "$DIM" "$NC" "$reason"
+    printf '      %sfix:   %s %s\n\n' "$DIM" "$NC" "$remedy"
+  done
+
+  cat <<EOF
+${DIM}Why this exists${NC}
+  metabob-activity-api is the trace store + Thompson Sampling learner.
+  Its tree should hold src/ (Hono routes, services, models), sql/ +
+  migrations/ (SurrealDB schema), test/ (real test suites), scripts/
+  (operational migration runners + smoke tests), activities/ (templates
+  that ship with the vessel), and docs/ (stateless reference). One-off
+  fix-complete writeups, status snapshots, and ad-hoc test scripts at
+  root accumulate as cruft — use commit history (git log + git blame)
+  for everything that's only true at one point in time.
+
+${DIM}Common moves${NC}
+  Stateless reference doc          ->  docs/<topic>.md
+  Migration script                 ->  scripts/apply-migration-NNN.sh
+                                       sql/migrations/NNN-name.surql
+  Smoke test / verify script       ->  scripts/<verb>-<noun>.sh (only if durable)
+  Unit / integration test          ->  test/<area>.test.ts
+  Activity template                ->  activities/<id>.json
+  Screenshots / playwright output  ->  add the directory to .gitignore
+
+${DIM}Bypass${NC}
+  git commit --no-verify   ${DIM}(use sparingly; the rules exist to keep blame readable)${NC}
+EOF
+
+  exit 1
+fi
+
+# ─── secrets scan ───
+if command -v gitleaks >/dev/null 2>&1; then
+  if ! gitleaks protect --staged --redact --no-banner 2>&1; then
+    printf '\n%s\n' "${RED}━━━ gitleaks: secrets detected in staged diff ━━━${NC}"
+    cat <<EOF
+${DIM}What to do${NC}
+  1. Remove the secret from the file before committing.
+  2. Rotate the leaked credential immediately — assume it is compromised
+     once it has touched the staging tree.
+  3. If gitleaks is flagging a false positive, add an inline allowlist
+     comment ${DIM}some-value  # gitleaks:allow${NC} or extend the ruleset
+     in .gitleaks.toml.
+
+${DIM}Bypass${NC}
+  git commit --no-verify   ${DIM}(only after rotating the credential)${NC}
+EOF
+    exit 1
+  fi
+else
+  printf '%s\n' "${YELLOW}note:${NC} gitleaks is not installed; secrets scan was skipped."
+  printf '%s\n' "      install: ${DIM}brew install gitleaks${NC} | ${DIM}go install github.com/gitleaks/gitleaks/v8@latest${NC} | ${DIM}https://github.com/gitleaks/gitleaks/releases${NC}"
+fi
+
+exit 0
