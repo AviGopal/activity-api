@@ -714,17 +714,12 @@ app.get('/', async (c) => {
       execution_id: trace.execution_id || trace.id?.toString().split(':')[1] || trace.id,
     }));
 
-    // Read-time fallback: when stored chain is empty but parent_execution_id
-    // is set, walk on the fly. Read-only. Per-request memoization cache:
-    // sibling rows with the same parent collapse to a single DB walk per
-    // distinct parent_execution_id.
-    const chainCache: CompositionChainCache = new Map();
-    const executionsWithChain = await Promise.all(
-      executionsNormalized.map((t: any) => applyChainFallback(t, chainCache)),
-    );
-
+    // Composition chain fallback is skipped on the list endpoint — it triggers
+    // one DB walk per result row for old traces with empty composition_chain,
+    // adding 1-2s per row (5 rows = 10s total). The chain is only needed in the
+    // single-trace detail view which fetches one row and can afford the walk.
     const response: ListExecutionTracesResponse = {
-      executions: executionsWithChain,
+      executions: executionsNormalized,
       total,
       limit,
       offset,
