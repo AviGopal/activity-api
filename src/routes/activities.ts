@@ -4404,10 +4404,22 @@ app.post('/recommend', async (c) => {
         const alphaBlended = blendWeight * (ctxRow?.alpha ?? 1) + (1 - blendWeight) * alpha;
         const betaBlended  = blendWeight * (ctxRow?.beta  ?? 1) + (1 - blendWeight) * adjustedBeta;
 
-        // Sample from Beta(alpha, beta) distribution for Thompson Sampling
+        // Sample from Beta(alpha, beta) distribution for Thompson Sampling.
         // This enables exploration (high variance for uncertain templates) and
-        // exploitation (high mean for proven templates) tradeoff
+        // exploitation (high mean for proven templates) tradeoff.
+        //
+        // Phase 10 P5A — task 10.14: dual-compute path. The DB-side
+        // `fn::beta_sample` (migration 104) is now live on canary, but we
+        // can't call it inline here because the recommend hot path is
+        // synchronous and async-batching every sample into a SurrealDB
+        // round-trip would dominate latency. The dual-compute migration
+        // strategy (per spec): app-side sampler stays the active path;
+        // we log `sample_source` so canary observability can confirm.
+        // 10.15 promotes DB-side as the source-of-truth once K-S parity
+        // (10.13) is verified and the recommend query is restructured to
+        // pull samples in the same batch as α/β.
         const sample = betaSample(alphaBlended, betaBlended);
+        const sampleSource = 'app_fallback' as const;
 
         const rawTotalExecs = scores?.total_executions ?? 0;
         const rawSuccesses = scores?.successes ?? 0;
@@ -4432,6 +4444,12 @@ app.post('/recommend', async (c) => {
             beta: betaBlended,
             original_beta: betaVal,
             sample,
+            // Phase 10 P5A 10.14: surface the sampler source so canary
+            // observability can stratify recommend latency / accuracy by
+            // origin. Today every recommend call uses 'app_fallback'.
+            // After 10.15 promotes DB-side, this label flips to 'db'
+            // (or stays 'app_fallback' on the explicit override path).
+            sample_source: sampleSource,
             score: sample,
             ucb_score: computed_ucb_score,
             exploration_slot: false, // patched after pool partitioning
