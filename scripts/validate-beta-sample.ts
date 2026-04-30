@@ -135,7 +135,9 @@ async function main() {
     `[validate-beta-sample] Beta(${ALPHA}, ${BETA}), N=${N}, target=${url}`,
   );
   const db = new Surreal();
-  await db.connect(url, { auth: { username, password }, namespace, database });
+  await db.connect(url);
+  await db.use({ namespace, database });
+  await db.signin({ username, password });
 
   const samples: number[] = [];
   // Pull samples in batches of 100 to keep request payloads small.
