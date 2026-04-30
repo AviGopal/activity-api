@@ -2220,70 +2220,95 @@ app.post('/executions', async (c) => {
     // variant_id. ON DUPLICATE KEY UPDATE keys on PRIMARY KEY (id), so
     // it never matched legacy rows — INSERT then conflicted on the
     // composite UNIQUE INDEX (variant_id, account_id) added by
-    // migration 100. Switch to a SELECT-by-composite → UPDATE-existing /
-    // INSERT-new pattern that keys on the unique tuple instead of the
-    // record id, so both legacy and new rows update in place.
-    //
-    // SurrealDB 3.x notes:
-    //   - `IS` compares NONE/None equivalently (= NONE returns false in
-    //     strict mode; IS NONE works).
-    //   - IF/ELSE blocks return the chosen branch's last expression,
-    //     so we wrap the SELECT in $existing and branch.
-    const upsertMetricsQuery = `
-      LET $existing = (
-        SELECT id FROM variant_performance_metrics
-          WHERE variant_id = $variant_id
-            AND (account_id IS $account_id OR (account_id IS NONE AND $account_id IS NULL))
-          LIMIT 1
-      )[0].id;
-
-      IF $existing IS NOT NONE {
-        UPDATE $existing SET
-          total_executions = (total_executions ?? 0) + 1,
-          successful_executions = (successful_executions ?? 0) + $success_delta,
-          failed_executions = (failed_executions ?? 0) + $failure_delta,
-          success_rate = ((successful_executions ?? 0) + $success_delta) / ((total_executions ?? 0) + 1),
-          avg_duration_ms = (((avg_duration_ms ?? 0) * (total_executions ?? 0)) + $duration_ms) / ((total_executions ?? 0) + 1),
-          avg_cost_usd = (((avg_cost_usd ?? 0) * (total_executions ?? 0)) + $cost) / ((total_executions ?? 0) + 1),
-          thompson_alpha = (successful_executions ?? 0) + $success_delta + 1,
-          thompson_beta = (failed_executions ?? 0) + $failure_delta + 1,
-          last_executed_at = time::now(),
-          updated_at = time::now()
-        RETURN AFTER;
-      } ELSE {
-        INSERT INTO variant_performance_metrics {
-          id: type::record('variant_performance_metrics', $record_id_slug),
-          variant_id: $variant_id,
-          activity_id: $variant_id,
-          org_id: $org_id,
-          account_id: IF $account_id IS NULL THEN NONE ELSE $account_id END,
-          account_id_version: 1,
-          total_executions: 1,
-          successful_executions: $success_delta,
-          failed_executions: $failure_delta,
-          success_rate: $success_delta,
-          avg_duration_ms: $duration_ms,
-          avg_cost_usd: $cost,
-          thompson_alpha: $success_delta + 1,
-          thompson_beta: $failure_delta + 1,
-          total_selections: 0,
-          last_executed_at: time::now(),
-          created_at: time::now(),
-          updated_at: time::now()
-        } RETURN AFTER;
-      };
+    // migration 100. Switch to JS-side branching on a composite-key
+    // SELECT: UPDATE the existing row by its (potentially-random) id
+    // when found, otherwise INSERT a fresh row with the deterministic
+    // slug. Two driver calls, but each is a single SurrealQL statement
+    // so the existing query-result shape (driver returns
+    // first-statement results) is preserved.
+    const accountIdParam = accountIdRecordRef(accountId);
+    const findExistingQuery = `
+      SELECT id FROM variant_performance_metrics
+        WHERE variant_id = $variant_id
+          AND (account_id IS $account_id OR (account_id IS NONE AND $account_id IS NULL))
+        LIMIT 1
+    `;
+    const updateQuery = `
+      UPDATE $id SET
+        total_executions = (total_executions ?? 0) + 1,
+        successful_executions = (successful_executions ?? 0) + $success_delta,
+        failed_executions = (failed_executions ?? 0) + $failure_delta,
+        success_rate = ((successful_executions ?? 0) + $success_delta) / ((total_executions ?? 0) + 1),
+        avg_duration_ms = (((avg_duration_ms ?? 0) * (total_executions ?? 0)) + $duration_ms) / ((total_executions ?? 0) + 1),
+        avg_cost_usd = (((avg_cost_usd ?? 0) * (total_executions ?? 0)) + $cost) / ((total_executions ?? 0) + 1),
+        thompson_alpha = (successful_executions ?? 0) + $success_delta + 1,
+        thompson_beta = (failed_executions ?? 0) + $failure_delta + 1,
+        last_executed_at = time::now(),
+        updated_at = time::now()
+      RETURN AFTER;
+    `;
+    const insertQuery = `
+      INSERT INTO variant_performance_metrics {
+        id: type::record('variant_performance_metrics', $record_id_slug),
+        variant_id: $variant_id,
+        activity_id: $variant_id,
+        org_id: $org_id,
+        account_id: IF $account_id IS NULL THEN NONE ELSE $account_id END,
+        account_id_version: 1,
+        total_executions: 1,
+        successful_executions: $success_delta,
+        failed_executions: $failure_delta,
+        success_rate: $success_delta,
+        avg_duration_ms: $duration_ms,
+        avg_cost_usd: $cost,
+        thompson_alpha: $success_delta + 1,
+        thompson_beta: $failure_delta + 1,
+        total_selections: 0,
+        last_executed_at: time::now(),
+        created_at: time::now(),
+        updated_at: time::now()
+      } RETURN AFTER;
     `;
 
-    const metricsResult = await surrealDB.query(upsertMetricsQuery, {
-      record_id_slug: metricsRecordIdSlug,
+    // surrealDB.query returns a multi-statement array (one entry per
+    // statement). Each of these helper SQLs is single-statement, so we
+    // unwrap [0] to get the inner rows array consistently.
+    const findRaw = await surrealDB.query<{ id: string }[]>(findExistingQuery, {
       variant_id: normalizedVariantId,
-      org_id: orgId,
-      account_id: accountIdRecordRef(accountId),
-      success_delta,
-      failure_delta,
-      duration_ms: validated.duration_ms,
-      cost: validated.cost,
+      account_id: accountIdParam,
     });
+    const findRows = (Array.isArray(findRaw) && findRaw.length > 0
+      ? (findRaw[0] as { id: string }[])
+      : []) as { id: string }[];
+    const existingId = findRows.length > 0 ? findRows[0]?.id : undefined;
+
+    let metricsResult: any[];
+    if (existingId) {
+      const updateRaw = await surrealDB.query<any[]>(updateQuery, {
+        id: existingId,
+        success_delta,
+        failure_delta,
+        duration_ms: validated.duration_ms,
+        cost: validated.cost,
+      });
+      metricsResult = (Array.isArray(updateRaw) && updateRaw.length > 0
+        ? (updateRaw[0] as any[])
+        : []) as any[];
+    } else {
+      const insertRaw = await surrealDB.query<any[]>(insertQuery, {
+        record_id_slug: metricsRecordIdSlug,
+        variant_id: normalizedVariantId,
+        org_id: orgId,
+        account_id: accountIdParam,
+        success_delta,
+        failure_delta,
+        duration_ms: validated.duration_ms,
+        cost: validated.cost,
+      });
+      metricsResult = (Array.isArray(insertRaw) && insertRaw.length > 0
+        ? (insertRaw[0] as any[])
+        : []) as any[];
+    }
 
     if (metricsResult.length === 0) {
       logger.error('Thompson Sampling UPSERT failed - no record returned', {
