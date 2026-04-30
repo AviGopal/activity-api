@@ -1589,17 +1589,31 @@ app.post('/', async (c) => {
       ? await queryWithAuth(jwtAuth.jwtToken, query, trace)
       : await surrealDB.query(query, trace);
 
-    // Verify INSERT succeeded
-    if (!result || result.length === 0) {
-      logger.error('INSERT returned no results', {
+    // Verify INSERT succeeded.
+    //
+    // queryWithAuth opens an authenticated SurrealDB session; PERMISSIONS
+    // (FOR select on activity_execution_traces) can filter the RETURN
+    // AFTER even when FOR create succeeded — the row was inserted but the
+    // session can't read it back. queryWithAuth and surrealDB.query both
+    // throw on actual SurrealDB errors, so a no-throw + empty-result
+    // outcome is "INSERT happened, RETURN was filtered" rather than a
+    // real failure. Treat null/undefined as failure (driver-level
+    // breakage); empty array is success.
+    if (result === null || result === undefined) {
+      logger.error('INSERT returned null/undefined', {
         execution_id: trace.execution_id,
         query_result: result,
       });
       return c.json({
         success: false,
-        error: 'Failed to insert execution trace - no results returned',
+        error: 'Failed to insert execution trace - driver returned null',
         execution_id: trace.execution_id,
       }, 500);
+    }
+    if (result.length === 0) {
+      logger.debug('INSERT succeeded but RETURN was filtered (likely PERMISSIONS)', {
+        execution_id: trace.execution_id,
+      });
     }
 
     logger.info('Execution trace stored', {
