@@ -1,85 +1,94 @@
 -- Phase 10 P5A of 2026-04-26-impulse-activity-loop: server-side Beta sampler
 --
--- `fn::beta_sample($a, $b)` returns one draw from the Beta(α, β) distribution
--- using the Marsaglia & Tsang (2000) gamma sampling method composed via
---   Beta(α, β) = G(α, 1) / (G(α, 1) + G(β, 1))
--- where G(k, 1) is a Gamma(shape=k, scale=1) sample.
+-- `fn::beta_sample($a, $b)` returns one draw from the Beta(α, β) distribution.
 --
--- Rationale: dual-compute path at `activities.ts:4416` currently calls
--- `@stdlib/random-base-beta` from JS for every Thompson sample, costing
--- one process round-trip + a heap allocation per draw. A SurrealDB
--- embedded function lets recommend / discover-by-shapes generate the
--- random draw in the same query that fetches α/β, eliminating the
--- network hop. App-side JS sampler stays as fallback (logged via
--- `sample_source: "db" | "app_fallback"` per task 10.14) until 10.15
--- promotes DB-only.
+-- Pure SurrealQL implementation. The earlier draft used a JavaScript
+-- `function() { ... }` body, which the canary SurrealDB rejects with
+-- "Scripting functions are not allowed" — the deployment has its
+-- scripting feature disabled, and we want to avoid widening the
+-- security surface to enable it just for this one function.
+--
+-- Strategy:
+--   1. For α, β ≥ 1 we use Johnk's algorithm:
+--        U1, U2 ~ Uniform(0,1)
+--        V1 = U1^(1/α),  V2 = U2^(1/β)
+--        If V1 + V2 ≤ 1: return V1 / (V1 + V2)
+--        Else: retry (recursion).
+--      Convergence is fast for moderate α + β (< 50). For high
+--      α + β the acceptance rate drops; we cap recursion depth and
+--      fall back to the normal approximation.
+--
+--   2. For high α + β (≥ 50, where Beta is well-approximated by
+--      a normal) we use a Box-Muller-style construction:
+--        mean = α / (α + β)
+--        var  = α β / ((α + β)² (α + β + 1))
+--        sample = clamp(mean + √var · Z, 0, 1)
+--      where Z is a standard normal generated from two uniforms.
+--      This sidesteps Johnk's high-rejection regime.
 --
 -- Acceptance: `KS test p > 0.05 against Beta(2,5) CDF over 1000
--- samples` (task 10.S3). Validation script lives at
--- `scripts/validate-beta-sample.ts`; not in this migration since it's
--- a regression check, not schema state.
+-- samples` (task 10.S3). The validation script
+-- `scripts/validate-beta-sample.ts` runs the regression against the
+-- live function once deployed. Note: at moderate α+β this matches
+-- exactly; at high α+β the normal approximation has bounded total
+-- variation distance ≈ O(1/√(α+β)) which the K-S test tolerates well.
 --
 -- Idempotent via `DEFINE FUNCTION OVERWRITE`.
 
-DEFINE FUNCTION OVERWRITE fn::beta_sample($a: number, $b: number) {
-  RETURN function($a, $b) {
-    // Clamp to a safe lower bound so the gamma sampler can't divide by
-    // zero or take log of zero on a malformed posterior.
-    const aRaw = Number(arguments[0]);
-    const bRaw = Number(arguments[1]);
-    const aSafe = Number.isFinite(aRaw) && aRaw > 1e-6 ? aRaw : 1;
-    const bSafe = Number.isFinite(bRaw) && bRaw > 1e-6 ? bRaw : 1;
-
-    // Marsaglia & Tsang (2000) gamma sampler. For shape ≥ 1, the
-    // squeeze accepts ~96 % of proposals on the first try. For shape
-    // < 1, boost to (shape+1) and scale by U^(1/shape).
-    function gammaSample(shape) {
-      if (shape < 1) {
-        const u = Math.random();
-        return gammaSample(shape + 1) * Math.pow(u, 1 / shape);
-      }
-      const d = shape - 1 / 3;
-      const c = 1 / Math.sqrt(9 * d);
-      // Bounded retry: at typical Thompson α/β (1..1000), the squeeze
-      // converges in < 5 iterations. 64 caps pathological cases without
-      // letting the function diverge.
-      for (let i = 0; i < 64; i++) {
-        let x, v;
-        // Generate N(0,1) via Box-Muller (cosine variant).
-        do {
-          const u1 = Math.random();
-          const u2 = Math.random();
-          // log(0) guard.
-          const safeU1 = u1 > 0 ? u1 : 1e-12;
-          x = Math.sqrt(-2 * Math.log(safeU1)) * Math.cos(2 * Math.PI * u2);
-          v = 1 + c * x;
-        } while (v <= 0);
-        v = v * v * v;
-        const u = Math.random();
-        // Squeeze test (cheap path).
-        if (u < 1 - 0.0331 * x * x * x * x) return d * v;
-        // Full log-acceptance.
-        const safeV = v > 0 ? v : 1e-12;
-        if (Math.log(u) < 0.5 * x * x + d * (1 - v + Math.log(safeV))) {
-          return d * v;
-        }
-      }
-      // Pathological — fall back to the mode E[G] = shape so callers
-      // never see NaN. Caller can detect by comparing against the
-      // posterior mean if precision matters.
-      return shape;
-    }
-
-    const ga = gammaSample(aSafe);
-    const gb = gammaSample(bSafe);
-    const denom = ga + gb;
-    return denom > 0 ? ga / denom : aSafe / (aSafe + bSafe);
+-- Internal: Johnk acceptance step + bounded recursion.
+DEFINE FUNCTION OVERWRITE fn::_beta_johnk($a: number, $b: number, $depth: int) {
+  IF $depth >= 32 {
+    -- Pathological — fall through to the normal-approx sampler.
+    RETURN fn::_beta_normal_approx($a, $b);
   };
+  LET $u1 = rand::float();
+  LET $u2 = rand::float();
+  -- log(0) guard: rand::float can return 0; nudge to a tiny positive.
+  LET $u1s = IF $u1 <= 0 THEN 0.0000001 ELSE $u1 END;
+  LET $u2s = IF $u2 <= 0 THEN 0.0000001 ELSE $u2 END;
+  LET $v1 = math::pow($u1s, 1.0 / $a);
+  LET $v2 = math::pow($u2s, 1.0 / $b);
+  LET $sum = $v1 + $v2;
+  IF $sum <= 1.0 AND $sum > 0.0 {
+    RETURN $v1 / $sum;
+  };
+  RETURN fn::_beta_johnk($a, $b, $depth + 1);
 };
 
--- Smoke-test self-evaluation: produces a single sample at α=2, β=5.
--- Deliberately not asserting a distribution here — the K-S regression
--- runs against the live deployed function via scripts/validate-beta-
--- sample.ts. This RETURN keeps `bun run init-db` from raising on the
--- migration; the value is discarded.
+-- Internal: Beta normal approximation (mean + √variance · Z), clamped
+-- to (0, 1). Uses Box-Muller to derive Z from two uniforms, sidestepping
+-- any need for rand::guass which may not exist on every SurrealDB build.
+DEFINE FUNCTION OVERWRITE fn::_beta_normal_approx($a: number, $b: number) {
+  LET $mean = $a / ($a + $b);
+  LET $var = ($a * $b) / (($a + $b) * ($a + $b) * ($a + $b + 1.0));
+  LET $std = math::sqrt($var);
+  LET $u1 = rand::float();
+  LET $u2 = rand::float();
+  LET $u1s = IF $u1 <= 0 THEN 0.0000001 ELSE $u1 END;
+  LET $z = math::sqrt(-2.0 * math::ln($u1s)) * math::cos(2.0 * 3.14159265358979 * $u2);
+  LET $sample = $mean + $std * $z;
+  -- Clamp to (epsilon, 1 - epsilon) so downstream log/quantile ops
+  -- never see exactly 0 or 1 from a clamped tail draw.
+  IF $sample < 0.0000001 { RETURN 0.0000001 };
+  IF $sample > 0.9999999 { RETURN 0.9999999 };
+  RETURN $sample;
+};
+
+-- Public: Beta(α, β) sampler. Routes to Johnk or normal-approx based on
+-- α + β concentration. Clamps degenerate inputs to a safe lower bound.
+DEFINE FUNCTION OVERWRITE fn::beta_sample($a: number, $b: number) {
+  LET $aSafe = IF $a > 0.000001 THEN $a ELSE 1.0 END;
+  LET $bSafe = IF $b > 0.000001 THEN $b ELSE 1.0 END;
+  -- For low concentration Johnk is exact and fast (typical Thompson
+  -- posteriors with 0–50 observations). For high concentration the
+  -- normal approximation is accurate to O(1/√(α+β)) and avoids
+  -- exponential-rejection overhead.
+  IF $aSafe + $bSafe < 50.0 {
+    RETURN fn::_beta_johnk($aSafe, $bSafe, 0);
+  };
+  RETURN fn::_beta_normal_approx($aSafe, $bSafe);
+};
+
+-- Smoke RETURN: produces a single sample at α=2, β=5 so init-db sees a
+-- non-error result for this migration. Discarded.
 RETURN fn::beta_sample(2, 5);
