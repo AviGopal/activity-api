@@ -323,6 +323,13 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
     // populate $auth.account_id depending on the access definition. Reading
     // both lets Phase B handlers consult $token.account_id directly via the
     // returned context without re-querying.
+    // Read tenant claims from $token (JWT claims) AND $auth (SurrealDB
+    // auth record), preferring $token. The apikey_token ACCESS schema
+    // has no AUTHENTICATE clause that loads a record into $auth, so for
+    // JWTs minted by identity-vessel `$auth` is NONE and only $token
+    // carries the claims (org_id, user_id, role, project_ids). For
+    // JWTs that DO populate $auth (legacy session-bound flows), $auth
+    // wins because it can carry more recent revocation/role state.
     const result = await db.query<[{
       id: string;
       org_id?: string;
@@ -334,15 +341,15 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
       instance_id?: string;
       role?: string;
     }]>(`RETURN {
-      id: $auth.id,
-      org_id: $auth.org_id,
-      account_id: $token.account_id,
-      user_id: $auth.user_id,
-      scopes: $auth.scopes,
-      project_ids: $auth.project_ids,
-      project_id: $auth.project_id,
-      instance_id: $auth.instance_id,
-      role: $auth.role
+      id: $auth.id ?? $token.id,
+      org_id: $auth.org_id ?? $token.org_id,
+      account_id: $auth.account_id ?? $token.account_id,
+      user_id: $auth.user_id ?? $token.user_id,
+      scopes: $auth.scopes ?? $token.scopes,
+      project_ids: $auth.project_ids ?? $token.project_ids,
+      project_id: $auth.project_id ?? $token.project_id,
+      instance_id: $auth.instance_id ?? $token.instance_id,
+      role: $auth.role ?? $token.role
     }`);
     const auth = result[0] || null;
 
