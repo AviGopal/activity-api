@@ -98,24 +98,32 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
-# Liveness and readiness probes
+# Liveness and readiness probes.
+#
+# /health runs `SELECT * FROM activity LIMIT 1` against SurrealDB; under
+# concurrent slow queries (e.g. GET /v2/activities/execution-traces against
+# the 29k-trace table) the probe can take 5–10s. Istio drops the pod from
+# its endpoints after consecutive failures → callers see "connection
+# termination" 503s. Loosened thresholds give the query fleet enough room
+# to stay registered without hiding genuine outages (failureThreshold=5 ×
+# periodSeconds=10s = 50s before de-listing).
 livenessProbe:
   httpGet:
     path: /health
     port: http
   initialDelaySeconds: 30
-  periodSeconds: 10
-  timeoutSeconds: 5
-  failureThreshold: 3
+  periodSeconds: 15
+  timeoutSeconds: 10
+  failureThreshold: 5
 
 readinessProbe:
   httpGet:
     path: /health
     port: http
   initialDelaySeconds: 10
-  periodSeconds: 5
-  timeoutSeconds: 3
-  failureThreshold: 3
+  periodSeconds: 10
+  timeoutSeconds: 10
+  failureThreshold: 5
 
 # Ingress configuration
 ingress:
