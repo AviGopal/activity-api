@@ -17,6 +17,12 @@ export const TagSchema = z.string()
 /**
  * Legacy category enum for backward compatibility
  */
+// Sync 2026-04-30: minibob's ActivityTemplate.category enum (types.ts:749-757)
+// includes "system" and "security" alongside the original 6. Without the
+// sync the activity-api template-sync rejects every minibob template that
+// uses these categories with `400 invalid_enum_value: "system"|"security"`,
+// which manifests on every minibob startup as a flood of TemplateSyncResolver
+// errors during canary validation runs (F-V7, observed 2026-04-30 path-a2).
 export const LegacyCategorySchema = z.enum([
   'feature',
   'bugfix',
@@ -24,6 +30,8 @@ export const LegacyCategorySchema = z.enum([
   'tool',
   'infrastructure',
   'meta',
+  'system',
+  'security',
 ]);
 
 // Session schemas
