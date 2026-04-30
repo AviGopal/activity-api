@@ -370,8 +370,13 @@ app.get('/', async (c) => {
       offset,
     };
 
-    // Multi-tenant filtering (skip when using JWT - RBAC handles it via PERMISSIONS)
-    if (!useJwtAuth) {
+    // Multi-tenant filtering.
+    // JWT path: RBAC via PERMISSIONS handles org scoping at the DB level.
+    // API-key / legacy path: must add org_id to WHERE so the index is used —
+    // without it the query fetches all orgs then filters in application code,
+    // which causes full-table scans and OOMKills (F-N-perf, 2026-04-30).
+    const needsWhereOrgFilter = !useJwtAuth || jwtAuth?.authType === 'apikey';
+    if (needsWhereOrgFilter) {
       if (session.org_id) {
         // Phase B2: prefer account_id; legacy/unscoped rows still match.
         // accountIdScopedWhere() emits the canonical disjunction; we OR in
