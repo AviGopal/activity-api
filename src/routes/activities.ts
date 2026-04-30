@@ -2270,32 +2270,29 @@ app.post('/executions', async (c) => {
       } RETURN AFTER;
     `;
 
-    // surrealDB.query returns a multi-statement array (one entry per
-    // statement). Each of these helper SQLs is single-statement, so we
-    // unwrap [0] to get the inner rows array consistently.
-    const findRaw = await surrealDB.query<{ id: string }[]>(findExistingQuery, {
+    // db/surreal.ts wraps surrealDB.query so it already returns the
+    // first-statement result array (mirrors queryWithAuth). Each of
+    // these helper SQLs is single-statement, so the returned value
+    // is already the rows array — no further [0] unwrap.
+    const findRows = await surrealDB.query<{ id: string }>(findExistingQuery, {
       variant_id: normalizedVariantId,
       account_id: accountIdParam,
     });
-    const findRows = (Array.isArray(findRaw) && findRaw.length > 0
-      ? (findRaw[0] as { id: string }[])
-      : []) as { id: string }[];
-    const existingId = findRows.length > 0 ? findRows[0]?.id : undefined;
+    const existingId = Array.isArray(findRows) && findRows.length > 0
+      ? (findRows[0] as { id?: string }).id
+      : undefined;
 
     let metricsResult: any[];
     if (existingId) {
-      const updateRaw = await surrealDB.query<any[]>(updateQuery, {
+      metricsResult = (await surrealDB.query<any>(updateQuery, {
         id: existingId,
         success_delta,
         failure_delta,
         duration_ms: validated.duration_ms,
         cost: validated.cost,
-      });
-      metricsResult = (Array.isArray(updateRaw) && updateRaw.length > 0
-        ? (updateRaw[0] as any[])
-        : []) as any[];
+      })) as any[];
     } else {
-      const insertRaw = await surrealDB.query<any[]>(insertQuery, {
+      metricsResult = (await surrealDB.query<any>(insertQuery, {
         record_id_slug: metricsRecordIdSlug,
         variant_id: normalizedVariantId,
         org_id: orgId,
@@ -2304,10 +2301,7 @@ app.post('/executions', async (c) => {
         failure_delta,
         duration_ms: validated.duration_ms,
         cost: validated.cost,
-      });
-      metricsResult = (Array.isArray(insertRaw) && insertRaw.length > 0
-        ? (insertRaw[0] as any[])
-        : []) as any[];
+      })) as any[];
     }
 
     if (metricsResult.length === 0) {

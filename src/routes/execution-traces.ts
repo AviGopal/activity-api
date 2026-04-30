@@ -2319,37 +2319,28 @@ app.post('/', async (c) => {
           cost: trace.cost_usd || 0,
         };
 
-        // queryWithAuth strips the outer multi-statement wrap (returns
-        // result[0]); surrealDB.query returns the raw array (one entry
-        // per statement), so unwrap consistently.
-        const findRaw = jwtAuth?.jwtToken
+        // Both queryWithAuth and surrealDB.query (wrapped in db/surreal.ts)
+        // return the first-statement results array — no further unwrap.
+        const findRows = jwtAuth?.jwtToken
           ? await queryWithAuth<{ id: string }>(jwtAuth.jwtToken, variantMetricsFindExisting, {
               variant_id: variantMetricsParams.variant_id,
               account_id: variantMetricsParams.account_id,
             })
-          : await surrealDB.query<{ id: string }[]>(variantMetricsFindExisting, {
+          : await surrealDB.query<{ id: string }>(variantMetricsFindExisting, {
               variant_id: variantMetricsParams.variant_id,
               account_id: variantMetricsParams.account_id,
             });
-        const findRows = jwtAuth?.jwtToken
-          ? (findRaw as unknown as { id: string }[])
-          : ((Array.isArray(findRaw) && findRaw.length > 0
-              ? (findRaw[0] as unknown as { id: string }[])
-              : []) as { id: string }[]);
-        const existingId = findRows.length > 0 ? findRows[0]?.id : undefined;
+        const existingId = Array.isArray(findRows) && findRows.length > 0
+          ? (findRows[0] as { id?: string }).id
+          : undefined;
 
         const opQuery = existingId ? variantMetricsUpdate : variantMetricsInsert;
         const opParams = existingId
           ? { id: existingId, ...variantMetricsParams }
           : variantMetricsParams;
-        const opRaw = jwtAuth?.jwtToken
-          ? await queryWithAuth<any>(jwtAuth.jwtToken, opQuery, opParams)
-          : await surrealDB.query<any[]>(opQuery, opParams);
         const variantMetricsResult = jwtAuth?.jwtToken
-          ? (opRaw as any[])
-          : ((Array.isArray(opRaw) && opRaw.length > 0
-              ? (opRaw[0] as any[])
-              : []) as any[]);
+          ? ((await queryWithAuth<any>(jwtAuth.jwtToken, opQuery, opParams)) as any[])
+          : ((await surrealDB.query<any>(opQuery, opParams)) as any[]);
 
         if (variantMetricsResult && variantMetricsResult.length > 0) {
           const updatedMetrics = variantMetricsResult[0];
