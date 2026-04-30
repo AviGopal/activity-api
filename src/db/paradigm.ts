@@ -1142,6 +1142,14 @@ export async function queryActivitiesByDense(
   }
 
   try {
+    // Phase 10 P5B / 10.27: HNSW KNN path (gated). When the index from
+    // migration 106 is materialised on canary AND DENSE_EMBEDDING_HNSW_
+    // ENABLED is true, take the SurrealDB-side <|k,ef|> KNN operator
+    // and return the indexed top-K directly. Otherwise fall back to
+    // the original O(n) JS scan so we keep working pre-deploy and
+    // during the benchmark window (10.28).
+    const hnswEnabled = process.env.DENSE_EMBEDDING_HNSW_ENABLED === 'true';
+
     // Fetch candidates that have at least one embedding field
     const whereClauses: string[] = [
       '(name_embedding IS NOT NONE OR description_embedding IS NOT NONE)',
@@ -1156,6 +1164,72 @@ export async function queryActivitiesByDense(
     if (executionType) {
       whereClauses.push('execution_type = $execution_type');
       params.execution_type = executionType;
+    }
+
+    if (hnswEnabled) {
+      // KNN via the HNSW index. <|K,EF|> picks the K closest vectors
+      // (using EF candidates during the descent) without a full scan.
+      // We probe both name and description fields and union the
+      // results, then deduplicate by id and keep the higher score.
+      // dense_search_method label feeds 10.28's benchmark observability.
+      params.query_vec = Array.from(queryVec);
+      params.k = limit * 2; // overfetch for the union/dedupe step
+      const hnswQuery = `
+        LET $name_hits = (
+          SELECT *, vector::distance::cosine(name_embedding, $query_vec) AS dense_score
+          FROM activity
+          WHERE name_embedding <|$k,128|> $query_vec
+            AND ${whereClauses.join(' AND ')}
+          ORDER BY dense_score ASC
+          LIMIT $k
+        );
+        LET $desc_hits = (
+          SELECT *, vector::distance::cosine(description_embedding, $query_vec) AS dense_score
+          FROM activity
+          WHERE description_embedding <|$k,128|> $query_vec
+            AND ${whereClauses.join(' AND ')}
+          ORDER BY dense_score ASC
+          LIMIT $k
+        );
+        RETURN [...$name_hits, ...$desc_hits];
+      `;
+      try {
+        const hnswRows: any[] = jwtToken
+          ? await queryWithAuth<any>(jwtToken, hnswQuery, params)
+          : await surrealDB.query<any>(hnswQuery, params);
+        if (Array.isArray(hnswRows) && hnswRows.length > 0) {
+          // Cosine distance ∈ [0,2]; convert to similarity ∈ [-1,1] so
+          // the sort and the JS-fallback path agree semantically.
+          // Then dedupe by id, keeping the higher similarity, and
+          // sort + cap.
+          const byId = new Map<string, any>();
+          for (const row of hnswRows.flat()) {
+            const sim = 1 - (row.dense_score ?? 0);
+            const merged = { ...row, dense_score: sim };
+            const prior = byId.get(row.id);
+            if (!prior || (prior.dense_score ?? 0) < sim) {
+              byId.set(row.id, merged);
+            }
+          }
+          const results = [...byId.values()]
+            .sort((a, b) => (b.dense_score ?? 0) - (a.dense_score ?? 0))
+            .slice(0, limit);
+          logger.info('[paradigm] queryActivitiesByDense: completed (hnsw)', {
+            searchQuery: searchQuery.substring(0, 50),
+            candidateCount: hnswRows.flat().length,
+            resultCount: results.length,
+            topScore: results[0]?.dense_score ?? null,
+            latency_ms: Date.now() - startTime,
+            dense_search_method: 'hnsw',
+          });
+          return results;
+        }
+        logger.debug('[paradigm] queryActivitiesByDense: HNSW returned 0 rows; falling back to scan');
+      } catch (hnswErr) {
+        logger.warn('[paradigm] queryActivitiesByDense: HNSW path failed; falling back to scan', {
+          error: hnswErr instanceof Error ? hnswErr.message : String(hnswErr),
+        });
+      }
     }
 
     const query = `
@@ -1189,12 +1263,13 @@ export async function queryActivitiesByDense(
       .sort((a: any, b: any) => b.dense_score - a.dense_score)
       .slice(0, limit);
 
-    logger.info('[paradigm] queryActivitiesByDense: completed', {
+    logger.info('[paradigm] queryActivitiesByDense: completed (scan)', {
       searchQuery: searchQuery.substring(0, 50),
       candidateCount: rows.length,
       resultCount: results.length,
       topScore: results[0]?.dense_score ?? null,
       latency_ms: Date.now() - startTime,
+      dense_search_method: 'scan',
     });
 
     return results;
