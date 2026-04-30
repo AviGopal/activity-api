@@ -2239,11 +2239,11 @@ app.post('/executions', async (c) => {
         total_executions = (total_executions ?? 0) + 1,
         successful_executions = (successful_executions ?? 0) + $input.successful_executions,
         failed_executions = (failed_executions ?? 0) + $input.failed_executions,
-        success_rate = successful_executions / total_executions,
-        avg_duration_ms = (((avg_duration_ms ?? 0) * (total_executions - 1)) + $input.avg_duration_ms) / total_executions,
-        avg_cost_usd = (((avg_cost_usd ?? 0) * (total_executions - 1)) + $input.avg_cost_usd) / total_executions,
-        thompson_alpha = successful_executions + 1,
-        thompson_beta = failed_executions + 1,
+        success_rate = ((successful_executions ?? 0) + $input.successful_executions) / ((total_executions ?? 0) + 1),
+        avg_duration_ms = (((avg_duration_ms ?? 0) * (total_executions ?? 0)) + $input.avg_duration_ms) / ((total_executions ?? 0) + 1),
+        avg_cost_usd = (((avg_cost_usd ?? 0) * (total_executions ?? 0)) + $input.avg_cost_usd) / ((total_executions ?? 0) + 1),
+        thompson_alpha = (successful_executions ?? 0) + $input.successful_executions + 1,
+        thompson_beta = (failed_executions ?? 0) + $input.failed_executions + 1,
         last_executed_at = time::now(),
         updated_at = time::now()
       RETURN AFTER;
