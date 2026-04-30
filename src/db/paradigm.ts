@@ -989,13 +989,32 @@ export async function queryActivitiesByFTS(
     // Build WHERE clause parts
     const whereClauses: string[] = [];
     const params: Record<string, any> = {
-      query: trimmedQuery,
       limit,
     };
 
     // FTS matching on name (score index 0) OR description (score index 1)
-    // Note: We use separate score indices to allow weighted scoring
-    whereClauses.push(`(name @0@@ $query OR description @1@@ $query)`);
+    // Note: We use separate score indices to allow weighted scoring.
+    //
+    // SurrealDB 3.x quirk: the `@N@@` full-text-match operator and
+    // `search::score(N)` do not bind a `$query` parameter — they require
+    // an inline string literal so the search analyser can plan against
+    // the indexed term at parse time. Same fix as concept-db 2026-04-29.
+    // Sanitise to single-quote-safe alphanumerics + spaces; everything
+    // else (backticks, quotes, semicolons, parens, control chars) is
+    // dropped so we never produce a malformed SurrealQL literal.
+    const ftsLiteral = trimmedQuery.replace(/[^A-Za-z0-9_\- ]+/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!ftsLiteral) {
+      // Pre-sanitised input was non-empty but contained nothing index-able
+      // (only punctuation). Return empty result-set rather than fall
+      // through to a query with an empty literal that would match all rows.
+      const latencyMs = Date.now() - startTime;
+      logger.info('[paradigm] queryActivitiesByFTS: empty after sanitisation', {
+        searchQuery: trimmedQuery,
+        latency_ms: latencyMs,
+      });
+      return { data: [], path: 'new', latency_ms: latencyMs };
+    }
+    whereClauses.push(`(name @0@@ '${ftsLiteral}' OR description @1@@ '${ftsLiteral}')`);
 
     // Multi-tenant filtering: include global scope OR org-specific activities
     if (orgId) {
