@@ -370,46 +370,33 @@ app.post('/', async (c) => {
     if (existing && existing.length > 0 && existing[0]) {
       // Update existing path
       const current = existing[0];
-      // @ts-ignore - SurrealDB query typing
-      const newTotal = (current.total_executions || 0) + 1;
-      // @ts-ignore - SurrealDB query typing
-      const newSuccessful = (current.successful_executions || 0) + (validated.success ? 1 : 0);
-      // @ts-ignore - SurrealDB query typing
-      const newFailed = (current.failed_executions || 0) + (validated.success ? 0 : 1);
-      
-      // Thompson Sampling parameters (Beta distribution)
-      const thompsonAlpha = newSuccessful + 1; // Prior: α = 1
-      const thompsonBeta = newFailed + 1;      // Prior: β = 1
-      const successRate = newSuccessful / newTotal;
-      
-      // Update rolling averages
-      // @ts-ignore - SurrealDB query typing
-      const currentAvgDuration = current.avg_duration_ms || 0;
-      // @ts-ignore - SurrealDB query typing
-      const currentAvgCost = current.avg_cost_usd || 0;
-      // @ts-ignore - SurrealDB query typing
-      const currentAvgTokens = current.avg_token_usage || 0;
-      // @ts-ignore - SurrealDB query typing
-      const currentTotal = current.total_executions || 0;
-      
-      const newAvgDuration = (currentAvgDuration * currentTotal + validated.duration_ms) / newTotal;
-      const newAvgCost = (currentAvgCost * currentTotal + validated.cost_usd) / newTotal;
-      const newAvgTokens = validated.token_usage !== undefined
-        ? Math.floor((currentAvgTokens * currentTotal + validated.token_usage) / newTotal)
-        : currentAvgTokens;
-      
+
+      // Phase 10 P1: atomic increments. Earlier path read `current` and
+      // computed newTotal/newSuccessful/newFailed/thompson_alpha/beta/
+      // success_rate/avg_* in JS, then wrote them back — classic lost-
+      // update race when two goal executions for the same (goal_hash,
+      // path_signature) land concurrently. All counter and rolling-mean
+      // expressions now compute against the row's pre-update state in a
+      // single SQL statement, so the second UPDATE sees the first's
+      // increments rather than overwriting them.
+      const successDelta = validated.success ? 1 : 0;
+      const failureDelta = validated.success ? 0 : 1;
+      const tokenUsage = validated.token_usage !== undefined ? validated.token_usage : null;
       const updateQuery = `
         UPDATE goal_execution_paths
         SET
-          total_executions = $total_executions,
-          successful_executions = $successful_executions,
-          failed_executions = $failed_executions,
-          thompson_alpha = $thompson_alpha,
-          thompson_beta = $thompson_beta,
-          success_rate = $success_rate,
-          avg_duration_ms = $avg_duration_ms,
-          avg_cost_usd = $avg_cost_usd,
-          avg_token_usage = $avg_token_usage,
+          total_executions = (total_executions ?? 0) + 1,
+          successful_executions = (successful_executions ?? 0) + $success_delta,
+          failed_executions = (failed_executions ?? 0) + $failure_delta,
+          thompson_alpha = (successful_executions ?? 0) + $success_delta + 1,
+          thompson_beta = (failed_executions ?? 0) + $failure_delta + 1,
+          success_rate = ((successful_executions ?? 0) + $success_delta) / ((total_executions ?? 0) + 1),
+          avg_duration_ms = (((avg_duration_ms ?? 0) * (total_executions ?? 0)) + $duration_ms) / ((total_executions ?? 0) + 1),
+          avg_cost_usd = (((avg_cost_usd ?? 0) * (total_executions ?? 0)) + $cost_usd) / ((total_executions ?? 0) + 1),
+          avg_token_usage = IF $token_usage IS NULL
+            THEN (avg_token_usage ?? 0)
+            ELSE math::floor((((avg_token_usage ?? 0) * (total_executions ?? 0)) + $token_usage) / ((total_executions ?? 0) + 1))
+            END,
           endpoint_output_shapes = $endpoint_output_shapes,
           last_executed_at = time::now(),
           updated_at = time::now()
@@ -421,27 +408,26 @@ app.post('/', async (c) => {
       const updated = await surrealDB.query<GoalExecutionPath[]>(updateQuery, {
         goal_hash: goalHash,
         path_signature: pathSignature,
-        total_executions: newTotal,
-        successful_executions: newSuccessful,
-        failed_executions: newFailed,
-        thompson_alpha: thompsonAlpha,
-        thompson_beta: thompsonBeta,
-        success_rate: successRate,
-        avg_duration_ms: newAvgDuration,
-        avg_cost_usd: newAvgCost,
-        avg_token_usage: newAvgTokens,
+        success_delta: successDelta,
+        failure_delta: failureDelta,
+        duration_ms: validated.duration_ms,
+        cost_usd: validated.cost_usd,
+        token_usage: tokenUsage,
         endpoint_output_shapes: endpointOutputShapes,
       });
       
       // @ts-ignore - SurrealDB query typing
       path = updated && updated.length > 0 ? updated[0] : current;
-      
+
       logger.info('Updated goal path', {
         goal_hash: goalHash,
-        total: newTotal,
-        success_rate: successRate,
-        thompson_alpha: thompsonAlpha,
-        thompson_beta: thompsonBeta,
+        // Counters/posteriors are now computed server-side; report what the
+        // UPDATE returned so the log reflects the post-atomic state rather
+        // than the JS-projected pre-state.
+        total: (path as any)?.total_executions,
+        success_rate: (path as any)?.success_rate,
+        thompson_alpha: (path as any)?.thompson_alpha,
+        thompson_beta: (path as any)?.thompson_beta,
       });
     } else {
       // Create new path

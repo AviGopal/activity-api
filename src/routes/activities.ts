@@ -3597,36 +3597,32 @@ app.post('/feedback', async (c) => {
     // Apply feedback multiplier to all shape scores
     const affectedActivities: string[] = [validated.activity_id];
 
+    // Phase 10 P1: atomic bulk multiply on the server. Earlier per-shape
+    // loop did SELECT-then-UPDATE over `existingScores`, which loses
+    // increments under concurrent feedback (two writes read the same
+    // alpha, both compute newAlpha, second UPDATE clobbers first).
+    // Single bulk UPDATE with `math::ceil((alpha ?? 1) * $multiplier)`
+    // computes server-side and is race-free at the row level.
     if (validated.direction === 'positive') {
-      // Positive feedback: multiply alpha
-      for (const score of existingScores) {
-        const currentAlpha = score.alpha || 1;
-        const newAlpha = Math.ceil(currentAlpha * multiplier);
-
-        // Phase B-followup: dual-tenant WHERE on UPDATE.
-        await surrealDB.query(
-          `UPDATE impulse_shape_activity_score
-           SET alpha = $new_alpha, updated_at = time::now()
-           WHERE ${accountIdScopedWhere()}
-             AND shape = $shape
-             AND activity_id = $activity_id`,
-          {
-            new_alpha: newAlpha,
-            org_id: orgId,
-            account_id: accountId,
-            shape: score.shape,
-            activity_id: validated.activity_id,
-          }
-        );
-
-        logger.info('Updated alpha for positive feedback', {
-          activity_id: validated.activity_id,
-          shape: score.shape,
-          old_alpha: currentAlpha,
-          new_alpha: newAlpha,
+      await surrealDB.query(
+        `UPDATE impulse_shape_activity_score
+         SET alpha = math::ceil((alpha ?? 1) * $multiplier), updated_at = time::now()
+         WHERE ${accountIdScopedWhere()}
+           AND activity_id = $activity_id`,
+        {
           multiplier,
-        });
-      }
+          org_id: orgId,
+          account_id: accountId,
+          activity_id: validated.activity_id,
+        }
+      );
+
+      logger.info('Applied positive-feedback multiplier to alpha', {
+        activity_id: validated.activity_id,
+        shapes: existingScores.map(s => s.shape),
+        score_count: existingScores.length,
+        multiplier,
+      });
 
       // TODO: Handle include_adjacent for positive feedback
       // This would query the composition graph to find adjacent activities
@@ -3638,35 +3634,25 @@ app.post('/feedback', async (c) => {
       }
 
     } else {
-      // Negative feedback: multiply beta
-      for (const score of existingScores) {
-        const currentBeta = score.beta || 1;
-        const newBeta = Math.ceil(currentBeta * multiplier);
-
-        // Phase B-followup: dual-tenant WHERE on UPDATE.
-        await surrealDB.query(
-          `UPDATE impulse_shape_activity_score
-           SET beta = $new_beta, updated_at = time::now()
-           WHERE ${accountIdScopedWhere()}
-             AND shape = $shape
-             AND activity_id = $activity_id`,
-          {
-            new_beta: newBeta,
-            org_id: orgId,
-            account_id: accountId,
-            shape: score.shape,
-            activity_id: validated.activity_id,
-          }
-        );
-
-        logger.info('Updated beta for negative feedback', {
-          activity_id: validated.activity_id,
-          shape: score.shape,
-          old_beta: currentBeta,
-          new_beta: newBeta,
+      await surrealDB.query(
+        `UPDATE impulse_shape_activity_score
+         SET beta = math::ceil((beta ?? 1) * $multiplier), updated_at = time::now()
+         WHERE ${accountIdScopedWhere()}
+           AND activity_id = $activity_id`,
+        {
           multiplier,
-        });
-      }
+          org_id: orgId,
+          account_id: accountId,
+          activity_id: validated.activity_id,
+        }
+      );
+
+      logger.info('Applied negative-feedback multiplier to beta', {
+        activity_id: validated.activity_id,
+        shapes: existingScores.map(s => s.shape),
+        score_count: existingScores.length,
+        multiplier,
+      });
 
       // Negative feedback is specific - don't penalize adjacent activities
     }
