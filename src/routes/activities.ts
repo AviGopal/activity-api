@@ -2127,7 +2127,7 @@ app.post('/executions', async (c) => {
     const metricsRecordIdSlug = variantMetricsRecordId(normalizedVariantId, accountId);
     const upsertMetricsQuery = `
       INSERT INTO variant_performance_metrics {
-        id: type::thing('variant_performance_metrics', $record_id_slug),
+        id: type::record('variant_performance_metrics', $record_id_slug),
         variant_id: $variant_id,
         activity_id: $variant_id,
         org_id: $org_id,
@@ -7532,7 +7532,7 @@ app.post('/tool-argument-patterns', async (c) => {
           tool_succeeded = $tool_succeeded,
           validation_error = $validation_error,
           failure_counts = $failure_counts,
-          account_id = $account_id,
+          account_id = IF $account_id IS NULL THEN NONE ELSE $account_id END,
           account_id_version = $account_id_version
         WHERE argument_hash = $hash AND ${accountIdScopedWhere()}
         RETURN AFTER
@@ -8572,7 +8572,7 @@ app.post('/relevance-feedback', async (c) => {
     const relevanceMetricsRecordSlug = variantMetricsRecordId(normalizedTemplateId, accountId);
     surrealDB.query(`
       INSERT INTO variant_performance_metrics {
-        id: type::thing('variant_performance_metrics', $record_id_slug),
+        id: type::record('variant_performance_metrics', $record_id_slug),
         variant_id: $variant_id,
         activity_id: $variant_id,
         org_id: $org_id,
