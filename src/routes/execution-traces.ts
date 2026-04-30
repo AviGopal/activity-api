@@ -2249,39 +2249,56 @@ app.post('/', async (c) => {
       // accounts in the same org get separate posteriors. The id is bound
       // per-candidate below — we intentionally do not bake it into the SQL
       // template here so a single template handles all candidate ids.
+      // Refactored 2026-04-30: SELECT-by-composite → UPDATE-existing /
+      // INSERT-new. Mirrors activities.ts metrics-upsert. Avoids
+      // ON DUPLICATE KEY UPDATE keying on PRIMARY KEY (id) when legacy
+      // rows have non-deterministic random-id slugs that don't match
+      // variantMetricsRecordId() output. Composite UNIQUE INDEX
+      // idx_variant_performance_variant_id (migration 100) on
+      // (variant_id, account_id) is the matching key here.
       const variantMetricsUpsert = `
-        INSERT INTO variant_performance_metrics {
-          id: type::record('variant_performance_metrics', $record_id_slug),
-          variant_id: $variant_id,
-          activity_id: $variant_id,
-          org_id: $org_id,
-          account_id: IF $account_id IS NULL THEN NONE ELSE $account_id END,
-          account_id_version: 1,
-          total_executions: 1,
-          successful_executions: $success_delta,
-          failed_executions: $failure_delta,
-          success_rate: $success_delta,
-          avg_duration_ms: $duration_ms,
-          avg_cost_usd: $cost,
-          thompson_alpha: $success_delta + 1,
-          thompson_beta: $failure_delta + 1,
-          total_selections: 0,
-          last_executed_at: time::now(),
-          created_at: time::now(),
-          updated_at: time::now()
-        }
-        ON DUPLICATE KEY UPDATE
-          total_executions = (total_executions ?? 0) + 1,
-          successful_executions = (successful_executions ?? 0) + $input.successful_executions,
-          failed_executions = (failed_executions ?? 0) + $input.failed_executions,
-          success_rate = ((successful_executions ?? 0) + $input.successful_executions) / ((total_executions ?? 0) + 1),
-          avg_duration_ms = (((avg_duration_ms ?? 0) * (total_executions ?? 0)) + $input.avg_duration_ms) / ((total_executions ?? 0) + 1),
-          avg_cost_usd = (((avg_cost_usd ?? 0) * (total_executions ?? 0)) + $input.avg_cost_usd) / ((total_executions ?? 0) + 1),
-          thompson_alpha = (successful_executions ?? 0) + $input.successful_executions + 1,
-          thompson_beta = (failed_executions ?? 0) + $input.failed_executions + 1,
-          last_executed_at = time::now(),
-          updated_at = time::now()
-        RETURN AFTER;
+        LET $existing = (
+          SELECT id FROM variant_performance_metrics
+            WHERE variant_id = $variant_id
+              AND (account_id IS $account_id OR (account_id IS NONE AND $account_id IS NULL))
+            LIMIT 1
+        )[0].id;
+
+        IF $existing IS NOT NONE {
+          UPDATE $existing SET
+            total_executions = (total_executions ?? 0) + 1,
+            successful_executions = (successful_executions ?? 0) + $success_delta,
+            failed_executions = (failed_executions ?? 0) + $failure_delta,
+            success_rate = ((successful_executions ?? 0) + $success_delta) / ((total_executions ?? 0) + 1),
+            avg_duration_ms = (((avg_duration_ms ?? 0) * (total_executions ?? 0)) + $duration_ms) / ((total_executions ?? 0) + 1),
+            avg_cost_usd = (((avg_cost_usd ?? 0) * (total_executions ?? 0)) + $cost) / ((total_executions ?? 0) + 1),
+            thompson_alpha = (successful_executions ?? 0) + $success_delta + 1,
+            thompson_beta = (failed_executions ?? 0) + $failure_delta + 1,
+            last_executed_at = time::now(),
+            updated_at = time::now()
+          RETURN AFTER;
+        } ELSE {
+          INSERT INTO variant_performance_metrics {
+            id: type::record('variant_performance_metrics', $record_id_slug),
+            variant_id: $variant_id,
+            activity_id: $variant_id,
+            org_id: $org_id,
+            account_id: IF $account_id IS NULL THEN NONE ELSE $account_id END,
+            account_id_version: 1,
+            total_executions: 1,
+            successful_executions: $success_delta,
+            failed_executions: $failure_delta,
+            success_rate: $success_delta,
+            avg_duration_ms: $duration_ms,
+            avg_cost_usd: $cost,
+            thompson_alpha: $success_delta + 1,
+            thompson_beta: $failure_delta + 1,
+            total_selections: 0,
+            last_executed_at: time::now(),
+            created_at: time::now(),
+            updated_at: time::now()
+          } RETURN AFTER;
+        };
       `;
 
       const metricsCandidateIds = resolveTemplateIdsForUpdate({

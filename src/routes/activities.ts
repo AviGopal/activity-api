@@ -2214,39 +2214,64 @@ app.post('/executions', async (c) => {
     // execution-traces.ts so wrapped/plain forms collapse to the same row.
     const normalizedVariantId = normalizeActivityId(activityIdFromRequest);
     const metricsRecordIdSlug = variantMetricsRecordId(normalizedVariantId, accountId);
+    // Refactored 2026-04-30: legacy rows have random-id slugs
+    // (variant_performance_metrics:xkrfzfzykx66...) while
+    // variantMetricsRecordId() generates deterministic slugs from
+    // variant_id. ON DUPLICATE KEY UPDATE keys on PRIMARY KEY (id), so
+    // it never matched legacy rows — INSERT then conflicted on the
+    // composite UNIQUE INDEX (variant_id, account_id) added by
+    // migration 100. Switch to a SELECT-by-composite → UPDATE-existing /
+    // INSERT-new pattern that keys on the unique tuple instead of the
+    // record id, so both legacy and new rows update in place.
+    //
+    // SurrealDB 3.x notes:
+    //   - `IS` compares NONE/None equivalently (= NONE returns false in
+    //     strict mode; IS NONE works).
+    //   - IF/ELSE blocks return the chosen branch's last expression,
+    //     so we wrap the SELECT in $existing and branch.
     const upsertMetricsQuery = `
-      INSERT INTO variant_performance_metrics {
-        id: type::record('variant_performance_metrics', $record_id_slug),
-        variant_id: $variant_id,
-        activity_id: $variant_id,
-        org_id: $org_id,
-        account_id: IF $account_id IS NULL THEN NONE ELSE $account_id END,
-        account_id_version: 1,
-        total_executions: 1,
-        successful_executions: $success_delta,
-        failed_executions: $failure_delta,
-        success_rate: $success_delta,
-        avg_duration_ms: $duration_ms,
-        avg_cost_usd: $cost,
-        thompson_alpha: $success_delta + 1,
-        thompson_beta: $failure_delta + 1,
-        total_selections: 0,
-        last_executed_at: time::now(),
-        created_at: time::now(),
-        updated_at: time::now()
-      }
-      ON DUPLICATE KEY UPDATE
-        total_executions = (total_executions ?? 0) + 1,
-        successful_executions = (successful_executions ?? 0) + $input.successful_executions,
-        failed_executions = (failed_executions ?? 0) + $input.failed_executions,
-        success_rate = ((successful_executions ?? 0) + $input.successful_executions) / ((total_executions ?? 0) + 1),
-        avg_duration_ms = (((avg_duration_ms ?? 0) * (total_executions ?? 0)) + $input.avg_duration_ms) / ((total_executions ?? 0) + 1),
-        avg_cost_usd = (((avg_cost_usd ?? 0) * (total_executions ?? 0)) + $input.avg_cost_usd) / ((total_executions ?? 0) + 1),
-        thompson_alpha = (successful_executions ?? 0) + $input.successful_executions + 1,
-        thompson_beta = (failed_executions ?? 0) + $input.failed_executions + 1,
-        last_executed_at = time::now(),
-        updated_at = time::now()
-      RETURN AFTER;
+      LET $existing = (
+        SELECT id FROM variant_performance_metrics
+          WHERE variant_id = $variant_id
+            AND (account_id IS $account_id OR (account_id IS NONE AND $account_id IS NULL))
+          LIMIT 1
+      )[0].id;
+
+      IF $existing IS NOT NONE {
+        UPDATE $existing SET
+          total_executions = (total_executions ?? 0) + 1,
+          successful_executions = (successful_executions ?? 0) + $success_delta,
+          failed_executions = (failed_executions ?? 0) + $failure_delta,
+          success_rate = ((successful_executions ?? 0) + $success_delta) / ((total_executions ?? 0) + 1),
+          avg_duration_ms = (((avg_duration_ms ?? 0) * (total_executions ?? 0)) + $duration_ms) / ((total_executions ?? 0) + 1),
+          avg_cost_usd = (((avg_cost_usd ?? 0) * (total_executions ?? 0)) + $cost) / ((total_executions ?? 0) + 1),
+          thompson_alpha = (successful_executions ?? 0) + $success_delta + 1,
+          thompson_beta = (failed_executions ?? 0) + $failure_delta + 1,
+          last_executed_at = time::now(),
+          updated_at = time::now()
+        RETURN AFTER;
+      } ELSE {
+        INSERT INTO variant_performance_metrics {
+          id: type::record('variant_performance_metrics', $record_id_slug),
+          variant_id: $variant_id,
+          activity_id: $variant_id,
+          org_id: $org_id,
+          account_id: IF $account_id IS NULL THEN NONE ELSE $account_id END,
+          account_id_version: 1,
+          total_executions: 1,
+          successful_executions: $success_delta,
+          failed_executions: $failure_delta,
+          success_rate: $success_delta,
+          avg_duration_ms: $duration_ms,
+          avg_cost_usd: $cost,
+          thompson_alpha: $success_delta + 1,
+          thompson_beta: $failure_delta + 1,
+          total_selections: 0,
+          last_executed_at: time::now(),
+          created_at: time::now(),
+          updated_at: time::now()
+        } RETURN AFTER;
+      };
     `;
 
     const metricsResult = await surrealDB.query(upsertMetricsQuery, {
