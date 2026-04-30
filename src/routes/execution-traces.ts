@@ -454,8 +454,8 @@ app.get('/', async (c) => {
         parent_execution_id, composition_chain,
         vessel_id, vessel_version,
         failure_mode,
-        array::len(tasks OR []) AS task_count,
-        array::len(impulse_resolutions OR []) AS impulse_count
+        array::len(tasks ?? []) AS task_count,
+        array::len(impulse_resolutions ?? []) AS impulse_count
       FROM activity_execution_traces
       ${whereClause}
       ORDER BY executed_at DESC
