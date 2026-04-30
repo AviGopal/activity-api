@@ -1091,6 +1091,7 @@ export async function denormalizeCompositionChain(
 export async function backfillChildCompositionChains(
   insertedExecutionId: string,
   insertedCompositionChain: string[],
+  jwtToken?: string,
 ): Promise<void> {
   if (!insertedExecutionId || typeof insertedExecutionId !== 'string') return;
   // newChain = parent's chain + parent's own id (root-first ordering, matches
@@ -1102,18 +1103,25 @@ export async function backfillChildCompositionChains(
     // clause is the idempotency guard — we never overwrite a populated
     // chain (those children already had a parent at their insert time and
     // the insert-time helper resolved them correctly).
-    await surrealDB.query(
-      `
+    //
+    // activity_execution_traces FOR update PERMISSIONS require $auth.org_id
+    // (migration 099); use the inbound JWT when available so the UPDATE
+    // doesn't silently no-op under root signin.
+    const updateSql = `
         UPDATE activity_execution_traces
         SET composition_chain = $new_chain
         WHERE parent_execution_id = $parent_execution_id
           AND (composition_chain IS NONE OR array::len(composition_chain) = 0)
-      `,
-      {
-        parent_execution_id: insertedExecutionId,
-        new_chain: newChain,
-      },
-    );
+      `;
+    const updateParams = {
+      parent_execution_id: insertedExecutionId,
+      new_chain: newChain,
+    };
+    if (jwtToken) {
+      await queryWithAuth(jwtToken, updateSql, updateParams);
+    } else {
+      await surrealDB.query(updateSql, updateParams);
+    }
   } catch (err) {
     logger.warn('[composition-chain] Failed to backfill child composition_chains — leaving empty', {
       inserted_execution_id: insertedExecutionId,
@@ -1572,7 +1580,14 @@ app.post('/', async (c) => {
       org_id_type: typeof trace.org_id
     });
 
-    const result = await surrealDB.query(query, trace);
+    // activity_execution_traces has FOR create WHERE $auth.org_id != NONE
+    // (migration 084 / 099). Root signin doesn't populate $auth, so use the
+    // inbound JWT minted by middleware (jwtAuth.ts:121-128) when available.
+    // Falls back to root for diagnostic / unauthenticated paths so the
+    // PERMISSIONS error surfaces upstream rather than silently succeeding.
+    const result = jwtAuth?.jwtToken
+      ? await queryWithAuth(jwtAuth.jwtToken, query, trace)
+      : await surrealDB.query(query, trace);
 
     // Verify INSERT succeeded
     if (!result || result.length === 0) {
@@ -1602,6 +1617,7 @@ app.post('/', async (c) => {
     await backfillChildCompositionChains(
       trace.execution_id,
       resolvedCompositionChain,
+      jwtAuth?.jwtToken,
     );
 
     // Emit fine-grained WebSocket events for real-time execution visualization
@@ -2088,7 +2104,9 @@ app.post('/', async (c) => {
 
         // Phase B2: dual-tenant LET/UPDATE/CREATE. Reads use the dual-tenant
         // WHERE; writes carry account_id + account_id_version=1.
-        await surrealDB.query(`
+        // context_thompson_scores requires $token.org_id IS NOT NONE for
+        // create/update (migration 099) — use inbound JWT when available.
+        const ctxSql = `
           LET $existing = (SELECT * FROM context_thompson_scores
             WHERE ${accountIdScopedWhere()} AND template_id = $template_id AND context_bucket = $bucket
             LIMIT 1);
@@ -2113,14 +2131,20 @@ app.post('/', async (c) => {
               created_at: time::now()
             }
           END
-        `, {
+        `;
+        const ctxParams = {
           org_id: traceOrgId,
           account_id: traceAccountId,
           template_id: trace.variant_id,
           bucket: rawContextBucket,
           alpha_delta: ctxAlphaDelta,
           beta_delta: ctxBetaDelta,
-        });
+        };
+        if (jwtAuth?.jwtToken) {
+          await queryWithAuth(jwtAuth.jwtToken, ctxSql, ctxParams);
+        } else {
+          await surrealDB.query(ctxSql, ctxParams);
+        }
 
         logger.debug('[learning] context_thompson_scores updated', {
           execution_id: trace.execution_id,
@@ -2148,7 +2172,8 @@ app.post('/', async (c) => {
         const rdBetaDelta  = trace.success ? 0 : 1;
 
         // Phase B2: dual-tenant LET/UPDATE/CREATE for the rederived path.
-        await surrealDB.query(`
+        // Same PERMISSIONS constraint as primary bucket path above.
+        const rdSql = `
           LET $existing = (SELECT * FROM context_thompson_scores
             WHERE ${accountIdScopedWhere()} AND template_id = $template_id AND context_bucket = $bucket
             LIMIT 1);
@@ -2173,14 +2198,20 @@ app.post('/', async (c) => {
               created_at: time::now()
             }
           END
-        `, {
+        `;
+        const rdParams = {
           org_id: traceOrgId,
           account_id: traceAccountId,
           template_id: trace.variant_id,
           bucket: rederived,
           alpha_delta: rdAlphaDelta,
           beta_delta: rdBetaDelta,
-        });
+        };
+        if (jwtAuth?.jwtToken) {
+          await queryWithAuth(jwtAuth.jwtToken, rdSql, rdParams);
+        } else {
+          await surrealDB.query(rdSql, rdParams);
+        }
       } catch (ctxRederiveErr: any) {
         logger.warn('[learning] context_thompson_scores re-derive update failed (non-blocking)', {
           execution_id: trace.execution_id,
