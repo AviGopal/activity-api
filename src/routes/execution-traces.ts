@@ -413,6 +413,14 @@ app.get('/', async (c) => {
     if (startDate) {
       whereConditions.push('executed_at >= $start_date');
       params.start_date = startDate;
+    } else {
+      // Default to the last 30 days when no start_date is provided.
+      // This bounds the ORDER BY executed_at DESC scan to a manageable window
+      // instead of scanning all 25k+ historical rows (OOMKill prevention).
+      // Clients needing older data can pass ?start_date=<iso> explicitly.
+      const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+      whereConditions.push('executed_at >= $start_date');
+      params.start_date = thirtyDaysAgo;
     }
 
     if (endDate) {
