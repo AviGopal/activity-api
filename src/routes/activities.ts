@@ -6192,6 +6192,146 @@ app.post('/validate-composition', async (c) => {
  *
  * Returns executions sorted by similarity score descending.
  */
+/**
+ * POST /v2/activities/shape-gap-resolution
+ *
+ * Phase 10 P4.5 of 2026-04-26-impulse-activity-loop. Records (or
+ * updates the usage counters of) a resolution for a previously
+ * missing impulse shape. Called by activity-api itself when a
+ * goal-seeking sub-tree completes successfully, or by MiniBob's
+ * slot-binding meta-activity via the `shapeGapResolution_write`
+ * impulse-resolve resolver.
+ *
+ * Body:
+ *   shape, resolved_by, resolution_type ∈ {activity, vessel, subgoal,
+ *     manual_seed}, escalation_depth (≥ 0), cost_usd (≥ 0),
+ *     account_id?, required_scope?
+ *
+ * Behaviour:
+ *   - UPSERT keyed on (shape, account_id, resolved_by, resolution_type)
+ *     so an identical resolution increments times_used + folds the new
+ *     cost into a running mean rather than creating a duplicate row.
+ *   - last_used_at refreshed on every write; first_seen_at is set
+ *     on creation only.
+ *
+ * Multi-tenant: PERMISSIONS on the table (migration 105) enforce
+ * org / account scoping at the row level when JWT auth is active.
+ */
+app.post('/shape-gap-resolution', async (c) => {
+  try {
+    const jwtAuth = getJwtAuthFromContext(c);
+    const session = (c.get as any)('session') as SessionData | undefined;
+    const orgId = jwtAuth?.orgId || session?.org_id || null;
+    const callerAccountId: string | null = jwtAuth?.accountId ?? null;
+
+    if (!orgId) {
+      return c.json({
+        error: 'Unauthorized',
+        message: 'Missing organization context',
+      }, 401);
+    }
+
+    const body = await c.req.json();
+    const {
+      shape,
+      account_id,
+      resolved_by,
+      resolution_type,
+      required_scope,
+      escalation_depth,
+      cost_usd,
+    } = body;
+
+    if (typeof shape !== 'string' || shape.length === 0) {
+      return c.json({ error: 'shape is required (non-empty string)' }, 400);
+    }
+    if (typeof resolved_by !== 'string' || resolved_by.length === 0) {
+      return c.json({ error: 'resolved_by is required (non-empty string)' }, 400);
+    }
+    const validTypes = new Set(['activity', 'vessel', 'subgoal', 'manual_seed']);
+    if (!validTypes.has(resolution_type)) {
+      return c.json({
+        error: `resolution_type must be one of: ${[...validTypes].join(', ')}`,
+      }, 400);
+    }
+    const escDepth = typeof escalation_depth === 'number' && escalation_depth >= 0
+      ? Math.floor(escalation_depth) : 0;
+    const costSafe = typeof cost_usd === 'number' && cost_usd >= 0 ? cost_usd : 0;
+    // Body's account_id wins over the caller's; falls back to the
+    // caller's accountId when the body doesn't specify, lets cross-
+    // account rows pass through with explicit null.
+    const rowAccountId = account_id !== undefined ? account_id : callerAccountId;
+
+    // UPSERT keyed on the resolution identity. WHERE matches a row
+    // representing the same way we resolved this gap; if found,
+    // increment + recompute average; otherwise CREATE.
+    const upsertQuery = `
+      LET $existing = (
+        SELECT id, times_used, cost_usd
+        FROM shape_gap_resolution
+        WHERE shape = $shape
+          AND org_id = $org_id
+          AND (account_id IS NONE AND $account_id IS NONE OR account_id = $account_id)
+          AND resolved_by = $resolved_by
+          AND resolution_type = $resolution_type
+        LIMIT 1
+      )[0];
+      IF $existing != NONE THEN (
+        UPDATE type::record('shape_gap_resolution', record::id($existing.id))
+        SET
+          times_used = (times_used ?? 0) + 1,
+          cost_usd = (((cost_usd ?? 0) * (times_used ?? 0)) + $cost_usd) / ((times_used ?? 0) + 1),
+          last_used_at = time::now(),
+          escalation_depth = math::min([escalation_depth, $escalation_depth]),
+          required_scope = $required_scope
+        RETURN AFTER
+      ) ELSE (
+        CREATE shape_gap_resolution CONTENT {
+          shape: $shape,
+          account_id: $account_id,
+          account_id_version: 1,
+          org_id: $org_id,
+          resolved_by: $resolved_by,
+          required_scope: $required_scope,
+          resolution_type: $resolution_type,
+          escalation_depth: $escalation_depth,
+          cost_usd: $cost_usd,
+          times_used: 1,
+          first_seen_at: time::now(),
+          last_used_at: time::now()
+        }
+      ) END;
+    `;
+    const params = {
+      shape,
+      org_id: orgId,
+      account_id: rowAccountId,
+      resolved_by,
+      resolution_type,
+      required_scope: required_scope ?? null,
+      escalation_depth: escDepth,
+      cost_usd: costSafe,
+    };
+
+    const result = jwtAuth?.jwtToken
+      ? await queryWithAuth<any>(jwtAuth.jwtToken, upsertQuery, params)
+      : await surrealDB.query<any>(upsertQuery, params);
+    const row = (Array.isArray(result) ? result.flat()[0] : result) ?? null;
+
+    return c.json({
+      success: true,
+      shape,
+      account_id: rowAccountId,
+      row,
+    });
+  } catch (error: any) {
+    logger.error('POST /v2/activities/shape-gap-resolution failed', {
+      error: error.message,
+    });
+    return c.json({ error: error.message }, 500);
+  }
+});
+
 app.post('/similar-state', async (c) => {
   try {
     const body = await c.req.json();

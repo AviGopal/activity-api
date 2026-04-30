@@ -2095,6 +2095,20 @@ router.post('/resolve', async (c) => {
         return c.json(buildWriteResolverResponse('shapeScore_write', delegated, 'shape score updated') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
       }
 
+      case 'shapeGapResolution_write': {
+        // Phase 10 P4.5 — task 10.25. Records (or updates the usage
+        // counters of) a resolution for a previously missing impulse
+        // shape. Called by MiniBob's slot-binding meta-activity after a
+        // recursive `create-shape-provider-goal` succeeds, OR by the
+        // activity-api itself when a goal-seeking sub-tree completes.
+        const writePointer = pointer as typeof pointer & { resolutionData?: unknown };
+        if (!writePointer.resolutionData) {
+          return c.json({ success: false, error: 'resolutionData required for shapeGapResolution_write' } as ImpulseResolveResponse, 400);
+        }
+        const delegated = await delegateWriteToRouter(c, activitiesRouter, '/shape-gap-resolution', writePointer.resolutionData);
+        return c.json(buildWriteResolverResponse('shapeGapResolution_write', delegated, 'shape gap resolution recorded') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
+      }
+
       case 'similarState_write': {
         const writePointer = pointer as typeof pointer & { stateData?: unknown };
         if (!writePointer.stateData) {
