@@ -1952,9 +1952,17 @@ app.post('/executions', async (c) => {
     if (projectId) {
       executionRecord.project_id = projectId;
     }
-    // Phase B1: dual-write account_id (option<string>; null is acceptable).
-    executionRecord.account_id = accountId;
-    executionRecord.account_id_version = 1;
+    // Phase B1: dual-write account_id (option<string> per deployed schema —
+    // SurrealDB 3.x rejects JSON `null` against `none | string`; same I2.4
+    // pattern fixed in execution-traces.ts on 2026-04-29). Only emit the
+    // field when caller has a non-null accountId; otherwise the SCHEMAFULL
+    // table defaults the field to NONE. account_id_version is paired with
+    // account_id (only meaningful when the field is written), so guard the
+    // same way.
+    if (accountId) {
+      executionRecord.account_id = accountId;
+      executionRecord.account_id_version = 1;
+    }
     if (validated.error_message) {
       executionRecord.error_message = validated.error_message;
     }
