@@ -107,29 +107,25 @@ function requireAuthenticated(c: any): { status: 401; error: string } | null {
 /**
  * Execute a query with the right auth context.
  *
- * Updated 2026-04-30: the previous API-key branch fell back to root,
- * citing "self-signed JWT can't validate against ACCESS". That comment
- * is stale — generateJwtToken (auth.ts:131) signs with HS512 and the
- * canonical (NS, DB, AC, org_id, user_id, scopes, project_ids) claims
- * that apikey_token ACCESS accepts. With JWT_SECRET aligned to the
- * schema KEY, queryWithAuth works for API-key auth too — and is
- * required for tables with `$auth.org_id != NONE` PERMISSIONS that
- * reject root-signed sessions.
+ * - For API key auth, the JWT is self-signed and SurrealDB cannot validate it
+ *   against the ACCESS method — queryWithAuth returns "The access method
+ *   cannot be used in the requested operation". Fall back to root credentials
+ *   with manual org_id filtering (caller is responsible for including
+ *   `org_id = $orgId` in the WHERE clause).
+ * - For real JWT auth (SurrealDB ACCESS), use queryWithAuth so PERMISSIONS
+ *   fire (which is also where the admin role check lives).
  *
- * Falls back to root only when no jwtToken is on the context (auth-
- * middleware mint failed, defense-in-depth path documented in
- * jwtAuth.ts:130-156). Caller-supplied `org_id = $orgId` filters still
- * provide org-scoping under the root fallback.
+ * Matches the pattern already used in POST /v2/impulses (executeQuery).
  */
 async function executeAsAuth<T>(
   jwtAuth: JwtAuthContext,
   sql: string,
   params: Record<string, unknown>,
 ): Promise<T[]> {
-  if (jwtAuth.jwtToken) {
-    return queryWithAuth<T>(jwtAuth.jwtToken, sql, params);
+  if (jwtAuth.authType === 'apikey') {
+    return surrealDB.query<T>(sql, params);
   }
-  return surrealDB.query<T>(sql, params);
+  return queryWithAuth<T>(jwtAuth.jwtToken, sql, params);
 }
 
 /**
@@ -283,31 +279,22 @@ router.post('/', async (c) => {
       impulse_type: impulse_data.type
     });
 
-    // Helper to execute queries with proper auth context.
-    //
-    // Updated 2026-04-30: previously the API-key branch fell back to
-    // root credentials, citing "self-signed JWT not valid for SurrealDB".
-    // That comment is stale — generateJwtToken (auth.ts:131) signs with
-    // HS512 + the canonical (NS, DB, AC, org_id, user_id, scopes,
-    // project_ids) claims that the apikey_token ACCESS schema accepts.
-    // Once JWT_SECRET is aligned between this process and the deployed
-    // ACCESS KEY, queryWithAuth works for both auth types.
-    //
-    // Routing every JWT-bearing request through queryWithAuth gets us
-    // $auth/$token claims at the SurrealDB level — required for tables
-    // with `$auth.org_id != NONE` PERMISSIONS clauses (impulse INSERTs
-    // were failing with "Anonymous access not allowed" under root). The
-    // empty-jwtToken fallback path remains: when generateJwtToken returns
-    // null (JWT_SECRET drift), we degrade to root and rely on the
-    // explicit `org_id = $orgId` filter the resolvers add.
+    // Helper to execute queries with proper auth context
+    // For API key auth, use root credentials (JWT token is self-signed, not valid for SurrealDB)
+    // For real JWT auth (from SurrealDB ACCESS), use queryWithAuth for RBAC
     const executeQuery = async <T>(sql: string, params: Record<string, any>): Promise<T[]> => {
+      // API key auth generates self-signed JWTs that SurrealDB can't validate
+      // Use root credentials instead, filtering is done via query params
+      if (jwtAuth?.authType === 'apikey') {
+        logger.debug('Using root query for API key auth (self-signed JWT)', { orgId: jwtAuth.orgId });
+        return surrealDB.query<T>(sql, params);
+      }
+      // Real JWT auth (from SurrealDB ACCESS method) can use queryWithAuth for RBAC
+      // Note: After the apikey check above, authType is narrowed to 'jwt' | 'minibob_token' | undefined
       if (jwtAuth?.jwtToken) {
+        logger.debug('Using authenticated query with JWT', { hasToken: true, authType: jwtAuth.authType });
         return queryWithAuth<T>(jwtAuth.jwtToken, sql, params);
       }
-      logger.debug('No jwtToken on auth context — falling back to root credentials', {
-        authType: jwtAuth?.authType,
-        orgId: jwtAuth?.orgId,
-      });
       return surrealDB.query<T>(sql, params);
     };
 
