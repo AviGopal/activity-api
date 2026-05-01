@@ -150,14 +150,21 @@ export async function generateJwtToken(context: {
       secretLength: config.auth.jwtSecret.length,
     });
 
-    // Generate JWT token with custom claims
+    // Generate JWT token with custom claims.
+    // `id` is intentionally OMITTED: SurrealDB resolves the `id` claim as a
+    // record reference during authenticate(), and `api_key:${keyId}` does
+    // not exist as a record in the api_keys table — the resolution fails
+    // with "The access method cannot be used in the requested operation",
+    // killing every queryWithAuth call. PERMISSIONS already use $token.*
+    // (canonical per CLAUDE.md "Auth"), so dropping `id` only disables
+    // the dashboard-only $auth path which we don't rely on.
     const token = await new jose.SignJWT({
       NS: config.surrealdb.namespace,
       DB: config.surrealdb.database,
       AC: 'apikey_token', // Must match DEFINE ACCESS name in schema (000-auth-schema.surql)
-      id: `api_key:${context.keyId}`,
       org_id: `organizations:${context.orgId}`,
       user_id: `users:${context.userId}`,
+      keyId: context.keyId, // For audit trails; not a record reference.
       scopes: context.scopes,
       project_ids: context.projectIds || [], // Required for PERMISSIONS enforcement
     })
