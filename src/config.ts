@@ -277,6 +277,14 @@ export function loadConfig(): Config {
         // impulses.ts — direct INSERT into goal_verification_labels table.
         // Read-side access not yet exposed; write-only corpus entry point.
         'goal_verification_label',
+        // Semantic-context shapes (2026-05-01): permissive search over the
+        // template registry, execution traces, and tool-argument patterns.
+        // Backing the improvise / cold-start path: even non-exact matches
+        // are surfaced and the consuming activity ranks them. No hard shape
+        // filtering — declared output_shapes contribute as a soft boost.
+        'activity_search',
+        'trace_search',
+        'tool_pattern_search',
       ],
     },
   };

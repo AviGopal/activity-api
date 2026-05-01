@@ -35,6 +35,7 @@ import activitiesRouter, { accountIdScopedWhere } from './activities';
 import executionTracesRouter from './execution-traces';
 import { runTemplateAuditReport, type TemplateAuditInput } from './template-audit';
 import { runExecutionTraceWithSignatures } from './execution-trace-with-signatures';
+import { queryActivitiesByFTS } from '../db/paradigm';
 import {
   runDiscoverByShapes,
   validateDiscoverByShapesInput,
@@ -2850,6 +2851,273 @@ router.post('/resolve', async (c) => {
             rowCount: result.total,
           },
         } as ImpulseResolveResponse, 200);
+      }
+
+      // -----------------------------------------------------------------
+      // Semantic-context shapes for the improvise / cold-start path.
+      //
+      // Each is intentionally permissive: low default thresholds, no hard
+      // shape filtering, ranked by relevance score. The consuming
+      // activity (improvise's gather_context task) decides what to do
+      // with imperfect matches — even a 0.3-similarity match is useful
+      // as scaffolding for a fresh attempt.
+      // -----------------------------------------------------------------
+
+      // activity_search: BM25 over registered templates.
+      // Pointer: { type, query, limit?, category?, output_shapes?, min_score? }
+      // Result body: { total, matches: [{ template_id, name, description,
+      //   tags, output_shapes, metrics, score }] }
+      case 'activity_search': {
+        const sp = pointer as typeof pointer & {
+          query?: string;
+          limit?: number;
+          category?: string;
+          output_shapes?: string[];
+          min_score?: number;
+        };
+        if (!sp.query || typeof sp.query !== 'string' || sp.query.trim() === '') {
+          return c.json({
+            success: false,
+            error: 'activity_search requires a non-empty `query` string',
+          } as ImpulseResolveResponse, 400);
+        }
+        const limit = Math.min(Math.max(sp.limit ?? 5, 1), 50);
+        const minScore = sp.min_score ?? 0;
+        const desiredShapes = Array.isArray(sp.output_shapes) ? sp.output_shapes : [];
+
+        try {
+          const ftsResult = await queryActivitiesByFTS(
+            sp.query,
+            jwtAuthCtx.orgId,
+            null,
+            limit * 3, // over-fetch so the shape-overlap boost can re-rank
+            jwtAuthCtx.jwtToken
+          );
+          const rows = ftsResult.data || [];
+
+          // Soft shape-overlap boost: +0.5 per matching declared output_shape.
+          // Templates without declared output_shapes pass through neutral.
+          const matches = rows
+            .map((row: any) => {
+              const declaredShapes: string[] = Array.isArray(row.output_shapes)
+                ? row.output_shapes
+                : [];
+              const overlap = desiredShapes.filter((s) => declaredShapes.includes(s)).length;
+              const score = (row.fts_score ?? 0) + 0.5 * overlap;
+              return { row, declaredShapes, score };
+            })
+            .filter((entry) => entry.score >= minScore)
+            .sort((a, b) => b.score - a.score)
+            .slice(0, limit)
+            .map(({ row, declaredShapes, score }) => ({
+              template_id: String(row.id || row.activity_id || '').replace(/^activity:/, '').replace(/^⟨|⟩$/g, ''),
+              name: row.name || row.id || '<unnamed>',
+              description: typeof row.description === 'string'
+                ? row.description.slice(0, 200)
+                : '',
+              tags: Array.isArray(row.tags) ? row.tags : [],
+              output_shapes: declaredShapes,
+              metrics: row.metrics || null,
+              score,
+            }));
+
+          return c.json({
+            success: true,
+            content: JSON.stringify({ total: matches.length, matches }),
+            metadata: {
+              shape: 'activity_search_result',
+              summary: `${matches.length} activity matches for "${sp.query.slice(0, 60)}"${desiredShapes.length ? ` (boosted on ${desiredShapes.length} expected shape(s))` : ''}`,
+              rowCount: matches.length,
+            },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          logger.error('activity_search failed', { error: err.message, query: sp.query });
+          return c.json({
+            success: false,
+            error: `activity_search failed: ${err.message}`,
+          } as ImpulseResolveResponse, 500);
+        }
+      }
+
+      // trace_search: substring + recency over execution traces.
+      // No FTS index on activity_execution_traces yet; sort by
+      // last_executed_at and filter by activity_id LIKE / goal_text LIKE.
+      // Pointer: { type, query, limit?, success_only?, since?, activity_id? }
+      // Result body: { total, traces: [{ execution_id, activity_id,
+      //   success, duration_ms, cost_usd, output_shapes,
+      //   tool_calls_summary, score }] }
+      case 'trace_search': {
+        const sp = pointer as typeof pointer & {
+          query?: string;
+          limit?: number;
+          success_only?: boolean;
+          since?: string;
+          activity_id?: string;
+        };
+        const limit = Math.min(Math.max(sp.limit ?? 3, 1), 25);
+        const successOnly = sp.success_only !== false; // default true
+        const since = sp.since
+          ? `<datetime> '${String(sp.since).replace(/[^0-9TZ:.\\-]/g, '')}'`
+          : "time::now() - 30d";
+        const queryFragment = (sp.query || '').replace(/[^A-Za-z0-9_\- ]+/g, ' ').trim();
+
+        try {
+          // Activity_execution_traces lacks FTS; use string::contains on
+          // activity_id (always present) as the cheapest semantic proxy.
+          // When `query` is empty we fall through to a recency-only walk.
+          const whereClauses: string[] = [`org_id = $org_id`, `executed_at > ${since}`];
+          const params: Record<string, unknown> = { org_id: jwtAuthCtx.orgId, limit };
+          if (successOnly) whereClauses.push(`success = true`);
+          if (sp.activity_id) {
+            whereClauses.push(`activity_id = $activity_id`);
+            params.activity_id = sp.activity_id;
+          }
+          if (queryFragment) {
+            // Substring match on activity_id and any indexed
+            // metadata.template_id field. Cheap and good-enough until an
+            // FTS index is added (planned migration).
+            whereClauses.push(`string::contains(string::lowercase(activity_id), string::lowercase($q))`);
+            params.q = queryFragment;
+          }
+
+          const sql = `
+            SELECT
+              execution_id, activity_id, success, duration_ms, cost_usd,
+              metadata, executed_at,
+              tasks
+            FROM activity_execution_traces
+            WHERE ${whereClauses.join(' AND ')}
+            ORDER BY executed_at DESC
+            LIMIT $limit
+          `;
+          const rows = (jwtAuthCtx.jwtToken
+            ? await queryWithAuth<any>(jwtAuthCtx.jwtToken, sql, params)
+            : await surrealDB.query<any>(sql, params)) as any[];
+
+          const traces = (Array.isArray(rows) ? rows : []).map((row: any, i: number) => {
+            const tasks = Array.isArray(row.tasks) ? row.tasks : [];
+            // Compact tool-call summary: tool name → count + success rate.
+            const toolStats: Record<string, { count: number; success: number }> = {};
+            for (const t of tasks) {
+              for (const call of (t.metadata?.toolCalls ?? [])) {
+                const tool = String(call?.tool || call?.name || 'unknown');
+                if (!toolStats[tool]) toolStats[tool] = { count: 0, success: 0 };
+                toolStats[tool].count += 1;
+                if (call?.result?.success !== false) toolStats[tool].success += 1;
+              }
+            }
+            const tool_calls_summary = Object.entries(toolStats).map(([tool, s]) => ({
+              tool,
+              count: s.count,
+              success_rate: s.count > 0 ? s.success / s.count : 0,
+            }));
+            const output_shapes = Array.isArray(row.metadata?.outputShapes)
+              ? row.metadata.outputShapes
+              : (Array.isArray(row.metadata?.output_shapes) ? row.metadata.output_shapes : []);
+            return {
+              execution_id: row.execution_id,
+              activity_id: row.activity_id,
+              goal_text: row.metadata?.goal_text || row.metadata?.goalText || null,
+              success: !!row.success,
+              duration_ms: row.duration_ms ?? 0,
+              cost_usd: row.cost_usd ?? 0,
+              output_shapes,
+              tool_calls_summary,
+              score: 1 / (i + 1), // recency-rank proxy until FTS lands
+            };
+          });
+
+          return c.json({
+            success: true,
+            content: JSON.stringify({ total: traces.length, traces }),
+            metadata: {
+              shape: 'trace_search_result',
+              summary: `${traces.length} traces matched query="${queryFragment.slice(0, 40)}" success_only=${successOnly}`,
+              rowCount: traces.length,
+            },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          logger.error('trace_search failed', { error: err.message, query: queryFragment });
+          return c.json({
+            success: false,
+            error: `trace_search failed: ${err.message}`,
+          } as ImpulseResolveResponse, 500);
+        }
+      }
+
+      // tool_pattern_search: surface proven argument shapes per tool.
+      // Pointer: { type, tools?, query?, min_success_rate?, min_sample_size?, limit? }
+      // Result body: { total, patterns: [{ tool_name, arguments,
+      //   success_rate, sample_size, last_seen_at, score }] }
+      case 'tool_pattern_search': {
+        const sp = pointer as typeof pointer & {
+          tools?: string[];
+          query?: string;
+          min_success_rate?: number;
+          min_sample_size?: number;
+          limit?: number;
+        };
+        const limit = Math.min(Math.max(sp.limit ?? 5, 1), 50);
+        const minSuccess = sp.min_success_rate ?? 0.5;
+        const minSamples = sp.min_sample_size ?? 3;
+        const tools = Array.isArray(sp.tools) ? sp.tools.filter(Boolean) : [];
+
+        try {
+          const whereClauses: string[] = [
+            `org_id = $org_id`,
+            `success_rate >= $min_success`,
+            `sample_size >= $min_samples`,
+          ];
+          const params: Record<string, unknown> = {
+            org_id: jwtAuthCtx.orgId,
+            min_success: minSuccess,
+            min_samples: minSamples,
+            limit,
+          };
+          if (tools.length > 0) {
+            whereClauses.push(`tool_name IN $tools`);
+            params.tools = tools;
+          }
+
+          const sql = `
+            SELECT tool_name, arguments, success_rate, sample_size,
+                   last_seen_at
+            FROM tool_argument_pattern
+            WHERE ${whereClauses.join(' AND ')}
+            ORDER BY success_rate DESC, sample_size DESC, last_seen_at DESC
+            LIMIT $limit
+          `;
+          const rows = (jwtAuthCtx.jwtToken
+            ? await queryWithAuth<any>(jwtAuthCtx.jwtToken, sql, params)
+            : await surrealDB.query<any>(sql, params)) as any[];
+
+          const patterns = (Array.isArray(rows) ? rows : []).map((row: any) => ({
+            tool_name: row.tool_name,
+            arguments: row.arguments || {},
+            success_rate: row.success_rate ?? 0,
+            sample_size: row.sample_size ?? 0,
+            last_seen_at: row.last_seen_at,
+            // success_rate-weighted recency: log-sample-size keeps the
+            // ranking from being dominated by very high-count patterns.
+            score: (row.success_rate ?? 0) * Math.log10((row.sample_size ?? 0) + 10),
+          }));
+
+          return c.json({
+            success: true,
+            content: JSON.stringify({ total: patterns.length, patterns }),
+            metadata: {
+              shape: 'tool_pattern_search_result',
+              summary: `${patterns.length} tool-argument patterns ${tools.length ? `for [${tools.join(', ')}]` : '(any tool)'} ≥ ${minSuccess} success`,
+              rowCount: patterns.length,
+            },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          logger.error('tool_pattern_search failed', { error: err.message });
+          return c.json({
+            success: false,
+            error: `tool_pattern_search failed: ${err.message}`,
+          } as ImpulseResolveResponse, 500);
+        }
       }
 
       default: {
