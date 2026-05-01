@@ -3986,6 +3986,50 @@ async function getActivitiesWithTieredFallback(
     );
 
     if (tier1Result.data && tier1Result.data.length >= minResults) {
+      // 2026-05-01 relevance fix follow-up: Tier 1 exact-shape match
+      // returns all shape-compatible templates, but its ordering is
+      // ev DESC (10.10) which is query-independent. When goalDescription
+      // is provided, blend FTS+dense hits to bring query-relevant
+      // templates into the candidate pool. Without this, the implied-
+      // shapes path from analyzeTaskSemantics always satisfies Tier 1,
+      // FTS never fires, and Thompson Sampling on global α/β picks the
+      // same global winner across all queries.
+      if (goalDescription && goalDescription.trim().length > 0) {
+        try {
+          const [ftsBlend, denseBlend] = await Promise.all([
+            queryActivitiesByFTS(goalDescription, orgId, executionType, limit * 3, jwtToken),
+            queryActivitiesByDense(goalDescription, orgId, executionType, limit * 3, jwtToken),
+          ]);
+          const ftsRows = ftsBlend.data ?? [];
+          const blended: ParadigmActivity[] = denseBlend.length > 0
+            ? mergeByRRF(ftsRows as ParadigmActivity[], denseBlend as ParadigmActivity[])
+            : (ftsRows as ParadigmActivity[]);
+          if (blended.length > 0) {
+            const seen = new Set<string>();
+            const ordered: ParadigmActivity[] = [];
+            for (const r of blended) {
+              const id = String((r as any).id);
+              if (!seen.has(id)) { seen.add(id); ordered.push(r); }
+            }
+            for (const r of tier1Result.data as ParadigmActivity[]) {
+              const id = String((r as any).id);
+              if (!seen.has(id)) { seen.add(id); ordered.push(r); }
+            }
+            logger.info('[tiered-fallback] Tier 1 (exact) + Tier 3 (FTS+dense) blended', {
+              tier1Count: tier1Result.data.length,
+              ftsCount: ftsRows.length,
+              denseCount: denseBlend.length,
+              blendedTotal: ordered.length,
+            });
+            return { activities: ordered, tier: denseBlend.length > 0 ? 'fts_hybrid' : 'fts' };
+          }
+        } catch (blendErr) {
+          logger.warn('[tiered-fallback] Tier 3 blend failed; falling through to Tier 1 only', {
+            error: blendErr instanceof Error ? blendErr.message : String(blendErr),
+          });
+        }
+      }
+
       logger.info('[tiered-fallback] Tier 1 (exact) succeeded', {
         resultCount: tier1Result.data.length,
         path: tier1Result.path,
