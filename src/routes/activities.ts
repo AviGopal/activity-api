@@ -4056,9 +4056,13 @@ async function getActivitiesWithTieredFallback(
   // favour globally. The ev DESC prefilter from 10.10 helps but doesn't
   // fix relevance — the query content has to feed candidate selection,
   // not just ranking.
+  // 2026-05-01 expansion: try Tier 3 ahead of Tier 2 whenever a query
+  // is present, regardless of whether shapes were provided. Tier 1
+  // (when shapes given) blends FTS in earlier; this branch handles the
+  // Tier-1-underfill-and-fall-through case where shapes are non-empty
+  // but didn't yield minResults — Tier 2 would then drown query relevance.
   const hasQuery = !!goalDescription && goalDescription.trim().length > 0;
-  const noShapeFilter = !shapes || shapes.length === 0;
-  if (hasQuery && noShapeFilter) {
+  if (hasQuery) {
     logger.debug('[tiered-fallback] No shape filter + query present; trying Tier 3 (FTS+dense) before Tier 2', {
       goalDescription: goalDescription!.substring(0, 50),
       limit,
