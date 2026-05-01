@@ -75,6 +75,12 @@ app.use('/v2/*', async (c, next) => {
     await next();
     return;
   }
+  // Phase 12: pool-stats endpoint is operational, unauthenticated
+  // (parallel to /health). Spec requires this for ops scraping.
+  if (c.req.path === '/v2/health/db-pool') {
+    await next();
+    return;
+  }
   // JWT auth only (no Redis session fallback)
   // Must return the middleware's result so the Response from a 401
   // c.json(...) propagates back to Hono. Without this, when
