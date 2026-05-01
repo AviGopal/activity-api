@@ -102,7 +102,9 @@ class AuthSessionPool {
   }
 
   enabled(): boolean {
-    return process.env.DB_POOL_ENABLED !== 'false';
+    // Spec: default false until canary validation flips it to true.
+    // Operators set DB_POOL_ENABLED=true on the canary env to opt in.
+    return process.env.DB_POOL_ENABLED === 'true';
   }
 
   async acquire(jwt: string, ns: string, database: string): Promise<AcquiredSession> {
