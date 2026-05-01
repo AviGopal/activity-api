@@ -33,3 +33,17 @@ DEFINE INDEX OVERWRITE idx_activity_description_fts
   ON activity
   FIELDS description
   FULLTEXT ANALYZER activity_analyzer BM25(1.2, 0.75) HIGHLIGHTS;
+
+-- 2026-05-01 follow-up: DEFINE INDEX OVERWRITE updates the schema but
+-- does NOT reindex existing rows in SurrealDB 3.x. After OVERWRITE the
+-- index is empty until either (a) every row gets touched by an UPDATE
+-- (fires the FTS index hook) or (b) REBUILD INDEX is run. Without this,
+-- search::score(N) returns 0 even though search::highlight() shows the
+-- term-position info is structurally correct on new writes.
+--
+-- REBUILD INDEX is slow (~10s per index against the current ~3k row
+-- corpus) but idempotent and only runs on first migration application.
+-- Production-scale corpora may want to run this off-band.
+
+REBUILD INDEX idx_activity_name_fts ON activity;
+REBUILD INDEX idx_activity_description_fts ON activity;
