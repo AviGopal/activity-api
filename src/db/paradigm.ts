@@ -596,10 +596,17 @@ export async function queryActivitiesByShapes(
       ? `WHERE ${whereClauses.join(' AND ')}`
       : '';
 
+    // 10.10: Pre-filter by ev (Beta posterior mean α/(α+β), computed
+    // server-side by the VALUE field from migration 109). The downstream
+    // Thompson Sampling layer in /recommend re-ranks via α/β draws, but
+    // that needs a useful candidate pool — `created_at DESC` returned
+    // recency-ordered slop, which buried high-mean templates behind newer
+    // never-executed ones. ev DESC surfaces the top-performing templates
+    // first; created_at DESC remains as a tiebreaker for ev=0.5 priors.
     const query = `
       SELECT * FROM activity
       ${whereClause}
-      ORDER BY created_at DESC
+      ORDER BY ev DESC, created_at DESC
       LIMIT $limit
     `;
 

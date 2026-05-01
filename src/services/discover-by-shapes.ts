@@ -134,7 +134,7 @@ export async function runDiscoverByShapes(
        FROM activity_metrics WHERE activity = $parent.id LIMIT 1)[0] AS metrics_row${compositionSubquery}
     FROM activity
     WHERE ${whereClause}
-    ORDER BY created_at DESC
+    ORDER BY ev DESC, created_at DESC
     LIMIT $limit
   `;
 
