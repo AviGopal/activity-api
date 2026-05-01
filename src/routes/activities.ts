@@ -4004,6 +4004,52 @@ async function getActivitiesWithTieredFallback(
     });
   }
 
+  // 2026-05-01 relevance fix: when no shape filter is available AND a
+  // non-trivial goalDescription is present, promote Tier 3 FTS+dense ahead
+  // of Tier 2. Otherwise Tier 2 returns the entire catalog (ev DESC
+  // ordered, but query-independent) and Tier 3 never fires, so every
+  // query collapses to whichever template Thompson Sampling happens to
+  // favour globally. The ev DESC prefilter from 10.10 helps but doesn't
+  // fix relevance — the query content has to feed candidate selection,
+  // not just ranking.
+  const hasQuery = !!goalDescription && goalDescription.trim().length > 0;
+  const noShapeFilter = !shapes || shapes.length === 0;
+  if (hasQuery && noShapeFilter) {
+    logger.debug('[tiered-fallback] No shape filter + query present; trying Tier 3 (FTS+dense) before Tier 2', {
+      goalDescription: goalDescription!.substring(0, 50),
+      limit,
+      minResults,
+    });
+    const [ftsFirst, denseFirst] = await Promise.all([
+      queryActivitiesByFTS(goalDescription!, orgId, executionType, limit * 3, jwtToken),
+      queryActivitiesByDense(goalDescription!, orgId, executionType, limit * 3, jwtToken),
+    ]);
+    const ftsRows = ftsFirst.data ?? [];
+    if (denseFirst.length > 0) {
+      const merged = mergeByRRF(ftsRows as ParadigmActivity[], denseFirst as ParadigmActivity[]);
+      if (merged.length >= minResults) {
+        logger.info('[tiered-fallback] Tier 3 (FTS+dense, query-first) succeeded', {
+          ftsCount: ftsRows.length,
+          denseCount: denseFirst.length,
+          mergedCount: merged.length,
+        });
+        return { activities: merged, tier: 'fts_hybrid' };
+      }
+    }
+    if (ftsRows.length >= minResults) {
+      logger.info('[tiered-fallback] Tier 3 (FTS, query-first) succeeded', {
+        resultCount: ftsRows.length,
+        topScore: (ftsRows[0] as any)?.fts_score,
+      });
+      return { activities: ftsRows, tier: 'fts' };
+    }
+    logger.debug('[tiered-fallback] Tier 3 query-first insufficient; falling through to Tier 2', {
+      ftsCount: ftsRows.length,
+      denseCount: denseFirst.length,
+      minResults,
+    });
+  }
+
   // Tier 2: Compatible - query without shape filter (relax constraints)
   logger.debug('[tiered-fallback] Trying Tier 2: compatible (no shape filter)', {
     category,
