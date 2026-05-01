@@ -970,9 +970,18 @@ app.post('/templates', async (c) => {
       LIMIT 1
     `;
 
-    const existing = await surrealDB.query<ActivityTemplate>(existingQuery, {
-      id: activityId,
-    });
+    // Use queryWithAuth when a JWT is on the auth context so $auth/$token
+    // populate for tables with PERMISSIONS clauses (the `activity` table's
+    // FOR create requires $auth.org_id != NONE, otherwise the upsert below
+    // fails with "Anonymous access not allowed"). Falls back to root only
+    // when no JWT is present (diagnostic / unauthenticated paths).
+    const existing = jwtAuth?.jwtToken
+      ? await queryWithAuth<ActivityTemplate>(jwtAuth.jwtToken, existingQuery, {
+          id: activityId,
+        })
+      : await surrealDB.query<ActivityTemplate>(existingQuery, {
+          id: activityId,
+        });
 
     if (existing.length > 0) {
       logger.warn('Template already exists', { id: activityId });
@@ -1175,7 +1184,11 @@ app.post('/templates', async (c) => {
       }
     `;
 
-    await surrealDB.query(upsertActivityQuery, activityRecord);
+    if (jwtAuth?.jwtToken) {
+      await queryWithAuth(jwtAuth.jwtToken, upsertActivityQuery, activityRecord);
+    } else {
+      await surrealDB.query(upsertActivityQuery, activityRecord);
+    }
 
     logger.info('Activity template inserted into activity table', {
       id: activityId,
@@ -1246,12 +1259,17 @@ app.post('/templates', async (c) => {
     // Phase B1: only bind account_id when non-null — SurrealDB 3.x option<string>
     // rejects JSON null; omitting the param lets the field default to NONE.
     const metricsAccountId = accountIdRecordRef(accountId);
-    await surrealDB.query(insertMetricsQuery, {
+    const metricsParams = {
       activity_id: activityId,
       org_id: metricsOrgId,
       ...(metricsAccountId != null ? { account_id: metricsAccountId } : {}),
       ...(metricsProjectId ? { project_id: metricsProjectId } : {}),
-    });
+    };
+    if (jwtAuth?.jwtToken) {
+      await queryWithAuth(jwtAuth.jwtToken, insertMetricsQuery, metricsParams);
+    } else {
+      await surrealDB.query(insertMetricsQuery, metricsParams);
+    }
 
     logger.info('Template registered successfully', {
       id: activityId,
