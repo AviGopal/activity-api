@@ -96,76 +96,66 @@ export async function runDiscoverByShapes(
     limit,
   });
 
-  let query: string;
-  let params: any;
+  // 10.S4: Single-statement query with subqueries in the SELECT projection
+  // collapses the prior 1 + N + N pattern (21 round-trips for limit=10) into
+  // one DB call. SurrealDB evaluates the inline subqueries per parent row
+  // using `$parent.id` to scope each correlated lookup. Composition score
+  // augmentation is folded in via a conditional subquery — empty predecessor
+  // path uses GROUP ALL to roll up edges across all parents of the candidate.
+  const isCandidatesMode = mode === 'candidates_with_scores';
+  const compositionSubquery = isCandidatesMode
+    ? predecessor_activity_id
+      ? `, (SELECT success_count, execution_count FROM activity_composition_graph
+           WHERE parent_activity_id = $predecessor_activity_id
+             AND child_activity_id = $parent.id LIMIT 1)[0] AS comp_row`
+      : `, (SELECT math::sum(success_count) AS success_count, math::sum(execution_count) AS execution_count
+           FROM activity_composition_graph
+           WHERE child_activity_id = $parent.id GROUP ALL)[0] AS comp_row`
+    : '';
 
+  const params: Record<string, unknown> = { required_shapes, limit };
+  if (predecessor_activity_id) params.predecessor_activity_id = predecessor_activity_id;
+
+  let whereClause: string;
   if (queryMode === 'forward') {
-    // Forward mode: Find activities that PRODUCE the required shapes
-    query = `
-      SELECT * FROM activity
-      WHERE output_shapes CONTAINSANY $required_shapes
-        AND (retired = false OR retired IS NONE)
-      ORDER BY created_at DESC
-      LIMIT $limit
-    `;
-    params = { required_shapes, limit };
+    whereClause = 'output_shapes CONTAINSANY $required_shapes AND (retired = false OR retired IS NONE)';
   } else {
-    // Backward mode: Find activities that CONSUME the required shapes
-    // Optional additive filter on output_shapes.
     const outputFilterClause = output_shapes.length > 0
       ? ' AND output_shapes CONTAINSANY $output_shapes_filter'
       : '';
-    if (current_shapes.length > 0) {
-      query = `
-        SELECT * FROM activity
-        WHERE input_shapes CONTAINSANY $required_shapes${outputFilterClause}
-          AND (retired = false OR retired IS NONE)
-        ORDER BY created_at DESC
-        LIMIT $limit
-      `;
-      params = { required_shapes, current_shapes, limit };
-    } else {
-      query = `
-        SELECT * FROM activity
-        WHERE input_shapes CONTAINSANY $required_shapes${outputFilterClause}
-          AND (retired = false OR retired IS NONE)
-        ORDER BY created_at DESC
-        LIMIT $limit
-      `;
-      params = { required_shapes, limit };
-    }
-    if (output_shapes.length > 0) {
-      params.output_shapes_filter = output_shapes;
-    }
+    whereClause = `input_shapes CONTAINSANY $required_shapes${outputFilterClause} AND (retired = false OR retired IS NONE)`;
+    if (current_shapes.length > 0) params.current_shapes = current_shapes;
+    if (output_shapes.length > 0) params.output_shapes_filter = output_shapes;
   }
+
+  const query = `
+    SELECT *,
+      (SELECT alpha, beta, total_executions, successful_executions, success_rate
+       FROM activity_metrics WHERE activity = $parent.id LIMIT 1)[0] AS metrics_row${compositionSubquery}
+    FROM activity
+    WHERE ${whereClause}
+    ORDER BY created_at DESC
+    LIMIT $limit
+  `;
 
   const activities = await surrealDB.query(query, params);
 
-  // Get Thompson Sampling scores for each activity
-  const activitiesWithScores = await Promise.all(
-    (activities || []).map(async (activity: any) => {
-      try {
-        const scoresQuery = `
-          SELECT * FROM activity_metrics
-          WHERE activity = $activity_id
-          LIMIT 1
-        `;
-        const scores = await surrealDB.query(scoresQuery, {
-          activity_id: activity.id,
-        });
-
-        const score = scores && scores.length > 0 ? scores[0] : null;
-
-        return {
-          ...activity,
-          metrics: score ? {
+  // Project metrics_row + comp_row into the legacy response shape.
+  const activitiesWithScores = (activities || []).map((row: any) => {
+    const score = row.metrics_row ?? null;
+    const { metrics_row, comp_row, ...activity } = row;
+    return {
+      ...activity,
+      metrics: score
+        ? {
             total_executions: score.total_executions || 0,
             successful_executions: score.successful_executions || 0,
             success_rate: score.success_rate || 0,
             thompson_alpha: score.alpha || 1,
             thompson_beta: score.beta || 1,
             confidence: (score.alpha || 1) / ((score.alpha || 1) + (score.beta || 1)),
-          } : {
+          }
+        : {
             total_executions: 0,
             successful_executions: 0,
             success_rate: 0,
@@ -173,52 +163,28 @@ export async function runDiscoverByShapes(
             thompson_beta: 1,
             confidence: 0.5,
           },
-        };
-      } catch (error) {
-        logger.warn('Failed to fetch metrics for activity', {
-          activity_id: activity.id,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        return activity;
-      }
-    }),
-  );
+      _comp_row: comp_row ?? null,
+    };
+  });
 
-  // Transform to legacy format for compatibility
-  const legacyActivities = activitiesWithScores.map(transformToLegacyTemplate);
+  const legacyActivities = activitiesWithScores.map((a: any) => {
+    const { _comp_row, ...rest } = a;
+    return transformToLegacyTemplate(rest);
+  });
 
-  // Augment each result with composition_score for candidates_with_scores mode.
-  const finalActivities = mode === 'candidates_with_scores'
-    ? await Promise.all(
-        legacyActivities.map(async (legacyActivity: any, idx: number) => {
-          const sourceActivity: any = activitiesWithScores[idx];
-          try {
-            const compQuery = predecessor_activity_id
-              ? `SELECT success_count, execution_count FROM activity_composition_graph WHERE parent_activity_id = $predecessor_activity_id AND child_activity_id = $activity_id LIMIT 1`
-              : `SELECT math::sum(success_count) AS success_count, math::sum(execution_count) AS execution_count FROM activity_composition_graph WHERE child_activity_id = $activity_id GROUP ALL`;
-            const compParams: Record<string, unknown> = predecessor_activity_id
-              ? { predecessor_activity_id, activity_id: sourceActivity.id }
-              : { activity_id: sourceActivity.id };
-            const compRows: any = await surrealDB.query(compQuery, compParams);
-            const row = compRows && compRows.length > 0 ? compRows[0] : null;
-            const composition_score = row && (row.execution_count || 0) > 0
-              ? {
-                  alpha: (row.success_count || 0) + 1,
-                  beta: ((row.execution_count || 0) - (row.success_count || 0)) + 1,
-                  sample_count: row.execution_count || 0,
-                  predecessor_id: predecessor_activity_id || undefined,
-                }
-              : null;
-            return { ...legacyActivity, composition_score };
-          } catch (error) {
-            logger.warn('Failed to fetch composition score', {
-              activity_id: sourceActivity.id,
-              error: error instanceof Error ? error.message : String(error),
-            });
-            return { ...legacyActivity, composition_score: null };
-          }
-        }),
-      )
+  const finalActivities = isCandidatesMode
+    ? legacyActivities.map((legacyActivity: any, idx: number) => {
+        const compRow = (activitiesWithScores[idx] as any)._comp_row;
+        const composition_score = compRow && (compRow.execution_count || 0) > 0
+          ? {
+              alpha: (compRow.success_count || 0) + 1,
+              beta: ((compRow.execution_count || 0) - (compRow.success_count || 0)) + 1,
+              sample_count: compRow.execution_count || 0,
+              predecessor_id: predecessor_activity_id || undefined,
+            }
+          : null;
+        return { ...legacyActivity, composition_score };
+      })
     : legacyActivities;
 
   logger.info('Activities discovered by shapes', {
