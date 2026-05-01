@@ -194,8 +194,34 @@ export async function queryWithAuth<T = any>(
   sql: string,
   params?: Record<string, any>
 ): Promise<T[]> {
-  const db = await createAuthenticatedClient(jwtToken);
+  // Phase 12: route through the auth-session pool when enabled. Saves
+  // the connect/use/authenticate handshake (~200-300ms cold) on every
+  // queryWithAuth call. Pool stays disabled (legacy path) when
+  // DB_POOL_ENABLED=false until canary validation flips the default.
+  const { authSessionPool } = await import('./auth-session-pool');
+  if (authSessionPool.enabled()) {
+    const session = await authSessionPool.acquire(
+      jwtToken,
+      config.surrealdb.namespace,
+      config.surrealdb.database,
+    );
+    try {
+      logger.info('Executing authenticated query (pooled)', {
+        sql,
+        params,
+        namespace: config.surrealdb.namespace,
+        database: config.surrealdb.database,
+      });
+      const result = await session.db.query(sql, params);
+      const firstResult = Array.isArray(result) && result.length > 0 ? result[0] : [];
+      return firstResult as T[];
+    } finally {
+      authSessionPool.release(session);
+    }
+  }
 
+  // Legacy path: open and close on every query.
+  const db = await createAuthenticatedClient(jwtToken);
   try {
     logger.info('Executing authenticated query', {
       sql,

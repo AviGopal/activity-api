@@ -100,8 +100,23 @@ app.get('/health', async (c) => {
       surrealdb: { status: 'unknown', latency_ms: 0 },
       discovery: { status: 'unknown', registered: false },
       embedding: localEmbeddingService.getStatus(),
+      pool: { size: 0, max_size: 0, hit_rate: null as number | null },
     }
   };
+
+  // Phase 12: include pool stats in /health (size, max_size, hit_rate).
+  try {
+    const { authSessionPool } = await import('./db/auth-session-pool');
+    const stats = authSessionPool.poolStats();
+    const total = stats.acquire_hits + stats.acquire_misses;
+    healthStatus.checks.pool = {
+      size: stats.size,
+      max_size: stats.max_size,
+      hit_rate: total >= 100 ? Math.round((stats.acquire_hits / total) * 100) / 100 : null,
+    };
+  } catch {
+    // Pool stats are advisory; never fail the health check on them.
+  }
 
   let allHealthy = true;
 
@@ -167,6 +182,17 @@ app.get('/health', async (c) => {
   // Return 503 Service Unavailable if any critical dependency is unhealthy
   // Discovery is non-critical, so it won't affect health status
   return c.json(healthStatus, allHealthy ? 200 : 503);
+});
+
+// Phase 12: full pool stats. Unauthenticated (parallel to /health) so
+// operators can scrape without minting credentials.
+app.get('/v2/health/db-pool', async (c) => {
+  try {
+    const { authSessionPool } = await import('./db/auth-session-pool');
+    return c.json(authSessionPool.poolStats());
+  } catch (e) {
+    return c.json({ error: 'pool unavailable', message: e instanceof Error ? e.message : String(e) }, 500);
+  }
 });
 
 // Authentication routes - DEPRECATED (vessel alignment 2026-04-02)
@@ -534,6 +560,14 @@ process.on('SIGTERM', async () => {
   // Stop heartbeat and deregister
   await discoveryClient.shutdown();
 
+  // Phase 12: drain auth-session pool
+  try {
+    const { authSessionPool } = await import('./db/auth-session-pool');
+    await authSessionPool.drain(5000);
+  } catch (e) {
+    logger.warn('[Server] auth-session-pool drain failed', { error: e instanceof Error ? e.message : String(e) });
+  }
+
   // Stop other workers
   logger.info('[Server] Graceful shutdown complete');
   process.exit(0);
@@ -541,10 +575,13 @@ process.on('SIGTERM', async () => {
 
 process.on('SIGINT', async () => {
   logger.info('[Server] SIGINT received, shutting down gracefully');
-
-  // Stop heartbeat and deregister
   await discoveryClient.shutdown();
-
+  try {
+    const { authSessionPool } = await import('./db/auth-session-pool');
+    await authSessionPool.drain(5000);
+  } catch (e) {
+    logger.warn('[Server] auth-session-pool drain failed', { error: e instanceof Error ? e.message : String(e) });
+  }
   logger.info('[Server] Graceful shutdown complete');
   process.exit(0);
 });
