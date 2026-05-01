@@ -3996,9 +3996,15 @@ async function getActivitiesWithTieredFallback(
       // same global winner across all queries.
       if (goalDescription && goalDescription.trim().length > 0) {
         try {
+          // Skip JWT auth for the blend FTS — the JWT ACCESS method
+          // configured in the schema rejects api-key-derived JWTs with
+          // "access method cannot be used in the requested operation".
+          // Pass null jwtToken so FTS uses the root path; multi-tenant
+          // scoping is preserved by the explicit (scope=global OR
+          // org_id=$org_id) WHERE clause inside queryActivitiesByFTS.
           const [ftsBlend, denseBlend] = await Promise.all([
-            queryActivitiesByFTS(goalDescription, orgId, executionType, limit * 3, jwtToken),
-            queryActivitiesByDense(goalDescription, orgId, executionType, limit * 3, jwtToken),
+            queryActivitiesByFTS(goalDescription, orgId, executionType, limit * 3, null),
+            queryActivitiesByDense(goalDescription, orgId, executionType, limit * 3, null),
           ]);
           const ftsRows = ftsBlend.data ?? [];
           const blended: ParadigmActivity[] = denseBlend.length > 0
@@ -4069,8 +4075,8 @@ async function getActivitiesWithTieredFallback(
       minResults,
     });
     const [ftsFirst, denseFirst] = await Promise.all([
-      queryActivitiesByFTS(goalDescription!, orgId, executionType, limit * 3, jwtToken),
-      queryActivitiesByDense(goalDescription!, orgId, executionType, limit * 3, jwtToken),
+      queryActivitiesByFTS(goalDescription!, orgId, executionType, limit * 3, null),
+      queryActivitiesByDense(goalDescription!, orgId, executionType, limit * 3, null),
     ]);
     const ftsRows = ftsFirst.data ?? [];
     if (denseFirst.length > 0) {
