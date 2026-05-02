@@ -210,6 +210,22 @@ class AuthSessionPool {
     }
   }
 
+  /**
+   * Test-only: reset all state so the singleton can be reused across tests.
+   * Closes any cached sessions, clears the wait queue, resets counters,
+   * and lifts the draining flag. Production code never calls this.
+   */
+  __resetForTests(): void {
+    for (const s of this.cache.values()) void safeClose(s.db);
+    this.cache.clear();
+    while (this.waitQueue.length > 0) this.waitQueue.shift()!.reject(new PoolDrainingError());
+    this.draining = false;
+    this.hits = 0;
+    this.misses = 0;
+    this.evictions = { expired: 0, lru: 0, drain: 0 };
+    this.maxSize = Number(process.env.DB_POOL_MAX) || DEFAULT_MAX;
+  }
+
   poolStats(): PoolStats {
     return {
       size: this.cache.size,
