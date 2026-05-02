@@ -80,9 +80,9 @@ class SurrealDBClient {
     return this.connecting;
   }
 
-  async query<T = any>(sql: string, params?: Record<string, any>): Promise<T[]> {
+  async query<T = any>(sql: string, params?: Record<string, any>, _isRetry = false): Promise<T[]> {
     await this.connect();
-    
+
     if (!this.db) {
       throw new Error('SurrealDB not connected');
     }
@@ -116,14 +116,34 @@ class SurrealDBClient {
       return firstResult as T[];
     } catch (error) {
       const err = error as Error;
-      logger.error('SurrealDB query failed', { 
-        sql, 
-        params, 
+
+      // SurrealDB WebSocket reconnects without re-authenticating, leaving the root
+      // connection in anonymous mode. Detect this and force a fresh connect+signin,
+      // then retry the query once. Without this guard, every query fails until the
+      // pod is restarted by the liveness probe.
+      if (
+        !_isRetry &&
+        (err.message.includes('Anonymous access not allowed') ||
+          err.message.includes('Not enough permissions to perform this action'))
+      ) {
+        logger.warn('SurrealDB root connection lost auth — resetting and reconnecting', {
+          sql,
+          error: err.message,
+        });
+        try { await this.db.close(); } catch {}
+        this.db = null;
+        this.connecting = null;
+        return await this.query<T>(sql, params, true);
+      }
+
+      logger.error('SurrealDB query failed', {
+        sql,
+        params,
         namespace: config.surrealdb.namespace,
         database: config.surrealdb.database,
-        error: err.message 
+        error: err.message
       });
-      
+
       // Enrich error with namespace context
       throw new Error(
         `Query failed in ${config.surrealdb.namespace}.${config.surrealdb.database}: ${err.message}`
