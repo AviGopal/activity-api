@@ -244,16 +244,16 @@ export async function insertActivity(
       .map(k => `${k}: $${k}`)
       .join(',\n        ');
 
-    // For org_id: org_id is a STRING field in paradigm schema
-    // $auth.org_id contains record format like "organizations:metabob_internal"
+    // For org_id: use $token.org_id — DEFINE ACCESS TYPE JWT populates $token,
+    // not $auth. $auth is only populated for DEFINE ACCESS TYPE RECORD users.
     const orgIdClause = jwtToken
-      ? `,\n        org_id: $auth.org_id` // Use record format from $auth
+      ? `,\n        org_id: <string>$token.org_id`
       : (activity.org_id ? `,\n        org_id: $org_id` : '');
     if (!jwtToken && activity.org_id) record.org_id = activity.org_id;
 
-    // For project_id: optional record field, let schema VALUE clause handle it from $auth
+    // For project_id: optional; only include when not relying on token context
     const projectIdClause = jwtToken
-      ? '' // Let schema auto-populate from $auth.project_id
+      ? ''
       : (activity.project_id ? `,\n        project_id: $project_id` : '');
     if (!jwtToken && activity.project_id) record.project_id = activity.project_id;
 
@@ -382,16 +382,16 @@ export async function insertExecution(
       .map(k => `${k}: $${k}`)
       .join(',\n        ');
 
-    // For org_id: org_id is a STRING field in paradigm schema
-    // $auth.org_id contains record format like "organizations:metabob_internal"
+    // For org_id: use $token.org_id — DEFINE ACCESS TYPE JWT populates $token,
+    // not $auth. $auth is only populated for DEFINE ACCESS TYPE RECORD users.
     const orgIdClause = jwtToken
-      ? `,\n        org_id: $auth.org_id` // Use record format from $auth
+      ? `,\n        org_id: <string>$token.org_id`
       : (execution.org_id ? `,\n        org_id: $org_id` : '');
     if (!jwtToken && execution.org_id) record.org_id = execution.org_id;
 
-    // For project_id: optional record field, let schema VALUE clause handle it from $auth
+    // For project_id: optional; only include when not relying on token context
     const projectIdClause = jwtToken
-      ? '' // Let schema auto-populate from $auth.project_id
+      ? ''
       : (execution.project_id ? `,\n        project_id: $project_id` : '');
     if (!jwtToken && execution.project_id) record.project_id = execution.project_id;
 
@@ -421,32 +421,12 @@ export async function insertExecution(
       latency_ms: Date.now() - startTime,
     });
 
-    // Phase B dual-write: trace_digest (fire-and-forget)
-    const digestQ = `
-      INSERT INTO trace_digest {
-        execution_id: $execution_id,
-        activity_id: $activity_id,
-        success: $success,
-        duration_ms: $duration_ms,
-        cost_usd: $cost_usd,
-        org_id: $org_id,
-        executed_at: time::now()
-      }
-    `;
-    const dp = {
-      execution_id: execution.id,
-      activity_id: execution.activity_id,
-      success: execution.success,
-      duration_ms: execution.duration_ms ?? 0,
-      cost_usd: execution.cost_usd ?? 0,
-      org_id: execution.org_id ?? 'public',
-    };
-    const digestWrite = jwtToken
-      ? queryWithAuth(jwtToken, digestQ, dp)
-      : surrealDB.query(digestQ, dp);
-    void digestWrite.catch((err: unknown) => {
-      logger.warn('[paradigm] trace_digest dual-write failed', { execution_id: execution.id, err: (err as Error)?.message ?? String(err) });
-    });
+    // trace_digest is written by storeExecutionTrace (execution-traces.ts) before
+    // it calls insertExecution. Writing it here would cause a unique-index
+    // violation on idx_trace_digest_execution_id for every AET route call.
+    // Paradigm-direct callers (non-AET path) do not have rich digest fields
+    // (task_summaries, output_impulse_shapes), so the AET route write is
+    // authoritative. Do NOT add trace_digest writes here.
 
     return result?.[0] || null;
 
