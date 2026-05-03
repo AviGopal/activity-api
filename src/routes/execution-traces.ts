@@ -351,6 +351,28 @@ async function insertTraceDigest(trace: any, body: any, jwtToken?: string): Prom
       }))
     : null;
 
+  // Build dynamically to avoid passing null for option<X> fields — SurrealDB 3.x
+  // rejects JSON null against these types; omit entirely so the field defaults to NONE.
+  const optFields: string[] = [];
+  const p: Record<string, unknown> = {
+    execution_id: trace.execution_id,
+    activity_id: trace.activity_id,
+    success: trace.success,
+    duration_ms: trace.duration_ms ?? 0,
+    cost_usd: trace.cost_usd ?? 0,
+    org_id: trace.org_id,
+    executed_at: trace.executed_at,
+  };
+
+  const failureModeType = body.failure_mode?.type;
+  if (failureModeType != null) { optFields.push('failure_mode_type: $failure_mode_type'); p.failure_mode_type = failureModeType; }
+  if (Array.isArray(trace.output_impulse_shapes) && trace.output_impulse_shapes.length > 0) {
+    optFields.push('output_impulse_shapes: $output_impulse_shapes');
+    p.output_impulse_shapes = trace.output_impulse_shapes;
+  }
+  if (taskSummaries !== null) { optFields.push('task_summaries: $task_summaries'); p.task_summaries = taskSummaries; }
+
+  const optStr = optFields.length > 0 ? ',\n      ' + optFields.join(',\n      ') : '';
   const q = `
     INSERT INTO trace_digest {
       execution_id: $execution_id,
@@ -358,25 +380,10 @@ async function insertTraceDigest(trace: any, body: any, jwtToken?: string): Prom
       success: $success,
       duration_ms: $duration_ms,
       cost_usd: $cost_usd,
-      failure_mode_type: $failure_mode_type,
-      output_impulse_shapes: $output_impulse_shapes,
-      task_summaries: $task_summaries,
       org_id: $org_id,
-      executed_at: $executed_at
+      executed_at: $executed_at${optStr}
     }
   `;
-  const p = {
-    execution_id: trace.execution_id,
-    activity_id: trace.activity_id,
-    success: trace.success,
-    duration_ms: trace.duration_ms ?? 0,
-    cost_usd: trace.cost_usd ?? 0,
-    failure_mode_type: body.failure_mode?.type ?? null,
-    output_impulse_shapes: Array.isArray(trace.output_impulse_shapes) ? trace.output_impulse_shapes : null,
-    task_summaries: taskSummaries,
-    org_id: trace.org_id,
-    executed_at: trace.executed_at,
-  };
   if (jwtToken) {
     await queryWithAuth(jwtToken, q, p);
   } else {

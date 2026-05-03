@@ -112,24 +112,35 @@ describe('Task 4.5/4.6: learning_track=learning → dual-write', () => {
     expect(body.stored).not.toBe('system_traces');
   });
 
-  test('GET /:executionId returns content_source field', async () => {
+  test('GET /:executionId returns content_source field (task 4.5)', async () => {
     if (skip('requires METABOB_API_KEY')) return;
     // Give fire-and-forget writes a moment to land
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 1500));
     const { status, body } = await apiGet(`/v2/activities/execution-traces/${execution_id}`);
     expect(status).toBe(200);
     expect(body.execution_id).toBe(execution_id);
+    // content_source='split' means execution_trace_content has a row (task 4.5)
+    // content_source='legacy' means content write is still pending — acceptable
     expect(['legacy', 'split']).toContain(body.content_source);
   });
 
-  test('exemplar endpoint returns digest_fallback for new activity_id', async () => {
+  test('exemplar/digest_fallback has output_impulse_shapes on trace_digest (task 4.6)', async () => {
     if (skip('requires METABOB_API_KEY')) return;
+    // trace_digest dual-write should have landed by now
+    await new Promise(r => setTimeout(r, 500));
     const encoded = encodeURIComponent(activity_id);
     const { status, body } = await apiGet(`/v2/activities/execution-traces/exemplars?activity_id=${encoded}`);
     expect(status).toBe(200);
     expect(['exemplar', 'digest_fallback']).toContain(body.source);
-    // May have 0 or 1 items depending on trace_digest write latency
     expect(Array.isArray(body.items)).toBe(true);
+    if (body.items.length > 0) {
+      // task 4.6: output_impulse_shapes must be on the trace_digest row
+      const digest = body.items[0];
+      expect(Array.isArray(digest.output_impulse_shapes)).toBe(true);
+      expect(digest.output_impulse_shapes).toContain('testShape');
+      // impulse_resolutions must NOT be on trace_digest (lives in execution_trace_content)
+      expect(digest.impulse_resolutions).toBeUndefined();
+    }
   });
 });
 
