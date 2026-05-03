@@ -986,12 +986,37 @@ app.get('/:executionId', async (c) => {
       });
     }
 
+    // Phase C: consult execution_trace_content first (split-write path).
+    // If absent, the inline AET fields carry the full payload (legacy path).
+    let contentSource: 'split' | 'legacy' = 'legacy';
+    let contentOverride: Record<string, unknown> = {};
+    try {
+      const contentRows = await surrealDB.query<{
+        tasks: unknown; state_snapshot: unknown; impulse_resolutions: unknown; output_impulses: unknown;
+      }>(`SELECT tasks, state_snapshot, impulse_resolutions, output_impulses FROM execution_trace_content WHERE execution_id = $eid LIMIT 1`, { eid: executionId });
+      if (contentRows && contentRows.length > 0) {
+        contentSource = 'split';
+        const cr = contentRows[0];
+        contentOverride = {
+          tasks: cr.tasks,
+          state_snapshot: cr.state_snapshot,
+          impulse_resolutions: cr.impulse_resolutions,
+          output_impulses: cr.output_impulses,
+        };
+      }
+    } catch (contentErr) {
+      logger.warn('execution_trace_content read failed; falling back to legacy AET fields', { executionId, err: contentErr instanceof Error ? contentErr.message : String(contentErr) });
+    }
+    logger.debug('trace content source', { executionId, content_source: contentSource });
+
     // Return trace with optional selection data
     // Ensure execution_id is populated (use SurrealDB id as fallback for legacy data)
     const traceNormalized: any = {
       ...trace,
+      ...(contentSource === 'split' ? contentOverride : {}),
       execution_id: trace.execution_id || (trace as any).id?.toString().split(':')[1] || (trace as any).id,
       selection_attribution: selectionData,
+      content_source: contentSource,
     };
 
     // Read-time fallback: same contract as list handler.
@@ -3088,6 +3113,55 @@ app.get('/calibration-summary', async (c) => {
       error: 'Failed to fetch calibration summary',
       message: error instanceof Error ? error.message : 'Unknown error',
     }, 500);
+  }
+});
+
+/**
+ * GET /v2/activities/execution-traces/exemplars?activity_id=<id>
+ *
+ * Returns exemplar traces for an activity selected by the adaptive exemplar selector.
+ * Falls back to a live trace_digest query when no exemplars have been selected yet.
+ *
+ * Response shape: { source: "exemplar" | "digest_fallback", items: ExemplarItem[] }
+ */
+app.get('/exemplars', async (c) => {
+  const activity_id = c.req.query('activity_id');
+  if (!activity_id) return c.json({ error: 'activity_id query parameter required' }, 400);
+
+  try {
+    // Try execution_exemplar first (via the activity_id index)
+    const exemplarRows = await surrealDB.query<{
+      execution_id: string; success: boolean; digest_id: string; selected_at: string;
+    }>(`SELECT execution_id, success, digest_id, selected_at FROM execution_exemplar WHERE activity_id = $activity_id ORDER BY selected_at DESC LIMIT 40`, { activity_id });
+
+    if (exemplarRows && exemplarRows.length > 0) {
+      // Join with trace_digest for metadata
+      const digestIds = exemplarRows.map(r => r.digest_id).filter(Boolean);
+      let digestMap: Record<string, unknown> = {};
+      if (digestIds.length > 0) {
+        const digestRows = await surrealDB.query<{ id: string } & Record<string, unknown>>(
+          `SELECT * FROM trace_digest WHERE id IN $ids`, { ids: digestIds }
+        );
+        for (const d of digestRows ?? []) {
+          digestMap[String(d.id)] = d;
+        }
+      }
+      const items = exemplarRows.map(r => ({
+        ...r,
+        digest: digestMap[r.digest_id] ?? null,
+      }));
+      return c.json({ source: 'exemplar', items });
+    }
+
+    // Fallback: read directly from trace_digest
+    const fallbackRows = await surrealDB.query<Record<string, unknown>>(
+      `SELECT * FROM trace_digest WHERE activity_id = $activity_id ORDER BY executed_at DESC LIMIT 20`, { activity_id }
+    );
+    return c.json({ source: 'digest_fallback', items: fallbackRows ?? [] });
+
+  } catch (error) {
+    logger.error('Failed to fetch exemplars', { error: error instanceof Error ? error.message : String(error) });
+    return c.json({ error: 'Failed to fetch exemplars', message: error instanceof Error ? error.message : 'Unknown error' }, 500);
   }
 });
 
