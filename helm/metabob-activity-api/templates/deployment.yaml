@@ -110,6 +110,12 @@ spec:
           value: {{ .Values.config.logFormat | quote }}
         - name: CORS_ORIGINS
           value: {{ .Values.config.corsOrigins | quote }}
+        - name: METABOB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "metabob-activity-api.fullname" . }}
+              key: metabob-api-key
+              optional: true
         livenessProbe:
           {{- toYaml .Values.livenessProbe | nindent 12 }}
         readinessProbe:

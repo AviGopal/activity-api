@@ -12,6 +12,7 @@ replicaCount: 2
 # requested operation". See helmfile.yaml.gotmpl for the injection wiring.
 secrets:
   jwtSecret: ""
+  metabobApiKey: ""    # API key for discovery-vessel registration (injected by helmfile)
 
 image:
   repository: metabobapp/metabob-activity-api
