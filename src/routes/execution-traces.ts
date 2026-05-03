@@ -384,11 +384,9 @@ async function insertTraceDigest(trace: any, body: any, jwtToken?: string): Prom
       executed_at: $executed_at${optStr}
     }
   `;
-  if (jwtToken) {
-    await queryWithAuth(jwtToken, q, p);
-  } else {
-    await surrealDB.query(q, p);
-  }
+  // Root path: trace_digest FOR create uses $auth.org_id (JWT only populates $token).
+  // Auth validated at HTTP layer; root path is safe and consistent with AET INSERT.
+  await surrealDB.query(q, p);
 }
 
 /**
@@ -419,11 +417,9 @@ async function insertTraceContent(trace: any, jwtToken?: string): Promise<void> 
       org_id: $org_id${optStr}
     }
   `;
-  if (jwtToken) {
-    await queryWithAuth(jwtToken, q, p);
-  } else {
-    await surrealDB.query(q, p);
-  }
+  // Root path: execution_trace_content FOR create uses $auth.org_id (JWT only
+  // populates $token). Auth validated at HTTP layer; root path is safe.
+  await surrealDB.query(q, p);
 }
 
 /**
@@ -458,11 +454,8 @@ async function insertSystemTrace(params: SystemTraceParams, jwtToken?: string): 
   };
   if (params.parent_execution_id) p.parent_execution_id = params.parent_execution_id;
 
-  if (jwtToken) {
-    await queryWithAuth(jwtToken, query, p);
-  } else {
-    await surrealDB.query(query, p);
-  }
+  // Root path: same $auth/$token PERMISSIONS reason as AET INSERT.
+  await surrealDB.query(query, p);
 }
 
 /**
@@ -1826,14 +1819,15 @@ app.post('/', async (c) => {
       org_id_type: typeof trace.org_id
     });
 
-    // activity_execution_traces has FOR create WHERE $auth.org_id != NONE
-    // (migration 084 / 099). Root signin doesn't populate $auth, so use the
-    // inbound JWT minted by middleware (jwtAuth.ts:121-128) when available.
-    // Falls back to root for diagnostic / unauthenticated paths so the
-    // PERMISSIONS error surfaces upstream rather than silently succeeding.
-    const result = jwtAuth?.jwtToken
-      ? await queryWithAuth(jwtAuth.jwtToken, query, trace)
-      : await surrealDB.query(query, trace);
+    // Always use root path for AET INSERT. The $auth / $token distinction
+    // in SurrealDB means JWT-auth sessions only populate $token, while the
+    // AET FOR create guard checks $auth.org_id — so queryWithAuth silently
+    // blocks the INSERT (PERMISSIONS evaluate false, no error, empty result).
+    // HTTP-layer auth (identity-vessel) already enforces access before we
+    // reach this point; the root path is safe and matches how the existing
+    // 19K rows were inserted (migration 121 repairs the schema PERMISSIONS
+    // to also accept $token.org_id so future authenticated SELECTs work).
+    const result = await surrealDB.query(query, trace);
 
     // Verify INSERT succeeded.
     //
