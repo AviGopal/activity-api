@@ -22,8 +22,13 @@
 
 USE NS `activity-system` DB `learning_loop`;
 
+-- SurrealDB 3.0.0 uses ALTER TABLE to update PERMISSIONS on existing tables.
+-- DEFINE TABLE OVERWRITE and plain DEFINE TABLE both fail on existing tables
+-- in this version. ALTER TABLE modifies only the specified attributes,
+-- leaving existing rows, field definitions, and indexes untouched.
+
 -- activity_execution_traces ---------------------------------------------------
-DEFINE TABLE activity_execution_traces OVERWRITE SCHEMAFULL
+ALTER TABLE activity_execution_traces
   PERMISSIONS
     FOR select WHERE
       (
@@ -57,7 +62,7 @@ DEFINE TABLE activity_execution_traces OVERWRITE SCHEMAFULL
       AND ($auth.role = 'admin' OR $token.role = 'admin');
 
 -- trace_digest ----------------------------------------------------------------
-DEFINE TABLE trace_digest OVERWRITE SCHEMAFULL
+ALTER TABLE trace_digest
   PERMISSIONS
     FOR select WHERE
       (org_id = $auth.org_id OR org_id = $token.org_id)
@@ -69,7 +74,7 @@ DEFINE TABLE trace_digest OVERWRITE SCHEMAFULL
       AND ($auth.role = 'admin' OR $token.role = 'admin');
 
 -- execution_trace_content -----------------------------------------------------
-DEFINE TABLE execution_trace_content OVERWRITE SCHEMAFULL
+ALTER TABLE execution_trace_content
   PERMISSIONS
     FOR select WHERE
       (org_id = $auth.org_id OR org_id = $token.org_id)
@@ -81,7 +86,7 @@ DEFINE TABLE execution_trace_content OVERWRITE SCHEMAFULL
       AND ($auth.role = 'admin' OR $token.role = 'admin');
 
 -- execution_system_traces -----------------------------------------------------
-DEFINE TABLE execution_system_traces OVERWRITE SCHEMAFULL
+ALTER TABLE execution_system_traces
   PERMISSIONS
     FOR select WHERE org_id = $auth.org_id OR org_id = $token.org_id
     FOR create WHERE $auth.org_id != NONE OR $token.org_id != NONE
