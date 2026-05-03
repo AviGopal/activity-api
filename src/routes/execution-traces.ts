@@ -1052,7 +1052,11 @@ app.get('/:executionId', async (c) => {
     } catch (contentErr) {
       logger.warn('execution_trace_content read failed; falling back to legacy AET fields', { executionId, err: contentErr instanceof Error ? contentErr.message : String(contentErr) });
     }
-    logger.debug('trace content source', { executionId, content_source: contentSource });
+    if (contentSource === 'legacy') {
+      logger.info('trace content source: legacy (Phase D gate)', { executionId, content_source: contentSource });
+    } else {
+      logger.debug('trace content source', { executionId, content_source: contentSource });
+    }
 
     // Return trace with optional selection data
     // Ensure execution_id is populated (use SurrealDB id as fallback for legacy data)
