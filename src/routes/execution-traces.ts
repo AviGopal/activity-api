@@ -390,26 +390,28 @@ async function insertTraceDigest(trace: any, body: any, jwtToken?: string): Prom
  */
 async function insertTraceContent(trace: any, jwtToken?: string): Promise<void> {
   // Only bother if there is actual content to store
-  if (!trace.tasks && !trace.state_snapshot && !trace.impulse_resolutions && !trace.output_impulses) return;
+  if (!trace.tasks && !trace.state_snapshot && !(trace as any).impulse_resolutions && !(trace as any).output_impulses) return;
 
+  // Build dynamically to avoid passing null for TYPE none|array<object> fields.
+  // SurrealDB 3.x rejects JSON null against option<X> coercion; omit entirely so
+  // the field defaults to NONE.
+  const optFields: string[] = [];
+  const p: Record<string, unknown> = {
+    execution_id: trace.execution_id,
+    org_id: trace.org_id,
+  };
+  if (trace.tasks) { optFields.push('tasks: $tasks'); p.tasks = trace.tasks; }
+  if (trace.state_snapshot) { optFields.push('state_snapshot: $state_snapshot'); p.state_snapshot = trace.state_snapshot; }
+  if ((trace as any).impulse_resolutions) { optFields.push('impulse_resolutions: $impulse_resolutions'); p.impulse_resolutions = (trace as any).impulse_resolutions; }
+  if ((trace as any).output_impulses) { optFields.push('output_impulses: $output_impulses'); p.output_impulses = (trace as any).output_impulses; }
+
+  const optStr = optFields.length > 0 ? ',\n      ' + optFields.join(',\n      ') : '';
   const q = `
     INSERT INTO execution_trace_content {
       execution_id: $execution_id,
-      tasks: $tasks,
-      state_snapshot: $state_snapshot,
-      impulse_resolutions: $impulse_resolutions,
-      output_impulses: $output_impulses,
-      org_id: $org_id
+      org_id: $org_id${optStr}
     }
   `;
-  const p = {
-    execution_id: trace.execution_id,
-    tasks: trace.tasks ?? null,
-    state_snapshot: trace.state_snapshot ?? null,
-    impulse_resolutions: (trace as any).impulse_resolutions ?? null,
-    output_impulses: (trace as any).output_impulses ?? null,
-    org_id: trace.org_id,
-  };
   if (jwtToken) {
     await queryWithAuth(jwtToken, q, p);
   } else {
