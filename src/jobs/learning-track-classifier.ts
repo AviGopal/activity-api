@@ -104,7 +104,8 @@ export async function classifyOneTemplate(activity_id: string): Promise<Classify
     `
     SELECT
       array::len(task_summaries ?? []) AS task_count,
-      array::len(output_impulse_shapes ?? []) AS shape_count
+      array::len(output_impulse_shapes ?? []) AS shape_count,
+      executed_at
     FROM trace_digest
     WHERE activity_id = $activity_id
     ORDER BY executed_at DESC
