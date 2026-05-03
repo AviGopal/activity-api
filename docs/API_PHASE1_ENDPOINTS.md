@@ -528,3 +528,115 @@ Phase 2 will implement the frontend components using these backend APIs:
 - Thompson Sampling visualization
 
 All required backend infrastructure is now in place and ready for frontend integration.
+
+---
+
+## Trace Storage Redesign (v1.17.0+)
+
+### New Endpoints
+
+#### `GET /v2/activities/execution-traces/exemplars`
+
+Returns exemplar execution traces for an activity template. Exemplars are selected by the adaptive exemplar selector driven by each template's Thompson `ev` (expected value) — biasing toward the minority outcome class.
+
+**Query Parameters:**
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `activity_id` | Yes | Activity template ID |
+
+**Response:**
+
+```json
+{
+  "source": "exemplar",
+  "items": [
+    {
+      "execution_id": "exec_123",
+      "success": true,
+      "digest_id": "trace_digest:abc",
+      "selected_at": "2026-05-02T18:00:00Z",
+      "digest": {
+        "activity_id": "activity:auth_resolve",
+        "success": true,
+        "duration_ms": 234,
+        "cost_usd": 0.0012,
+        "output_impulse_shapes": ["authToken"],
+        "task_summaries": [{ "id": "t1", "status": "success", "duration_ms": 230, "resolver_tier": "llm" }]
+      }
+    }
+  ]
+}
+```
+
+When no exemplars have been selected yet for the activity, falls back to a live `trace_digest` query:
+
+```json
+{
+  "source": "digest_fallback",
+  "items": [/* trace_digest rows, most recent first, limit 20 */]
+}
+```
+
+**Notes:**
+- Exemplar selection runs nightly (24h interval, configurable via `EXEMPLAR_SELECTOR_INTERVAL_MS`) and on burst (every 20 new traces, configurable via `EXEMPLAR_BURST_THRESHOLD`).
+- Exemplar counts: `n_success = max(1, round(N * (1 - ev)))`, `n_failure = max(1, round(N * ev))` where `N = 20` (configurable via `EXEMPLAR_N`).
+
+---
+
+#### `GET /v2/admin/learning-tracks`
+
+Returns learning-track classification state for activity templates. Admin scope required.
+
+**Query Parameters:**
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `activity_id` | No | Filter to a single template |
+| `limit` | No | Page size (default: 100, max: 500) |
+| `offset` | No | Pagination offset |
+
+**Response:**
+
+```json
+{
+  "items": [
+    {
+      "activity_id": "activity:auth_resolve",
+      "learning_track": "system",
+      "last_classified_at": "2026-05-02T06:00:00Z",
+      "signals": {
+        "avg_task_count": 0.0,
+        "avg_output_shape_count": 0.0,
+        "declared_output_shapes_count": 0,
+        "sample_count": 47
+      }
+    }
+  ],
+  "total": 1,
+  "limit": 100,
+  "offset": 0
+}
+```
+
+**Learning tracks:**
+
+| Track | Description |
+|-------|-------------|
+| `unclassified` | Default for new templates; insufficient samples or signal straddles thresholds |
+| `learning` | Produces tasks and/or shapes; feeds Thompson posteriors via AET + trace_digest |
+| `system` | Bookkeeping template (zero tasks, zero shapes, no declared output shapes); traces stored in `execution_system_traces` only, excluded from Thompson posterior updates |
+
+---
+
+### Execution Trace Read Changes (v1.18.0+)
+
+`GET /v2/activities/execution-traces/:executionId` now returns a `content_source` field indicating where the full trace content came from:
+
+| Value | Description |
+|-------|-------------|
+| `"split"` | Content fields (`tasks`, `state_snapshot`, `impulse_resolutions`, `output_impulses`) read from `execution_trace_content` (Phase B split-write path) |
+| `"legacy"` | Content fields read from inline AET fields (pre-Phase-B traces) |
+
+This field can be used to monitor the migration progress from the legacy inline storage to the split-storage model. When `content_source: "legacy"` volume reaches zero, Phase D (content-field drop, task 7) can safely be triggered.
+
