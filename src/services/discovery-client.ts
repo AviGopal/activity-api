@@ -366,10 +366,12 @@ export class DiscoveryClient {
 
     for (let attempt = 0; attempt <= config.discovery.retryAttempts; attempt++) {
       try {
+        const apiKey = process.env.METABOB_API_KEY || process.env.ACTIVITY_API_KEY;
         const options: RequestInit = {
           method,
           headers: {
             'Content-Type': 'application/json',
+            ...(apiKey ? { Authorization: `ApiKey ${apiKey}` } : {}),
           },
         };
 
