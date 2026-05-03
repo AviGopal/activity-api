@@ -195,6 +195,13 @@ DEFINE FIELD IF NOT EXISTS created_at ON activity TYPE datetime
 DEFINE FIELD IF NOT EXISTS updated_at ON activity TYPE datetime
   VALUE time::now();
 
+-- learning_track classifier fields (added migration 119)
+DEFINE FIELD IF NOT EXISTS learning_track ON activity TYPE string
+  VALUE $value OR 'unclassified'
+  ASSERT $value IN ['unclassified', 'learning', 'system'];
+
+DEFINE FIELD IF NOT EXISTS last_classified_at ON activity TYPE option<datetime>;
+
 -- Indexes
 DEFINE INDEX IF NOT EXISTS idx_activity_id ON activity FIELDS id UNIQUE;
 DEFINE INDEX IF NOT EXISTS idx_activity_name ON activity FIELDS name;
@@ -329,6 +336,8 @@ DEFINE INDEX IF NOT EXISTS idx_execution_executed_at ON execution FIELDS execute
 
 -- Composite index for dashboard success rate time-series queries
 DEFINE INDEX IF NOT EXISTS idx_execution_org_success_time ON execution FIELDS org_id, success, executed_at;
+-- Per-template exemplar recall index (added migration 113)
+DEFINE INDEX OVERWRITE idx_execution_activity_success_time ON execution FIELDS activity_id, success, executed_at;
 
 -- ============================================================================
 -- Table 4: vessel

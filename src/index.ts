@@ -245,6 +245,70 @@ app.route('/v2/connections', connectionsRoutes);
 app.route('/v2/ribosome', ribosomeRoutes);
 
 // ============================================================================
+// Admin: learning-track classification status
+// GET /v2/admin/learning-tracks?activity_id=<id>&limit=100&offset=0
+// Admin-scope required.
+// ============================================================================
+app.get('/v2/admin/learning-tracks', async (c) => {
+  try {
+    const { getJwtAuthFromContext } = await import('./middleware/jwtAuth');
+    const jwtAuth = getJwtAuthFromContext(c);
+    if (!jwtAuth?.scopes?.includes('admin')) {
+      return c.json({ error: 'admin scope required' }, 403);
+    }
+
+    const activityId = c.req.query('activity_id');
+    const limit = Math.min(parseInt(c.req.query('limit') ?? '100', 10), 500);
+    const offset = parseInt(c.req.query('offset') ?? '0', 10);
+
+    const { surrealDB: db } = await import('./db/surreal');
+    const rows = await db.query<{
+      id: string;
+      learning_track: string | null;
+      last_classified_at: string | null;
+      output_shapes: string[] | null;
+    }>(
+      activityId
+        ? `SELECT id, learning_track, last_classified_at, output_shapes FROM activity WHERE id = $id LIMIT 1`
+        : `SELECT id, learning_track, last_classified_at, output_shapes FROM activity WHERE execution_type = 'template' ORDER BY id LIMIT $limit START $offset`,
+      activityId ? { id: activityId } : { limit, offset }
+    );
+
+    // Enrich with trace_digest signal counts
+    const enriched = await Promise.all((rows ?? []).map(async (row) => {
+      const sigRows = await db.query<{
+        avg_task_count: number;
+        avg_output_shape_count: number;
+        sample_count: number;
+      }>(
+        `SELECT
+           math::mean(array::len(task_summaries ?? [])) AS avg_task_count,
+           math::mean(array::len(output_impulse_shapes ?? [])) AS avg_output_shape_count,
+           count() AS sample_count
+         FROM trace_digest WHERE activity_id = $id GROUP ALL`,
+        { id: String(row.id) }
+      ).catch(() => null);
+      const sig = sigRows?.[0];
+      return {
+        activity_id: row.id,
+        learning_track: row.learning_track ?? 'unclassified',
+        last_classified_at: row.last_classified_at ?? null,
+        signals: {
+          avg_task_count: sig?.avg_task_count ?? null,
+          avg_output_shape_count: sig?.avg_output_shape_count ?? null,
+          declared_output_shapes_count: row.output_shapes?.length ?? 0,
+          sample_count: sig?.sample_count ?? 0,
+        },
+      };
+    }));
+
+    return c.json({ items: enriched, count: enriched.length });
+  } catch (err) {
+    return c.json({ error: 'internal error', detail: err instanceof Error ? err.message : String(err) }, 500);
+  }
+});
+
+// ============================================================================
 // Error Handling
 // ============================================================================
 
@@ -666,5 +730,44 @@ if (vesselCleanupEnabled) {
     logger.info('[Server] Vessel cleanup job started');
   }).catch(err => {
     logger.error('[Server] Failed to start vessel cleanup job', { error: err.message });
+  });
+}
+
+// Exemplar selector — nightly job to refresh execution_exemplar table.
+// Interval: EXEMPLAR_SELECTOR_INTERVAL_MS (default 24h).
+const exemplarSelectorEnabled = process.env.EXEMPLAR_SELECTOR_ENABLED !== 'false';
+if (exemplarSelectorEnabled) {
+  import('./services/exemplar-selector').then(({ selectExemplarsForAllActiveActivities }) => {
+    const intervalMs = parseInt(process.env.EXEMPLAR_SELECTOR_INTERVAL_MS ?? String(24 * 60 * 60 * 1000), 10);
+    setInterval(() => {
+      void selectExemplarsForAllActiveActivities().catch(err => {
+        logger.warn('[Server] Exemplar selector cycle failed', { error: err.message });
+      });
+    }, intervalMs);
+    logger.info('[Server] Exemplar selector job started', { intervalMs });
+  }).catch(err => {
+    logger.error('[Server] Failed to start exemplar selector job', { error: err.message });
+  });
+}
+
+// Learning-track classifier — runs immediately on startup then every 6h (default).
+// Classifies activity templates as 'learning' | 'system' | 'unclassified' based on
+// observed trace signals. Env: LEARNING_TRACK_CADENCE_MS, LEARNING_TRACK_CLASSIFIER_ENABLED.
+const classifierEnabled = process.env.LEARNING_TRACK_CLASSIFIER_ENABLED !== 'false';
+if (classifierEnabled) {
+  import('./jobs/learning-track-classifier').then(({ runClassifierCycle }) => {
+    const cadenceMs = parseInt(process.env.LEARNING_TRACK_CADENCE_MS ?? String(6 * 60 * 60 * 1000), 10);
+    // Immediate first run so a fresh deploy classifies without waiting for the full cadence
+    void runClassifierCycle().catch(err => {
+      logger.warn('[Server] Initial learning-track classifier cycle failed', { error: err.message });
+    });
+    setInterval(() => {
+      void runClassifierCycle().catch(err => {
+        logger.warn('[Server] Learning-track classifier cycle failed', { error: err.message });
+      });
+    }, cadenceMs);
+    logger.info('[Server] Learning-track classifier job started', { cadenceMs });
+  }).catch(err => {
+    logger.error('[Server] Failed to start learning-track classifier job', { error: err.message });
   });
 }

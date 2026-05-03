@@ -269,6 +269,14 @@ DEFINE INDEX IF NOT EXISTS idx_activity_execution_traces_vessel_id
 DEFINE INDEX IF NOT EXISTS idx_activity_execution_traces_resolved_by_vessel_id
   ON activity_execution_traces FIELDS resolved_by_vessel_id;
 
+-- Composite success+time indexes (added in migration 113)
+-- Fixes TableScan on WHERE success = true ORDER BY executed_at (migration 102 indexes omitted success)
+DEFINE INDEX OVERWRITE idx_aet_activity_success_time
+  ON activity_execution_traces FIELDS activity_id, success, executed_at;
+
+DEFINE INDEX OVERWRITE idx_aet_org_activity_success_time
+  ON activity_execution_traces FIELDS org_id, activity_id, success, executed_at;
+
 -- =============================================================================
 -- Table: activity_composition_graph
 -- =============================================================================

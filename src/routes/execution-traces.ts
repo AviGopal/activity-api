@@ -22,6 +22,8 @@ import {
   computeThompsonSamplingUpdates,
   type ShapeMatchMetadata,
 } from '../services/thompson-sampling';
+import { resolveLearningTrack, type LearningTrack } from '../lib/learning-track';
+import { incrementExemplarBurstCounter } from '../services/exemplar-selector';
 
 const app = new Hono();
 
@@ -321,6 +323,136 @@ async function forwardToLearning(
       session_id: sessionId,
       error: error instanceof Error ? error.message : String(error),
     });
+  }
+}
+
+interface SystemTraceParams {
+  execution_id: string;
+  activity_id: string;
+  success: boolean;
+  duration_ms: number;
+  cost_usd: number;
+  parent_execution_id: string | null;
+  org_id: string;
+  executed_at: Date;
+}
+
+/**
+ * Write a slim digest row co-produced alongside each AET row (Phase B dual-write).
+ * Enables fast exemplar recall without loading the full 16KB AET payload.
+ */
+async function insertTraceDigest(trace: any, body: any, jwtToken?: string): Promise<void> {
+  const taskSummaries = Array.isArray(trace.tasks)
+    ? trace.tasks.map((t: any) => ({
+        id: t.id,
+        status: t.success === false ? 'failure' : 'success',
+        duration_ms: t.duration_ms ?? 0,
+        resolver_tier: t.resolver_tier ?? null,
+      }))
+    : null;
+
+  const q = `
+    INSERT INTO trace_digest {
+      execution_id: $execution_id,
+      activity_id: $activity_id,
+      success: $success,
+      duration_ms: $duration_ms,
+      cost_usd: $cost_usd,
+      failure_mode_type: $failure_mode_type,
+      output_impulse_shapes: $output_impulse_shapes,
+      task_summaries: $task_summaries,
+      org_id: $org_id,
+      executed_at: $executed_at
+    }
+  `;
+  const p = {
+    execution_id: trace.execution_id,
+    activity_id: trace.activity_id,
+    success: trace.success,
+    duration_ms: trace.duration_ms ?? 0,
+    cost_usd: trace.cost_usd ?? 0,
+    failure_mode_type: body.failure_mode?.type ?? null,
+    output_impulse_shapes: Array.isArray(trace.output_impulse_shapes) ? trace.output_impulse_shapes : null,
+    task_summaries: taskSummaries,
+    org_id: trace.org_id,
+    executed_at: trace.executed_at,
+  };
+  if (jwtToken) {
+    await queryWithAuth(jwtToken, q, p);
+  } else {
+    await surrealDB.query(q, p);
+  }
+}
+
+/**
+ * Write the content row co-produced alongside each AET row (Phase B dual-write).
+ * Splits out large FLEXIBLE fields so metadata reads don't load blob payloads.
+ */
+async function insertTraceContent(trace: any, jwtToken?: string): Promise<void> {
+  // Only bother if there is actual content to store
+  if (!trace.tasks && !trace.state_snapshot && !trace.impulse_resolutions && !trace.output_impulses) return;
+
+  const q = `
+    INSERT INTO execution_trace_content {
+      execution_id: $execution_id,
+      tasks: $tasks,
+      state_snapshot: $state_snapshot,
+      impulse_resolutions: $impulse_resolutions,
+      output_impulses: $output_impulses,
+      org_id: $org_id
+    }
+  `;
+  const p = {
+    execution_id: trace.execution_id,
+    tasks: trace.tasks ?? null,
+    state_snapshot: trace.state_snapshot ?? null,
+    impulse_resolutions: (trace as any).impulse_resolutions ?? null,
+    output_impulses: (trace as any).output_impulses ?? null,
+    org_id: trace.org_id,
+  };
+  if (jwtToken) {
+    await queryWithAuth(jwtToken, q, p);
+  } else {
+    await surrealDB.query(q, p);
+  }
+}
+
+/**
+ * Write a minimal row to execution_system_traces for activities on the
+ * 'system' learning_track. Intentionally slim — these rows are excluded
+ * from Thompson posterior updates and kept separate from the learning corpus.
+ */
+async function insertSystemTrace(params: SystemTraceParams, jwtToken?: string): Promise<void> {
+  const optionals: string[] = [];
+  if (params.parent_execution_id) optionals.push('parent_execution_id: $parent_execution_id');
+
+  const query = `
+    INSERT INTO execution_system_traces {
+      execution_id: $execution_id,
+      activity_id: $activity_id,
+      success: $success,
+      duration_ms: $duration_ms,
+      cost_usd: $cost_usd,
+      org_id: $org_id,
+      executed_at: $executed_at${optionals.length > 0 ? `,\n      ${optionals.join(',\n      ')}` : ''}
+    }
+  `;
+
+  const p: Record<string, unknown> = {
+    execution_id: params.execution_id,
+    activity_id: params.activity_id,
+    success: params.success,
+    duration_ms: params.duration_ms,
+    cost_usd: params.cost_usd,
+    org_id: params.org_id,
+    executed_at: params.executed_at,
+  };
+  if (params.parent_execution_id) p.parent_execution_id = params.parent_execution_id;
+
+  if (jwtToken) {
+    await queryWithAuth(jwtToken, query, p);
+  } else {
+    await surrealDB.query(query, p);
   }
 }
 
@@ -1501,6 +1633,43 @@ app.post('/', async (c) => {
       }
     }
 
+    // ========================================================================
+    // Learning-track routing (trace-storage-redesign Phase B)
+    // Consult the cached learning_track field on the activity template.
+    // 'system' → lightweight execution_system_traces row; no AET, no digest.
+    // 'learning' | 'unclassified' | any error → existing AET path (fall-through).
+    // ========================================================================
+    let learningTrack: LearningTrack = 'unclassified';
+    try {
+      learningTrack = await resolveLearningTrack(trace.activity_id as string);
+    } catch (err) {
+      logger.warn('learning-track lookup failed; falling through to AET', { activity_id: trace.activity_id, err: err instanceof Error ? err.message : String(err) });
+    }
+
+    if (learningTrack === 'system') {
+      await insertSystemTrace({
+        execution_id: trace.execution_id as string,
+        activity_id: trace.activity_id as string,
+        success: trace.success as boolean,
+        duration_ms: trace.duration_ms as number,
+        cost_usd: trace.cost_usd as number,
+        parent_execution_id: (trace as any).parent_execution_id ?? null,
+        org_id: trace.org_id as string,
+        executed_at: trace.executed_at as Date,
+      }, jwtAuth?.jwtToken);
+
+      logger.info('System-track trace routed to execution_system_traces', {
+        execution_id: trace.execution_id,
+        activity_id: trace.activity_id,
+      });
+
+      return c.json({
+        success: true,
+        execution_id: trace.execution_id,
+        stored: 'system_traces',
+      });
+    }
+
     // Insert into database
     // Build query dynamically to avoid NULL vs NONE issues for optional fields
     const optionalFields: string[] = [];
@@ -1623,6 +1792,20 @@ app.post('/', async (c) => {
       task_count: body.execution_trace?.tasks?.length || 0,
       db_result: result[0],
     });
+
+    // ========================================================================
+    // Phase B dual-write: trace_digest + execution_trace_content
+    // Fire-and-forget so dual-write latency does not add to AET write P95.
+    // Failures are logged but never propagate to the caller.
+    // ========================================================================
+    void insertTraceDigest(trace, body, jwtAuth?.jwtToken).catch((err) => {
+      logger.warn('trace_digest dual-write failed', { execution_id: trace.execution_id, err: err instanceof Error ? err.message : String(err) });
+    });
+    void insertTraceContent(trace, jwtAuth?.jwtToken).catch((err) => {
+      logger.warn('execution_trace_content dual-write failed', { execution_id: trace.execution_id, err: err instanceof Error ? err.message : String(err) });
+    });
+    // Burst counter for adaptive exemplar selection
+    void incrementExemplarBurstCounter(trace.activity_id as string).catch(() => {});
 
     // Backfill composition_chain on any already-inserted children of this
     // trace. Handles minibob's L1/L2 meta-trace write-order race where

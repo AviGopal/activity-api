@@ -12,6 +12,7 @@
 import { surrealDB, queryWithAuth } from './surreal';
 import { logger } from '../utils/logger';
 import { localEmbeddingService } from '../services/embedding-service';
+import { resolveLearningTrack } from '../lib/learning-track';
 
 // =============================================================================
 // FEATURE FLAGS (P4.1: Dual-write control)
@@ -330,6 +331,51 @@ export async function insertExecution(
     if (execution.resolved_by_vessel_id) record.resolved_by_vessel_id = execution.resolved_by_vessel_id;
     if (execution.resolver_tier) record.resolver_tier = execution.resolver_tier;
 
+    // Learning-track routing: 'system' traces go to execution_system_traces
+    // and are excluded from Thompson posterior updates.  Any error falls through.
+    let learningTrack = 'unclassified';
+    try {
+      if (execution.activity_id) {
+        learningTrack = await resolveLearningTrack(execution.activity_id);
+      }
+    } catch (err) {
+      logger.warn('[paradigm] learning-track lookup failed; falling through', { activity_id: execution.activity_id, err: err instanceof Error ? err.message : String(err) });
+    }
+
+    if (learningTrack === 'system') {
+      const sysQ = `
+        INSERT INTO execution_system_traces {
+          execution_id: $execution_id,
+          activity_id: $activity_id,
+          success: $success,
+          duration_ms: $duration_ms,
+          cost_usd: $cost_usd,
+          org_id: $org_id,
+          executed_at: time::now()
+          ${execution.parent_execution_id ? ', parent_execution_id: $parent_execution_id' : ''}
+        }
+      `;
+      const sp: Record<string, unknown> = {
+        execution_id: execution.id,
+        activity_id: execution.activity_id,
+        success: execution.success,
+        duration_ms: execution.duration_ms ?? 0,
+        cost_usd: execution.cost_usd ?? 0,
+        org_id: execution.org_id ?? 'public',
+      };
+      if (execution.parent_execution_id) sp.parent_execution_id = execution.parent_execution_id;
+      if (jwtToken) {
+        await queryWithAuth(jwtToken, sysQ, sp);
+      } else {
+        await surrealDB.query(sysQ, sp);
+      }
+      logger.info('[paradigm] System-track execution routed to execution_system_traces', {
+        id: execution.id,
+        activity_id: execution.activity_id,
+      });
+      return null;
+    }
+
     // Build field list - org_id/project_id are special: use $auth if JWT, or convert to record type
     const fields = Object.keys(record)
       .filter(k => record[k] !== undefined)
@@ -373,6 +419,33 @@ export async function insertExecution(
       success: execution.success,
       path: 'new',
       latency_ms: Date.now() - startTime,
+    });
+
+    // Phase B dual-write: trace_digest (fire-and-forget)
+    const digestQ = `
+      INSERT INTO trace_digest {
+        execution_id: $execution_id,
+        activity_id: $activity_id,
+        success: $success,
+        duration_ms: $duration_ms,
+        cost_usd: $cost_usd,
+        org_id: $org_id,
+        executed_at: time::now()
+      }
+    `;
+    const dp = {
+      execution_id: execution.id,
+      activity_id: execution.activity_id,
+      success: execution.success,
+      duration_ms: execution.duration_ms ?? 0,
+      cost_usd: execution.cost_usd ?? 0,
+      org_id: execution.org_id ?? 'public',
+    };
+    const digestWrite = jwtToken
+      ? queryWithAuth(jwtToken, digestQ, dp)
+      : surrealDB.query(digestQ, dp);
+    void digestWrite.catch((err: unknown) => {
+      logger.warn('[paradigm] trace_digest dual-write failed', { execution_id: execution.id, err: (err as Error)?.message ?? String(err) });
     });
 
     return result?.[0] || null;
