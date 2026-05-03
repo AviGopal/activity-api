@@ -870,6 +870,49 @@ app.get('/', async (c) => {
 });
 
 /**
+ * GET /v2/activities/execution-traces/exemplars?activity_id=<id>
+ *
+ * Returns exemplar traces for an activity selected by the adaptive exemplar selector.
+ * Falls back to a live trace_digest query when no exemplars have been selected yet.
+ *
+ * MUST be registered before /:executionId to prevent dynamic-route shadowing.
+ *
+ * Response shape: { source: "exemplar" | "digest_fallback", items: ExemplarItem[] }
+ */
+app.get('/exemplars', async (c) => {
+  const activity_id = c.req.query('activity_id');
+  if (!activity_id) return c.json({ error: 'activity_id query parameter required' }, 400);
+
+  try {
+    const exemplarRows = await surrealDB.query<{
+      execution_id: string; success: boolean; digest_id: string; selected_at: string;
+    }>(`SELECT execution_id, success, digest_id, selected_at FROM execution_exemplar WHERE activity_id = $activity_id ORDER BY selected_at DESC LIMIT 40`, { activity_id });
+
+    if (exemplarRows && exemplarRows.length > 0) {
+      const digestIds = exemplarRows.map(r => r.digest_id).filter(Boolean);
+      let digestMap: Record<string, unknown> = {};
+      if (digestIds.length > 0) {
+        const digestRows = await surrealDB.query<{ id: string } & Record<string, unknown>>(
+          `SELECT * FROM trace_digest WHERE id IN $ids`, { ids: digestIds }
+        );
+        for (const d of digestRows ?? []) digestMap[String(d.id)] = d;
+      }
+      const items = exemplarRows.map(r => ({ ...r, digest: digestMap[r.digest_id] ?? null }));
+      return c.json({ source: 'exemplar', items });
+    }
+
+    const fallbackRows = await surrealDB.query<Record<string, unknown>>(
+      `SELECT * FROM trace_digest WHERE activity_id = $activity_id ORDER BY executed_at DESC LIMIT 20`, { activity_id }
+    );
+    return c.json({ source: 'digest_fallback', items: fallbackRows ?? [] });
+
+  } catch (error) {
+    logger.error('Failed to fetch exemplars', { error: error instanceof Error ? error.message : String(error) });
+    return c.json({ error: 'Failed to fetch exemplars', message: error instanceof Error ? error.message : 'Unknown error' }, 500);
+  }
+});
+
+/**
  * GET /v2/activities/execution-traces/:executionId
  *
  * Get detailed information about a specific execution trace
@@ -3113,55 +3156,6 @@ app.get('/calibration-summary', async (c) => {
       error: 'Failed to fetch calibration summary',
       message: error instanceof Error ? error.message : 'Unknown error',
     }, 500);
-  }
-});
-
-/**
- * GET /v2/activities/execution-traces/exemplars?activity_id=<id>
- *
- * Returns exemplar traces for an activity selected by the adaptive exemplar selector.
- * Falls back to a live trace_digest query when no exemplars have been selected yet.
- *
- * Response shape: { source: "exemplar" | "digest_fallback", items: ExemplarItem[] }
- */
-app.get('/exemplars', async (c) => {
-  const activity_id = c.req.query('activity_id');
-  if (!activity_id) return c.json({ error: 'activity_id query parameter required' }, 400);
-
-  try {
-    // Try execution_exemplar first (via the activity_id index)
-    const exemplarRows = await surrealDB.query<{
-      execution_id: string; success: boolean; digest_id: string; selected_at: string;
-    }>(`SELECT execution_id, success, digest_id, selected_at FROM execution_exemplar WHERE activity_id = $activity_id ORDER BY selected_at DESC LIMIT 40`, { activity_id });
-
-    if (exemplarRows && exemplarRows.length > 0) {
-      // Join with trace_digest for metadata
-      const digestIds = exemplarRows.map(r => r.digest_id).filter(Boolean);
-      let digestMap: Record<string, unknown> = {};
-      if (digestIds.length > 0) {
-        const digestRows = await surrealDB.query<{ id: string } & Record<string, unknown>>(
-          `SELECT * FROM trace_digest WHERE id IN $ids`, { ids: digestIds }
-        );
-        for (const d of digestRows ?? []) {
-          digestMap[String(d.id)] = d;
-        }
-      }
-      const items = exemplarRows.map(r => ({
-        ...r,
-        digest: digestMap[r.digest_id] ?? null,
-      }));
-      return c.json({ source: 'exemplar', items });
-    }
-
-    // Fallback: read directly from trace_digest
-    const fallbackRows = await surrealDB.query<Record<string, unknown>>(
-      `SELECT * FROM trace_digest WHERE activity_id = $activity_id ORDER BY executed_at DESC LIMIT 20`, { activity_id }
-    );
-    return c.json({ source: 'digest_fallback', items: fallbackRows ?? [] });
-
-  } catch (error) {
-    logger.error('Failed to fetch exemplars', { error: error instanceof Error ? error.message : String(error) });
-    return c.json({ error: 'Failed to fetch exemplars', message: error instanceof Error ? error.message : 'Unknown error' }, 500);
   }
 });
 
