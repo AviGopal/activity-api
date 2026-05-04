@@ -1754,13 +1754,12 @@ app.post('/', async (c) => {
     // Optional array/object fields
     if (trace.impulses_used) optionalFields.push('impulses_used: $impulses_used');
     if (trace.component_changes) optionalFields.push('component_changes: $component_changes');
-    if (trace.tasks) optionalFields.push('tasks: $tasks');
-    if (trace.state_snapshot) optionalFields.push('state_snapshot: $state_snapshot');
+    // tasks, state_snapshot, impulse_resolutions, output_impulses go to execution_trace_content
+    // via insertTraceContent dual-write (Phase B); migration 118 removed them from AET.
     // Edge learning fields
     if (trace.improvisation) optionalFields.push('improvisation: $improvisation');
     if (trace.input_impulse_shapes) optionalFields.push('input_impulse_shapes: $input_impulse_shapes');
     if (trace.output_impulse_shapes) optionalFields.push('output_impulse_shapes: $output_impulse_shapes');
-    if (trace.output_impulses) optionalFields.push('output_impulses: $output_impulses');
     if (trace.metadata) optionalFields.push('metadata: $metadata');
     // Selection-to-execution correlation
     if ((trace as any).correlation_id) optionalFields.push('correlation_id: $correlation_id');
@@ -1771,7 +1770,6 @@ app.post('/', async (c) => {
     if ((trace as any).vessel_id) optionalFields.push('vessel_id: $vessel_id');
     if ((trace as any).resolved_by_vessel_id) optionalFields.push('resolved_by_vessel_id: $resolved_by_vessel_id');
     if ((trace as any).vessel_version) optionalFields.push('vessel_version: $vessel_version');
-    if ((trace as any).impulse_resolutions) optionalFields.push('impulse_resolutions: $impulse_resolutions');
     // Project ID - only include if set (MiniBob instances may not have projects)
     if (trace.project_id) optionalFields.push('project_id: $project_id');
     // Phase B2: account_id is option<string> per the deployed schema —
