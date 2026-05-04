@@ -895,7 +895,7 @@ app.get('/exemplars', async (c) => {
       let digestMap: Record<string, unknown> = {};
       if (digestIds.length > 0) {
         const digestRows = await surrealDB.query<{ id: string } & Record<string, unknown>>(
-          `SELECT * FROM trace_digest WHERE id IN array::map($ids, |$id| type::thing($id))`, { ids: digestIds }
+          `SELECT * FROM trace_digest WHERE id IN array::map($ids, |$id| type::record($id))`, { ids: digestIds }
         );
         for (const d of digestRows ?? []) digestMap[String(d.id)] = d;
       }
