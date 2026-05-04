@@ -10,15 +10,21 @@
 
 USE NS `activity-system` DB `learning_loop`;
 
--- SurrealDB 3.x: record IDs are typed; compare against the full record reference, not a plain string.
+-- SurrealDB 3.x: record IDs are typed references, not strings.
+-- Compare against the full record reference feature_flag:phase_d_content_drop, not 'phase_d_content_drop'.
 LET $gate = (SELECT enabled FROM feature_flag WHERE id = feature_flag:phase_d_content_drop LIMIT 1)[0].enabled;
 
+-- Per-field existence guard makes this idempotent on re-runs.
+-- Migration 094 (DEFINE FIELD OVERWRITE impulse_resolutions) re-adds that field on every
+-- startup before this migration runs; the guard removes it cleanly on each run.
 IF $gate = true THEN {
-  REMOVE FIELD tasks             ON activity_execution_traces;
-  REMOVE FIELD state_snapshot    ON activity_execution_traces;
-  REMOVE FIELD execution_trace   ON activity_execution_traces;
-  REMOVE FIELD impulse_resolutions ON activity_execution_traces;
-  REMOVE FIELD output_impulses   ON activity_execution_traces;
+  LET $aet = (INFO FOR TABLE activity_execution_traces).fields;
+  IF $aet.tasks              IS NOT NONE THEN REMOVE FIELD tasks              ON activity_execution_traces END;
+  IF $aet.state_snapshot     IS NOT NONE THEN REMOVE FIELD state_snapshot     ON activity_execution_traces END;
+  IF $aet.execution_trace    IS NOT NONE THEN REMOVE FIELD execution_trace    ON activity_execution_traces END;
+  IF $aet.impulse_resolutions IS NOT NONE THEN REMOVE FIELD impulse_resolutions ON activity_execution_traces END;
+  IF $aet.output_impulses    IS NOT NONE THEN REMOVE FIELD output_impulses    ON activity_execution_traces END;
 
-  REMOVE FIELD trace             ON execution;
+  LET $exec = (INFO FOR TABLE execution).fields;
+  IF $exec.trace IS NOT NONE THEN REMOVE FIELD trace ON execution END;
 } END;
