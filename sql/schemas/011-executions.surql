@@ -150,18 +150,8 @@ DEFINE FIELD IF NOT EXISTS impulses_used ON activity_execution_traces TYPE optio
 DEFINE FIELD IF NOT EXISTS component_changes ON activity_execution_traces TYPE option<array<string>> FLEXIBLE
   COMMENT "Array of component IDs changed in this execution";
 
-DEFINE FIELD IF NOT EXISTS execution_trace ON activity_execution_traces TYPE option<object> FLEXIBLE
-  COMMENT "Full execution trace data (task-by-task details)";
-
-DEFINE FIELD IF NOT EXISTS state_snapshot ON activity_execution_traces TYPE option<object> FLEXIBLE
-  COMMENT "State snapshot with any nested structure (input_state, output_state, stateTransition)";
-
-DEFINE FIELD IF NOT EXISTS tasks ON activity_execution_traces TYPE option<array<object>> FLEXIBLE
-  COMMENT "Array of task execution details with any nested structure";
-
--- Nested field definition for tasks array elements (FLEXIBLE required for arbitrary nested task objects)
-DEFINE FIELD IF NOT EXISTS tasks.* ON activity_execution_traces TYPE object FLEXIBLE
-  COMMENT "Individual task execution detail with arbitrary fields (task_id, description, status, duration_ms, tool_calls, etc.)";
+-- execution_trace, state_snapshot, tasks, tasks.* — REMOVED by Phase D (migration 118).
+-- Content is now stored in execution_trace_content (schema: 060-trace-storage-redesign.surql).
 
 DEFINE FIELD IF NOT EXISTS parent_execution_id ON activity_execution_traces TYPE option<string>
   COMMENT "Parent execution ID (for composition tracking)";
@@ -179,12 +169,8 @@ DEFINE FIELD IF NOT EXISTS resolved_by_vessel_id ON activity_execution_traces TY
 DEFINE FIELD IF NOT EXISTS vessel_version ON activity_execution_traces TYPE option<string>
   COMMENT "Vessel version (semver-sha7) for learning correlation";
 
--- Per-impulse resolver attribution (added in migration 086)
-DEFINE FIELD IF NOT EXISTS impulse_resolutions ON activity_execution_traces TYPE option<array<object>> FLEXIBLE
-  COMMENT "Per-impulse resolution detail: [{impulse_id, resolver_id, resolver_tier, vessel_id, latency_ms, cost_usd}]";
-
-DEFINE FIELD IF NOT EXISTS impulse_resolutions.* ON activity_execution_traces TYPE object FLEXIBLE
-  COMMENT "Individual impulse resolution entry with arbitrary nested fields";
+-- impulse_resolutions, impulse_resolutions.* — REMOVED by Phase D (migration 118).
+-- Content is now stored in execution_trace_content.
 
 -- Edge Learning Fields (from improvisation traces)
 DEFINE FIELD IF NOT EXISTS improvisation ON activity_execution_traces TYPE option<bool>
@@ -196,12 +182,8 @@ DEFINE FIELD IF NOT EXISTS input_impulse_shapes ON activity_execution_traces TYP
 DEFINE FIELD IF NOT EXISTS output_impulse_shapes ON activity_execution_traces TYPE option<array<string>> FLEXIBLE
   COMMENT "Shapes of output impulses produced (documentation, source_code, command_result, etc.)";
 
-DEFINE FIELD IF NOT EXISTS output_impulses ON activity_execution_traces TYPE option<array<object>> FLEXIBLE
-  COMMENT "Full output impulse data [{shape, pointer}] for ribosome extraction";
-
--- Nested field definitions for output_impulses array elements (FLEXIBLE required for arbitrary nested structure)
-DEFINE FIELD IF NOT EXISTS output_impulses.* ON activity_execution_traces TYPE object FLEXIBLE
-  COMMENT "Individual output impulse with shape and pointer (allows arbitrary nested fields)";
+-- output_impulses, output_impulses.* — REMOVED by Phase D (migration 118).
+-- Content is now stored in execution_trace_content.
 
 DEFINE FIELD IF NOT EXISTS metadata ON activity_execution_traces TYPE option<object> FLEXIBLE
   COMMENT "Extensible metadata for edge learning (inputShapes, outputShapes, producedImpulses, etc.)";
@@ -612,11 +594,11 @@ DEFINE TABLE IF NOT EXISTS view_execution_traces AS
     status,
     duration_ms,
     cost_usd,
-    execution_trace,
     stored_at,
     created_at,
     updated_at
   FROM activity_execution_traces;
+  -- execution_trace field omitted: dropped by Phase D (migration 118), now in execution_trace_content
 
 -- View: activity_executions (legacy table name from 001-init-schema.surql)
 DEFINE TABLE IF NOT EXISTS view_activity_executions AS
