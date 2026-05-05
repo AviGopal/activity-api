@@ -82,7 +82,7 @@ export async function selectExemplarsForAllActiveActivities(): Promise<ExemplarS
   const result: ExemplarSelectResult = { processed: 0, failed: 0 };
 
   const activities = await surrealDB.query<{ activity_id: string }>(
-    `SELECT DISTINCT activity_id FROM trace_digest LIMIT 2000`
+    `SELECT activity_id FROM trace_digest GROUP BY activity_id LIMIT 2000`
   );
 
   if (!activities || activities.length === 0) return result;
