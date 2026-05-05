@@ -1063,18 +1063,17 @@ router.post('/resolve', async (c) => {
       }
 
       case 'variantMetricsSummary': {
-        // Metadata-first impulse type: returns pre-computed metrics per variant
+        // Metadata-first impulse type: returns pre-computed metrics per variant.
+        // activityId is optional — when omitted, returns a global summary across
+        // all tracked variants (useful for Thompson Sampling audits and upkeep).
         // Replaces: templateComparison (clean removal)
-        if (!pointer.activityId) {
-          return c.json({
-            success: false,
-            error: 'variantMetricsSummary requires activityId',
-          } as ImpulseResolveResponse, 400);
-        }
 
         // Query execution table directly and compute per-variant metrics
         // Note: v_activity_score groups by activity_id only, not variant_id
         // Phase B2: dual-tenant scoping on the execution-table aggregate.
+        const variantFilter = pointer.activityId
+          ? `AND activity_id CONTAINS $activityId`
+          : '';
         const query = `
           SELECT
             activity_id,
@@ -1087,14 +1086,14 @@ router.post('/resolve', async (c) => {
             math::mean(<float> duration_ms) AS avg_duration_ms,
             math::mean(<float> cost_usd) AS avg_cost_usd
           FROM execution
-          WHERE activity_id CONTAINS $activityId
-          AND ${accountIdScopedWhere()}
+          WHERE ${accountIdScopedWhere()}
+          ${variantFilter}
           GROUP BY activity_id
           ORDER BY success_rate DESC
         `;
 
         const variants = await executeAsAuth<any>(jwtAuthCtx, query, {
-          activityId: pointer.activityId,
+          activityId: pointer.activityId ?? '',
           orgId: jwtAuthCtx.orgId,
           org_id: jwtAuthCtx.orgId,
           account_id: jwtAuthCtx.accountId ?? null,
@@ -1103,7 +1102,7 @@ router.post('/resolve', async (c) => {
         if (variants.length === 0) {
           content = JSON.stringify({
             loaded: false,
-            metadata: { rowCount: 0, baseActivityId: pointer.activityId, variantCount: 0 },
+            metadata: { rowCount: 0, baseActivityId: pointer.activityId ?? null, variantCount: 0 },
             content: { variants: [] }
           }, null, 2);
           break;
@@ -1116,7 +1115,7 @@ router.post('/resolve', async (c) => {
 
         const metadata = {
           rowCount: variants.length,
-          baseActivityId: pointer.activityId,
+          baseActivityId: pointer.activityId ?? null,
           variantCount: variants.length,
           availableOps: ['filter', 'compare', 'resolve'],
           summary: {
