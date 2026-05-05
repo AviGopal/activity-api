@@ -69,11 +69,12 @@ async function delegateWriteToRouter(
   const sessionId = c.req.header('x-session-id');
   if (sessionId) headers['X-Session-ID'] = sessionId;
 
-  // For API key auth (no JWT), inject org_id from the validated session so the
-  // inner route doesn't fall back to 'public'. The execution-traces handler reads
-  // body.org_id first, so this is sufficient without re-running middleware.
+  // The inner sub-app has no auth middleware, so getJwtAuthFromContext() returns
+  // null inside the delegated handler. Always inject org_id from the outer
+  // context so the handler doesn't fall back to 'public'. body.org_id takes
+  // priority if already set (caller knows best).
   let enrichedBody = body ?? {};
-  if (!jwtAuth?.jwtToken && jwtAuth?.orgId) {
+  if (jwtAuth?.orgId) {
     const bodyObj = typeof enrichedBody === 'object' && enrichedBody !== null ? enrichedBody : {};
     if (!('org_id' in bodyObj)) {
       enrichedBody = { ...bodyObj, org_id: jwtAuth.orgId };
