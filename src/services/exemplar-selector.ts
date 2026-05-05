@@ -21,6 +21,11 @@ import { logger } from '../utils/logger';
 const EXEMPLAR_N = parseInt(process.env.EXEMPLAR_N ?? '20', 10);
 const BURST_THRESHOLD = parseInt(process.env.EXEMPLAR_BURST_THRESHOLD ?? '20', 10);
 const BURST_KEY_PREFIX = 'exemplar_pending:';
+// Rate-limit nightly bulk run: delay between activities (ms). Prevents SurrealDB
+// CPU saturation when trace_digest has many distinct activities (>500). Default
+// 150ms spreads 2000 activities over ~5 minutes instead of <30 seconds.
+// Set to 0 to disable (not recommended in production with large datasets).
+const BULK_ACTIVITY_DELAY_MS = parseInt(process.env.EXEMPLAR_BULK_DELAY_MS ?? '150', 10);
 
 export interface ExemplarSelectResult {
   processed: number;
@@ -87,7 +92,10 @@ export async function selectExemplarsForAllActiveActivities(): Promise<ExemplarS
 
   if (!activities || activities.length === 0) return result;
 
-  for (const { activity_id } of activities) {
+  logger.info('[exemplar] bulk selection starting', { total: activities.length, delay_ms: BULK_ACTIVITY_DELAY_MS });
+
+  for (let i = 0; i < activities.length; i++) {
+    const { activity_id } = activities[i];
     try {
       await selectExemplarsForActivity(activity_id);
       result.processed++;
@@ -95,9 +103,12 @@ export async function selectExemplarsForAllActiveActivities(): Promise<ExemplarS
       logger.warn('[exemplar] selection failed for activity', { activity_id, err: err instanceof Error ? err.message : String(err) });
       result.failed++;
     }
+    if (BULK_ACTIVITY_DELAY_MS > 0 && i < activities.length - 1) {
+      await new Promise(resolve => setTimeout(resolve, BULK_ACTIVITY_DELAY_MS));
+    }
   }
 
-  logger.info('[exemplar] nightly selection complete', result);
+  logger.info('[exemplar] bulk selection complete', result);
   return result;
 }
 
