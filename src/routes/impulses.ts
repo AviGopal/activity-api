@@ -69,10 +69,21 @@ async function delegateWriteToRouter(
   const sessionId = c.req.header('x-session-id');
   if (sessionId) headers['X-Session-ID'] = sessionId;
 
+  // For API key auth (no JWT), inject org_id from the validated session so the
+  // inner route doesn't fall back to 'public'. The execution-traces handler reads
+  // body.org_id first, so this is sufficient without re-running middleware.
+  let enrichedBody = body ?? {};
+  if (!jwtAuth?.jwtToken && jwtAuth?.orgId) {
+    const bodyObj = typeof enrichedBody === 'object' && enrichedBody !== null ? enrichedBody : {};
+    if (!('org_id' in bodyObj)) {
+      enrichedBody = { ...bodyObj, org_id: jwtAuth.orgId };
+    }
+  }
+
   const req = new Request(`http://internal${path}`, {
     method: 'POST',
     headers,
-    body: JSON.stringify(body ?? {}),
+    body: JSON.stringify(enrichedBody),
   });
 
   const res = await target.fetch(req);
