@@ -44,6 +44,10 @@ DEFINE INDEX idx_trace_digest_activity_success_time
   ON trace_digest FIELDS activity_id, success, executed_at;
 DEFINE INDEX idx_trace_digest_org_activity_time
   ON trace_digest FIELDS org_id, activity_id, executed_at;
+-- (org_id, executed_at) for time-range dashboard queries without activity_id filter
+-- Without this, WHERE org_id=X AND executed_at>Y scans all rows for org then filters
+DEFINE INDEX idx_trace_digest_org_time
+  ON trace_digest FIELDS org_id, executed_at;
 
 -- ---------------------------------------------------------------------------
 -- execution_trace_content
