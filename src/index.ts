@@ -739,6 +739,9 @@ const exemplarSelectorEnabled = process.env.EXEMPLAR_SELECTOR_ENABLED !== 'false
 if (exemplarSelectorEnabled) {
   import('./services/exemplar-selector').then(({ selectExemplarsForAllActiveActivities }) => {
     const intervalMs = parseInt(process.env.EXEMPLAR_SELECTOR_INTERVAL_MS ?? String(24 * 60 * 60 * 1000), 10);
+    void selectExemplarsForAllActiveActivities().catch(err => {
+      logger.warn('[Server] Exemplar selector startup run failed', { error: err.message });
+    });
     setInterval(() => {
       void selectExemplarsForAllActiveActivities().catch(err => {
         logger.warn('[Server] Exemplar selector cycle failed', { error: err.message });
