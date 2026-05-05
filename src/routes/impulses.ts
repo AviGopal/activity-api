@@ -796,7 +796,7 @@ router.post('/resolve', async (c) => {
           // arms of the disjunction.
           const newQuery = `
             SELECT * FROM execution
-            WHERE id = $execution_id
+            WHERE (id = type::thing($execution_id) OR id = $execution_id)
             AND ${accountIdScopedWhere()}
             LIMIT 1
           `;

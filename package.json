@@ -1,6 +1,6 @@
 {
   "name": "metabob-activity-api",
-  "version": "1.19.21",
+  "version": "1.19.22",
   "description": "Lightweight TypeScript server for Metabob activity system - replaces Python RPC API v2 endpoints",
   "main": "src/index.ts",
   "type": "module",
