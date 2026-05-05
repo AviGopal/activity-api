@@ -844,15 +844,21 @@ router.post('/resolve', async (c) => {
         // Fall back to legacy activity_execution_traces table
         if (!trace) {
           // Phase B2: dual-tenant scoping for activity_execution_traces.
+          // Strip record-ID prefix (e.g. "execution:abc" → "abc") since legacy
+          // rows store just the bare id without the table prefix.
+          const bareExecutionId = pointer.executionId.startsWith('execution:')
+            ? pointer.executionId.slice('execution:'.length)
+            : pointer.executionId;
           const legacyQuery = `
             SELECT * FROM activity_execution_traces
-            WHERE execution_id = $execution_id
+            WHERE (execution_id = $execution_id OR execution_id = $bare_execution_id)
             AND ${accountIdScopedWhere()}
             LIMIT 1
           `;
 
           const legacyResult = await executeAsAuth<any>(jwtAuthCtx, legacyQuery, {
             execution_id: pointer.executionId,
+            bare_execution_id: bareExecutionId,
             orgId: jwtAuthCtx.orgId,
             org_id: jwtAuthCtx.orgId,
             account_id: jwtAuthCtx.accountId ?? null,
