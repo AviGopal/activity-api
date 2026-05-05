@@ -513,11 +513,22 @@ app.get('/', async (c) => {
     // For API-key auth, session is never populated (org_id: null). Fall back
     // to jwtAuth.orgId which carries the org from identity-vessel validation.
     const effectiveOrgId = session.org_id || jwtAuth?.orgId || null;
+    const effectiveAccountId = (session as any).account_id ?? null;
     if (needsWhereOrgFilter) {
       if (effectiveOrgId) {
-        whereConditions.push(`(${accountIdScopedWhere()} OR org_id = NULL)`);
-        params.org_id = effectiveOrgId;
-        params.account_id = (session as any).account_id ?? null;
+        if (effectiveAccountId) {
+          // Account-scoped path: match account records + untagged org records.
+          whereConditions.push(`(${accountIdScopedWhere()} OR org_id = NULL)`);
+          params.org_id = effectiveOrgId;
+          params.account_id = effectiveAccountId;
+        } else {
+          // Org-scoped path (API-key, no account_id): use plain equality so
+          // the composite (org_id, executed_at) index is used instead of the
+          // single-field executed_at index that requires a full org scan +
+          // sort (F-130, 2026-05-05: 9.5s → 1.3s on 21k-row org).
+          whereConditions.push('org_id = $org_id');
+          params.org_id = effectiveOrgId;
+        }
       }
 
       if (session.project_id) {
