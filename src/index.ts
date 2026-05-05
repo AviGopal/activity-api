@@ -739,9 +739,12 @@ const exemplarSelectorEnabled = process.env.EXEMPLAR_SELECTOR_ENABLED !== 'false
 if (exemplarSelectorEnabled) {
   import('./services/exemplar-selector').then(({ selectExemplarsForAllActiveActivities }) => {
     const intervalMs = parseInt(process.env.EXEMPLAR_SELECTOR_INTERVAL_MS ?? String(24 * 60 * 60 * 1000), 10);
-    void selectExemplarsForAllActiveActivities().catch(err => {
-      logger.warn('[Server] Exemplar selector startup run failed', { error: err.message });
-    });
+    // Delay startup run 30s so SurrealDB is ready (avoids connection-refused on cold start)
+    setTimeout(() => {
+      void selectExemplarsForAllActiveActivities().catch(err => {
+        logger.warn('[Server] Exemplar selector startup run failed', { error: err instanceof Error ? err.message : String(err) });
+      });
+    }, 30_000);
     setInterval(() => {
       void selectExemplarsForAllActiveActivities().catch(err => {
         logger.warn('[Server] Exemplar selector cycle failed', { error: err.message });
