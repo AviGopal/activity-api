@@ -285,6 +285,29 @@ export function loadConfig(): Config {
         'activity_search',
         'trace_search',
         'tool_pattern_search',
+        // Write/mutation shapes — advertised so vessel-discovery routes
+        // load_impulse(*_write) calls here via REST instead of MCP.
+        // Each shape has a matching case in src/routes/impulses.ts.
+        'activityExecutionTrace_write',
+        'activityFeedback_write',
+        'activityComposition_write',
+        'activityTemplate_write',
+        'activityVariant_write',
+        'impulseRelevance_write',
+        'toolUsage_write',
+        'toolArgumentPattern_write',
+        'executionSequences_write',
+        'shapeScore_write',
+        'shapeGapResolution_write',
+        'similarState_write',
+        'goalSeeking_write',
+        'execution_write',
+        'compositionEdge_write',
+        'goal_verification_label_write',
+        // Admin/destructive shapes (admin scope required at route level)
+        'activityTemplate_update',
+        'activityTemplate_deprecate',
+        'activityExecutionTrace_delete',
       ],
     },
   };
