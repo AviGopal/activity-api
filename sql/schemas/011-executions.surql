@@ -259,6 +259,11 @@ DEFINE INDEX OVERWRITE idx_aet_activity_success_time
 DEFINE INDEX OVERWRITE idx_aet_org_activity_success_time
   ON activity_execution_traces FIELDS org_id, activity_id, success, executed_at;
 
+-- Org+time index (migration 122) — enables unfiltered list queries without activity_id
+-- WHERE org_id = $x AND executed_at >= $t ORDER BY executed_at DESC (range scan, not full scan)
+DEFINE INDEX OVERWRITE idx_aet_org_time
+  ON activity_execution_traces FIELDS org_id, executed_at;
+
 -- =============================================================================
 -- Table: activity_composition_graph
 -- =============================================================================
