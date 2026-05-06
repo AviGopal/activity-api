@@ -1464,7 +1464,10 @@ router.post('/resolve', async (c) => {
         }
 
         // Sort by Thompson sample (exploration / exploitation) and take top-limit.
-        const scored = templates.slice(0, limit * 2).map((t: any) => {
+        const scored = templates
+          .slice(0, limit * 2)
+          .filter((t: any) => t.variant_id || t.id)
+          .map((t: any) => {
           const id = t.variant_id || t.id;
           // Try both the raw ID and the normalized form (strip "activity:" prefix and angle brackets)
           const normId = id.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
