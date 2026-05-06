@@ -1453,7 +1453,8 @@ router.post('/resolve', async (c) => {
         }
 
         // Fetch template objects for high-α IDs not already in FTS results
-        const ftsIds = new Set(templates.map((t: any) => (t.variant_id || t.id || '').replace(/^activity:/, '').replace(/[⟨⟩`]/g, '')));
+        // Use String() to handle SurrealDB Thing objects that are not plain strings
+        const ftsIds = new Set(templates.map((t: any) => String(t.variant_id || t.id || '').replace(/^activity:/, '').replace(/[⟨⟩`]/g, '')));
         const missingTopIds = topScoredIds.filter(id => !ftsIds.has(id));
         if (missingTopIds.length > 0) {
           try {
@@ -1472,7 +1473,7 @@ router.post('/resolve', async (c) => {
 
         // Fetch Thompson Sampling posteriors for all candidate templates.
         const activityIds: string[] = templates
-          .map((t: any) => t.variant_id || t.id)
+          .map((t: any) => String(t.variant_id || t.id || ''))
           .filter(Boolean);
         let scoresMap = new Map<string, { alpha: number; beta: number; sample_count: number }>();
         // Also pre-populate from the top-scored results we already fetched
@@ -1506,7 +1507,8 @@ router.post('/resolve', async (c) => {
           .slice(0, limit * 2)
           .filter((t: any) => t.variant_id || t.id)
           .map((t: any) => {
-          const id = t.variant_id || t.id;
+          // Use String() to handle SurrealDB Thing objects that are not plain strings
+          const id = String(t.variant_id || t.id || '');
           // Try both the raw ID and the normalized form (strip "activity:" prefix and angle brackets)
           const normId = id.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
           const score = scoresMap.get(id) ?? scoresMap.get(normId);
