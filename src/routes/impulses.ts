@@ -35,7 +35,7 @@ import activitiesRouter, { accountIdScopedWhere } from './activities';
 import executionTracesRouter from './execution-traces';
 import { runTemplateAuditReport, type TemplateAuditInput } from './template-audit';
 import { runExecutionTraceWithSignatures } from './execution-trace-with-signatures';
-import { queryActivitiesByFTS } from '../db/paradigm';
+import { queryActivitiesByFTS, getActivityScores } from '../db/paradigm';
 import {
   runDiscoverByShapes,
   validateDiscoverByShapesInput,
@@ -1381,47 +1381,98 @@ router.post('/resolve', async (c) => {
       // =============================================================================
 
       case 'activityTemplateRecommendation': {
-        // Search for templates similar to a goal/query
-        // Used by genesis template to learn from existing templates
-        const query_text = pointer.query || '';
-        const category = pointer.category;
-        const limit = pointer.limit || 3;
+        // Accept both "goal" (canonical) and legacy "query" field names.
+        const query_text = (pointer.goal as string) || (pointer.query as string) || '';
+        const limit = (pointer.limit as number) || 3;
 
-        logger.info('Resolving activityTemplateRecommendation', { query_text, category, limit });
+        logger.info('Resolving activityTemplateRecommendation', { query_text, limit });
 
-        // Query templates with optional category filter
-        let whereClause = '';
-        const params: Record<string, any> = { limit };
-
-        // Handle category filter - can be string or array
-        const categoryValue = Array.isArray(category) ? category[0] : category;
-        // NOTE: Category is now a soft boost in Thompson Sampling, not a hard filter
-        // The /recommend endpoint handles category as a preference signal
-        // if (categoryValue && categoryValue !== 'tool') {
-        //   whereClause = 'WHERE category = $category';
-        //   params.category = categoryValue;
-        // }
-
-        // Org-scope: show caller's templates and global/system templates
-        const orgCondition = whereClause
-          ? whereClause + ' AND (org_id = $orgId OR scope = \'global\' OR org_id IS NONE)'
-          : 'WHERE (org_id = $orgId OR scope = \'global\' OR org_id IS NONE)';
-        params.orgId = jwtAuthCtx.orgId;
-
-        const templatesQuery = `
-          SELECT variant_id, variant_name, description, category, task_steps, created_at
-          FROM activity_template
-          ${orgCondition}
-          ORDER BY created_at DESC
-          LIMIT $limit
-        `;
-
-        const templates = await executeAsAuth<any>(jwtAuthCtx, templatesQuery, params);
+        // Fetch candidate templates: use FTS if a query is provided, else recency.
+        let templates: any[] = [];
+        if (query_text) {
+          try {
+            const ftsResult = await queryActivitiesByFTS(
+              query_text,
+              jwtAuthCtx.orgId,
+              null,
+              limit * 3,
+              jwtAuthCtx.jwtToken ?? null,
+            );
+            templates = ftsResult.data.slice(0, limit * 3);
+          } catch {
+            // Fall through to recency query
+          }
+        }
 
         if (templates.length === 0) {
-          content = `# Similar Templates\n\nNo templates found matching query: "${query_text}"`;
+          const recencyParams: Record<string, any> = {
+            limit: limit * 3,
+            orgId: jwtAuthCtx.orgId,
+          };
+          templates = await executeAsAuth<any>(
+            jwtAuthCtx,
+            `SELECT variant_id, variant_name, description, category, task_steps, created_at
+             FROM activity_template
+             WHERE (org_id = $orgId OR scope = 'global' OR org_id IS NONE)
+             ORDER BY created_at DESC
+             LIMIT $limit`,
+            recencyParams,
+          );
+        }
+
+        // Fetch Thompson Sampling posteriors for all candidate templates.
+        const activityIds: string[] = templates
+          .map((t: any) => t.variant_id || t.id)
+          .filter(Boolean);
+        let scoresMap = new Map<string, { alpha: number; beta: number; sample_count: number }>();
+        if (activityIds.length > 0) {
+          try {
+            const scoresResult = await getActivityScores(
+              jwtAuthCtx.orgId,
+              activityIds,
+              jwtAuthCtx.jwtToken ?? undefined,
+              null,
+            );
+            for (const s of scoresResult.data) {
+              const alpha = (s.successes ?? 0) + 1;
+              const beta_val = ((s.total_executions ?? 0) - (s.successes ?? 0)) + 1;
+              scoresMap.set(s.activity_id, {
+                alpha,
+                beta: beta_val,
+                sample_count: s.total_executions ?? 0,
+              });
+            }
+          } catch {
+            // Non-fatal: proceed without posteriors
+          }
+        }
+
+        // Sort by Thompson sample (exploration / exploitation) and take top-limit.
+        const scored = templates.slice(0, limit * 2).map((t: any) => {
+          const id = t.variant_id || t.id;
+          const score = scoresMap.get(id);
+          const alpha = score?.alpha ?? 1;
+          const beta_v = score?.beta ?? 1;
+          const sample = alpha / (alpha + beta_v); // mean of Beta as tie-break proxy
+          return { t, id, alpha, beta: beta_v, sample_count: score?.sample_count ?? 0, sample };
+        });
+        scored.sort((a, b) => b.sample - a.sample);
+        const top = scored.slice(0, limit);
+
+        if (top.length === 0) {
+          content = `# Activity Recommendations\n\nNo templates found matching: "${query_text}"`;
         } else {
-          content = formatTemplateListAsMarkdown(templates, `Templates similar to: "${query_text}"`);
+          const lines = [`# Activity Recommendations\n\nGoal: "${query_text}"\n`];
+          for (const { t, id, alpha, beta: b, sample_count } of top) {
+            lines.push(`## ${t.variant_name || t.name || id}`);
+            lines.push(`- **template_id**: ${id}`);
+            lines.push(`- **alpha**: ${alpha}`);
+            lines.push(`- **beta**: ${b}`);
+            lines.push(`- **sample_count**: ${sample_count}`);
+            if (t.description) lines.push(`- **description**: ${t.description}`);
+            lines.push('');
+          }
+          content = lines.join('\n');
         }
         break;
       }
