@@ -932,10 +932,14 @@ router.post('/resolve', async (c) => {
       }
 
       case 'activityMetrics': {
+        // F-V38: accept templateId as alias for activityId (prompt 33 sends templateId)
+        if (!pointer.activityId && pointer.templateId) {
+          pointer.activityId = pointer.templateId;
+        }
         if (!pointer.activityId) {
           return c.json({
             success: false,
-            error: 'activityId required for activityMetrics pointer',
+            error: 'activityId (or templateId) required for activityMetrics pointer',
           } as ImpulseResolveResponse, 400);
         }
 

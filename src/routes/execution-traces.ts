@@ -2248,6 +2248,30 @@ app.post('/', async (c) => {
         }
       `;
 
+      // F-V39: The canonical template store is the `activity` table (paradigm).
+      // `activity_template` holds only 34 legacy rows; all 2781 active templates
+      // registered by minibob land in `activity`. Without this second UPDATE the
+      // Thompson posteriors never advance past the (1,1) prior regardless of how
+      // many real executions are stored.
+      const activityTableUpdateQuery = `
+        UPDATE activity
+        SET
+          thompson_alpha = (thompson_alpha ?? 1) + $alpha_delta,
+          thompson_beta = (thompson_beta ?? 1) + $beta_delta,
+          total_executions = (total_executions ?? 0) + 1,
+          successful_executions = (successful_executions ?? 0) + $success_delta,
+          failed_executions = (failed_executions ?? 0) + $failure_delta,
+          last_executed_at = time::now()
+        WHERE (record::id(id) = $activity_id OR name = $activity_id)
+          AND (org_id = $org_id OR org_id = $org_id_alt)
+        RETURN {
+          id,
+          thompson_alpha,
+          thompson_beta,
+          total_executions
+        }
+      `;
+
       // Validate org_id is set (defined at line 737 with session fallback)
       if (!traceOrgId || traceOrgId === 'undefined') {
         logger.error('[learning] Cannot update Thompson Sampling - org_id is undefined', {
@@ -2305,7 +2329,18 @@ app.post('/', async (c) => {
           ? await queryWithAuth(jwtAuth.jwtToken, updateQuery, updateParams)
           : await surrealDB.query(updateQuery, updateParams);
 
-        if (updateResult && updateResult.length > 0) {
+        // F-V39: Also update the `activity` table (paradigm), which holds the
+        // 2781 active templates. `activity_template` has only 34 legacy rows.
+        const activityTableResult = jwtAuth?.jwtToken
+          ? await queryWithAuth(jwtAuth.jwtToken, activityTableUpdateQuery, updateParams)
+          : await surrealDB.query(activityTableUpdateQuery, updateParams);
+
+        // Use whichever table returned a match
+        const combinedResult = (updateResult && updateResult.length > 0) ? updateResult
+          : (activityTableResult && activityTableResult.length > 0) ? activityTableResult
+          : null;
+
+        if (combinedResult && combinedResult.length > 0) {
           if (candidateId === trace.variant_id) {
             primaryUpdateMatched = true;
           }
@@ -2313,10 +2348,11 @@ app.post('/', async (c) => {
             execution_id: trace.execution_id,
             activity_id: candidateId,
             via_metadata_template_id: candidateId !== trace.variant_id,
+            table: (updateResult && updateResult.length > 0) ? 'activity_template' : 'activity',
             success: trace.success,
-            new_alpha: updateResult[0].thompson_alpha,
-            new_beta: updateResult[0].thompson_beta,
-            total_executions: updateResult[0].total_executions,
+            new_alpha: combinedResult[0].thompson_alpha,
+            new_beta: combinedResult[0].thompson_beta,
+            total_executions: combinedResult[0].total_executions,
           });
 
           // FIX 3: Invalidate Redis cache to ensure fresh scores in next recommendation
@@ -2342,7 +2378,7 @@ app.post('/', async (c) => {
             });
           }
         } else {
-          logger.warn('[learning] Thompson Sampling score update returned no results', {
+          logger.warn('[learning] Thompson Sampling score update returned no results in either table', {
             execution_id: trace.execution_id,
             activity_id: candidateId,
             query_params: updateParams,
