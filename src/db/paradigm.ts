@@ -1099,6 +1099,7 @@ export async function queryActivitiesByFTS(
 
     // Build query with BM25 score calculation
     // Weight name matches 2x higher than description matches
+    // TIMEOUT guards against FTS hanging on large tables (> ~2000 rows without warm indices)
     const query = `
       SELECT *,
         search::score(0) * 2 + search::score(1) AS fts_score
@@ -1106,6 +1107,7 @@ export async function queryActivitiesByFTS(
       WHERE ${whereClause}
       ORDER BY fts_score DESC
       LIMIT $limit
+      TIMEOUT 8s
     `;
 
     logger.debug('[paradigm] queryActivitiesByFTS: executing query', {

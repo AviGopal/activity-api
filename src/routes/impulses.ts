@@ -1391,13 +1391,18 @@ router.post('/resolve', async (c) => {
         let templates: any[] = [];
         if (query_text) {
           try {
-            const ftsResult = await queryActivitiesByFTS(
-              query_text,
-              jwtAuthCtx.orgId,
-              null,
-              limit * 3,
-              jwtAuthCtx.jwtToken ?? null,
-            );
+            const ftsResult = await Promise.race([
+              queryActivitiesByFTS(
+                query_text,
+                jwtAuthCtx.orgId,
+                null,
+                limit * 3,
+                jwtAuthCtx.jwtToken ?? null,
+              ),
+              new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error('FTS timeout')), 10000)
+              ),
+            ]);
             templates = ftsResult.data.slice(0, limit * 3);
           } catch {
             // Fall through to recency query
