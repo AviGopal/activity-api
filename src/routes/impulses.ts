@@ -1429,38 +1429,76 @@ router.post('/resolve', async (c) => {
           );
         }
 
+        // F-V40: Also fetch top-α templates from variant_performance_metrics to seed the
+        // candidate pool. FTS results and high-α execution templates rarely overlap — the
+        // FTS matches semantic text but variant_performance_metrics tracks execution templates
+        // (validator-dispatch, slot-binding, etc.). Merging both sets ensures real posteriors
+        // appear in recommendations even when the text query doesn't match them.
+        let topScoredIds: string[] = [];
+        try {
+          const topScoresResult = await getActivityScores(
+            jwtAuthCtx.orgId,
+            undefined, // no ID filter — fetch top entries
+            jwtAuthCtx.jwtToken ?? undefined,
+            null,
+          );
+          topScoredIds = topScoresResult.data
+            .filter((s: any) => (s.total_executions ?? 0) > 0)
+            .sort((a: any, b: any) => (b.successes ?? 0) - (a.successes ?? 0))
+            .slice(0, limit * 2)
+            .map((s: any) => s.activity_id)
+            .filter(Boolean);
+        } catch {
+          // Non-fatal
+        }
+
+        // Fetch template objects for high-α IDs not already in FTS results
+        const ftsIds = new Set(templates.map((t: any) => (t.variant_id || t.id || '').replace(/^activity:/, '').replace(/[⟨⟩`]/g, '')));
+        const missingTopIds = topScoredIds.filter(id => !ftsIds.has(id));
+        if (missingTopIds.length > 0) {
+          try {
+            const topTemplates = await executeAsAuth<any>(
+              jwtAuthCtx,
+              `SELECT id, name, description, category, task_steps, created_at
+               FROM activity
+               WHERE record::id(id) IN $ids OR name IN $ids`,
+              { ids: missingTopIds },
+            );
+            templates = [...templates, ...topTemplates];
+          } catch {
+            // Non-fatal: FTS results still usable
+          }
+        }
+
         // Fetch Thompson Sampling posteriors for all candidate templates.
         const activityIds: string[] = templates
           .map((t: any) => t.variant_id || t.id)
           .filter(Boolean);
         let scoresMap = new Map<string, { alpha: number; beta: number; sample_count: number }>();
-        if (activityIds.length > 0) {
-          try {
-            const scoresResult = await getActivityScores(
-              jwtAuthCtx.orgId,
-              activityIds,
-              jwtAuthCtx.jwtToken ?? undefined,
-              null,
-            );
-            for (const s of scoresResult.data) {
-              const alpha = (s.successes ?? 0) + 1;
-              const beta_val = ((s.total_executions ?? 0) - (s.successes ?? 0)) + 1;
-              const scoreEntry = {
-                alpha,
-                beta: beta_val,
-                sample_count: s.total_executions ?? 0,
-              };
-              // Store under both raw and normalized forms so FTS-returned IDs
-              // (e.g. "activity:⟨validator-dispatch⟩") and plain names
-              // ("validator-dispatch") both hit the map.
-              const rawId = s.activity_id;
-              const normId = rawId.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
-              scoresMap.set(rawId, scoreEntry);
-              if (normId !== rawId) scoresMap.set(normId, scoreEntry);
-            }
-          } catch {
-            // Non-fatal: proceed without posteriors
+        // Also pre-populate from the top-scored results we already fetched
+        try {
+          const allScoresResult = await getActivityScores(
+            jwtAuthCtx.orgId,
+            activityIds.length > 0 ? activityIds : undefined,
+            jwtAuthCtx.jwtToken ?? undefined,
+            null,
+          );
+          for (const s of allScoresResult.data) {
+            if (!s.activity_id) continue;
+            const alpha = (s.successes ?? 0) + 1;
+            const beta_val = ((s.total_executions ?? 0) - (s.successes ?? 0)) + 1;
+            const scoreEntry = {
+              alpha,
+              beta: beta_val,
+              sample_count: s.total_executions ?? 0,
+            };
+            const rawId = s.activity_id;
+            const normId = rawId.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
+            scoresMap.set(rawId, scoreEntry);
+            if (normId !== rawId) scoresMap.set(normId, scoreEntry);
           }
+        } catch {
+          // Non-fatal: proceed without posteriors
         }
 
         // Sort by Thompson sample (exploration / exploitation) and take top-limit.
