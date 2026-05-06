@@ -1445,11 +1445,18 @@ router.post('/resolve', async (c) => {
             for (const s of scoresResult.data) {
               const alpha = (s.successes ?? 0) + 1;
               const beta_val = ((s.total_executions ?? 0) - (s.successes ?? 0)) + 1;
-              scoresMap.set(s.activity_id, {
+              const scoreEntry = {
                 alpha,
                 beta: beta_val,
                 sample_count: s.total_executions ?? 0,
-              });
+              };
+              // Store under both raw and normalized forms so FTS-returned IDs
+              // (e.g. "activity:⟨validator-dispatch⟩") and plain names
+              // ("validator-dispatch") both hit the map.
+              const rawId = s.activity_id;
+              const normId = rawId.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
+              scoresMap.set(rawId, scoreEntry);
+              if (normId !== rawId) scoresMap.set(normId, scoreEntry);
             }
           } catch {
             // Non-fatal: proceed without posteriors
@@ -1459,7 +1466,9 @@ router.post('/resolve', async (c) => {
         // Sort by Thompson sample (exploration / exploitation) and take top-limit.
         const scored = templates.slice(0, limit * 2).map((t: any) => {
           const id = t.variant_id || t.id;
-          const score = scoresMap.get(id);
+          // Try both the raw ID and the normalized form (strip "activity:" prefix and angle brackets)
+          const normId = id.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
+          const score = scoresMap.get(id) ?? scoresMap.get(normId);
           const alpha = score?.alpha ?? 1;
           const beta_v = score?.beta ?? 1;
           const sample = alpha / (alpha + beta_v); // mean of Beta as tie-break proxy
