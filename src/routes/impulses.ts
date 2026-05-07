@@ -1435,25 +1435,29 @@ router.post('/resolve', async (c) => {
         let scoresMap = new Map<string, { alpha: number; beta: number; sample_count: number }>();
         let topScoredIds: string[] = [];
         try {
+          // Use root-credential query — executeAsAuth with apikey bypasses PERMISSIONS.
+          // The accountIdScopedWhere() pattern misses rows where account_id is set to a
+          // real value (e.g. validator-dispatch has account_id = "accounts:metabob") because
+          // the caller's accountId is null for service-to-service API keys.
+          // Simple org_id scope is correct here; PERMISSIONS enforcement happens at the DB level
+          // only for queryWithAuth (JWT path), not for root surrealDB.query() calls.
           const metricsRows = await executeAsAuth<any>(
             jwtAuthCtx,
-            `SELECT activity_id, successes, total_executions
+            `SELECT activity_id, thompson_alpha, thompson_beta, total_executions
              FROM variant_performance_metrics
-             WHERE (${accountIdScopedWhere()} OR org_id IS NONE)
+             WHERE (org_id = $org_id OR org_id IS NONE)
                AND total_executions > 0
-             ORDER BY successes DESC
+             ORDER BY thompson_alpha DESC
              LIMIT $metricsLimit`,
             {
-              orgId: jwtAuthCtx.orgId,
               org_id: jwtAuthCtx.orgId,
-              account_id: jwtAuthCtx.accountId ?? null,
               metricsLimit: limit * 4,
             },
           );
           for (const s of metricsRows) {
             if (!s.activity_id) continue;
-            const alpha = (s.successes ?? 0) + 1;
-            const beta_val = ((s.total_executions ?? 0) - (s.successes ?? 0)) + 1;
+            const alpha = s.thompson_alpha ?? 1;
+            const beta_val = s.thompson_beta ?? 1;
             const scoreEntry = {
               alpha,
               beta: beta_val,
