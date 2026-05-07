@@ -1491,20 +1491,46 @@ router.post('/resolve', async (c) => {
         }
 
         // Sort by Thompson sample (exploration / exploitation) and take top-limit.
-        const scored = templates
+        // Start with scored FTS/recency candidates.
+        const scoredFromTemplates = templates
           .slice(0, limit * 2)
           .filter((t: any) => t.variant_id || t.id)
           .map((t: any) => {
-          // Use String() to handle SurrealDB Thing objects that are not plain strings
-          const id = String(t.variant_id || t.id || '');
-          // Try both the raw ID and the normalized form (strip "activity:" prefix and angle brackets)
-          const normId = id.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
-          const score = scoresMap.get(id) ?? scoresMap.get(normId);
-          const alpha = score?.alpha ?? 1;
-          const beta_v = score?.beta ?? 1;
-          const sample = alpha / (alpha + beta_v); // mean of Beta as tie-break proxy
-          return { t, id, alpha, beta: beta_v, sample_count: score?.sample_count ?? 0, sample };
-        });
+            // Use String() to handle SurrealDB Thing objects that are not plain strings
+            const id = String(t.variant_id || t.id || '');
+            // Try both the raw ID and the normalized form
+            const normId = id.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
+            const score = scoresMap.get(id) ?? scoresMap.get(normId);
+            const alpha = score?.alpha ?? 1;
+            const beta_v = score?.beta ?? 1;
+            const sample = alpha / (alpha + beta_v);
+            return { t, id, normId, alpha, beta: beta_v, sample_count: score?.sample_count ?? 0, sample };
+          });
+
+        // Also add stub entries for high-α templates from scoresMap not already covered.
+        // These are system templates (validator-dispatch, slot-binding, etc.) that exist in
+        // variant_performance_metrics but not in the activity table as user-facing records.
+        const coveredIds = new Set(scoredFromTemplates.map(s => s.normId));
+        const stubEntries: typeof scoredFromTemplates = [];
+        for (const [rawId, score] of scoresMap.entries()) {
+          const normId = rawId.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
+          if (coveredIds.has(normId)) continue; // already represented
+          coveredIds.add(normId);
+          const alpha = score.alpha;
+          const beta_v = score.beta;
+          const sample = alpha / (alpha + beta_v);
+          stubEntries.push({
+            t: { name: normId, description: `System template (${normId})` },
+            id: rawId,
+            normId,
+            alpha,
+            beta: beta_v,
+            sample_count: score.sample_count,
+            sample,
+          });
+        }
+
+        const scored = [...scoredFromTemplates, ...stubEntries];
         scored.sort((a, b) => b.sample - a.sample);
         const top = scored.slice(0, limit);
 
