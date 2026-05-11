@@ -523,27 +523,42 @@ logger.info(`Server running at http://localhost:${server.port}`);
 logger.info(`WebSocket endpoint available at ws://localhost:${server.port}/ws`);
 
 // ============================================================================
-// FTS Scorer Warm-Up
+// FTS Scorer Maintenance
 // ============================================================================
-// SurrealDB 3.0.0 stores BM25 scorer state in memory. REBUILD INDEX in the
-// init-database migration runs before minibob seeds templates; those INSERTs
-// re-invalidate the scorer. We warm-up all three FTS indexes here — after the
-// server starts but before incoming traffic — so search::score(N) returns
-// non-zero values. Runs non-blocking; queries during the ~10s rebuild window
-// return score=0 rows (still correct candidates, just unordered).
-(async () => {
-  try {
-    const { surrealDB } = await import('./db/surreal');
-    await surrealDB.query(`REBUILD INDEX idx_activity_name_fts ON activity`);
-    await surrealDB.query(`REBUILD INDEX idx_activity_description_fts ON activity`);
-    await surrealDB.query(`REBUILD INDEX idx_activity_tags_fts ON activity`);
-    logger.info('[FTS] All three FTS indexes rebuilt — BM25 scorer warm');
-  } catch (err) {
-    logger.warn('[FTS] FTS index warm-up failed (scores may be 0 until next rebuild)', {
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
-})();
+// SurrealDB 3.0.0 BM25 bug (F-V45/F-V46): any write to an FTS-indexed table
+// invalidates all BM25 scorer state for that table. Since `activity` is written
+// on every execution trace (Thompson α/β update), the scorer is invalidated
+// continuously. The only remedy is REBUILD, which takes ~9s per index.
+//
+// Strategy: run REBUILD on all three FTS indexes every 5 minutes. Between
+// rebuilds the scorer may be invalid (search::score(N) = 0), but FTS still
+// returns the correct CANDIDATE SET via the @N@ matching operator — scoring
+// is just uniformly 0 during the ~27s rebuild window and for a short period
+// after each `activity` write. Thompson Sampling provides the primary ranking;
+// FTS score is a secondary signal.
+const FTS_REBUILD_INTERVAL_MS = parseInt(process.env.FTS_REBUILD_INTERVAL_MS ?? String(5 * 60 * 1000), 10);
+
+async function rebuildFtsIndexes(): Promise<void> {
+  const { surrealDB } = await import('./db/surreal');
+  await surrealDB.query(`REBUILD INDEX idx_activity_name_fts ON activity`);
+  await surrealDB.query(`REBUILD INDEX idx_activity_description_fts ON activity`);
+  await surrealDB.query(`REBUILD INDEX idx_activity_tags_fts ON activity`);
+}
+
+// Initial rebuild — delay 15s to let the learning-track classifier finish its
+// first cycle (which writes last_classified_at to every activity row).
+setTimeout(() => {
+  void rebuildFtsIndexes()
+    .then(() => logger.info('[FTS] Initial FTS scorer rebuild complete'))
+    .catch(err => logger.warn('[FTS] Initial FTS scorer rebuild failed', { error: String(err) }));
+}, 15_000);
+
+// Periodic rebuild every FTS_REBUILD_INTERVAL_MS (default 5 min).
+setInterval(() => {
+  void rebuildFtsIndexes()
+    .then(() => logger.info('[FTS] Periodic FTS scorer rebuild complete'))
+    .catch(err => logger.warn('[FTS] Periodic FTS scorer rebuild failed', { error: String(err) }));
+}, FTS_REBUILD_INTERVAL_MS);
 
 // ============================================================================
 // Discovery Vessel Integration
