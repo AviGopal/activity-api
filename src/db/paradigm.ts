@@ -1108,7 +1108,7 @@ export async function queryActivitiesByFTS(
     // TIMEOUT guards against FTS hanging on large tables (> ~2000 rows without warm indices)
     const query = `
       SELECT *,
-        search::score(0) * 2 + search::score(2) * 1.5 + search::score(1) AS fts_score
+        (search::score(0) ?? 0) * 2 + (search::score(2) ?? 0) * 1.5 + (search::score(1) ?? 0) AS fts_score
       FROM activity
       WHERE ${whereClause}
       ORDER BY fts_score DESC
