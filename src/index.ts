@@ -523,6 +523,29 @@ logger.info(`Server running at http://localhost:${server.port}`);
 logger.info(`WebSocket endpoint available at ws://localhost:${server.port}/ws`);
 
 // ============================================================================
+// FTS Scorer Warm-Up
+// ============================================================================
+// SurrealDB 3.0.0 stores BM25 scorer state in memory. REBUILD INDEX in the
+// init-database migration runs before minibob seeds templates; those INSERTs
+// re-invalidate the scorer. We warm-up all three FTS indexes here — after the
+// server starts but before incoming traffic — so search::score(N) returns
+// non-zero values. Runs non-blocking; queries during the ~10s rebuild window
+// return score=0 rows (still correct candidates, just unordered).
+(async () => {
+  try {
+    const { surrealDB } = await import('./db/surreal');
+    await surrealDB.query(`REBUILD INDEX idx_activity_name_fts ON activity`);
+    await surrealDB.query(`REBUILD INDEX idx_activity_description_fts ON activity`);
+    await surrealDB.query(`REBUILD INDEX idx_activity_tags_fts ON activity`);
+    logger.info('[FTS] All three FTS indexes rebuilt — BM25 scorer warm');
+  } catch (err) {
+    logger.warn('[FTS] FTS index warm-up failed (scores may be 0 until next rebuild)', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+})();
+
+// ============================================================================
 // Discovery Vessel Integration
 // ============================================================================
 
