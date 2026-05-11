@@ -36,9 +36,9 @@ DEFINE ANALYZER IF NOT EXISTS activity_analyzer
   FILTERS lowercase, ascii, snowball(english);
 
 -- =============================================================================
--- Indexes: idx_activity_name_fts and idx_activity_description_fts
+-- Indexes: idx_activity_name_fts, idx_activity_description_fts, idx_activity_tags_fts
 -- =============================================================================
--- Purpose: Full-text search indexes on activity name and description
+-- Purpose: Full-text search indexes on activity name, description, and tags
 --
 -- NOTE: SurrealDB requires separate indexes per field for FULLTEXT indexes.
 --       Multi-field FULLTEXT indexes are not supported.
@@ -46,11 +46,18 @@ DEFINE ANALYZER IF NOT EXISTS activity_analyzer
 -- FIELDS (separate indexes):
 --   - name:        Activity name (e.g., "Fix TypeScript Compilation Error")
 --   - description: Activity description (optional, can be NONE)
+--   - tags:        Hierarchical tag array (e.g., ["bugfix.auth.tokens", "typescript"])
 --
 -- SCORING: BM25(k1=1.2, b=0.75)
 --   - k1=1.2: Term frequency saturation (higher = more weight on term frequency)
 --   - b=0.75: Document length normalization (0=no penalty, 1=full penalty)
 --   - These are the standard/default BM25 parameters from academic literature
+--
+-- SCORE INDEX ASSIGNMENT (queryActivitiesByFTS):
+--   - @0@ → idx_activity_name_fts        (weight ×2 in ranking expression)
+--   - @1@ → idx_activity_description_fts (weight ×1)
+--   - @2@ → idx_activity_tags_fts        (weight ×1.5)
+--   - Combined: search::score(0)*2 + search::score(2)*1.5 + search::score(1)
 --
 -- USAGE PATTERNS:
 --
@@ -60,15 +67,14 @@ DEFINE ANALYZER IF NOT EXISTS activity_analyzer
 --
 -- 2. Search with BM25 score on name (ranked by relevance):
 --    SELECT *, search::score(0) AS relevance FROM activity
---    WHERE name @0@@ 'typescript compilation'
+--    WHERE name @0@ 'typescript compilation'
 --    ORDER BY relevance DESC;
 --
--- 3. Combined name + description search with weighted scores:
---    -- Use @0@@ for name index (score index 0), @1@@ for description index (score index 1)
+-- 3. Combined name + description + tags search with weighted scores:
 --    SELECT *,
---      search::score(0) * 2 + search::score(1) AS relevance
+--      search::score(0) * 2 + search::score(2) * 1.5 + search::score(1) AS relevance
 --    FROM activity
---    WHERE name @0@@ 'fix bug' OR description @1@@ 'fix bug'
+--    WHERE name @0@ 'fix bug' OR description @1@ 'fix bug' OR tags @2@ 'fix bug'
 --    ORDER BY relevance DESC;
 --
 -- 4. FTS combined with other filters (org scoping, execution type):
@@ -84,9 +90,11 @@ DEFINE ANALYZER IF NOT EXISTS activity_analyzer
 --
 -- NOTES:
 --   - The @@ operator performs full-text matching using the analyzer
---   - The @N@@ operator binds a score index (N) for use with search::score(N)
---   - When using multiple indexes, assign different score indices (@0@@, @1@@)
+--   - The @N@ operator (single-@) binds a score index (N) for use with search::score(N)
+--   - SurrealDB 3.x: use @N@ not @N@@ (triple-@ is a parser bug that rejects the RHS literal)
 --   - Description field can be NONE; FTS handles this gracefully
+--   - tags field is an array; FTS indexes each element as a separate document
+--   - HIGHLIGHTS enabled on tags index for snippet extraction
 --   - Index respects PERMISSIONS defined on the activity table
 -- =============================================================================
 
@@ -99,6 +107,17 @@ DEFINE INDEX IF NOT EXISTS idx_activity_description_fts
   ON activity
   FIELDS description
   FULLTEXT ANALYZER activity_analyzer BM25(1.2, 0.75);
+
+-- Tags FTS index (migration 126, 2026-05-09)
+-- Enables tag-token matching in the unified FTS scoring expression.
+-- Uses HIGHLIGHTS for future snippet extraction; DEFINE INDEX OVERWRITE
+-- because the initial schema ships without this index and canary rebuilds
+-- the index on first deployment.
+DEFINE INDEX IF NOT EXISTS idx_activity_tags_fts
+  ON activity
+  FIELDS tags
+  FULLTEXT ANALYZER activity_analyzer BM25(1.2, 0.75)
+  HIGHLIGHTS;
 
 -- =============================================================================
 -- Performance Considerations

@@ -999,18 +999,22 @@ export async function getShapeConditionedScores(
 }
 
 /**
- * Query activities using full-text search on name and description.
- * Uses BM25 scoring from the idx_activity_name_fts and idx_activity_description_fts indexes.
+ * Query activities using full-text search on name, description, and tags.
+ * Uses BM25 scoring from three FTS indexes:
+ *   idx_activity_name_fts        → score index 0 (weight ×2)
+ *   idx_activity_description_fts → score index 1 (weight ×1)
+ *   idx_activity_tags_fts        → score index 2 (weight ×1.5)
  *
  * The search uses the @N@ operator for FTS matching with score indices:
  * - @0@ binds to name index (search::score(0))
  * - @1@ binds to description index (search::score(1))
+ * - @2@ binds to tags index (search::score(2))
  *
  * SurrealDB 3.x note: triple-@ (@N@@) is a parser bug — it splits as
  * `@@ @` and rejects the RHS literal. Use single-@ (@N@).
  *
- * Name matches are weighted 2x higher than description matches to prioritize
- * activities where the search term appears in the title.
+ * Combined ranking: search::score(0)*2 + search::score(2)*1.5 + search::score(1)
+ * This prioritises name matches, then tag matches, then description matches.
  *
  * @param searchQuery - Search query string (tokenized and stemmed by activity_analyzer)
  * @param orgId - Organization ID for multi-tenant filtering (optional)
@@ -1077,7 +1081,7 @@ export async function queryActivitiesByFTS(
       });
       return { data: [], path: 'new', latency_ms: latencyMs };
     }
-    whereClauses.push(`(name @0@ '${ftsLiteral}' OR description @1@ '${ftsLiteral}')`);
+    whereClauses.push(`(name @0@ '${ftsLiteral}' OR description @1@ '${ftsLiteral}' OR tags @2@ '${ftsLiteral}')`);
 
     // Multi-tenant filtering: include global scope OR org-specific activities
     if (orgId) {
@@ -1098,11 +1102,13 @@ export async function queryActivitiesByFTS(
     const whereClause = whereClauses.join(' AND ');
 
     // Build query with BM25 score calculation
-    // Weight name matches 2x higher than description matches
+    // Ranking: name (×2) > tags (×1.5) > description (×1)
+    // Tag matches rank above description because tags are curated hierarchical classifiers
+    // (e.g. "bugfix.auth.tokens") and carry higher precision signal than free-text description.
     // TIMEOUT guards against FTS hanging on large tables (> ~2000 rows without warm indices)
     const query = `
       SELECT *,
-        search::score(0) * 2 + search::score(1) AS fts_score
+        search::score(0) * 2 + search::score(2) * 1.5 + search::score(1) AS fts_score
       FROM activity
       WHERE ${whereClause}
       ORDER BY fts_score DESC
