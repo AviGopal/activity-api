@@ -9079,20 +9079,27 @@ app.post('/relevance-feedback', async (c) => {
 
 // ============================================================================
 // POST /v2/activities/internal/fts-rebuild
-// Trigger an immediate REBUILD of all three FTS indexes. Used by integration
-// tests (18.1.x) to warm the BM25 scorer after inserting test fixtures, so
-// tests don't have to wait for the next 5-minute periodic rebuild.
+// Trigger a background REBUILD of all three FTS indexes. Used by integration
+// tests (18.1.x) to warm the BM25 scorer after inserting test fixtures.
+// Returns 202 immediately — REBUILD runs in the background (~6 min for all 3
+// indexes against the full corpus). The gateway would time out waiting for a
+// synchronous rebuild response (sequential REBUILD blocks for each index until
+// SurrealDB confirms completion). Fire-and-forget avoids the gateway timeout.
 // Requires standard API-key auth (no admin scope needed — rebuild is read-safe).
 // ============================================================================
 app.post('/internal/fts-rebuild', async (c) => {
-  try {
+  const { surrealDB } = await import('../db/surreal');
+  const indexes = [
+    'idx_activity_name_fts',
+    'idx_activity_description_fts',
+    'idx_activity_tags_fts',
+  ];
+
+  // Fire-and-forget: return 202 immediately so the HTTP gateway does not time
+  // out. The rebuild runs asynchronously — poll GET /v2/activities/templates?q=
+  // for non-zero fts_score values to confirm the scorer is warm.
+  void (async () => {
     const start = Date.now();
-    const { surrealDB } = await import('../db/surreal');
-    const indexes = [
-      'idx_activity_name_fts',
-      'idx_activity_description_fts',
-      'idx_activity_tags_fts',
-    ];
     for (const idx of indexes) {
       try {
         await surrealDB.query(`REBUILD INDEX ${idx} ON activity`);
@@ -9100,15 +9107,13 @@ app.post('/internal/fts-rebuild', async (c) => {
         if (String(err).includes('currently building')) {
           logger.info(`POST /v2/activities/internal/fts-rebuild: ${idx} already building, skipping`);
         } else {
-          throw err;
+          logger.error(`POST /v2/activities/internal/fts-rebuild: ${idx} failed`, { error: String(err) });
+          return;
         }
       }
     }
-    const ms = Date.now() - start;
-    logger.info('POST /v2/activities/internal/fts-rebuild complete', { ms });
-    return c.json({ ok: true, duration_ms: ms });
-  } catch (error: any) {
-    logger.error('POST /v2/activities/internal/fts-rebuild failed', { error: error.message });
-    return c.json({ error: 'FTS rebuild failed', message: error.message }, 500);
-  }
+    logger.info('POST /v2/activities/internal/fts-rebuild complete (async)', { ms: Date.now() - start });
+  })();
+
+  return c.json({ ok: true, message: 'rebuild started', estimated_ms: 360_000 }, 202);
 });

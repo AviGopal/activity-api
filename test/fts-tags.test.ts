@@ -27,12 +27,16 @@ const API_KEY  = process.env.METABOB_API_KEY ?? '';
 // Skip the entire suite when credentials are missing (e.g. local dev without .env.test)
 const SKIP = !API_KEY;
 
-const TEST_ORG = 'organizations:fts-tags-test-18-1';
-const PREFIX   = 'fts-tags-test-18-1-';
+const TEST_ORG = 'organizations:fts_tags_test_18_1';
+const PREFIX   = 'fts_tags_test_18_1_';
 
-const ID_AUTH_SPECIFIC = `${PREFIX}auth-specific`;  // tags: ["bugfix.auth.tokens"]
-const ID_AUTH_GENERAL  = `${PREFIX}auth-general`;   // tags: ["auth"]
-const ID_BUGFIX_ONLY   = `${PREFIX}bugfix-only`;    // tags: ["bugfix"]
+// IDs use underscores: SurrealDB backtick-wrapped hyphenated IDs are stored but
+// are invisible to the application-level listing query (they appear as a different
+// record format). Underscores produce plain `activity:fts_tags_test_18_1_*` IDs
+// that round-trip cleanly through the GET /v2/activities/templates listing.
+const ID_AUTH_SPECIFIC = `${PREFIX}auth_specific`;  // tags: ["bugfix.auth.tokens"]
+const ID_AUTH_GENERAL  = `${PREFIX}auth_general`;   // tags: ["auth"]
+const ID_BUGFIX_ONLY   = `${PREFIX}bugfix_only`;    // tags: ["bugfix"]
 const ID_UNRELATED     = `${PREFIX}unrelated`;      // tags: ["documentation"]
 
 const ALL_IDS = [ID_AUTH_SPECIFIC, ID_AUTH_GENERAL, ID_BUGFIX_ONLY, ID_UNRELATED];
@@ -54,25 +58,29 @@ async function createTemplate(id: string, name: string, description: string, tag
       description,
       tags,
       execution_type: 'template',
-      scope: 'org',
-      org_id: TEST_ORG,
+      scope: 'global',
       public: false,
       output_shapes: ['result'],
       tasks: [],
     }),
   });
-  if (!res.ok) {
+  // 409 = already exists (idempotent re-run), treat as success.
+  if (!res.ok && res.status !== 409) {
     const text = await res.text();
     throw new Error(`createTemplate(${id}) HTTP ${res.status}: ${text.slice(0, 200)}`);
   }
 }
 
 async function rebuildFts(): Promise<void> {
+  // Sequential REBUILD of 3 FTS indexes takes ~350s — longer than Cloudflare's
+  // gateway timeout (60s). Accept 503 as "rebuild in progress, will complete"
+  // and rely on the periodic 30-min schedule keeping the scorer warm most of
+  // the time. Only hard-fail on non-timeout errors.
   const res = await fetch(`${BASE_URL}/v2/activities/internal/fts-rebuild`, {
     method: 'POST',
     headers: headers(),
   });
-  if (!res.ok) {
+  if (!res.ok && res.status !== 503) {
     const text = await res.text();
     throw new Error(`fts-rebuild HTTP ${res.status}: ${text.slice(0, 200)}`);
   }
@@ -121,11 +129,23 @@ beforeAll(async () => {
     ),
   ]);
 
-  // Warm the BM25 scorer immediately after inserts so score assertions work
-  // without waiting for the next 5-minute periodic rebuild (F-V46 fix must be
-  // deployed for scores to stay non-zero between this REBUILD and the query).
+  // Trigger REBUILD. The HTTP gateway times out at ~60s and returns 503;
+  // the server-side REBUILD continues and takes ~350s for all 3 indexes.
+  // Each template creation above writes to `activity` and resets the BM25
+  // scorer (SurrealDB 3.0.0 bug: F-V45/F-V46). The rebuild must complete
+  // AFTER all template writes, so we trigger it explicitly here.
   await rebuildFts();
-});
+
+  // Poll until scorer is warm (non-zero score for the "auth" query).
+  // Allow 10 min: 60s gateway timeout + 350s server-side rebuild = 410s,
+  // plus 60s headroom. Poll every 10s.
+  const deadline = Date.now() + 10 * 60 * 1000;
+  while (Date.now() < deadline) {
+    const results = await searchTemplates('auth', 10);
+    if (results.some(r => (r.fts_score ?? 0) > 0)) break;
+    await new Promise(r => setTimeout(r, 10_000));
+  }
+}, 15 * 60 * 1000); // 15-min timeout for beforeAll (template creation + REBUILD + poll)
 
 afterAll(async () => {
   // Test artifacts under TEST_ORG are isolated — they only surface in queries
