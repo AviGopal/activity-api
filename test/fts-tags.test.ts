@@ -141,11 +141,16 @@ beforeAll(async () => {
   // may already have a score before the REBUILD that includes our new fixtures
   // has completed. Require ID_AUTH_SPECIFIC specifically in results.
   // Allow 10 min: 202 response + ~6 min async REBUILD + 60s headroom. Poll every 10s.
+  // Swallow 503/5xx during the poll — SurrealDB can be slow under active REBUILD.
   const deadline = Date.now() + 10 * 60 * 1000;
   while (Date.now() < deadline) {
-    const results = await searchTemplates('auth', 20);
-    const hit = results.find(r => stripPrefix(r.id) === ID_AUTH_SPECIFIC);
-    if (hit && (hit.fts_score ?? 0) > 0) break;
+    try {
+      const results = await searchTemplates('auth', 20);
+      const hit = results.find(r => stripPrefix(r.id) === ID_AUTH_SPECIFIC);
+      if (hit && (hit.fts_score ?? 0) > 0) break;
+    } catch {
+      // transient error (e.g. 503 while REBUILD holds SurrealDB), keep polling
+    }
     await new Promise(r => setTimeout(r, 10_000));
   }
 }, 15 * 60 * 1000); // 15-min timeout for beforeAll (template creation + REBUILD + poll)
