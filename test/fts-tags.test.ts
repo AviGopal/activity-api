@@ -136,13 +136,16 @@ beforeAll(async () => {
   // AFTER all template writes, so we trigger it explicitly here.
   await rebuildFts();
 
-  // Poll until scorer is warm (non-zero score for the "auth" query).
-  // Allow 10 min: 60s gateway timeout + 350s server-side rebuild = 410s,
-  // plus 60s headroom. Poll every 10s.
+  // Poll until the scorer is warm AND the test fixture is indexed.
+  // Checking for any non-zero score is insufficient: a prior probe template
+  // may already have a score before the REBUILD that includes our new fixtures
+  // has completed. Require ID_AUTH_SPECIFIC specifically in results.
+  // Allow 10 min: 202 response + ~6 min async REBUILD + 60s headroom. Poll every 10s.
   const deadline = Date.now() + 10 * 60 * 1000;
   while (Date.now() < deadline) {
-    const results = await searchTemplates('auth', 10);
-    if (results.some(r => (r.fts_score ?? 0) > 0)) break;
+    const results = await searchTemplates('auth', 20);
+    const hit = results.find(r => stripPrefix(r.id) === ID_AUTH_SPECIFIC);
+    if (hit && (hit.fts_score ?? 0) > 0) break;
     await new Promise(r => setTimeout(r, 10_000));
   }
 }, 15 * 60 * 1000); // 15-min timeout for beforeAll (template creation + REBUILD + poll)
