@@ -526,34 +526,48 @@ logger.info(`WebSocket endpoint available at ws://localhost:${server.port}/ws`);
 // FTS Scorer Maintenance
 // ============================================================================
 // SurrealDB 3.0.0 BM25 bug (F-V45/F-V46): any write to an FTS-indexed table
-// invalidates all BM25 scorer state for that table. Since `activity` is written
-// on every execution trace (Thompson α/β update), the scorer is invalidated
-// continuously. The only remedy is REBUILD, which takes ~9s per index.
+// invalidates all BM25 scorer state for that table. The previous fix removed
+// the high-frequency Thompson α/β writes to `activity`. The remaining writes
+// are: startup learning-track classifier (~30s burst), rare variant creation,
+// and minibob template registration at startup.
 //
-// Strategy: run REBUILD on all three FTS indexes every 5 minutes. Between
-// rebuilds the scorer may be invalid (search::score(N) = 0), but FTS still
-// returns the correct CANDIDATE SET via the @N@ matching operator — scoring
-// is just uniformly 0 during the ~27s rebuild window and for a short period
-// after each `activity` write. Thompson Sampling provides the primary ranking;
-// FTS score is a secondary signal.
-const FTS_REBUILD_INTERVAL_MS = parseInt(process.env.FTS_REBUILD_INTERVAL_MS ?? String(5 * 60 * 1000), 10);
+// The three FTS indexes now take ~80-140s each to REBUILD against the 2800-row
+// corpus (measured empirically). Running them sequentially (old approach) took
+// ~350s total — longer than the old 5-min interval, keeping the index in
+// "building" state permanently. Fixes:
+//   1. Parallel REBUILD: runs all 3 simultaneously, limiting total time to the
+//      longest index rebuild (~140s) instead of sum (~350s).
+//   2. 30-minute interval (default, env-tunable): with ~140s rebuild time and a
+//      30-minute cycle, the scorer is warm for ~27 of every 30 minutes.
+//
+// The startup delay stays at 5 minutes to let the classifier cycle (which runs
+// immediately at pod start and writes ~2800 rows over ~30s) fully complete
+// before the first REBUILD, so the new rows land before the scorer is seeded.
+
+const FTS_REBUILD_INTERVAL_MS = parseInt(
+  process.env.FTS_REBUILD_INTERVAL_MS ?? String(30 * 60 * 1000), 10,
+);
 
 async function rebuildFtsIndexes(): Promise<void> {
   const { surrealDB } = await import('./db/surreal');
-  await surrealDB.query(`REBUILD INDEX idx_activity_name_fts ON activity`);
-  await surrealDB.query(`REBUILD INDEX idx_activity_description_fts ON activity`);
-  await surrealDB.query(`REBUILD INDEX idx_activity_tags_fts ON activity`);
+  await Promise.all([
+    surrealDB.query(`REBUILD INDEX idx_activity_name_fts ON activity`),
+    surrealDB.query(`REBUILD INDEX idx_activity_description_fts ON activity`),
+    surrealDB.query(`REBUILD INDEX idx_activity_tags_fts ON activity`),
+  ]);
 }
 
-// Initial rebuild — delay 15s to let the learning-track classifier finish its
-// first cycle (which writes last_classified_at to every activity row).
+// Initial rebuild — delayed 5 min to let the startup classifier cycle finish
+// (it writes last_classified_at to all activity rows and takes ~30s). If we
+// rebuild at t=15s the index build races the classifier writes and the scorer
+// ends up cold until the next periodic cycle.
 setTimeout(() => {
   void rebuildFtsIndexes()
     .then(() => logger.info('[FTS] Initial FTS scorer rebuild complete'))
     .catch(err => logger.warn('[FTS] Initial FTS scorer rebuild failed', { error: String(err) }));
-}, 15_000);
+}, 5 * 60 * 1000);
 
-// Periodic rebuild every FTS_REBUILD_INTERVAL_MS (default 5 min).
+// Periodic rebuild every FTS_REBUILD_INTERVAL_MS (default 30 min).
 setInterval(() => {
   void rebuildFtsIndexes()
     .then(() => logger.info('[FTS] Periodic FTS scorer rebuild complete'))

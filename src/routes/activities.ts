@@ -9088,9 +9088,11 @@ app.post('/internal/fts-rebuild', async (c) => {
   try {
     const start = Date.now();
     const { surrealDB } = await import('../db/surreal');
-    await surrealDB.query(`REBUILD INDEX idx_activity_name_fts ON activity`);
-    await surrealDB.query(`REBUILD INDEX idx_activity_description_fts ON activity`);
-    await surrealDB.query(`REBUILD INDEX idx_activity_tags_fts ON activity`);
+    await Promise.all([
+      surrealDB.query(`REBUILD INDEX idx_activity_name_fts ON activity`),
+      surrealDB.query(`REBUILD INDEX idx_activity_description_fts ON activity`),
+      surrealDB.query(`REBUILD INDEX idx_activity_tags_fts ON activity`),
+    ]);
     const ms = Date.now() - start;
     logger.info('POST /v2/activities/internal/fts-rebuild complete', { ms });
     return c.json({ ok: true, duration_ms: ms });
