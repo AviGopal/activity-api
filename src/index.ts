@@ -531,18 +531,19 @@ logger.info(`WebSocket endpoint available at ws://localhost:${server.port}/ws`);
 // are: startup learning-track classifier (~30s burst), rare variant creation,
 // and minibob template registration at startup.
 //
-// The three FTS indexes now take ~80-140s each to REBUILD against the 2800-row
-// corpus (measured empirically). Running them sequentially (old approach) took
-// ~350s total — longer than the old 5-min interval, keeping the index in
-// "building" state permanently. Fixes:
-//   1. Parallel REBUILD: runs all 3 simultaneously, limiting total time to the
-//      longest index rebuild (~140s) instead of sum (~350s).
-//   2. 30-minute interval (default, env-tunable): with ~140s rebuild time and a
-//      30-minute cycle, the scorer is warm for ~27 of every 30 minutes.
+// The three FTS indexes take ~80-140s each to REBUILD against the 2800-row
+// corpus. Running sequentially totals ~350s.
 //
-// The startup delay stays at 5 minutes to let the classifier cycle (which runs
-// immediately at pod start and writes ~2800 rows over ~30s) fully complete
-// before the first REBUILD, so the new rows land before the scorer is seeded.
+// SurrealDB 3.x rejects concurrent REBUILD INDEX calls on the same table
+// ("Database index `X` is currently building"), so Promise.all does not help.
+// Sequential REBUILD is the correct approach.
+//
+// With a 30-minute interval, the scorer is warm for ~27 of every 30 minutes
+// (~350s / 1800s = 81% cold; but in practice queries during the rebuild window
+// still return results — only `search::score()` returns 0 while building).
+//
+// The startup delay stays at 5 minutes to let the learning-track classifier
+// finish its ~2800-row UPDATE burst before the first REBUILD fires.
 
 const FTS_REBUILD_INTERVAL_MS = parseInt(
   process.env.FTS_REBUILD_INTERVAL_MS ?? String(30 * 60 * 1000), 10,
@@ -550,11 +551,22 @@ const FTS_REBUILD_INTERVAL_MS = parseInt(
 
 async function rebuildFtsIndexes(): Promise<void> {
   const { surrealDB } = await import('./db/surreal');
-  await Promise.all([
-    surrealDB.query(`REBUILD INDEX idx_activity_name_fts ON activity`),
-    surrealDB.query(`REBUILD INDEX idx_activity_description_fts ON activity`),
-    surrealDB.query(`REBUILD INDEX idx_activity_tags_fts ON activity`),
-  ]);
+  const indexes = [
+    'idx_activity_name_fts',
+    'idx_activity_description_fts',
+    'idx_activity_tags_fts',
+  ];
+  for (const idx of indexes) {
+    try {
+      await surrealDB.query(`REBUILD INDEX ${idx} ON activity`);
+    } catch (err: any) {
+      if (String(err).includes('currently building')) {
+        logger.info(`[FTS] ${idx} already rebuilding, skipping`);
+      } else {
+        throw err;
+      }
+    }
+  }
 }
 
 // Initial rebuild — delayed 5 min to let the startup classifier cycle finish

@@ -9088,11 +9088,22 @@ app.post('/internal/fts-rebuild', async (c) => {
   try {
     const start = Date.now();
     const { surrealDB } = await import('../db/surreal');
-    await Promise.all([
-      surrealDB.query(`REBUILD INDEX idx_activity_name_fts ON activity`),
-      surrealDB.query(`REBUILD INDEX idx_activity_description_fts ON activity`),
-      surrealDB.query(`REBUILD INDEX idx_activity_tags_fts ON activity`),
-    ]);
+    const indexes = [
+      'idx_activity_name_fts',
+      'idx_activity_description_fts',
+      'idx_activity_tags_fts',
+    ];
+    for (const idx of indexes) {
+      try {
+        await surrealDB.query(`REBUILD INDEX ${idx} ON activity`);
+      } catch (err: any) {
+        if (String(err).includes('currently building')) {
+          logger.info(`POST /v2/activities/internal/fts-rebuild: ${idx} already building, skipping`);
+        } else {
+          throw err;
+        }
+      }
+    }
     const ms = Date.now() - start;
     logger.info('POST /v2/activities/internal/fts-rebuild complete', { ms });
     return c.json({ ok: true, duration_ms: ms });
