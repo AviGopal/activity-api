@@ -2248,29 +2248,12 @@ app.post('/', async (c) => {
         }
       `;
 
-      // F-V39: The canonical template store is the `activity` table (paradigm).
-      // `activity_template` holds only 34 legacy rows; all 2781 active templates
-      // registered by minibob land in `activity`. Without this second UPDATE the
-      // Thompson posteriors never advance past the (1,1) prior regardless of how
-      // many real executions are stored.
-      const activityTableUpdateQuery = `
-        UPDATE activity
-        SET
-          thompson_alpha = (thompson_alpha ?? 1) + $alpha_delta,
-          thompson_beta = (thompson_beta ?? 1) + $beta_delta,
-          total_executions = (total_executions ?? 0) + 1,
-          successful_executions = (successful_executions ?? 0) + $success_delta,
-          failed_executions = (failed_executions ?? 0) + $failure_delta,
-          last_executed_at = time::now()
-        WHERE (record::id(id) = $activity_id OR name = $activity_id)
-          AND (org_id = $org_id OR org_id = $org_id_alt)
-        RETURN {
-          id,
-          thompson_alpha,
-          thompson_beta,
-          total_executions
-        }
-      `;
+      // NOTE: We do NOT write Thompson posteriors to the `activity` table.
+      // Any write to `activity` invalidates the BM25 FTS scorer (SurrealDB 3.0
+      // regression, F-V46), keeping fts_score=0 permanently at ~27 writes/min.
+      // The canonical posterior store is `variant_performance_metrics` (below).
+      // The recommendation read path (activities.ts:4540) already prioritises
+      // scores?.alpha from that table over activity.thompson_alpha.
 
       // Validate org_id is set (defined at line 737 with session fallback)
       if (!traceOrgId || traceOrgId === 'undefined') {
@@ -2329,16 +2312,7 @@ app.post('/', async (c) => {
           ? await queryWithAuth(jwtAuth.jwtToken, updateQuery, updateParams)
           : await surrealDB.query(updateQuery, updateParams);
 
-        // F-V39: Also update the `activity` table (paradigm), which holds the
-        // 2781 active templates. `activity_template` has only 34 legacy rows.
-        const activityTableResult = jwtAuth?.jwtToken
-          ? await queryWithAuth(jwtAuth.jwtToken, activityTableUpdateQuery, updateParams)
-          : await surrealDB.query(activityTableUpdateQuery, updateParams);
-
-        // Use whichever table returned a match
-        const combinedResult = (updateResult && updateResult.length > 0) ? updateResult
-          : (activityTableResult && activityTableResult.length > 0) ? activityTableResult
-          : null;
+        const combinedResult = (updateResult && updateResult.length > 0) ? updateResult : null;
 
         if (combinedResult && combinedResult.length > 0) {
           if (candidateId === trace.variant_id) {
@@ -2348,7 +2322,7 @@ app.post('/', async (c) => {
             execution_id: trace.execution_id,
             activity_id: candidateId,
             via_metadata_template_id: candidateId !== trace.variant_id,
-            table: (updateResult && updateResult.length > 0) ? 'activity_template' : 'activity',
+            table: 'activity_template',
             success: trace.success,
             new_alpha: combinedResult[0].thompson_alpha,
             new_beta: combinedResult[0].thompson_beta,

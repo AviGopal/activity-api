@@ -9076,3 +9076,26 @@ app.post('/relevance-feedback', async (c) => {
     }, 500);
   }
 });
+
+// ============================================================================
+// POST /v2/activities/internal/fts-rebuild
+// Trigger an immediate REBUILD of all three FTS indexes. Used by integration
+// tests (18.1.x) to warm the BM25 scorer after inserting test fixtures, so
+// tests don't have to wait for the next 5-minute periodic rebuild.
+// Requires standard API-key auth (no admin scope needed — rebuild is read-safe).
+// ============================================================================
+app.post('/internal/fts-rebuild', async (c) => {
+  try {
+    const start = Date.now();
+    const { surrealDB } = await import('../db/surreal');
+    await surrealDB.query(`REBUILD INDEX idx_activity_name_fts ON activity`);
+    await surrealDB.query(`REBUILD INDEX idx_activity_description_fts ON activity`);
+    await surrealDB.query(`REBUILD INDEX idx_activity_tags_fts ON activity`);
+    const ms = Date.now() - start;
+    logger.info('POST /v2/activities/internal/fts-rebuild complete', { ms });
+    return c.json({ ok: true, duration_ms: ms });
+  } catch (error: any) {
+    logger.error('POST /v2/activities/internal/fts-rebuild failed', { error: error.message });
+    return c.json({ error: 'FTS rebuild failed', message: error.message }, 500);
+  }
+});
