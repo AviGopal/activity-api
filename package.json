@@ -1,6 +1,6 @@
 {
   "name": "metabob-activity-api",
-  "version": "1.20.0",
+  "version": "1.20.1",
   "description": "Lightweight TypeScript server for Metabob activity system - replaces Python RPC API v2 endpoints",
   "main": "src/index.ts",
   "type": "module",
@@ -14,6 +14,7 @@
     "extract-variants": "bun run sql/extract-best-variants.ts",
     "bootstrap-shapes": "bun run sql/bootstrap-shapes.ts",
     "seed:cleanup-test": "bun run scripts/seed-cleanup-test-data.ts",
+    "backfill-embeddings": "bun run scripts/backfill-embeddings.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src --ext .ts",

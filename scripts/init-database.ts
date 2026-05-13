@@ -63,6 +63,91 @@ interface SQLResult {
   time?: string;
 }
 
+// Build shared SurrealDB request headers (auth-conditional).
+function buildHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Accept': 'application/json',
+    'surreal-ns': SURREALDB_NAMESPACE,
+    'surreal-db': SURREALDB_DATABASE,
+  };
+  if (SURREALDB_AUTH_ENABLED) {
+    headers['Authorization'] =
+      'Basic ' + Buffer.from(`${SURREALDB_USERNAME}:${SURREALDB_PASSWORD}`).toString('base64');
+  }
+  return headers;
+}
+
+// ── Migration tracking ────────────────────────────────────────────────────────
+// Stores applied migration filenames in `init_migrations` so re-runs skip them.
+// This prevents REBUILD INDEX (and other slow/idempotent) migrations from
+// blocking the init container on every pod restart.
+//
+// Bootstrap rule: if `init_migrations` is empty but `activity_template` has
+// rows, the DB is a pre-tracking live instance — mark all known files as
+// applied so this run is a no-op (they were all applied by previous deploys).
+
+async function runSQL(sql: string): Promise<SQLResult[]> {
+  const response = await fetch(`${SURREALDB_URL}/sql`, {
+    method: 'POST',
+    headers: buildHeaders(),
+    body: sql,
+  });
+  if (!response.ok) return [];
+  return response.json().catch(() => []);
+}
+
+async function ensureMigrationsTable(): Promise<void> {
+  await runSQL(`
+    DEFINE TABLE IF NOT EXISTS init_migrations SCHEMAFULL
+      PERMISSIONS FOR select, create FULL;
+    DEFINE FIELD IF NOT EXISTS filename ON init_migrations TYPE string;
+    DEFINE FIELD IF NOT EXISTS applied_at ON init_migrations TYPE datetime DEFAULT time::now();
+    DEFINE INDEX IF NOT EXISTS idx_init_migrations_filename ON init_migrations FIELDS filename UNIQUE;
+  `);
+}
+
+async function getAppliedMigrations(): Promise<Set<string>> {
+  const results = await runSQL('SELECT filename FROM init_migrations;');
+  if (!results[0] || results[0].status !== 'OK') return new Set();
+  const rows: any[] = Array.isArray(results[0].result) ? results[0].result : [];
+  return new Set(rows.map((r: any) => r.filename));
+}
+
+async function markMigrationApplied(filename: string): Promise<void> {
+  await runSQL(
+    `INSERT IGNORE INTO init_migrations (filename) VALUES ('${filename.replace(/'/g, "\\'")}');`
+  );
+}
+
+async function bootstrapMigrationsTable(allFiles: string[]): Promise<boolean> {
+  // Check if DB already has data (live instance predating migration tracking).
+  const results = await runSQL('SELECT count() FROM activity_template GROUP ALL;');
+  const count: number =
+    results[0]?.status === 'OK' && Array.isArray(results[0].result) && results[0].result[0]
+      ? (results[0].result[0].count ?? 0)
+      : 0;
+
+  if (count === 0) {
+    // Fresh DB — apply everything normally.
+    console.log('[Init] Fresh DB detected — applying all migrations.');
+    return false;
+  }
+
+  // Live DB: pre-populate the tracking table with all known migration filenames.
+  // This marks them as already applied so the init container skips them on
+  // this and future restarts, preventing slow REBUILD INDEX re-runs.
+  console.log(
+    `[Init] Live DB detected (${count} activity_template rows). ` +
+    `Pre-populating init_migrations with ${allFiles.length} known files.`
+  );
+  for (const file of allFiles) {
+    const filename = file.split('/').pop()!;
+    await markMigrationApplied(filename);
+  }
+  console.log('[Init] ✓ init_migrations bootstrapped — this run will skip all existing migrations.');
+  return true; // caller should skip all migrations this run
+}
+
 async function applySQLFile(filePath: string): Promise<boolean> {
   const fileName = filePath.split('/').pop();
   console.log(`\n[Migration] Applying ${fileName}...`);
@@ -102,15 +187,7 @@ async function applySQLFile(filePath: string): Promise<boolean> {
       return false;
     }
 
-    // Build headers - only include Authorization when auth is enabled
-    const headers: Record<string, string> = {
-      'Accept': 'application/json',
-      'surreal-ns': SURREALDB_NAMESPACE,
-      'surreal-db': SURREALDB_DATABASE,
-    };
-    if (SURREALDB_AUTH_ENABLED) {
-      headers['Authorization'] = 'Basic ' + Buffer.from(`${SURREALDB_USERNAME}:${SURREALDB_PASSWORD}`).toString('base64');
-    }
+    const headers = buildHeaders();
 
     const response = await fetch(`${SURREALDB_URL}/sql`, {
       method: 'POST',
@@ -252,13 +329,39 @@ async function main() {
 
   console.log(`\n[Init] Found ${sqlFiles.length} migration file(s)`);
 
+  // ── Migration tracking ───────────────────────────────────────────────────
+  // Ensure the tracking table exists, then load the set of applied migrations.
+  // On a live DB where the table is brand-new (empty), bootstrap it by marking
+  // all current files as already applied — they were applied by prior deploys.
+  await ensureMigrationsTable();
+  let appliedMigrations = await getAppliedMigrations();
+  let bootstrapped = false;
+
+  if (appliedMigrations.size === 0) {
+    bootstrapped = await bootstrapMigrationsTable(sqlFiles);
+    if (bootstrapped) {
+      appliedMigrations = await getAppliedMigrations();
+    }
+  }
+
   // Apply each migration
   let successCount = 0;
+  let skippedCount = 0;
   for (const file of sqlFiles) {
+    const filename = file.split('/').pop()!;
+
+    if (appliedMigrations.has(filename)) {
+      console.log(`[Migration] ⏭ Skipping ${filename} (already applied)`);
+      successCount++;
+      skippedCount++;
+      continue;
+    }
+
     const filePath = join(SQL_DIR, file);
     const success = await applySQLFile(filePath);
     if (success) {
       successCount++;
+      await markMigrationApplied(filename);
     } else {
       // Continue even on failure (for idempotency)
       console.warn(`[Init] ⚠ Migration ${file} had errors but continuing...`);
@@ -266,7 +369,10 @@ async function main() {
   }
 
   console.log('\n' + '='.repeat(80));
-  console.log(`[Init] Migration complete: ${successCount}/${sqlFiles.length} succeeded`);
+  console.log(
+    `[Init] Migration complete: ${successCount}/${sqlFiles.length} succeeded` +
+    (skippedCount > 0 ? ` (${skippedCount} skipped — already applied)` : '')
+  );
   console.log('='.repeat(80));
 
   if (successCount < sqlFiles.length) {
