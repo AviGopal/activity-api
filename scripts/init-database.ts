@@ -121,10 +121,12 @@ async function markMigrationApplied(filename: string): Promise<void> {
 
 async function bootstrapMigrationsTable(allFiles: string[]): Promise<boolean> {
   // Check if DB already has data (live instance predating migration tracking).
-  const results = await runSQL('SELECT count() FROM activity_template GROUP ALL;');
+  // Use activity_execution_traces (guaranteed non-empty on any live DB) rather
+  // than activity_template, which lives in the `activity` table in the new paradigm.
+  const results = await runSQL('SELECT count() AS c FROM activity_execution_traces GROUP ALL;');
   const count: number =
     results[0]?.status === 'OK' && Array.isArray(results[0].result) && results[0].result[0]
-      ? (results[0].result[0].count ?? 0)
+      ? (results[0].result[0].c ?? 0)
       : 0;
 
   if (count === 0) {
@@ -137,7 +139,7 @@ async function bootstrapMigrationsTable(allFiles: string[]): Promise<boolean> {
   // This marks them as already applied so the init container skips them on
   // this and future restarts, preventing slow REBUILD INDEX re-runs.
   console.log(
-    `[Init] Live DB detected (${count} activity_template rows). ` +
+    `[Init] Live DB detected (${count} activity_execution_traces rows). ` +
     `Pre-populating init_migrations with ${allFiles.length} known files.`
   );
   for (const file of allFiles) {
