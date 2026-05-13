@@ -118,6 +118,7 @@ import {
 } from '../models/schemas';
 import { broadcaster } from '../websocket/broadcaster';
 import { autoCreateVariantIfNeeded, checkAndRetireTemplate } from '../services/variant-creator';
+import { applyOutcomeToPosteriors } from '../lib/posterior-update';
 
 const app = new Hono();
 
@@ -2341,6 +2342,24 @@ app.post('/executions', async (c) => {
       });
     }
 
+    // TODO (18.3.3): parallel stratified update — remove inline writes above once
+    // canary confirms correctness (24h observation window).
+    applyOutcomeToPosteriors(
+      {
+        activity_id: activityIdFromRequest,
+        success: validated.success,
+        failure_mode: null,
+        cost_usd: validated.cost,
+      },
+      surrealDB,
+      orgId!,
+    ).catch((err) => {
+      logger.warn('[18.3.3] applyOutcomeToPosteriors failed (non-blocking, /executions)', {
+        activity_id: activityIdFromRequest,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+
     // Step 3: Invalidate Redis cache for this template
     const redis = RedisClient.getInstance();
     await redis.del(`${CACHE_KEY_PREFIX}${activityIdFromRequest}`);
@@ -3807,6 +3826,23 @@ app.post('/feedback', async (c) => {
 
       // Negative feedback is specific - don't penalize adjacent activities
     }
+
+    // TODO (18.3.3): parallel stratified update — remove inline writes above once
+    // canary confirms correctness (24h observation window).
+    applyOutcomeToPosteriors(
+      {
+        activity_id: validated.activity_id,
+        success: validated.direction === 'positive',
+        failure_mode: null,
+      },
+      surrealDB,
+      orgId,
+    ).catch((err) => {
+      logger.warn('[18.3.3] applyOutcomeToPosteriors failed (non-blocking, /feedback)', {
+        activity_id: validated.activity_id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
 
     // Invalidate Redis cache for template recommendations
     try {

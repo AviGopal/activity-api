@@ -25,6 +25,7 @@ import {
   type PathRecommendationRequest,
   type RecommendedPath,
 } from '../models/schemas';
+import { applyOutcomeToPosteriors } from '../lib/posterior-update';
 
 const app = new Hono();
 
@@ -505,7 +506,26 @@ app.post('/', async (c) => {
         success_rate: successRate,
       });
     }
-    
+
+    // TODO (18.3.3): parallel stratified update — remove inline writes above once
+    // canary confirms correctness (24h observation window).
+    // Credit the terminal activity in the path (leaf that produced the outcome).
+    applyOutcomeToPosteriors(
+      {
+        activity_id: validated.path_activities[validated.path_activities.length - 1],
+        success: validated.success,
+        failure_mode: null,
+        cost_usd: validated.cost_usd,
+      },
+      surrealDB,
+      (body as any).org_id ?? 'public',
+    ).catch((err) => {
+      logger.warn('[18.3.3] applyOutcomeToPosteriors failed (non-blocking, goal-paths)', {
+        goal_hash: goalHash,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+
     return c.json({
       success: true,
       path,

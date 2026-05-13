@@ -24,6 +24,7 @@ import {
 } from '../services/thompson-sampling';
 import { resolveLearningTrack, type LearningTrack } from '../lib/learning-track';
 import { incrementExemplarBurstCounter } from '../services/exemplar-selector';
+import { applyOutcomeToPosteriors } from '../lib/posterior-update';
 
 const app = new Hono();
 
@@ -2370,6 +2371,25 @@ app.post('/', async (c) => {
           metadata_template_id: metadataTemplateId,
         });
       }
+
+      // TODO (18.3.3): parallel stratified update — remove inline writes above once
+      // canary confirms correctness (24h observation window).
+      applyOutcomeToPosteriors(
+        {
+          activity_id: trace.variant_id as string,
+          success: trace.success as boolean,
+          failure_mode: (body.failure_mode ?? null) as any,
+          tasks: trace.tasks as any,
+          cost_usd: trace.cost_usd as number,
+        },
+        surrealDB,
+        trace.org_id as string,
+      ).catch((err) => {
+        logger.warn('[18.3.3] applyOutcomeToPosteriors failed (non-blocking)', {
+          execution_id: trace.execution_id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
     } catch (scoreUpdateError) {
       // Don't fail the request if score update fails - trace is already stored
       logger.error('[learning] Failed to update Thompson Sampling scores (non-blocking)', {
