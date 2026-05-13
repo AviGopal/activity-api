@@ -1,5 +1,5 @@
 /**
- * Stratified posterior update for Thompson Sampling (Phase 18.3).
+ * Stratified posterior update for Thompson Sampling (Phase 18.3 + 18.4).
  *
  * All α/β write sites should call `applyOutcomeToPosteriors` instead of
  * computing deltas inline. The function maps `failure_mode.type` to the
@@ -13,6 +13,10 @@
  * `applyOutcomeToPosteriors` so both run concurrently. Once the test suite
  * confirms correctness the old inline writes should be removed (marked with
  * TODO below). This two-phase approach avoids a risky refactor in one shot.
+ *
+ * Phase 18.4 adds `propagateCreditAlongChain` which walks the composition
+ * chain (root-first) with exponential decay (γ=0.5) to attribute credit or
+ * blame to ancestor activities.
  */
 
 import { logger } from '../utils/logger';
@@ -41,6 +45,39 @@ export interface TraceForPosterior {
   }>;
   org_id?: string;
   cost_usd?: number;
+  /**
+   * Ancestor composition chain, root-first. When present, applyOutcomeToPosteriors
+   * fires propagateCreditAlongChain as a fire-and-forget side effect.
+   */
+  composition_chain?: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Phase 18.4 — Composition-chain credit propagation
+// ---------------------------------------------------------------------------
+
+/** Maximum number of ancestors to credit/blame (counted from the leaf). */
+const CREDIT_PROPAGATION_MAX_DEPTH = 4;
+
+/** Exponential decay factor per hop away from the leaf. */
+const CREDIT_PROPAGATION_GAMMA = 0.5;
+
+/**
+ * Minimal execution descriptor for chain-credit propagation.
+ * Callers outside applyOutcomeToPosteriors can also use this directly.
+ */
+export interface ExecutionForChainCredit {
+  /** The leaf activity (already credited by applyOutcomeToPosteriors). */
+  activity_id: string;
+  /** Ancestor chain, root-first — same field stored on the execution record. */
+  composition_chain: string[];
+  success: boolean;
+  failure_mode?: FailureMode | null;
+  /**
+   * When set, writes are also applied to `context_thompson_scores` keyed by
+   * this bucket (bucketed-Thompson interlock, spec 18.4.4).
+   */
+  context_bucket?: string | null;
 }
 
 export interface UpdateSummary {
@@ -169,6 +206,143 @@ async function writeImpulseRelevancePenalty(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 18.4: Composition-chain credit propagation
+// ---------------------------------------------------------------------------
+
+/**
+ * Write a (alpha_delta, beta_delta) pair to `variant_performance_metrics` for
+ * a single ancestor activity.  Also writes to `context_thompson_scores` when
+ * context_bucket is non-null/non-undefined.
+ *
+ * All writes are best-effort — errors are logged at WARN and swallowed.
+ */
+async function writeAncestorDelta(
+  ancestorId: string,
+  alphaDelta: number,
+  betaDelta: number,
+  db: DBQueryable,
+  orgId: string,
+  contextBucket: string | null | undefined,
+): Promise<void> {
+  if (alphaDelta === 0 && betaDelta === 0) return;
+
+  try {
+    await db.query(
+      `
+      UPDATE variant_performance_metrics
+      SET
+        thompson_alpha = (thompson_alpha ?? 1) + $alpha_delta,
+        thompson_beta  = (thompson_beta  ?? 1) + $beta_delta,
+        updated_at     = time::now()
+      WHERE variant_id = $activity_id
+        AND org_id     = $org_id
+      `,
+      {
+        activity_id: ancestorId,
+        org_id: orgId,
+        alpha_delta: alphaDelta,
+        beta_delta: betaDelta,
+      },
+    );
+  } catch (err) {
+    logger.warn('posterior-update: chain credit write to variant_performance_metrics failed', {
+      ancestor_id: ancestorId,
+      alpha_delta: alphaDelta,
+      beta_delta: betaDelta,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  if (contextBucket != null) {
+    try {
+      await db.query(
+        `
+        UPDATE context_thompson_scores
+        SET
+          thompson_alpha = (thompson_alpha ?? 1) + $alpha_delta,
+          thompson_beta  = (thompson_beta  ?? 1) + $beta_delta,
+          updated_at     = time::now()
+        WHERE variant_id      = $activity_id
+          AND org_id          = $org_id
+          AND context_bucket  = $context_bucket
+        `,
+        {
+          activity_id: ancestorId,
+          org_id: orgId,
+          alpha_delta: alphaDelta,
+          beta_delta: betaDelta,
+          context_bucket: contextBucket,
+        },
+      );
+    } catch (err) {
+      logger.warn('posterior-update: chain credit write to context_thompson_scores failed', {
+        ancestor_id: ancestorId,
+        context_bucket: contextBucket,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+}
+
+/**
+ * Propagate execution credit (or blame) from a leaf activity up its
+ * composition chain with exponential decay γ=0.5.
+ *
+ * Rules (spec 18.4):
+ *  - Success: each ancestor at depth d receives α += γ^d  (γ=0.5)
+ *  - Normal failure: each ancestor at depth d receives β += γ^d
+ *  - Cascading failure: propagate β to ancestors up to (and including) the
+ *    direct parent (depth-1), with the same decay. A receives nothing since
+ *    it is the root and cannot be both cause and victim in the chain below.
+ *    (Heuristic — full cause attribution requires task→activity mapping.)
+ *  - Depth is capped at CREDIT_PROPAGATION_MAX_DEPTH (default 4).
+ *
+ * This function is fire-and-forget safe: it never throws.
+ */
+export async function propagateCreditAlongChain(
+  execution: ExecutionForChainCredit,
+  db: DBQueryable,
+  orgId: string,
+): Promise<void> {
+  const { composition_chain, success, failure_mode, context_bucket } = execution;
+
+  if (!composition_chain || composition_chain.length === 0) return;
+
+  const isCascading = !success && failure_mode?.type === 'cascading';
+
+  // composition_chain is root-first: [A, B, C, D].
+  // The leaf (D, the executed activity) is NOT in composition_chain — it was
+  // already credited by applyOutcomeToPosteriors.
+  // We walk from the end of the chain (closest ancestor = depth 1).
+  const ancestors = [...composition_chain].reverse(); // [C, B, A, ...]
+
+  for (let i = 0; i < Math.min(ancestors.length, CREDIT_PROPAGATION_MAX_DEPTH); i++) {
+    const ancestorId = ancestors[i];
+    const depth = i + 1; // 1-indexed depth from leaf
+    const decayFactor = Math.pow(CREDIT_PROPAGATION_GAMMA, depth);
+
+    let alphaDelta = 0;
+    let betaDelta = 0;
+
+    if (success) {
+      alphaDelta = decayFactor;
+    } else if (isCascading) {
+      // For cascading: propagate β only to the direct parent (depth 1).
+      // Ancestors beyond depth 1 are not causally implicated by this heuristic.
+      if (depth === 1) {
+        betaDelta = decayFactor;
+      }
+      // depth > 1: skip (A receives nothing per spec 18.4.3 heuristic)
+    } else {
+      // All other failure types: decayed β to all ancestors
+      betaDelta = decayFactor;
+    }
+
+    await writeAncestorDelta(ancestorId, alphaDelta, betaDelta, db, orgId, context_bucket);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main exported function
 // ---------------------------------------------------------------------------
 
@@ -249,6 +423,27 @@ export async function applyOutcomeToPosteriors(
   };
 
   emitPosteriorUpdateMetric(summary);
+
+  // Phase 18.4: fire-and-forget chain credit propagation when a composition
+  // chain is present on the trace.
+  if (trace.composition_chain && trace.composition_chain.length > 0) {
+    propagateCreditAlongChain(
+      {
+        activity_id: activityId,
+        composition_chain: trace.composition_chain,
+        success: trace.success,
+        failure_mode: trace.failure_mode,
+        context_bucket: null,
+      },
+      db,
+      orgId,
+    ).catch((err) => {
+      logger.warn('posterior-update: propagateCreditAlongChain failed (non-blocking)', {
+        activity_id: activityId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }
 
   return summary;
 }

@@ -7,7 +7,13 @@
  */
 
 import { describe, test, expect, mock } from 'bun:test';
-import { applyOutcomeToPosteriors, type DBQueryable, type TraceForPosterior } from '../src/lib/posterior-update';
+import {
+  applyOutcomeToPosteriors,
+  propagateCreditAlongChain,
+  type DBQueryable,
+  type TraceForPosterior,
+  type ExecutionForChainCredit,
+} from '../src/lib/posterior-update';
 import type { FailureMode } from '../src/models/schemas';
 
 // ---------------------------------------------------------------------------
@@ -335,5 +341,233 @@ describe('applyOutcomeToPosteriors — UpdateSummary', () => {
     const { db } = makeDb();
     const summary = await applyOutcomeToPosteriors(makeTrace({ success: true }), db, ORG);
     expect(summary.warnings).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: propagateCreditAlongChain (Phase 18.4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Helper to extract variant_performance_metrics calls for a given activity id.
+ */
+function getGlobalCalls(
+  calls: Array<{ sql: string; params: Record<string, unknown> }>,
+  activityId: string,
+) {
+  return calls.filter(
+    c => c.sql.includes('variant_performance_metrics') && c.params.activity_id === activityId,
+  );
+}
+
+describe('propagateCreditAlongChain — 18.4.5: success on 4-deep chain', () => {
+  // Chain A→B→C→D. D is the leaf (already credited by applyOutcomeToPosteriors).
+  // composition_chain stores ancestors root-first: [A, B, C] (D is NOT in chain).
+  // Chain propagation should give:
+  //   depth 1 (C): α += γ^1 = 0.5
+  //   depth 2 (B): α += γ^2 = 0.25
+  //   depth 3 (A): α += γ^3 = 0.125
+  test('success: C gets α+=0.5, B gets α+=0.25, A gets α+=0.125', async () => {
+    const { db, calls } = makeDb();
+
+    const execution: ExecutionForChainCredit = {
+      activity_id: 'D',
+      composition_chain: ['A', 'B', 'C'], // ancestors only, root-first; D excluded
+      success: true,
+      failure_mode: null,
+    };
+
+    await propagateCreditAlongChain(execution, db, ORG);
+
+    // C is at depth 1 (closest ancestor) — reversed chain is [C, B, A]
+    const cCalls = getGlobalCalls(calls, 'C');
+    expect(cCalls).toHaveLength(1);
+    expect(cCalls[0].params.alpha_delta).toBeCloseTo(0.5);
+    expect(cCalls[0].params.beta_delta).toBe(0);
+
+    // B is at depth 2
+    const bCalls = getGlobalCalls(calls, 'B');
+    expect(bCalls).toHaveLength(1);
+    expect(bCalls[0].params.alpha_delta).toBeCloseTo(0.25);
+    expect(bCalls[0].params.beta_delta).toBe(0);
+
+    // A is at depth 3
+    const aCalls = getGlobalCalls(calls, 'A');
+    expect(aCalls).toHaveLength(1);
+    expect(aCalls[0].params.alpha_delta).toBeCloseTo(0.125);
+    expect(aCalls[0].params.beta_delta).toBe(0);
+
+    // D is the leaf — not in composition_chain, propagateCreditAlongChain does not write it
+    const dCalls = getGlobalCalls(calls, 'D');
+    expect(dCalls).toHaveLength(0);
+  });
+
+  test('success: total writes == 3 (one per ancestor in chain)', async () => {
+    const { db, calls } = makeDb();
+    await propagateCreditAlongChain(
+      { activity_id: 'D', composition_chain: ['A', 'B', 'C'], success: true },
+      db,
+      ORG,
+    );
+    const globalWrites = calls.filter(c => c.sql.includes('variant_performance_metrics'));
+    expect(globalWrites).toHaveLength(3);
+  });
+
+  test('depth cap: chains longer than 4 only write 4 ancestors', async () => {
+    const { db, calls } = makeDb();
+    await propagateCreditAlongChain(
+      { activity_id: 'F', composition_chain: ['A', 'B', 'C', 'D', 'E'], success: true },
+      db,
+      ORG,
+    );
+    const globalWrites = calls.filter(c => c.sql.includes('variant_performance_metrics'));
+    expect(globalWrites).toHaveLength(4); // capped at CREDIT_PROPAGATION_MAX_DEPTH=4
+  });
+});
+
+describe('propagateCreditAlongChain — 18.4.6: cascading failure on 4-deep chain', () => {
+  // Chain A→B→C→D. D fails with cascading, upstream_task_id points at a task
+  // in B. Heuristic: propagate β to the direct parent (C, depth 1) only.
+  // A receives nothing per spec 18.4.3.
+  test('cascading: only direct parent (C, depth-1) gets β+=0.5', async () => {
+    const { db, calls } = makeDb();
+
+    const fm: FailureMode = {
+      type: 'cascading',
+      reason: 'upstream task in B failed',
+      upstream_task_id: 'task-in-B',
+    };
+
+    const execution: ExecutionForChainCredit = {
+      activity_id: 'D',
+      composition_chain: ['A', 'B', 'C'],
+      success: false,
+      failure_mode: fm,
+    };
+
+    await propagateCreditAlongChain(execution, db, ORG);
+
+    // C is at depth 1 — gets β += γ^1 = 0.5
+    const cCalls = getGlobalCalls(calls, 'C');
+    expect(cCalls).toHaveLength(1);
+    expect(cCalls[0].params.alpha_delta).toBe(0);
+    expect(cCalls[0].params.beta_delta).toBeCloseTo(0.5);
+
+    // B is at depth 2 — receives nothing for cascading
+    const bCalls = getGlobalCalls(calls, 'B');
+    expect(bCalls).toHaveLength(0);
+
+    // A is at depth 3 — receives nothing for cascading
+    const aCalls = getGlobalCalls(calls, 'A');
+    expect(aCalls).toHaveLength(0);
+  });
+
+  test('cascading: no writes to D (leaf not in chain)', async () => {
+    const { db, calls } = makeDb();
+    const fm: FailureMode = {
+      type: 'cascading',
+      reason: 'upstream',
+      upstream_task_id: 'task-x',
+    };
+    await propagateCreditAlongChain(
+      { activity_id: 'D', composition_chain: ['A', 'B', 'C'], success: false, failure_mode: fm },
+      db,
+      ORG,
+    );
+    const dCalls = getGlobalCalls(calls, 'D');
+    expect(dCalls).toHaveLength(0);
+  });
+});
+
+describe('propagateCreditAlongChain — edge cases', () => {
+  test('empty chain → no DB writes', async () => {
+    const { db, calls } = makeDb();
+    await propagateCreditAlongChain(
+      { activity_id: 'X', composition_chain: [], success: true },
+      db,
+      ORG,
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  test('context_bucket present → also writes context_thompson_scores', async () => {
+    const { db, calls } = makeDb();
+    await propagateCreditAlongChain(
+      {
+        activity_id: 'D',
+        composition_chain: ['A'],
+        success: true,
+        context_bucket: 'bucket-1',
+      },
+      db,
+      ORG,
+    );
+    // Should write to both variant_performance_metrics and context_thompson_scores for A
+    const globalCalls = getGlobalCalls(calls, 'A');
+    expect(globalCalls).toHaveLength(1);
+    const bucketCalls = calls.filter(
+      c => c.sql.includes('context_thompson_scores') && c.params.activity_id === 'A',
+    );
+    expect(bucketCalls).toHaveLength(1);
+    expect(bucketCalls[0].params.context_bucket).toBe('bucket-1');
+  });
+
+  test('context_bucket null → no context_thompson_scores write', async () => {
+    const { db, calls } = makeDb();
+    await propagateCreditAlongChain(
+      { activity_id: 'D', composition_chain: ['A'], success: true, context_bucket: null },
+      db,
+      ORG,
+    );
+    const bucketCalls = calls.filter(c => c.sql.includes('context_thompson_scores'));
+    expect(bucketCalls).toHaveLength(0);
+  });
+
+  test('non-cascading failure propagates decayed β to all ancestors', async () => {
+    const { db, calls } = makeDb();
+    const fm: FailureMode = {
+      type: 'verifier_negative',
+      reason: 'check failed',
+      validator_id: 'v1',
+      failed_evidence: [],
+    };
+    await propagateCreditAlongChain(
+      { activity_id: 'D', composition_chain: ['A', 'B'], success: false, failure_mode: fm },
+      db,
+      ORG,
+    );
+    // B depth 1: β += 0.5; A depth 2: β += 0.25
+    const bCalls = getGlobalCalls(calls, 'B');
+    expect(bCalls[0].params.beta_delta).toBeCloseTo(0.5);
+    const aCalls = getGlobalCalls(calls, 'A');
+    expect(aCalls[0].params.beta_delta).toBeCloseTo(0.25);
+  });
+});
+
+describe('applyOutcomeToPosteriors — composition_chain fire-and-forget wiring', () => {
+  test('trace with composition_chain triggers chain propagation writes', async () => {
+    const { db, calls } = makeDb();
+    await applyOutcomeToPosteriors(
+      makeTrace({
+        success: true,
+        composition_chain: ['ancestor-A', 'ancestor-B'],
+      }),
+      db,
+      ORG,
+    );
+    // Wait a tick for the fire-and-forget promise to settle
+    await new Promise(r => setTimeout(r, 10));
+    const ancestorBCalls = getGlobalCalls(calls, 'ancestor-B');
+    expect(ancestorBCalls).toHaveLength(1);
+    expect(ancestorBCalls[0].params.alpha_delta).toBeCloseTo(0.5);
+  });
+
+  test('trace without composition_chain does NOT trigger extra writes', async () => {
+    const { db, calls } = makeDb();
+    await applyOutcomeToPosteriors(makeTrace({ success: true }), db, ORG);
+    await new Promise(r => setTimeout(r, 10));
+    // Only the single variant_performance_metrics write for the leaf itself
+    const allWrites = calls.filter(c => c.sql.includes('variant_performance_metrics'));
+    expect(allWrites).toHaveLength(1);
   });
 });
