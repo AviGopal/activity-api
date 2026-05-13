@@ -549,42 +549,28 @@ const FTS_REBUILD_INTERVAL_MS = parseInt(
   process.env.FTS_REBUILD_INTERVAL_MS ?? String(30 * 60 * 1000), 10,
 );
 
-async function rebuildFtsIndexes(): Promise<void> {
-  const { surrealDB } = await import('./db/surreal');
-  const indexes = [
-    'idx_activity_name_fts',
-    'idx_activity_description_fts',
-    'idx_activity_tags_fts',
-  ];
-  for (const idx of indexes) {
-    try {
-      await surrealDB.query(`REBUILD INDEX ${idx} ON activity`);
-    } catch (err: any) {
-      if (String(err).includes('currently building')) {
-        logger.info(`[FTS] ${idx} already rebuilding, skipping`);
-      } else {
-        throw err;
-      }
-    }
-  }
-}
+// Use the shared rebuild job so the HTTP endpoint and periodic scheduler share
+// the same in-process concurrency guard (prevents partial-rebuild races).
+import('./jobs/fts-rebuild').then(({ rebuildFtsIndexes }) => {
+  // Initial rebuild — delayed 5 min to let the startup classifier cycle finish
+  // (it writes last_classified_at to all activity rows and takes ~30s). If we
+  // rebuild at t=15s the index build races the classifier writes and the scorer
+  // ends up cold until the next periodic cycle.
+  setTimeout(() => {
+    void rebuildFtsIndexes()
+      .then(() => logger.info('[FTS] Initial FTS scorer rebuild complete'))
+      .catch(err => logger.warn('[FTS] Initial FTS scorer rebuild failed', { error: String(err) }));
+  }, 5 * 60 * 1000);
 
-// Initial rebuild — delayed 5 min to let the startup classifier cycle finish
-// (it writes last_classified_at to all activity rows and takes ~30s). If we
-// rebuild at t=15s the index build races the classifier writes and the scorer
-// ends up cold until the next periodic cycle.
-setTimeout(() => {
-  void rebuildFtsIndexes()
-    .then(() => logger.info('[FTS] Initial FTS scorer rebuild complete'))
-    .catch(err => logger.warn('[FTS] Initial FTS scorer rebuild failed', { error: String(err) }));
-}, 5 * 60 * 1000);
-
-// Periodic rebuild every FTS_REBUILD_INTERVAL_MS (default 30 min).
-setInterval(() => {
-  void rebuildFtsIndexes()
-    .then(() => logger.info('[FTS] Periodic FTS scorer rebuild complete'))
-    .catch(err => logger.warn('[FTS] Periodic FTS scorer rebuild failed', { error: String(err) }));
-}, FTS_REBUILD_INTERVAL_MS);
+  // Periodic rebuild every FTS_REBUILD_INTERVAL_MS (default 30 min).
+  setInterval(() => {
+    void rebuildFtsIndexes()
+      .then(() => logger.info('[FTS] Periodic FTS scorer rebuild complete'))
+      .catch(err => logger.warn('[FTS] Periodic FTS scorer rebuild failed', { error: String(err) }));
+  }, FTS_REBUILD_INTERVAL_MS);
+}).catch(err => {
+  logger.error('[FTS] Failed to load fts-rebuild job', { error: String(err) });
+});
 
 // ============================================================================
 // Discovery Vessel Integration

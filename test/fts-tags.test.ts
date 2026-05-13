@@ -136,16 +136,23 @@ beforeAll(async () => {
   // AFTER all template writes, so we trigger it explicitly here.
   await rebuildFts();
 
-  // Poll until the scorer is warm AND the test fixture is indexed.
-  // Checking for any non-zero score is insufficient: a prior probe template
-  // may already have a score before the REBUILD that includes our new fixtures
-  // has completed. Require ID_AUTH_SPECIFIC specifically in results.
+  // Poll until ALL THREE FTS indexes are warm AND the test fixture is indexed.
+  //
+  // The REBUILD runs sequentially: name → description → tags (~80-140s each).
+  // Polling ?q=auth exits as soon as the description index is warm (because
+  // "auth" appears in the description field), but 18.1.5 needs the tags index
+  // warm (the bugfix.auth query sanitises to "bugfix auth" — both terms live
+  // in the tags field of ID_AUTH_SPECIFIC). Use ?q=bugfix.auth as the gate
+  // query because it only returns a non-zero score for ID_AUTH_SPECIFIC once
+  // the tags index is rebuilt (the last index in the sequence).
+  //
   // Allow 10 min: 202 response + ~6 min async REBUILD + 60s headroom. Poll every 10s.
   // Swallow 503/5xx during the poll — SurrealDB can be slow under active REBUILD.
   const deadline = Date.now() + 10 * 60 * 1000;
   while (Date.now() < deadline) {
     try {
-      const results = await searchTemplates('auth', 20);
+      // Use the hardest query — requires tags index to be rebuilt (last in sequence).
+      const results = await searchTemplates('bugfix.auth', 20);
       const hit = results.find(r => stripPrefix(r.id) === ID_AUTH_SPECIFIC);
       if (hit && (hit.fts_score ?? 0) > 0) break;
     } catch {

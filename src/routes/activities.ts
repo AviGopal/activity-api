@@ -9088,32 +9088,23 @@ app.post('/relevance-feedback', async (c) => {
 // Requires standard API-key auth (no admin scope needed — rebuild is read-safe).
 // ============================================================================
 app.post('/internal/fts-rebuild', async (c) => {
-  const { surrealDB } = await import('../db/surreal');
-  const indexes = [
-    'idx_activity_name_fts',
-    'idx_activity_description_fts',
-    'idx_activity_tags_fts',
-  ];
+  // Use the shared rebuild job so the HTTP endpoint and the periodic scheduler
+  // (index.ts setInterval) share the same in-process concurrency guard.
+  // If a rebuild is already running this returns 202 without starting a second
+  // one — preventing partial-rebuild races that leave some indexes cold.
+  const { rebuildFtsIndexes, isFtsRebuildInProgress } = await import('../jobs/fts-rebuild');
+
+  if (isFtsRebuildInProgress()) {
+    logger.info('POST /v2/activities/internal/fts-rebuild: rebuild already in progress');
+    return c.json({ ok: true, message: 'rebuild already in progress', estimated_ms: 360_000 }, 202);
+  }
 
   // Fire-and-forget: return 202 immediately so the HTTP gateway does not time
   // out. The rebuild runs asynchronously — poll GET /v2/activities/templates?q=
   // for non-zero fts_score values to confirm the scorer is warm.
-  void (async () => {
-    const start = Date.now();
-    for (const idx of indexes) {
-      try {
-        await surrealDB.query(`REBUILD INDEX ${idx} ON activity`);
-      } catch (err: any) {
-        if (String(err).includes('currently building')) {
-          logger.info(`POST /v2/activities/internal/fts-rebuild: ${idx} already building, skipping`);
-        } else {
-          logger.error(`POST /v2/activities/internal/fts-rebuild: ${idx} failed`, { error: String(err) });
-          return;
-        }
-      }
-    }
-    logger.info('POST /v2/activities/internal/fts-rebuild complete (async)', { ms: Date.now() - start });
-  })();
+  void rebuildFtsIndexes()
+    .then(() => logger.info('POST /v2/activities/internal/fts-rebuild complete (async)'))
+    .catch(err => logger.error('POST /v2/activities/internal/fts-rebuild failed (async)', { error: String(err) }));
 
   return c.json({ ok: true, message: 'rebuild started', estimated_ms: 360_000 }, 202);
 });
