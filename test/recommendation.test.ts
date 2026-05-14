@@ -3,6 +3,7 @@ import {
   applyCompatibilityFilter,
   generatePointerRecommendations,
   identifyBlockingShapes,
+  buildPointerStateSpace,
   type ImpulseStateEntry,
   type PointerStateEntry,
 } from '../src/services/recommendation';
@@ -248,5 +249,56 @@ describe('backward-compat with undefined impulse_state_space', () => {
       [],
     );
     expect(result).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildPointerStateSpace
+// ---------------------------------------------------------------------------
+
+describe('buildPointerStateSpace', () => {
+  test('returns entries for each shape from discovery-vessel', async () => {
+    const mockShapes = ['file', 'gitDiff', 'memo'];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ shapes: mockShapes }), { status: 200 });
+
+    const result = await buildPointerStateSpace([]);
+    globalThis.fetch = originalFetch;
+
+    expect(result).toHaveLength(3);
+    expect(result.map((e) => e.shape).sort()).toEqual(['file', 'gitDiff', 'memo'].sort());
+    expect(result.every((e) => e.vessel_id === 'discovered')).toBe(true);
+    expect(result.every((e) => e.resolve_tier === 'deterministic')).toBe(true);
+  });
+
+  test('returns [] when discovery-vessel is unreachable', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => { throw new Error('ECONNREFUSED'); };
+
+    const result = await buildPointerStateSpace(['acc1']);
+    globalThis.fetch = originalFetch;
+
+    expect(result).toEqual([]);
+  });
+
+  test('returns [] when discovery-vessel returns non-200', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response('', { status: 503 });
+
+    const result = await buildPointerStateSpace([]);
+    globalThis.fetch = originalFetch;
+
+    expect(result).toEqual([]);
+  });
+
+  test('returns [] when response has no shapes array', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({}), { status: 200 });
+
+    const result = await buildPointerStateSpace([]);
+    globalThis.fetch = originalFetch;
+
+    expect(result).toEqual([]);
   });
 });

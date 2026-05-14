@@ -6,6 +6,7 @@
  */
 
 import { logger } from '../utils/logger';
+import { config } from '../config';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -270,26 +271,66 @@ export function identifyBlockingShapes(
 }
 
 // ---------------------------------------------------------------------------
-// buildPointerStateSpace — G2-BLOCKED stub
+// buildPointerStateSpace — discovery-vessel integration
 // ---------------------------------------------------------------------------
 
 /**
- * G2-BLOCKED: requires vessel-session-handshake (openspec change
- * 2026-04-29-vessel-session-handshake).
+ * Queries discovery-vessel's /registry/shapes endpoint to enumerate all
+ * registered shapes and wraps each as a PointerStateEntry.
  *
- * When G2 lands, query discovery-vessel for all registered shapes filtered
- * to `accessible_account_ids`, construct a PointerStateEntry per shape, and
- * return the deduplicated list.  Until then, return an empty array so every
- * missing input shape gets the conservative "escalatable" discount (0.5).
+ * Account-id filtering (task 5.3) is deferred until discovery-vessel
+ * exposes a scoped query endpoint. For now all registered shapes are returned
+ * regardless of accessible_account_ids — the conservative default until
+ * per-account scoping lands.
+ *
+ * Degrades gracefully: on any network error or non-200 response, logs a
+ * warning and returns [] so the recommendation call continues with the
+ * "escalatable" discount for all missing shapes.
  */
 export async function buildPointerStateSpace(
   _accessible_account_ids: string[],
 ): Promise<PointerStateEntry[]> {
-  // G2-BLOCKED: cross-vessel shape enumeration not yet available.
-  logger.debug('buildPointerStateSpace: G2-blocked stub returning []', {
-    accessible_account_ids_count: _accessible_account_ids.length,
-  });
-  return [];
+  const discoveryEndpoint = config.discovery.endpoint;
+  const url = `${discoveryEndpoint}/registry/shapes`;
+  const start = Date.now();
+
+  try {
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(3000),
+    });
+
+    if (!res.ok) {
+      logger.warn('buildPointerStateSpace: discovery-vessel returned non-200', {
+        status: res.status,
+        url,
+        latency_ms: Date.now() - start,
+      });
+      return [];
+    }
+
+    const body = (await res.json()) as { shapes?: string[] };
+    const shapes = Array.isArray(body?.shapes) ? body.shapes : [];
+
+    logger.debug('buildPointerStateSpace: registry shapes fetched', {
+      shape_count: shapes.length,
+      latency_ms: Date.now() - start,
+    });
+
+    // Map shape names to PointerStateEntries. vessel_id is "discovered"
+    // until discovery-vessel exposes per-shape vessel attribution.
+    return shapes.map((shape) => ({
+      shape,
+      vessel_id: 'discovered',
+      resolve_tier: 'deterministic' as const,
+    }));
+  } catch (err) {
+    logger.warn('buildPointerStateSpace: discovery-vessel unreachable, degrading to []', {
+      url,
+      error: err instanceof Error ? err.message : String(err),
+      latency_ms: Date.now() - start,
+    });
+    return [];
+  }
 }
 
 // ---------------------------------------------------------------------------
