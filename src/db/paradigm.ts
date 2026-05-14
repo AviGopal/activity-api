@@ -1107,14 +1107,17 @@ export async function queryActivitiesByFTS(
 
     const whereClause = whereClauses.join(' AND ');
 
-    // Build query with BM25 score calculation
-    // Ranking: name (×2) > tags (×1.5) > description (×1)
-    // Tag matches rank above description because tags are curated hierarchical classifiers
-    // (e.g. "bugfix.auth.tokens") and carry higher precision signal than free-text description.
-    // TIMEOUT guards against FTS hanging on large tables (> ~2000 rows without warm indices)
+    // Presence-based scoring: field-priority ranking (name > tags > description).
+    // SurrealDB 3.0.0 has a known bug where search::score(N) always returns 0.0
+    // even after REBUILD INDEX with HIGHLIGHTS — highlights work, scoring does not.
+    // Workaround: re-evaluate @N@ per field in the SELECT and assign static field
+    // weights. Resolved in SurrealDB 3.0.5; revisit on upgrade.
+    // Ranking: name (2.0) > tags (1.5) > description (1.0)
     const query = `
       SELECT *,
-        (search::score(0) ?? 0) * 2 + (search::score(2) ?? 0) * 1.5 + (search::score(1) ?? 0) AS fts_score
+        (IF name @0@ '${ftsLiteral}' THEN 2.0 ELSE 0.0 END) +
+        (IF tags @2@ '${ftsLiteral}' THEN 1.5 ELSE 0.0 END) +
+        (IF description @1@ '${ftsLiteral}' THEN 1.0 ELSE 0.0 END) AS fts_score
       FROM activity
       WHERE ${whereClause}
       ORDER BY fts_score DESC
