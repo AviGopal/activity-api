@@ -316,8 +316,33 @@ export async function propagateCreditAlongChain(
   // We walk from the end of the chain (closest ancestor = depth 1).
   const ancestors = [...composition_chain].reverse(); // [C, B, A, ...]
 
+  // Batch-resolve execution IDs to variant IDs via activity_execution_traces.
+  // composition_chain stores execution IDs emitted by minibob; variant_performance_metrics
+  // is keyed on variant_id (template ID). Entries that are already template IDs
+  // (no matching execution row) are used as-is for backward compat with unit tests.
+  let variantIdByExecId: Map<string, string> = new Map();
+  try {
+    const limited = ancestors.slice(0, CREDIT_PROPAGATION_MAX_DEPTH);
+    const rows = await db.query<{ execution_id: string; variant_id: string }[]>(
+      `SELECT execution_id, variant_id FROM activity_execution_traces
+       WHERE execution_id IN $ids AND org_id = $org_id`,
+      { ids: limited, org_id: orgId },
+    );
+    for (const row of rows?.[0] ?? []) {
+      if (row.execution_id && row.variant_id) {
+        variantIdByExecId.set(row.execution_id, row.variant_id);
+      }
+    }
+  } catch (err) {
+    logger.warn('posterior-update: chain exec→variant lookup failed, using chain entries as variant IDs', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
   for (let i = 0; i < Math.min(ancestors.length, CREDIT_PROPAGATION_MAX_DEPTH); i++) {
-    const ancestorId = ancestors[i];
+    const ancestorExecId = ancestors[i];
+    // Resolve to variant_id; fall back to ancestorExecId itself (unit test compat).
+    const ancestorId = variantIdByExecId.get(ancestorExecId) ?? ancestorExecId;
     const depth = i + 1; // 1-indexed depth from leaf
     const decayFactor = Math.pow(CREDIT_PROPAGATION_GAMMA, depth);
 
