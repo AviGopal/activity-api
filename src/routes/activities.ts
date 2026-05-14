@@ -77,7 +77,14 @@ const betaSample: (alpha: number, betaParam: number) => number = (() => {
   return beta;
 })();
 import type { SessionData } from '../models/schemas';
-import { getJwtAuthFromContext, hasJwtAuth, type JwtAuthContext } from '../middleware/jwtAuth';
+import { getJwtAuthFromContext, hasJwtAuth, getExecutionScopeFromContext, type JwtAuthContext } from '../middleware/jwtAuth';
+import {
+  applyCompatibilityFilter,
+  generatePointerRecommendations,
+  identifyBlockingShapes,
+  buildPointerStateSpace,
+  type ImpulseStateEntry,
+} from '../services/recommendation';
 import { generateActivity } from '../services/activity-generator';
 import {
   ExecutionRecordSchema,
@@ -4296,7 +4303,14 @@ app.post('/recommend', async (c) => {
       exclude_activities = [],  // T4: Blacklist of activity IDs to exclude
       session_context,          // Spec 2/3/4: loaded impulse state with timestamps
       exploration_config: rawExplorationConfig,
+      impulse_state_space,      // Phase 11: executor's loaded impulse pool (state-space-aware filtering)
+      // NOTE: pointer_state_space is intentionally NOT destructured — derived server-side
     } = body;
+
+    // Strip pointer_state_space if caller sent it (backward-compat warning)
+    if ((body as any).pointer_state_space !== undefined) {
+      logger.warn('POST /recommend: pointer_state_space in request body is ignored; derived server-side from ExecutionScope');
+    }
 
     const exploration_config = {
       exploration_ratio: 0.2,
@@ -4905,8 +4919,71 @@ app.post('/recommend', async (c) => {
       });
     }
 
+    // Phase 11: state-space-aware filtering and pointer recommendations
+    const executionScope = getExecutionScopeFromContext(c);
+    const pointerStateSpace = await buildPointerStateSpace(
+      executionScope?.accessible_account_ids ?? []
+    );
+    const parsedImpulseStateSpace = Array.isArray(impulse_state_space) && impulse_state_space.length > 0
+      ? impulse_state_space as ImpulseStateEntry[]
+      : undefined;
+
+    let filteredRecommendations = finalRecommendations;
+    let pointerRecommendations: unknown[] = [];
+    let blockingShapes: unknown[] = [];
+
+    if (parsedImpulseStateSpace !== undefined) {
+      // Re-rank by compatibility then strip internal _compatibility_score field
+      const reranked = applyCompatibilityFilter(
+        finalRecommendations.map((r: any) => ({
+          ...r,
+          // applyCompatibilityFilter uses alpha/beta from selection_metadata
+          alpha: r.selection_metadata?.alpha,
+          beta: r.selection_metadata?.beta,
+          input_shapes: r.input_shapes,
+        })),
+        parsedImpulseStateSpace,
+        pointerStateSpace,
+      );
+      // Rebuild filteredRecommendations in the reranked order, without _compatibility_score
+      filteredRecommendations = reranked.map(({ _compatibility_score: _, ...rest }) => {
+        // Drop the shadow copy of alpha/beta we injected; the originals are in selection_metadata
+        const { alpha: _a, beta: _b, ...clean } = rest as any;
+        // Find the original finalRecommendations entry by template_id
+        return finalRecommendations.find((r: any) => r.template_id === clean.template_id) ?? clean;
+      });
+
+      blockingShapes = identifyBlockingShapes(
+        filteredRecommendations.slice(0, 5).map((r: any) => ({
+          template_id: r.template_id,
+          input_shapes: r.input_shapes,
+        })),
+        parsedImpulseStateSpace,
+        pointerStateSpace,
+      );
+
+      pointerRecommendations = generatePointerRecommendations(
+        pointerStateSpace,
+        parsedImpulseStateSpace,
+        finalRecommendations.slice(0, 20).map((r: any) => ({
+          template_id: r.template_id,
+          template_name: r.template_name,
+          input_shapes: r.input_shapes,
+          alpha: r.selection_metadata?.alpha,
+          beta: r.selection_metadata?.beta,
+        })),
+      );
+
+      logger.info('Phase 11: state-space filtering applied', {
+        impulse_state_space_count: parsedImpulseStateSpace.length,
+        pointer_state_space_count: pointerStateSpace.length,
+        blocking_shapes_count: blockingShapes.length,
+        pointer_recommendations_count: pointerRecommendations.length,
+      });
+    }
+
     return c.json({
-      recommendations: finalRecommendations,
+      recommendations: filteredRecommendations,
       // Include fallback tier to indicate which matching strategy was used
       fallback_tier: fallbackTier,
       // Include missing impulse suggestions if any were found
@@ -4918,9 +4995,14 @@ app.post('/recommend', async (c) => {
           avg_relevance_boost: s.avg_relevance_boost,
         })),
       } : {}),
+      // Phase 11: state-space output fields (only present when impulse_state_space provided)
+      ...(parsedImpulseStateSpace !== undefined ? {
+        pointer_recommendations: pointerRecommendations,
+        blocking_shapes: blockingShapes,
+      } : {}),
     });
   } catch (error: any) {
-    logger.error('POST /recommend failed', { 
+    logger.error('POST /recommend failed', {
       error: error.message,
       stack: error.stack,
     });

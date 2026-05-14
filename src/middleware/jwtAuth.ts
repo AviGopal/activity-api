@@ -418,6 +418,56 @@ export function getJwtAuthFromContext(c: Context): JwtAuthContext | null {
   return c.get('jwtAuth') as JwtAuthContext | null;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 11: ExecutionScope — multi-account access context
+// ---------------------------------------------------------------------------
+
+/**
+ * Derived view of the caller's access context.
+ *
+ * `accessible_account_ids` is the union of:
+ *  - The primary account_id (from the JWT or orgId fallback)
+ *  - Any additional accounts reachable via `account_<id>:` scope prefixes
+ *
+ * Used by buildPointerStateSpace (G2-blocked stub) to scope cross-vessel
+ * shape discovery to the accounts the caller can see.
+ */
+export interface ExecutionScope {
+  primary_account_id: string;
+  accessible_account_ids: string[];
+  scopes: string[];
+  grants: Map<string, string[]>;
+}
+
+export function parseExecutionScope(jwtAuth: JwtAuthContext): ExecutionScope {
+  const account_id = jwtAuth.accountId ?? jwtAuth.orgId ?? 'unknown';
+  const scopes = jwtAuth.scopes ?? [];
+  const accountPrefixRe = /^account_([^:]+):/;
+  const grants = new Map<string, string[]>();
+  for (const scope of scopes) {
+    const m = scope.match(accountPrefixRe);
+    if (m) {
+      const acct = m[1];
+      if (!grants.has(acct)) grants.set(acct, []);
+      grants.get(acct)!.push(scope);
+    }
+  }
+  const accessible_account_ids = [account_id, ...grants.keys()].filter(
+    (v, i, a) => a.indexOf(v) === i
+  );
+  return { primary_account_id: account_id, accessible_account_ids, scopes, grants };
+}
+
+/**
+ * Lazily derive an ExecutionScope from the jwtAuth already set on the Hono
+ * context.  Returns null when the request is unauthenticated (public path).
+ */
+export function getExecutionScopeFromContext(c: Context): ExecutionScope | null {
+  const jwtAuth = getJwtAuthFromContext(c);
+  if (!jwtAuth) return null;
+  return parseExecutionScope(jwtAuth);
+}
+
 /**
  * Check if request has valid JWT authentication
  */
