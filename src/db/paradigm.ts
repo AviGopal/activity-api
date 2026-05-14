@@ -1083,10 +1083,16 @@ export async function queryActivitiesByFTS(
     }
     whereClauses.push(`(name @0@ '${ftsLiteral}' OR description @1@ '${ftsLiteral}' OR tags @2@ '${ftsLiteral}')`);
 
-    // Multi-tenant filtering: include global scope OR org-specific activities
+    // Multi-tenant filtering: include global scope OR org-specific activities.
+    // Templates may be stored with bare org_id ('metabob') or prefixed
+    // ('organizations:metabob') depending on which seeding path wrote them.
+    // Match both to avoid false-negative FTS results for legacy-seeded templates.
     if (orgId) {
-      whereClauses.push(`(scope = 'global' OR org_id = $org_id)`);
-      params.org_id = orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`;
+      const orgIdBare = orgId.replace(/^organizations:/, '');
+      const orgIdPrefixed = `organizations:${orgIdBare}`;
+      whereClauses.push(`(scope = 'global' OR org_id = $org_id_bare OR org_id = $org_id_prefixed)`);
+      params.org_id_bare = orgIdBare;
+      params.org_id_prefixed = orgIdPrefixed;
     } else if (!jwtToken) {
       // No org_id and no JWT: only show global activities
       whereClauses.push(`scope = 'global'`);
