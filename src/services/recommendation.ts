@@ -276,22 +276,25 @@ export function identifyBlockingShapes(
 
 /**
  * Queries discovery-vessel's /registry/shapes endpoint to enumerate all
- * registered shapes and wraps each as a PointerStateEntry.
+ * registered shapes accessible to the given account IDs and wraps each as a
+ * PointerStateEntry.
  *
- * Account-id filtering (task 5.3) is deferred until discovery-vessel
- * exposes a scoped query endpoint. For now all registered shapes are returned
- * regardless of accessible_account_ids — the conservative default until
- * per-account scoping lands.
+ * When `accessible_account_ids` is non-empty, the org_ids query param is sent
+ * to discovery-vessel so only org-scoped or system vessel shapes are returned.
+ * System vessels (e.g., discovery-vessel itself) are always included.
  *
  * Degrades gracefully: on any network error or non-200 response, logs a
  * warning and returns [] so the recommendation call continues with the
  * "escalatable" discount for all missing shapes.
  */
 export async function buildPointerStateSpace(
-  _accessible_account_ids: string[],
+  accessible_account_ids: string[],
 ): Promise<PointerStateEntry[]> {
   const discoveryEndpoint = config.discovery.endpoint;
-  const url = `${discoveryEndpoint}/registry/shapes`;
+  const orgIdsParam = accessible_account_ids.length
+    ? `?org_ids=${accessible_account_ids.map(encodeURIComponent).join(',')}`
+    : '';
+  const url = `${discoveryEndpoint}/registry/shapes${orgIdsParam}`;
   const start = Date.now();
 
   try {
