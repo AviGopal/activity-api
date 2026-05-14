@@ -4920,10 +4920,6 @@ app.post('/recommend', async (c) => {
     }
 
     // Phase 11: state-space-aware filtering and pointer recommendations
-    const executionScope = getExecutionScopeFromContext(c);
-    const pointerStateSpace = await buildPointerStateSpace(
-      executionScope?.accessible_account_ids ?? []
-    );
     const parsedImpulseStateSpace = Array.isArray(impulse_state_space) && impulse_state_space.length > 0
       ? impulse_state_space as ImpulseStateEntry[]
       : undefined;
@@ -4933,6 +4929,10 @@ app.post('/recommend', async (c) => {
     let blockingShapes: unknown[] = [];
 
     if (parsedImpulseStateSpace !== undefined) {
+      const executionScope = getExecutionScopeFromContext(c);
+      const pointerStateSpace = await buildPointerStateSpace(
+        executionScope?.accessible_account_ids ?? []
+      );
       // Re-rank by compatibility then strip internal _compatibility_score field
       const reranked = applyCompatibilityFilter(
         finalRecommendations.map((r: any) => ({
