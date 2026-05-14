@@ -1059,13 +1059,10 @@ export async function queryActivitiesByFTS(
       limit,
     };
 
-    // FTS matching on name (score index 0) OR description (score index 1)
-    // Note: We use separate score indices to allow weighted scoring.
+    // FTS matching on name (score index 0) and tags (score index 2).
     //
-    // SurrealDB 3.x quirk: the `@N@@` full-text-match operator and
-    // `search::score(N)` do not bind a `$query` parameter — they require
-    // an inline string literal so the search analyser can plan against
-    // the indexed term at parse time. Same fix as concept-db 2026-04-29.
+    // SurrealDB 3.x quirk: the `@N@` full-text-match operator requires an
+    // inline string literal (not a bound parameter). Sanitise to safe chars.
     // Sanitise to single-quote-safe alphanumerics + spaces; everything
     // else (backticks, quotes, semicolons, parens, control chars) is
     // dropped so we never produce a malformed SurrealQL literal.
@@ -1081,7 +1078,21 @@ export async function queryActivitiesByFTS(
       });
       return { data: [], path: 'new', latency_ms: latencyMs };
     }
-    whereClauses.push(`(name @0@ '${ftsLiteral}' OR description @1@ '${ftsLiteral}' OR tags @2@ '${ftsLiteral}')`);
+
+    // Per-token OR-semantics: split phrase into tokens and match any token in
+    // name or tags. Two SurrealDB 3.x bugs drive this design:
+    // 1. Multi-word @N@ uses AND semantics — all tokens must appear in the same
+    //    field. A 4-word query rarely matches even when all words exist across
+    //    name+tags combined. Fix: per-token OR, so any single token hit qualifies.
+    // 2. Mixing @0@, @1@, @2@ in an OR clause with an AND filter produces
+    //    incorrect results (query-planner bug). Fix: use only @0@ (name) and
+    //    @2@ (tags) in WHERE; use description CONTAINS in SELECT only.
+    // Activities matching more tokens rank higher via summed per-token scoring.
+    const tokens = ftsLiteral.split(/\s+/).filter(t => t.length >= 2).slice(0, 8);
+    if (tokens.length === 0) tokens.push(ftsLiteral);
+
+    const tokenWhereParts = tokens.flatMap(tok => [`name @0@ '${tok}'`, `tags @2@ '${tok}'`]);
+    whereClauses.push(`(${tokenWhereParts.join(' OR ')})`);
 
     // Multi-tenant filtering: include global scope OR org-specific activities.
     // Templates may be stored with bare org_id ('metabob') or prefixed
@@ -1107,17 +1118,20 @@ export async function queryActivitiesByFTS(
 
     const whereClause = whereClauses.join(' AND ');
 
-    // Presence-based scoring: field-priority ranking (name > tags > description).
-    // SurrealDB 3.0.0 has a known bug where search::score(N) always returns 0.0
-    // even after REBUILD INDEX with HIGHLIGHTS — highlights work, scoring does not.
-    // Workaround: re-evaluate @N@ per field in the SELECT and assign static field
-    // weights. Resolved in SurrealDB 3.0.5; revisit on upgrade.
-    // Ranking: name (2.0) > tags (1.5) > description (1.0)
+    // Score = sum of per-token-per-field presence weights.
+    // name (2.0) > tags (1.5) > description substring (1.0).
+    // SurrealDB 3.0.0 search::score(N) always returns 0.0 (known bug, fixed in
+    // 3.0.5). Workaround: IF/THEN presence check assigns static field weights.
+    const scoreTerms = tokens.flatMap(tok => [
+      `(IF name @0@ '${tok}' THEN 2.0 ELSE 0.0 END)`,
+      `(IF tags @2@ '${tok}' THEN 1.5 ELSE 0.0 END)`,
+      `(IF string::lowercase(description ?? '') CONTAINS '${tok.toLowerCase()}' THEN 1.0 ELSE 0.0 END)`,
+    ]);
+    const scoreExpr = scoreTerms.join(' + ');
+
     const query = `
       SELECT *,
-        (IF name @0@ '${ftsLiteral}' THEN 2.0 ELSE 0.0 END) +
-        (IF tags @2@ '${ftsLiteral}' THEN 1.5 ELSE 0.0 END) +
-        (IF description @1@ '${ftsLiteral}' THEN 1.0 ELSE 0.0 END) AS fts_score
+        ${scoreExpr} AS fts_score
       FROM activity
       WHERE ${whereClause}
       ORDER BY fts_score DESC

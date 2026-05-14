@@ -101,20 +101,22 @@ async function main() {
   let errors = 0;
   const startTime = Date.now();
 
-  // Batch loop
-  let offset = 0;
+  // Batch loop — always START 0: successfully updated records drop out of the WHERE
+  // clause (embedding_model changes), so the result set shrinks naturally. Using a
+  // non-zero offset alongside in-place updates causes pagination drift (skipped rows).
+  // Break if a full batch yields zero successes (persistent errors, no forward progress).
   while (processed < toProcess) {
     const batchLimit = Math.min(BATCH_SIZE, toProcess - processed);
     // surrealDB.query() already unwraps first result set — batch is the row array directly
     const batch = await surrealDB.query<any>(
-      `SELECT id, name, description, embedding_model FROM activity WHERE ${whereClause} LIMIT ${batchLimit} START ${offset}`
+      `SELECT id, name, description, embedding_model FROM activity WHERE ${whereClause} LIMIT ${batchLimit}`
     );
 
     if (!batch || batch.length === 0) {
       break;
     }
 
-    log(`Processing batch offset=${offset} size=${batch.length}`);
+    log(`Processing batch size=${batch.length} (${processed} done so far)`);
 
     // Build text pairs for embedBatch
     const names = batch.map(r => String(r.name || r.id || ''));
@@ -130,9 +132,8 @@ async function main() {
         error: err instanceof Error ? err.message : String(err),
       });
       errors += batch.length;
-      offset += batch.length;
       processed += batch.length;
-      continue;
+      break; // embedBatch failure is unrecoverable for this run
     }
 
     const nameVecs = allVecs.slice(0, batch.length);
@@ -176,12 +177,8 @@ async function main() {
       processed++;
     }
 
-    offset += batch.length;
-
     // Brief pause between batches to avoid overwhelming the DB
-    if (offset < toProcess) {
-      await sleep(200);
-    }
+    await sleep(200);
   }
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
