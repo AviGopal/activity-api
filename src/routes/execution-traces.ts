@@ -2381,6 +2381,7 @@ app.post('/', async (c) => {
           failure_mode: (body.failure_mode ?? null) as any,
           tasks: trace.tasks as any,
           cost_usd: trace.cost_usd as number,
+          ...(resolvedCompositionChain.length > 0 ? { composition_chain: resolvedCompositionChain } : {}),
         },
         surrealDB,
         trace.org_id as string,
