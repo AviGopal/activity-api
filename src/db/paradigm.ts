@@ -1088,7 +1088,19 @@ export async function queryActivitiesByFTS(
     //    incorrect results (query-planner bug). Fix: use only @0@ (name) and
     //    @2@ (tags) in WHERE; use description CONTAINS in SELECT only.
     // Activities matching more tokens rank higher via summed per-token scoring.
-    const tokens = ftsLiteral.split(/\s+/).filter(t => t.length >= 2).slice(0, 8);
+    // Stop words are excluded so common English words don't dilute ranking for
+    // long natural-language goal_text queries (recommend path). Short queries
+    // (search path) rarely contain stop words so they are unaffected.
+    const FTS_STOP_WORDS = new Set([
+      'a', 'an', 'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+      'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were', 'be', 'been',
+      'has', 'have', 'had', 'do', 'does', 'did', 'it', 'its', 'as', 'so',
+      'if', 'then', 'that', 'this', 'all', 'any', 'each', 'not', 'no',
+    ]);
+    const tokens = ftsLiteral
+      .split(/\s+/)
+      .filter(t => t.length >= 3 && !FTS_STOP_WORDS.has(t.toLowerCase()))
+      .slice(0, 8);
     if (tokens.length === 0) tokens.push(ftsLiteral);
 
     const tokenWhereParts = tokens.flatMap(tok => [`name @0@ '${tok}'`, `tags @2@ '${tok}'`]);
