@@ -20,6 +20,7 @@
  */
 
 import { logger } from '../utils/logger';
+import { normalizeActivityId } from '../db/paradigm';
 import type { FailureMode } from '../models/schemas';
 
 // ---------------------------------------------------------------------------
@@ -342,7 +343,9 @@ export async function propagateCreditAlongChain(
   for (let i = 0; i < Math.min(ancestors.length, CREDIT_PROPAGATION_MAX_DEPTH); i++) {
     const ancestorExecId = ancestors[i];
     // Resolve to variant_id; fall back to ancestorExecId itself (unit test compat).
-    const ancestorId = variantIdByExecId.get(ancestorExecId) ?? ancestorExecId;
+    // Normalize to strip the `activity:` prefix so the WHERE clause matches the
+    // normalized form stored in variant_performance_metrics.
+    const ancestorId = normalizeActivityId(variantIdByExecId.get(ancestorExecId) ?? ancestorExecId);
     const depth = i + 1; // 1-indexed depth from leaf
     const decayFactor = Math.pow(CREDIT_PROPAGATION_GAMMA, depth);
 
