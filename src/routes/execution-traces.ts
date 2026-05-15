@@ -2617,17 +2617,14 @@ app.post('/', async (c) => {
           cost: trace.cost_usd || 0,
         };
 
-        // Both queryWithAuth and surrealDB.query (wrapped in db/surreal.ts)
-        // return the first-statement results array — no further unwrap.
-        const findRows = jwtAuth?.jwtToken
-          ? await queryWithAuth<{ id: string }>(jwtAuth.jwtToken, variantMetricsFindExisting, {
-              variant_id: variantMetricsParams.variant_id,
-              account_id: variantMetricsParams.account_id,
-            })
-          : await surrealDB.query<{ id: string }>(variantMetricsFindExisting, {
-              variant_id: variantMetricsParams.variant_id,
-              account_id: variantMetricsParams.account_id,
-            });
+        // Always use root path for variant_performance_metrics writes — mirrors
+        // the AET INSERT fix (line 1836). FOR create uses $auth which is NONE
+        // for TYPE JWT access ($token gets the claims, not $auth). HTTP-layer
+        // auth (identity-vessel) already enforces access before we reach here.
+        const findRows = await surrealDB.query<{ id: string }>(variantMetricsFindExisting, {
+          variant_id: variantMetricsParams.variant_id,
+          account_id: variantMetricsParams.account_id,
+        });
         const existingId = Array.isArray(findRows) && findRows.length > 0
           ? (findRows[0] as { id?: string }).id
           : undefined;
@@ -2636,9 +2633,7 @@ app.post('/', async (c) => {
         const opParams = existingId
           ? { id: existingId, ...variantMetricsParams }
           : variantMetricsParams;
-        const variantMetricsResult = jwtAuth?.jwtToken
-          ? ((await queryWithAuth<any>(jwtAuth.jwtToken, opQuery, opParams)) as any[])
-          : ((await surrealDB.query<any>(opQuery, opParams)) as any[]);
+        const variantMetricsResult = (await surrealDB.query<any>(opQuery, opParams)) as any[];
 
         if (variantMetricsResult && variantMetricsResult.length > 0) {
           const updatedMetrics = variantMetricsResult[0];
