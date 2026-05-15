@@ -1097,10 +1097,15 @@ export async function queryActivitiesByFTS(
       'has', 'have', 'had', 'do', 'does', 'did', 'it', 'its', 'as', 'so',
       'if', 'then', 'that', 'this', 'all', 'any', 'each', 'not', 'no',
     ]);
+    // Sort by length desc so longer (more specific) tokens are preferred when
+    // slicing. "lifecycle" is more discriminative than "run"; putting it first
+    // means slicing never loses the rare terms that actually distinguish the
+    // target activity from generic matches.
     const tokens = ftsLiteral
       .split(/\s+/)
       .filter(t => t.length >= 3 && !FTS_STOP_WORDS.has(t.toLowerCase()))
-      .slice(0, 8);
+      .sort((a, b) => b.length - a.length)
+      .slice(0, 10);
     if (tokens.length === 0) tokens.push(ftsLiteral);
 
     const tokenWhereParts = tokens.flatMap(tok => [`name @0@ '${tok}'`, `tags @2@ '${tok}'`]);
