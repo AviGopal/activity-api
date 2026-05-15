@@ -329,7 +329,7 @@ export async function propagateCreditAlongChain(
        WHERE execution_id IN $ids AND org_id = $org_id`,
       { ids: limited, org_id: orgId },
     );
-    for (const row of rows?.[0] ?? []) {
+    for (const row of Array.isArray(rows) ? rows : []) {
       if (row.execution_id && row.variant_id) {
         variantIdByExecId.set(row.execution_id, row.variant_id);
       }
