@@ -87,6 +87,15 @@ export const TemplateTaskSchema = z.object({
   config: TaskConfigSchema.optional(), // resolver-specific config
   // Validation for task output
   validation: TaskValidationSchema.optional(),
+  // Phase 20.1.5: Task-level input/output shapes stored as plain strings.
+  // Predicate-form InputShapeRef objects ({ shape, producedBy, cardinality, ... }) are
+  // EXECUTOR-SIDE ONLY — templates declare required shape names; executors (minibob) apply
+  // predicates at runtime from execution context.  Do NOT expand this to z.union([string, object])
+  // without first considering that activity-api does not interpret predicates.
+  inputShapes: z.array(z.string()).optional(),
+  optionalInputShapes: z.array(z.string()).optional(),
+  outputShapes: z.array(z.string()).optional(),
+  outputImpulses: z.array(z.string()).optional(),
   retry: z.object({
     // Accept both snake_case (from MiniBob MCP) and camelCase (from ribosome)
     max_attempts: z.number().optional(),
