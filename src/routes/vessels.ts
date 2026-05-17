@@ -629,4 +629,38 @@ app.get('/capabilities', deprecationMiddleware, async (c) => {
   }
 });
 
+/**
+ * GET /v2/vessels/:id/metrics?window=24h
+ *
+ * Phase 22 (Autonomous Vessel Forge): returns production success rate for a
+ * vessel identified by :id over the last `window` hours (default 24h).
+ * Read-only over existing activity_execution_traces — no new table.
+ *
+ * Response: { vessel_id, window_hours, total_uses, successful_uses,
+ *             success_rate, failure_modes, status: green|yellow|red }
+ */
+app.get('/:id/metrics', async (c) => {
+  const vesselId = c.req.param('id');
+  const windowParam = c.req.query('window') ?? '24h';
+  const windowHours = (() => {
+    const m = windowParam.match(/^(\d+(?:\.\d+)?)(h|m|d)?$/);
+    if (!m) return 24;
+    const n = parseFloat(m[1] ?? '24');
+    const unit = m[2] ?? 'h';
+    if (unit === 'm') return n / 60;
+    if (unit === 'd') return n * 24;
+    return n;
+  })();
+
+  try {
+    const { computeVesselProductionSuccessRate } = await import('../services/vessel-metrics');
+    const jwtToken = (c.get as any)('jwtToken') as string | undefined;
+    const result = await computeVesselProductionSuccessRate(vesselId, windowHours, jwtToken);
+    return c.json(result, 200);
+  } catch (err: any) {
+    logger.error('GET /v2/vessels/:id/metrics failed', { vessel_id: vesselId, error: err?.message });
+    return c.json({ error: err?.message || 'metrics lookup failed' }, 500);
+  }
+});
+
 export default app;
