@@ -240,6 +240,12 @@ export function loadConfig(): Config {
         // (required), account_id (opt). Response carries the same
         // row layout as GET /v2/activities/shape-gap-resolution.
         'shape_gap_resolution',
+        // Phase 22 (Autonomous Vessel Forge): forwards to discovery-vessel to
+        // count active producers for a shape. Used by slot-binding's
+        // check_discovery_for_producer task to branch between forge (0 producers)
+        // and create-shape-provider-goal (>0 producers). Non-fatal — returns
+        // {count:0} when discovery is unavailable.
+        'shape_producer_inventory',
         'activityTemplateRecommendation',
         'activityTemplatesByMetrics',
         'executionTraces',

@@ -1234,6 +1234,72 @@ router.post('/resolve', async (c) => {
         }
       }
 
+      case 'shape_producer_inventory': {
+        // Phase 22 (Autonomous Vessel Forge): forwards to discovery-vessel's
+        // /registry/shapes endpoint and returns a producer inventory with
+        // count, vessel_ids, and health_summary. Used by slot-binding's
+        // check_discovery_for_producer task to determine whether to dispatch
+        // create-shape-provider-goal (producers exist) or forge_vessel_for_shape
+        // (count === 0). Non-2xx responses from discovery-vessel degrade to
+        // {count: 0} rather than throwing so slot-binding stays non-fatal.
+        //
+        // Pointer fields:
+        //   shape (required)
+        //   org_ids (optional; array of org_id strings for multi-tenant query)
+        const spiPointer = pointer as typeof pointer & {
+          shape?: string;
+          org_ids?: string[];
+        };
+        if (!spiPointer.shape || typeof spiPointer.shape !== 'string') {
+          return c.json({ success: false, error: 'shape is required for shape_producer_inventory' } as ImpulseResolveResponse, 400);
+        }
+        try {
+          const discoveryEndpoint = process.env.DISCOVERY_VESSEL_ENDPOINT || 'http://discovery-vessel.activity-system.svc.cluster.local:8080';
+          const spiBody: Record<string, unknown> = {
+            pointer: { type: 'vesselCapability', shape: spiPointer.shape },
+          };
+          if (spiPointer.org_ids?.length) {
+            (spiBody.pointer as Record<string, unknown>).org_ids = spiPointer.org_ids;
+          }
+          const apiKey = process.env.METABOB_API_KEY || process.env.ACTIVITY_API_KEY;
+          const spiRes = await fetch(`${discoveryEndpoint}/resolve`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(apiKey ? { Authorization: `ApiKey ${apiKey}` } : {}),
+            },
+            body: JSON.stringify(spiBody),
+          });
+          if (!spiRes.ok) {
+            // Discovery down or shape unknown — return empty inventory (non-fatal)
+            return c.json({
+              success: true,
+              content: JSON.stringify({ shape: spiPointer.shape, count: 0, vessel_ids: [], health_summary: 'discovery_unavailable' }),
+              metadata: { shape: 'shape_producer_inventory', summary: 'discovery returned non-2xx — count=0' },
+            } as ImpulseResolveResponse, 200);
+          }
+          const spiData = (await spiRes.json()) as { vessels?: Array<{ id: string; health_score?: number }> };
+          const vesselIds = (spiData.vessels ?? []).map((v) => v.id);
+          const avgHealth = vesselIds.length > 0
+            ? (spiData.vessels ?? []).reduce((sum, v) => sum + (v.health_score ?? 1), 0) / vesselIds.length
+            : 0;
+          const healthSummary = vesselIds.length === 0 ? 'no_producers' : avgHealth >= 0.7 ? 'healthy' : 'degraded';
+          return c.json({
+            success: true,
+            content: JSON.stringify({ shape: spiPointer.shape, count: vesselIds.length, vessel_ids: vesselIds, health_summary: healthSummary }),
+            metadata: { shape: 'shape_producer_inventory', summary: `${vesselIds.length} producer(s) for ${spiPointer.shape}` },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          logger.error('shape_producer_inventory resolve failed', { error: err?.message });
+          // Non-fatal: return empty inventory so slot-binding escalates correctly
+          return c.json({
+            success: true,
+            content: JSON.stringify({ shape: spiPointer.shape, count: 0, vessel_ids: [], health_summary: 'error', error: err?.message }),
+            metadata: { shape: 'shape_producer_inventory', summary: 'error resolving producers — count=0' },
+          } as ImpulseResolveResponse, 200);
+        }
+      }
+
       case 'thompson_posterior': {
         // Phase 9: routable shape for per-variant Thompson posteriors. Lifts
         // the implicit Thompson vessel inside activity-api into the standard
