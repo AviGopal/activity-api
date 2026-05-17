@@ -173,6 +173,13 @@ const KEYWORD_TO_TAGS: Record<string, string[]> = {
   'types': ['tool.code.quality', 'tool'],
   'typescript': ['development.typescript', 'tool.code.quality', 'tool'],
 
+  // Vessel forge / scaffold-vessel keywords (Phase 22 — Autonomous Vessel Forge)
+  'forge': ['feature.vessel.forge', 'infrastructure', 'development.scaffold'],
+  'vessel': ['feature.vessel.forge', 'infrastructure', 'development.scaffold'],
+  'scaffold-vessel': ['feature.vessel.forge', 'infrastructure', 'development.scaffold'],
+  'new-shape-producer': ['feature.vessel.forge', 'infrastructure'],
+  'create-vessel': ['feature.vessel.forge', 'infrastructure', 'development.scaffold'],
+
   // Development / Scaffolding
   'module': ['development.scaffold', 'development', 'feature'],
   'scaffold': ['development.scaffold', 'development'],

@@ -192,4 +192,50 @@ describe('semantic-tags', () => {
       expect(matchingActivities[0].name).toBe('Investigate Codebase');
     });
   });
+
+  describe('forge/vessel keyword tag expansion (Phase 22)', () => {
+    test("'forge' maps to feature.vessel.forge + infrastructure + development.scaffold", () => {
+      const tags = extractTagPrefixes('forge a new vessel for the missing shape');
+      expect(tags).toContain('feature.vessel.forge');
+      expect(tags).toContain('infrastructure');
+      expect(tags).toContain('development.scaffold');
+    });
+
+    test("'vessel' maps to feature.vessel.forge", () => {
+      const tags = extractTagPrefixes('create a vessel that produces json_schema_validator shapes');
+      expect(tags).toContain('feature.vessel.forge');
+    });
+
+    test("'scaffold-vessel' maps to feature.vessel.forge", () => {
+      const tags = extractTagPrefixes('scaffold-vessel for the missing impulse shape');
+      expect(tags).toContain('feature.vessel.forge');
+      expect(tags).toContain('infrastructure');
+    });
+
+    test("'new-shape-producer' maps to feature.vessel.forge", () => {
+      const tags = extractTagPrefixes('new-shape-producer for json_schema_validator');
+      expect(tags).toContain('feature.vessel.forge');
+    });
+
+    test("'create-vessel' maps to feature.vessel.forge + infrastructure", () => {
+      const tags = extractTagPrefixes('create-vessel to handle the missing binding');
+      expect(tags).toContain('feature.vessel.forge');
+      expect(tags).toContain('infrastructure');
+    });
+
+    test('forge vessel activity matches forge-tagged templates before scaffold-only templates', () => {
+      const forgeActivities = [
+        { name: 'Forge Vessel For Shape', tags: ['feature.vessel.forge', 'infrastructure'] },
+        { name: 'Create TypeScript Module', tags: ['development.scaffold', 'development'] },
+      ];
+      const tags = extractTagPrefixes('forge a vessel for the missing json_schema_validator shape');
+      const matches = forgeActivities
+        .map(a => ({ name: a.name, quality: calculateTagMatchQuality(tags, a.tags) }))
+        .filter(a => a.quality > 0)
+        .sort((a, b) => b.quality - a.quality);
+
+      expect(matches.length).toBeGreaterThan(0);
+      expect(matches[0].name).toBe('Forge Vessel For Shape');
+    });
+  });
 });
