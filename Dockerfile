@@ -56,6 +56,8 @@ COPY --from=build /app/repos ./repos
 ENV NODE_ENV=production
 ENV PORT=8080
 ENV HOST=0.0.0.0
+# Model files are under /app/src/assets/models/ (copied via COPY --from=build /app/src ./src)
+ENV EMBEDDING_MODEL_DIR=/app/src/assets/models/all-MiniLM-L6-v2
 # Version information for tracing
 ENV BUILD_SHA=${BUILD_SHA}
 ENV BUILD_VERSION=${BUILD_VERSION}
