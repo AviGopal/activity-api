@@ -3,6 +3,7 @@ name: CI with Webhook Integration
 on:
   push:
     branches:
+      - dev
       - feature/*
       - bugfix/*
       - refactor/*
