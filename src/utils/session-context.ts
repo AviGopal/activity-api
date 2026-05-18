@@ -112,6 +112,51 @@ export function extractContextTokensWithDecay(
   return { tokens: result, decayWeightsByShape };
 }
 
+// ---------------------------------------------------------------------------
+// State-space-signature (v1)
+// ---------------------------------------------------------------------------
+//
+// Canonical input ordering (byte-identical across activity-api and minibob):
+//   1. shapes:    sorted alphabetically
+//   2. provenance tuples (shape, producedBy): sorted by shape, then producedBy
+//   3. missing:   sorted alphabetically
+//   4. version token: "v1"
+//
+// The hash is truncated to 16 hex chars (64 bits) — low enough collision risk
+// for the ~3k context_thompson_scores rows, small enough to fit in a DB index.
+
+export interface ProvenanceTuple {
+  shape: string;
+  producedBy?: string;
+}
+
+export interface StateSpaceSignatureInput {
+  shapes: string[];
+  provenance?: ProvenanceTuple[];
+  missing?: string[];
+  /** Version token. "1" (default) = shape + provenance + missing. "1c" = shape-only coarse. */
+  version?: '1' | '1c';
+}
+
+export function computeStateSpaceSignature(input: StateSpaceSignatureInput): string {
+  const version = input.version ?? '1';
+  const shapes = [...input.shapes].sort();
+  const missing = [...(input.missing ?? [])].sort();
+
+  let provenancePart = '';
+  if (version === '1' && input.provenance && input.provenance.length > 0) {
+    const sorted = [...input.provenance].sort((a, b) => {
+      const sc = a.shape.localeCompare(b.shape);
+      if (sc !== 0) return sc;
+      return (a.producedBy ?? '').localeCompare(b.producedBy ?? '');
+    });
+    provenancePart = sorted.map(p => `${p.shape}:${p.producedBy ?? ''}`).join(',');
+  }
+
+  const raw = [version, shapes.join(','), provenancePart, missing.join(',')].join('|');
+  return createHash('sha256').update(raw).digest().slice(0, 8).toString('hex');
+}
+
 export function computeContextBucket(
   taskDescription: string,
   impulseShapes: string[],
