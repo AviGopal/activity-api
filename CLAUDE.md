@@ -96,9 +96,11 @@ bun test
 # Type checking
 bun run typecheck
 
-# Linting (required before CI)
+# Linting (required before CI) — includes shape-dispatch agreement check
 bun run lint
 ```
+
+**Shape contract is enforced.** `bun run lint` includes `scripts/check-shape-dispatch.ts` which verifies that every entry in `config.discovery.shapes` has a matching `case` in `src/routes/impulses.ts` and vice versa. The check is powered by `packages/shape-dispatch-check/` in the super-repo. See `docs/architecture/TYPESCRIPT_VESSEL_TEMPLATE.md` §"Invariant 2" for the suppression and aliasing patterns.
 
 ## Environment Variables
 
