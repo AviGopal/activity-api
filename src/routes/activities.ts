@@ -2267,12 +2267,12 @@ app.post('/executions', async (c) => {
         success_rate = ((successful_executions ?? 0) + $success_delta) / ((total_executions ?? 0) + 1),
         avg_duration_ms = (((avg_duration_ms ?? 0) * (total_executions ?? 0)) + $duration_ms) / ((total_executions ?? 0) + 1),
         avg_cost_usd = (((avg_cost_usd ?? 0) * (total_executions ?? 0)) + $cost) / ((total_executions ?? 0) + 1),
-        thompson_alpha = (successful_executions ?? 0) + $success_delta + 1,
-        thompson_beta = (failed_executions ?? 0) + $failure_delta + 1,
         last_executed_at = time::now(),
         updated_at = time::now()
       RETURN AFTER;
     `;
+    // α/β posteriors omitted from INSERT initial values and UPDATE — applyOutcomeToPosteriors
+    // (below) writes them with stratified deltas. Keeping both would double-increment.
     const insertQuery = `
       INSERT INTO variant_performance_metrics {
         id: type::record('variant_performance_metrics', $record_id_slug),
@@ -2287,8 +2287,8 @@ app.post('/executions', async (c) => {
         success_rate: $success_delta,
         avg_duration_ms: $duration_ms,
         avg_cost_usd: $cost,
-        thompson_alpha: $success_delta + 1,
-        thompson_beta: $failure_delta + 1,
+        thompson_alpha: 1,
+        thompson_beta: 1,
         total_selections: 0,
         last_executed_at: time::now(),
         created_at: time::now(),
@@ -2349,8 +2349,6 @@ app.post('/executions', async (c) => {
       });
     }
 
-    // TODO (18.3.3): parallel stratified update — remove inline writes above once
-    // canary confirms correctness (24h observation window).
     applyOutcomeToPosteriors(
       {
         activity_id: activityIdFromRequest,
@@ -2361,7 +2359,7 @@ app.post('/executions', async (c) => {
       surrealDB,
       orgId!,
     ).catch((err) => {
-      logger.warn('[18.3.3] applyOutcomeToPosteriors failed (non-blocking, /executions)', {
+      logger.warn('applyOutcomeToPosteriors failed (non-blocking, /executions)', {
         activity_id: activityIdFromRequest,
         error: err instanceof Error ? err.message : String(err),
       });
@@ -3834,8 +3832,7 @@ app.post('/feedback', async (c) => {
       // Negative feedback is specific - don't penalize adjacent activities
     }
 
-    // TODO (18.3.3): parallel stratified update — remove inline writes above once
-    // canary confirms correctness (24h observation window).
+    // Also credit the activity's variant_performance_metrics posteriors.
     applyOutcomeToPosteriors(
       {
         activity_id: validated.activity_id,
@@ -3845,7 +3842,7 @@ app.post('/feedback', async (c) => {
       surrealDB,
       orgId,
     ).catch((err) => {
-      logger.warn('[18.3.3] applyOutcomeToPosteriors failed (non-blocking, /feedback)', {
+      logger.warn('applyOutcomeToPosteriors failed (non-blocking, /feedback)', {
         activity_id: validated.activity_id,
         error: err instanceof Error ? err.message : String(err),
       });

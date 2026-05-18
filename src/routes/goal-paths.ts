@@ -389,8 +389,8 @@ app.post('/', async (c) => {
           total_executions = (total_executions ?? 0) + 1,
           successful_executions = (successful_executions ?? 0) + $success_delta,
           failed_executions = (failed_executions ?? 0) + $failure_delta,
-          thompson_alpha = (successful_executions ?? 0) + $success_delta + 1,
-          thompson_beta = (failed_executions ?? 0) + $failure_delta + 1,
+          thompson_alpha = (thompson_alpha ?? 1) + $success_delta,
+          thompson_beta = (thompson_beta ?? 1) + $failure_delta,
           success_rate = ((successful_executions ?? 0) + $success_delta) / ((total_executions ?? 0) + 1),
           avg_duration_ms = (((avg_duration_ms ?? 0) * (total_executions ?? 0)) + $duration_ms) / ((total_executions ?? 0) + 1),
           avg_cost_usd = (((avg_cost_usd ?? 0) * (total_executions ?? 0)) + $cost_usd) / ((total_executions ?? 0) + 1),
@@ -507,9 +507,7 @@ app.post('/', async (c) => {
       });
     }
 
-    // TODO (18.3.3): parallel stratified update — remove inline writes above once
-    // canary confirms correctness (24h observation window).
-    // Credit the terminal activity in the path (leaf that produced the outcome).
+    // Credit the terminal activity in the path's variant_performance_metrics.
     applyOutcomeToPosteriors(
       {
         activity_id: validated.path_activities[validated.path_activities.length - 1],

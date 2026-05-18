@@ -324,7 +324,7 @@ export async function propagateCreditAlongChain(
   let variantIdByExecId: Map<string, string> = new Map();
   try {
     const limited = ancestors.slice(0, CREDIT_PROPAGATION_MAX_DEPTH);
-    const rows = await db.query<{ execution_id: string; variant_id: string }[]>(
+    const rows = await db.query<{ execution_id: string; variant_id: string }>(
       `SELECT execution_id, variant_id FROM activity_execution_traces
        WHERE execution_id IN $ids AND org_id = $org_id`,
       { ids: limited, org_id: orgId },

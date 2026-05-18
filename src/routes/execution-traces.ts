@@ -2230,11 +2230,14 @@ app.post('/', async (c) => {
       // code paths land with different formats. Without this dual match, a failed
       // trace whose body.org_id arrives plain but whose template was stored with a
       // prefixed org_id silently updates 0 rows — and beta never increments.
+      // Thompson α/β posteriors are written by applyOutcomeToPosteriors (below)
+      // to variant_performance_metrics using stratified deltas. Writing α/β here
+      // to activity_template was retired (Phase 1, surrealdb-rl-layer) — writes
+      // to activity_template invalidate the BM25 FTS scorer (F-V46 regression).
+      // Counters (total_executions, last_executed_at) are kept for dashboard display.
       const updateQuery = `
         UPDATE activity_template
         SET
-          thompson_alpha = (thompson_alpha ?? 1) + $alpha_delta,
-          thompson_beta = (thompson_beta ?? 1) + $beta_delta,
           total_executions = (total_executions ?? 0) + 1,
           successful_executions = (successful_executions ?? 0) + $success_delta,
           failed_executions = (failed_executions ?? 0) + $failure_delta,
@@ -2243,8 +2246,6 @@ app.post('/', async (c) => {
           AND (org_id = $org_id OR org_id = $org_id_alt)
         RETURN {
           id,
-          thompson_alpha,
-          thompson_beta,
           total_executions
         }
       `;
@@ -2319,14 +2320,12 @@ app.post('/', async (c) => {
           if (candidateId === trace.variant_id) {
             primaryUpdateMatched = true;
           }
-          logger.info('[learning] Thompson Sampling scores updated', {
+          logger.info('[learning] activity_template counters updated (posteriors via applyOutcomeToPosteriors)', {
             execution_id: trace.execution_id,
             activity_id: candidateId,
             via_metadata_template_id: candidateId !== trace.variant_id,
             table: 'activity_template',
             success: trace.success,
-            new_alpha: combinedResult[0].thompson_alpha,
-            new_beta: combinedResult[0].thompson_beta,
             total_executions: combinedResult[0].total_executions,
           });
 
@@ -2372,8 +2371,6 @@ app.post('/', async (c) => {
         });
       }
 
-      // TODO (18.3.3): parallel stratified update — remove inline writes above once
-      // canary confirms correctness (24h observation window).
       applyOutcomeToPosteriors(
         {
           activity_id: trace.variant_id as string,
@@ -2559,6 +2556,8 @@ app.post('/', async (c) => {
             AND (account_id IS $account_id OR (account_id IS NONE AND $account_id IS NULL))
           LIMIT 1
       `;
+      // α/β posteriors omitted here — applyOutcomeToPosteriors (site 1 above)
+      // writes them with stratified deltas. Keeping both would double-increment.
       const variantMetricsUpdate = `
         UPDATE $id SET
           total_executions = (total_executions ?? 0) + 1,
@@ -2567,8 +2566,6 @@ app.post('/', async (c) => {
           success_rate = ((successful_executions ?? 0) + $success_delta) / ((total_executions ?? 0) + 1),
           avg_duration_ms = (((avg_duration_ms ?? 0) * (total_executions ?? 0)) + $duration_ms) / ((total_executions ?? 0) + 1),
           avg_cost_usd = (((avg_cost_usd ?? 0) * (total_executions ?? 0)) + $cost) / ((total_executions ?? 0) + 1),
-          thompson_alpha = (successful_executions ?? 0) + $success_delta + 1,
-          thompson_beta = (failed_executions ?? 0) + $failure_delta + 1,
           last_executed_at = time::now(),
           updated_at = time::now()
         RETURN AFTER;
