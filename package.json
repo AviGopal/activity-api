@@ -17,7 +17,7 @@
     "backfill-embeddings": "bun run scripts/backfill-embeddings.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src --ext .ts",
+    "lint": "eslint src --ext .ts && bun run scripts/check-shape-dispatch.ts",
     "lint:fix": "eslint src --ext .ts --fix",
     "format": "prettier --write 'src/**/*.ts'",
     "format:check": "prettier --check 'src/**/*.ts'",

@@ -1412,6 +1412,7 @@ router.post('/resolve', async (c) => {
       // Vessels should call Analysis API directly, not proxy through activity-api
       // =============================================================================
 
+      // @shape-dispatch:private — deprecated stubs; return 410 Gone, not advertised
       case 'analysisResult':
       case 'cochangeSuggestions':
       case 'impactAnalysis':
@@ -1430,6 +1431,7 @@ router.post('/resolve', async (c) => {
         } as ImpulseResolveResponse, 410); // 410 Gone - permanent deprecation
       }
 
+      // @shape-dispatch:private — deprecated stub; return 410 Gone, not advertised
       case 'problemCluster': {
         // Return helpful error directing vessels to Analysis API
         return c.json({
