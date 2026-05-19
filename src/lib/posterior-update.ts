@@ -21,7 +21,6 @@
 
 import { logger } from '../utils/logger';
 import { normalizeActivityId } from '../db/paradigm';
-import { computeContextBucket } from '../utils/session-context';
 import type { FailureMode } from '../models/schemas';
 
 // ---------------------------------------------------------------------------
@@ -75,11 +74,6 @@ const CREDIT_PROPAGATION_GAMMA = 0.5;
 /**
  * Minimal execution descriptor for chain-credit propagation.
  * Callers outside applyOutcomeToPosteriors can also use this directly.
- *
- * Note: context_bucket is intentionally absent. Each ancestor's bucket is
- * recomputed inside propagateCreditAlongChain from that ancestor's own
- * task_description + input_impulse_shapes, so the leaf's bucket is never
- * inherited by an ancestor.
  */
 export interface ExecutionForChainCredit {
   /** The leaf activity (already credited by applyOutcomeToPosteriors). */
@@ -88,6 +82,13 @@ export interface ExecutionForChainCredit {
   composition_chain: string[];
   success: boolean;
   failure_mode?: FailureMode | null;
+  /**
+   * Per-ancestor v1 signatures, keyed by ancestor execution_id.
+   * When provided, writeAncestorDelta writes to context_thompson_scores using
+   * the ancestor's own signature. Absent entries skip the conditional write
+   * (expected during the transition period; log at debug, never warn).
+   */
+  ancestor_signatures?: Record<string, { signature: string; signature_version: number }>;
 }
 
 export interface UpdateSummary {
@@ -222,7 +223,7 @@ async function writeImpulseRelevancePenalty(
 /**
  * Write a (alpha_delta, beta_delta) pair to `variant_performance_metrics` for
  * a single ancestor activity.  Also writes to `context_thompson_scores` when
- * context_bucket is non-null/non-undefined.
+ * signature is non-null, using LET/IF/CREATE for upsert semantics.
  *
  * All writes are best-effort — errors are logged at WARN and swallowed.
  */
@@ -232,7 +233,8 @@ async function writeAncestorDelta(
   betaDelta: number,
   db: DBQueryable,
   orgId: string,
-  contextBucket: string | null | undefined,
+  signature: string | null,
+  signatureVersion: number = 1,
 ): Promise<void> {
   if (alphaDelta === 0 && betaDelta === 0) return;
 
@@ -263,31 +265,41 @@ async function writeAncestorDelta(
     });
   }
 
-  if (contextBucket != null) {
+  if (signature != null) {
     try {
       await db.query(
         `
-        UPDATE context_thompson_scores
-        SET
-          thompson_alpha = (thompson_alpha ?? 1) + $alpha_delta,
-          thompson_beta  = (thompson_beta  ?? 1) + $beta_delta,
-          updated_at     = time::now()
-        WHERE variant_id      = $activity_id
-          AND org_id          = $org_id
-          AND context_bucket  = $context_bucket
+        LET $existing = (SELECT * FROM context_thompson_scores
+          WHERE org_id = $org_id AND template_id = $activity_id
+            AND signature_version = $sig_version AND context_bucket = $sig LIMIT 1);
+        IF array::len($existing) > 0 THEN
+          UPDATE context_thompson_scores
+          SET alpha = alpha + $alpha_delta, beta = beta + $beta_delta,
+              n_observations = n_observations + 1, last_updated_at = time::now()
+          WHERE org_id = $org_id AND template_id = $activity_id
+            AND signature_version = $sig_version AND context_bucket = $sig
+        ELSE
+          CREATE context_thompson_scores CONTENT {
+            org_id: $org_id, template_id: $activity_id, context_bucket: $sig,
+            signature_version: $sig_version, alpha: 1.0 + $alpha_delta,
+            beta: 1.0 + $beta_delta, n_observations: 1,
+            last_updated_at: time::now(), created_at: time::now()
+          }
+        END
         `,
         {
           activity_id: ancestorId,
           org_id: orgId,
+          sig: signature,
+          sig_version: signatureVersion,
           alpha_delta: alphaDelta,
           beta_delta: betaDelta,
-          context_bucket: contextBucket,
         },
       );
     } catch (err) {
       logger.warn('posterior-update: chain credit write to context_thompson_scores failed', {
         ancestor_id: ancestorId,
-        context_bucket: contextBucket,
+        signature,
         error: err instanceof Error ? err.message : String(err),
       });
     }
@@ -326,25 +338,19 @@ export async function propagateCreditAlongChain(
   // We walk from the end of the chain (closest ancestor = depth 1).
   const ancestors = [...composition_chain].reverse(); // [C, B, A, ...]
 
-  // Batch-resolve execution IDs to variant IDs + per-ancestor trace metadata
-  // (task_description, input_impulse_shapes) so each ancestor's context_bucket
-  // is recomputed from its own shapes rather than inherited from the leaf.
-  type AncestorMeta = { variant_id: string; task_description?: string; input_impulse_shapes?: string[] };
+  // Batch-resolve execution IDs to variant IDs.
+  type AncestorMeta = { variant_id: string };
   let ancestorMetaByExecId: Map<string, AncestorMeta> = new Map();
   try {
     const limited = ancestors.slice(0, CREDIT_PROPAGATION_MAX_DEPTH);
-    const rows = await db.query<{ execution_id: string; variant_id: string; task_description?: string; input_impulse_shapes?: string[] }>(
-      `SELECT execution_id, variant_id, task_description, input_impulse_shapes FROM activity_execution_traces
+    const rows = await db.query<{ execution_id: string; variant_id: string }>(
+      `SELECT execution_id, variant_id FROM activity_execution_traces
        WHERE execution_id IN $ids AND org_id = $org_id`,
       { ids: limited, org_id: orgId },
     );
     for (const row of Array.isArray(rows) ? rows : []) {
       if (row.execution_id && row.variant_id) {
-        ancestorMetaByExecId.set(row.execution_id, {
-          variant_id: row.variant_id,
-          task_description: row.task_description,
-          input_impulse_shapes: row.input_impulse_shapes,
-        });
+        ancestorMetaByExecId.set(row.execution_id, { variant_id: row.variant_id });
       }
     }
   } catch (err) {
@@ -353,7 +359,7 @@ export async function propagateCreditAlongChain(
     });
   }
 
-  let legacySkips = 0;
+  let noSigCount = 0;
 
   for (let i = 0; i < Math.min(ancestors.length, CREDIT_PROPAGATION_MAX_DEPTH); i++) {
     const ancestorExecId = ancestors[i];
@@ -365,15 +371,12 @@ export async function propagateCreditAlongChain(
     const depth = i + 1; // 1-indexed depth from leaf
     const decayFactor = Math.pow(CREDIT_PROPAGATION_GAMMA, depth);
 
-    // Compute per-ancestor context bucket from that ancestor's own shapes.
-    // When input_impulse_shapes is absent (legacy trace), skip the conditional
-    // write rather than inheriting the leaf's bucket.
-    let ancestorBucket: string | null = null;
-    if (meta?.input_impulse_shapes && meta.input_impulse_shapes.length > 0) {
-      ancestorBucket = computeContextBucket(meta.task_description ?? '', meta.input_impulse_shapes, orgId);
-    } else {
-      legacySkips++;
-    }
+    // Use per-ancestor v1 signature when available.
+    // When absent (transition period), skip the conditional write for this ancestor.
+    const sigEntry = execution.ancestor_signatures?.[ancestorExecId];
+    const ancestorSig = sigEntry?.signature ?? null;
+    const ancestorSigVersion = sigEntry?.signature_version ?? 1;
+    if (ancestorSig === null) noSigCount++;
 
     let alphaDelta = 0;
     let betaDelta = 0;
@@ -392,15 +395,15 @@ export async function propagateCreditAlongChain(
       betaDelta = decayFactor;
     }
 
-    await writeAncestorDelta(ancestorId, alphaDelta, betaDelta, db, orgId, ancestorBucket);
+    await writeAncestorDelta(ancestorId, alphaDelta, betaDelta, db, orgId, ancestorSig, ancestorSigVersion);
   }
 
-  if (legacySkips > 0) {
-    logger.info('chain_credit_legacy_skip', {
-      event: 'chain_credit_legacy_skip',
+  if (noSigCount > 0) {
+    logger.debug('chain_credit_no_sig', {
+      event: 'chain_credit_no_sig',
       org_id: orgId,
       total_ancestors: Math.min(ancestors.length, CREDIT_PROPAGATION_MAX_DEPTH),
-      skipped: legacySkips,
+      no_sig_count: noSigCount,
       leaf_activity_id: execution.activity_id,
     });
   }
