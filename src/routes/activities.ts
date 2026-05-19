@@ -19,6 +19,7 @@ import { analyzeTaskSemantics } from '../utils/semantic-tags';
 import {
   extractContextTokensWithDecay,
   computeContextBucket,
+  computeStateSpaceSignature,
   decayWeight,
   type SessionContext,
 } from '../utils/session-context';
@@ -4516,6 +4517,56 @@ app.post('/recommend', async (c) => {
       }
     }
 
+    // Phase 24 §4: conditional posterior lookup using v1 state-space signature
+    // Queries signature_version=1 rows; overrides α/β when n_observations >= SIGNATURE_SAMPLING_FLOOR.
+    const SIGNATURE_SAMPLING_FLOOR = parseInt(
+      process.env.RECOMMEND_SIGNATURE_SAMPLING_FLOOR ?? '5', 10
+    );
+    let stateSpaceSig: string | null = null;
+    const sigScoresMap = new Map<string, { alpha: number; beta: number; n_observations: number }>();
+
+    if (Array.isArray(impulse_state_space) && impulse_state_space.length > 0 && activityIds.length > 0) {
+      try {
+        stateSpaceSig = computeStateSpaceSignature({
+          shapes: impulse_state_space.map((e: any) => e.shape ?? e).filter(Boolean),
+          provenance: impulse_state_space
+            .filter((e: any) => e.produced_by || e.produced_at_task_id)
+            .map((e: any) => ({ shape: e.shape ?? e, producedBy: e.produced_by ?? e.produced_at_task_id })),
+          missing: [],  // blocking_shapes computed later; signature uses present pool
+        });
+
+        const sigResult = await surrealDB.query<any>(`
+          SELECT template_id, alpha, beta, n_observations
+          FROM context_thompson_scores
+          WHERE org_id = $org_id AND signature_version = 1 AND context_bucket = $sig AND template_id IN $ids
+        `, {
+          org_id: orgId,
+          sig: stateSpaceSig,
+          ids: activityIds,
+        });
+
+        for (const row of (sigResult || [])) {
+          if (row.template_id) {
+            sigScoresMap.set(row.template_id, {
+              alpha: row.alpha ?? 1,
+              beta: row.beta ?? 1,
+              n_observations: row.n_observations ?? 0,
+            });
+          }
+        }
+
+        logger.debug('v1 conditional posterior lookup', {
+          sig: stateSpaceSig,
+          hits: sigScoresMap.size,
+          floor: SIGNATURE_SAMPLING_FLOOR,
+        });
+      } catch (sigErr: any) {
+        logger.warn('v1 conditional posterior lookup failed (non-blocking)', {
+          error: sigErr.message,
+        });
+      }
+    }
+
     // Calculate impulse relevancy boosts (with optional decay weights from session_context)
     const decayWeightsForRelevancy = contextDecayWeightsByShape.size > 0 ? contextDecayWeightsByShape : undefined;
     const impulseBoostsMap = await calculateImpulseRelevancyBoosts(activityIds, loaded_impulses, decayWeightsForRelevancy);
@@ -4693,8 +4744,18 @@ app.post('/recommend', async (c) => {
         const ctxRow = contextScoresMap.get(activityId);
         const nContext = ctxRow ? (ctxRow.alpha + ctxRow.beta - 2) : 0;
         const blendWeight = nContext >= 5 ? 0.7 : nContext >= 2 ? 0.3 : 0.0;
-        const alphaBlended = blendWeight * (ctxRow?.alpha ?? 1) + (1 - blendWeight) * alpha;
-        const betaBlended  = blendWeight * (ctxRow?.beta  ?? 1) + (1 - blendWeight) * adjustedBeta;
+        let alphaBlended = blendWeight * (ctxRow?.alpha ?? 1) + (1 - blendWeight) * alpha;
+        let betaBlended  = blendWeight * (ctxRow?.beta  ?? 1) + (1 - blendWeight) * adjustedBeta;
+
+        // Phase 24 §4: v1 conditional posterior override
+        // When state-space-signature row has enough observations, use it directly.
+        let posteriorSource: string = blendWeight > 0 ? 'context_bucketed' : scoreMethod;
+        const sigRow = sigScoresMap.get(activityId);
+        if (sigRow && sigRow.n_observations >= SIGNATURE_SAMPLING_FLOOR) {
+          alphaBlended = sigRow.alpha + totalBoost;
+          betaBlended  = sigRow.beta  + impulseBetaPenalty;
+          posteriorSource = 'conditional';
+        }
 
         // Sample from Beta(alpha, beta) distribution for Thompson Sampling.
         // This enables exploration (high variance for uncertain templates) and
@@ -4731,7 +4792,8 @@ app.post('/recommend', async (c) => {
           _total_executions: rawTotalExecs,
           selection_metadata: {
             method: 'thompson_sampling',
-            score_source: blendWeight > 0 ? 'context_bucketed' : scoreMethod,
+            score_source: posteriorSource,
+            _posterior_source: posteriorSource,
             alpha: alphaBlended,
             beta: betaBlended,
             original_beta: betaVal,
@@ -4764,6 +4826,12 @@ app.post('/recommend', async (c) => {
               context_bucket: contextBucket,
               context_blend_weight: blendWeight,
               context_n_observations: nContext,
+            } : {}),
+            // Phase 24 §4: conditional posterior metadata
+            ...(sigRow ? {
+              conditional_sig: stateSpaceSig,
+              conditional_n_observations: sigRow.n_observations,
+              conditional_active: sigRow.n_observations >= SIGNATURE_SAMPLING_FLOOR,
             } : {}),
             // Output shape analysis
             output_shape_analysis: expected_output_shapes.length > 0 ? {
