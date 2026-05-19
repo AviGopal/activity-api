@@ -40,13 +40,13 @@ DEFINE TABLE OVERWRITE test_registration SCHEMAFULL
 
 DEFINE FIELD OVERWRITE org_id                 ON test_registration TYPE string;
 DEFINE FIELD OVERWRITE test_id                ON test_registration TYPE string;
-DEFINE FIELD OVERWRITE inputs_schema          ON test_registration FLEXIBLE TYPE object DEFAULT {};
-DEFINE FIELD OVERWRITE perturbation_schedule  ON test_registration FLEXIBLE TYPE array DEFAULT [];
+DEFINE FIELD OVERWRITE inputs_schema          ON test_registration TYPE object FLEXIBLE DEFAULT {};
+DEFINE FIELD OVERWRITE perturbation_schedule  ON test_registration TYPE array FLEXIBLE DEFAULT [];
 DEFINE FIELD OVERWRITE perturbation_cadence   ON test_registration TYPE option<string>
   ASSERT $value = NONE OR $value IN ['daily', 'weekly', 'monthly'];
-DEFINE FIELD OVERWRITE goal_alignment         ON test_registration FLEXIBLE TYPE array DEFAULT [];
+DEFINE FIELD OVERWRITE goal_alignment         ON test_registration TYPE array FLEXIBLE DEFAULT [];
 DEFINE FIELD OVERWRITE discrimination_claim   ON test_registration TYPE option<string>;
-DEFINE FIELD OVERWRITE witness_types          ON test_registration FLEXIBLE TYPE array DEFAULT [];
+DEFINE FIELD OVERWRITE witness_types          ON test_registration TYPE array FLEXIBLE DEFAULT [];
 DEFINE FIELD OVERWRITE audit_depth_cap        ON test_registration TYPE option<int>
   ASSERT $value = NONE OR ($value > 0 AND $value <= 4);
 DEFINE FIELD OVERWRITE created_at             ON test_registration TYPE datetime DEFAULT time::now();
@@ -76,14 +76,14 @@ DEFINE FIELD OVERWRITE test_id                ON test_report TYPE string;
 DEFINE FIELD OVERWRITE run_id                 ON test_report TYPE string;
 DEFINE FIELD OVERWRITE test_registration_id   ON test_report TYPE option<string>;
 DEFINE FIELD OVERWRITE passed                 ON test_report TYPE bool;
-DEFINE FIELD OVERWRITE passes                 ON test_report FLEXIBLE TYPE array DEFAULT [];
-DEFINE FIELD OVERWRITE witnesses              ON test_report FLEXIBLE TYPE array DEFAULT [];
-DEFINE FIELD OVERWRITE failure_mode           ON test_report FLEXIBLE TYPE option<object>;
-DEFINE FIELD OVERWRITE caveats                ON test_report FLEXIBLE TYPE array DEFAULT [];
+DEFINE FIELD OVERWRITE passes                 ON test_report TYPE array FLEXIBLE DEFAULT [];
+DEFINE FIELD OVERWRITE witnesses              ON test_report TYPE array FLEXIBLE DEFAULT [];
+DEFINE FIELD OVERWRITE failure_mode           ON test_report TYPE option<object> FLEXIBLE;
+DEFINE FIELD OVERWRITE caveats                ON test_report TYPE array FLEXIBLE DEFAULT [];
 DEFINE FIELD OVERWRITE duration_ms            ON test_report TYPE option<float>;
 DEFINE FIELD OVERWRITE cost_usd               ON test_report TYPE option<float>;
-DEFINE FIELD OVERWRITE perturbation_row       ON test_report FLEXIBLE TYPE option<object>;
-DEFINE FIELD OVERWRITE details                ON test_report FLEXIBLE TYPE option<object>;
+DEFINE FIELD OVERWRITE perturbation_row       ON test_report TYPE option<object> FLEXIBLE;
+DEFINE FIELD OVERWRITE details                ON test_report TYPE option<object> FLEXIBLE;
 DEFINE FIELD OVERWRITE created_at             ON test_report TYPE datetime DEFAULT time::now();
 
 DEFINE INDEX OVERWRITE idx_test_report_org_test_time
@@ -106,10 +106,10 @@ DEFINE FIELD OVERWRITE org_id                 ON test_audit_report TYPE string;
 DEFINE FIELD OVERWRITE test_registration_id   ON test_audit_report TYPE string;
 DEFINE FIELD OVERWRITE test_report_id         ON test_audit_report TYPE string;
 DEFINE FIELD OVERWRITE passed                 ON test_audit_report TYPE bool;
-DEFINE FIELD OVERWRITE caveats                ON test_audit_report FLEXIBLE TYPE array DEFAULT [];
-DEFINE FIELD OVERWRITE validation_results     ON test_audit_report FLEXIBLE TYPE array DEFAULT [];
-DEFINE FIELD OVERWRITE failed_evidence        ON test_audit_report FLEXIBLE TYPE option<object>;
-DEFINE FIELD OVERWRITE composition_chain      ON test_audit_report FLEXIBLE TYPE array DEFAULT [];
+DEFINE FIELD OVERWRITE caveats                ON test_audit_report TYPE array FLEXIBLE DEFAULT [];
+DEFINE FIELD OVERWRITE validation_results     ON test_audit_report TYPE array FLEXIBLE DEFAULT [];
+DEFINE FIELD OVERWRITE failed_evidence        ON test_audit_report TYPE option<object> FLEXIBLE;
+DEFINE FIELD OVERWRITE composition_chain      ON test_audit_report TYPE array FLEXIBLE DEFAULT [];
 DEFINE FIELD OVERWRITE created_at             ON test_audit_report TYPE datetime DEFAULT time::now();
 
 DEFINE INDEX OVERWRITE idx_test_audit_report_org_registration
@@ -137,7 +137,7 @@ DEFINE FIELD OVERWRITE observed_effect        ON sensitivity_evidence TYPE optio
 DEFINE FIELD OVERWRITE expected_delta         ON sensitivity_evidence TYPE option<float>;
 DEFINE FIELD OVERWRITE observed_delta         ON sensitivity_evidence TYPE option<float>;
 DEFINE FIELD OVERWRITE varied_as_predicted    ON sensitivity_evidence TYPE bool;
-DEFINE FIELD OVERWRITE details                ON sensitivity_evidence FLEXIBLE TYPE option<object>;
+DEFINE FIELD OVERWRITE details                ON sensitivity_evidence TYPE option<object> FLEXIBLE;
 DEFINE FIELD OVERWRITE created_at             ON sensitivity_evidence TYPE datetime DEFAULT time::now();
 
 DEFINE INDEX OVERWRITE idx_sensitivity_evidence_org_registration_time
@@ -171,7 +171,7 @@ DEFINE FIELD OVERWRITE classification         ON code_modification_proposal TYPE
     'audit_misaligned', 'audit_record_incomplete'
   ];
 DEFINE FIELD OVERWRITE rationale              ON code_modification_proposal TYPE option<string>;
-DEFINE FIELD OVERWRITE supersedes             ON code_modification_proposal FLEXIBLE TYPE array DEFAULT [];
+DEFINE FIELD OVERWRITE supersedes             ON code_modification_proposal TYPE array FLEXIBLE DEFAULT [];
 DEFINE FIELD OVERWRITE verification_confidence ON code_modification_proposal TYPE option<float>;
 DEFINE FIELD OVERWRITE created_at             ON code_modification_proposal TYPE datetime DEFAULT time::now();
 
