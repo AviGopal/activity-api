@@ -264,6 +264,10 @@ export function loadConfig(): Config {
         // the minibob co-occurrence extractor (commit 1f8d703) so it can do
         // signature reasoning without a second round trip per impulse id.
         'executionTraceWithSignatures',
+        // contextThompsonScores: paginated read over context_thompson_scores rows.
+        // Supports filtering by templateId, signatureVersion, minObservations.
+        // Powers harness discrimination stat (§6) and operator inspection.
+        'contextThompsonScores',
         // mcpTool: discovery-to-tools bridge. Activity-api currently exposes
         // its write surface through *_write impulse shapes (the preferred
         // dispatch path per docs/specs/discovery-to-tools-bridge.md

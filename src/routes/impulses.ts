@@ -3335,6 +3335,85 @@ router.post('/resolve', async (c) => {
         }
       }
 
+      case 'contextThompsonScores': {
+        // Returns per-signature-per-template conditional Thompson posterior rows.
+        // Pointer fields:
+        //   templateId?: string   — filter to one template
+        //   signatureVersion?: number — filter to one version (default: all)
+        //   minObservations?: number — floor on n_observations (default: 0)
+        //   limit?: number         — max rows (default: 100, capped at 500)
+        //   offset?: number        — pagination offset (default: 0)
+        const cts = pointer as typeof pointer & {
+          templateId?: string;
+          signatureVersion?: number;
+          minObservations?: number;
+          limit?: number;
+          offset?: number;
+        };
+        const limit = Math.min(Math.max(cts.limit ?? 100, 1), 500);
+        const offset = Math.max(cts.offset ?? 0, 0);
+        const minObs = cts.minObservations ?? 0;
+
+        try {
+          const conditions: string[] = ['org_id = $org_id'];
+          const params: Record<string, unknown> = {
+            org_id: jwtAuthCtx.orgId,
+            limit,
+            offset,
+          };
+          if (cts.templateId) {
+            conditions.push('template_id = $template_id');
+            params.template_id = cts.templateId;
+          }
+          if (typeof cts.signatureVersion === 'number') {
+            conditions.push('signature_version = $sig_version');
+            params.sig_version = cts.signatureVersion;
+          }
+          if (minObs > 0) {
+            conditions.push('n_observations >= $min_obs');
+            params.min_obs = minObs;
+          }
+          const sql = `
+            SELECT template_id, context_bucket, signature_version,
+                   alpha, beta, n_observations, last_updated_at, created_at
+            FROM context_thompson_scores
+            WHERE ${conditions.join(' AND ')}
+            ORDER BY template_id ASC, signature_version ASC, n_observations DESC
+            LIMIT $limit START $offset
+          `;
+          const rows = (jwtAuthCtx.jwtToken
+            ? await queryWithAuth<any>(jwtAuthCtx.jwtToken, sql, params)
+            : await surrealDB.query<any>(sql, params)) as any[];
+
+          const entries = (Array.isArray(rows) ? rows : []).map((row: any) => ({
+            template_id: row.template_id,
+            context_bucket: row.context_bucket,
+            signature_version: row.signature_version ?? 0,
+            alpha: row.alpha ?? 1,
+            beta: row.beta ?? 1,
+            n_observations: row.n_observations ?? 0,
+            last_updated_at: row.last_updated_at,
+            created_at: row.created_at,
+          }));
+
+          return c.json({
+            success: true,
+            content: JSON.stringify({ total: entries.length, offset, limit, entries }),
+            metadata: {
+              shape: 'contextThompsonScores',
+              summary: `${entries.length} context_thompson_scores rows${cts.templateId ? ` for template ${cts.templateId}` : ''}`,
+              rowCount: entries.length,
+            },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          logger.error('contextThompsonScores failed', { error: err.message });
+          return c.json({
+            success: false,
+            error: `contextThompsonScores failed: ${err.message}`,
+          } as ImpulseResolveResponse, 500);
+        }
+      }
+
       default: {
         // Unknown shape - delegate to vessel discovery
         // This follows the "Resolvers live WHERE THE DATA IS" principle
