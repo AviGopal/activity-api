@@ -52,6 +52,14 @@ export interface TraceForPosterior {
    * fires propagateCreditAlongChain as a fire-and-forget side effect.
    */
   composition_chain?: string[];
+  /**
+   * v1 state-space signature for conditional Thompson keying.
+   * When present, applyOutcomeToPosteriors writes to context_thompson_scores
+   * with signature_version + context_bucket=signature using stratified deltas.
+   */
+  signature?: string;
+  /** Must accompany signature; typically 1 for v1 signatures. */
+  signature_version?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -455,6 +463,70 @@ export async function applyOutcomeToPosteriors(
         alpha_delta: alphaDelta,
         beta_delta: betaDelta,
         error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // v1 conditional context_thompson_scores write — stratified deltas, signature-keyed
+  if (
+    trace.signature &&
+    typeof trace.signature_version === 'number' &&
+    (alphaDelta !== 0 || betaDelta !== 0)
+  ) {
+    try {
+      await db.query(
+        `
+        LET $existing = (SELECT * FROM context_thompson_scores
+          WHERE org_id = $org_id
+            AND template_id = $activity_id
+            AND signature_version = $sig_version
+            AND context_bucket = $sig
+          LIMIT 1);
+        IF array::len($existing) > 0 THEN
+          UPDATE context_thompson_scores
+          SET alpha = alpha + $alpha_delta,
+              beta  = beta  + $beta_delta,
+              n_observations = n_observations + 1,
+              last_updated_at = time::now()
+          WHERE org_id = $org_id
+            AND template_id = $activity_id
+            AND signature_version = $sig_version
+            AND context_bucket = $sig
+        ELSE
+          CREATE context_thompson_scores CONTENT {
+            org_id: $org_id,
+            template_id: $activity_id,
+            context_bucket: $sig,
+            signature_version: $sig_version,
+            alpha: 1.0 + $alpha_delta,
+            beta:  1.0 + $beta_delta,
+            n_observations: 1,
+            last_updated_at: time::now(),
+            created_at: time::now()
+          }
+        END
+        `,
+        {
+          org_id: orgId,
+          activity_id: activityId,
+          sig: trace.signature,
+          sig_version: trace.signature_version,
+          alpha_delta: alphaDelta,
+          beta_delta: betaDelta,
+        },
+      );
+      logger.debug('posterior_update_v1_conditional', {
+        event: 'posterior_update_v1_conditional',
+        activity_id: activityId,
+        signature: trace.signature,
+        signature_version: trace.signature_version,
+        alpha_delta: alphaDelta,
+        beta_delta: betaDelta,
+      });
+    } catch (v1Err) {
+      logger.warn('posterior-update: context_thompson_scores v1 write failed (non-blocking)', {
+        activity_id: activityId,
+        error: v1Err instanceof Error ? v1Err.message : String(v1Err),
       });
     }
   }

@@ -14,7 +14,7 @@ import {
   type TraceForPosterior,
   type ExecutionForChainCredit,
 } from '../src/lib/posterior-update';
-import { computeContextBucket } from '../src/utils/session-context';
+import { computeContextBucket, computeStateSpaceSignature } from '../src/utils/session-context';
 import type { FailureMode } from '../src/models/schemas';
 
 // ---------------------------------------------------------------------------
@@ -614,5 +614,58 @@ describe('applyOutcomeToPosteriors — composition_chain fire-and-forget wiring'
     // Only the single variant_performance_metrics write for the leaf itself
     const allWrites = calls.filter(c => c.sql.includes('variant_performance_metrics'));
     expect(allWrites).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: v1 signature conditional writes (task 2.3 / 2.4)
+// ---------------------------------------------------------------------------
+
+describe('applyOutcomeToPosteriors — v1 signature conditional writes', () => {
+  test('(a) conditional write fires when signature present', async () => {
+    const { db, calls } = makeDb();
+    const sig = computeStateSpaceSignature({ shapes: ['codeFile', 'gitDiff'], provenance: [], missing: [] });
+
+    await applyOutcomeToPosteriors(
+      makeTrace({ success: true, signature: sig, signature_version: 1 }),
+      db,
+      ORG,
+    );
+
+    const sigWrites = calls.filter(c => c.sql.includes('context_thompson_scores'));
+    expect(sigWrites).toHaveLength(1);
+    expect(sigWrites[0].params.sig).toBe(sig);
+    expect(sigWrites[0].params.sig_version).toBe(1);
+    expect(sigWrites[0].params.alpha_delta).toBe(1);
+    expect(sigWrites[0].params.beta_delta).toBe(0);
+  });
+
+  test('(b) signature-absent path: no context_thompson_scores write', async () => {
+    const { db, calls } = makeDb();
+    await applyOutcomeToPosteriors(makeTrace({ success: true }), db, ORG);
+
+    const sigWrites = calls.filter(c => c.sql.includes('context_thompson_scores'));
+    expect(sigWrites).toHaveLength(0);
+  });
+
+  test('(c) failure-mode rules apply per-bucket identically to global — verifier_negative → beta=1', async () => {
+    const { db, calls } = makeDb();
+    const sig = computeStateSpaceSignature({ shapes: ['analysisResult'], provenance: [], missing: [] });
+
+    await applyOutcomeToPosteriors(
+      makeTrace({
+        success: false,
+        failure_mode: { type: 'verifier_negative', reason: 'test', context: { validator_id: 'v1', failed_evidence: [] } },
+        signature: sig,
+        signature_version: 1,
+      }),
+      db,
+      ORG,
+    );
+
+    const sigWrites = calls.filter(c => c.sql.includes('context_thompson_scores'));
+    expect(sigWrites).toHaveLength(1);
+    expect(sigWrites[0].params.alpha_delta).toBe(0);
+    expect(sigWrites[0].params.beta_delta).toBe(1);
   });
 });

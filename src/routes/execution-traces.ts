@@ -2371,6 +2371,31 @@ app.post('/', async (c) => {
         });
       }
 
+      // v1 state-space signature: read from body.metadata or derive server-side.
+      // Passed to applyOutcomeToPosteriors so it can write a stratified v1 row
+      // to context_thompson_scores alongside the v0 context_bucket row below.
+      let v1Sig: string | undefined;
+      let v1SigVersion: number | undefined;
+      {
+        const rawSig = (body as any).metadata?.state_space_signature;
+        const rawVer = (body as any).metadata?.signature_version;
+        if (typeof rawSig === 'string' && /^[0-9a-f]{16}$/.test(rawSig) &&
+            typeof rawVer === 'number' && Number.isInteger(rawVer) && rawVer >= 1) {
+          v1Sig = rawSig;
+          v1SigVersion = rawVer;
+        } else if (Array.isArray(body.input_impulse_shapes) && body.input_impulse_shapes.length > 0) {
+          try {
+            const { computeStateSpaceSignature } = await import('../utils/session-context');
+            v1Sig = computeStateSpaceSignature({
+              shapes: body.input_impulse_shapes,
+              provenance: Array.isArray((body as any).metadata?.provenance) ? (body as any).metadata.provenance : [],
+              missing: Array.isArray((body as any).metadata?.missing_shapes) ? (body as any).metadata.missing_shapes : [],
+            });
+            v1SigVersion = 1;
+          } catch { /* non-blocking */ }
+        }
+      }
+
       applyOutcomeToPosteriors(
         {
           activity_id: trace.variant_id as string,
@@ -2379,6 +2404,7 @@ app.post('/', async (c) => {
           tasks: trace.tasks as any,
           cost_usd: trace.cost_usd as number,
           ...(resolvedCompositionChain.length > 0 ? { composition_chain: resolvedCompositionChain } : {}),
+          ...(v1Sig ? { signature: v1Sig, signature_version: v1SigVersion } : {}),
         },
         surrealDB,
         trace.org_id as string,
