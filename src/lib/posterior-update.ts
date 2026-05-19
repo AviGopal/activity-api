@@ -21,6 +21,7 @@
 
 import { logger } from '../utils/logger';
 import { normalizeActivityId } from '../db/paradigm';
+import { computeContextBucket } from '../utils/session-context';
 import type { FailureMode } from '../models/schemas';
 
 // ---------------------------------------------------------------------------
@@ -66,6 +67,11 @@ const CREDIT_PROPAGATION_GAMMA = 0.5;
 /**
  * Minimal execution descriptor for chain-credit propagation.
  * Callers outside applyOutcomeToPosteriors can also use this directly.
+ *
+ * Note: context_bucket is intentionally absent. Each ancestor's bucket is
+ * recomputed inside propagateCreditAlongChain from that ancestor's own
+ * task_description + input_impulse_shapes, so the leaf's bucket is never
+ * inherited by an ancestor.
  */
 export interface ExecutionForChainCredit {
   /** The leaf activity (already credited by applyOutcomeToPosteriors). */
@@ -74,11 +80,6 @@ export interface ExecutionForChainCredit {
   composition_chain: string[];
   success: boolean;
   failure_mode?: FailureMode | null;
-  /**
-   * When set, writes are also applied to `context_thompson_scores` keyed by
-   * this bucket (bucketed-Thompson interlock, spec 18.4.4).
-   */
-  context_bucket?: string | null;
 }
 
 export interface UpdateSummary {
@@ -305,7 +306,7 @@ export async function propagateCreditAlongChain(
   db: DBQueryable,
   orgId: string,
 ): Promise<void> {
-  const { composition_chain, success, failure_mode, context_bucket } = execution;
+  const { composition_chain, success, failure_mode } = execution;
 
   if (!composition_chain || composition_chain.length === 0) return;
 
@@ -317,21 +318,25 @@ export async function propagateCreditAlongChain(
   // We walk from the end of the chain (closest ancestor = depth 1).
   const ancestors = [...composition_chain].reverse(); // [C, B, A, ...]
 
-  // Batch-resolve execution IDs to variant IDs via activity_execution_traces.
-  // composition_chain stores execution IDs emitted by minibob; variant_performance_metrics
-  // is keyed on variant_id (template ID). Entries that are already template IDs
-  // (no matching execution row) are used as-is for backward compat with unit tests.
-  let variantIdByExecId: Map<string, string> = new Map();
+  // Batch-resolve execution IDs to variant IDs + per-ancestor trace metadata
+  // (task_description, input_impulse_shapes) so each ancestor's context_bucket
+  // is recomputed from its own shapes rather than inherited from the leaf.
+  type AncestorMeta = { variant_id: string; task_description?: string; input_impulse_shapes?: string[] };
+  let ancestorMetaByExecId: Map<string, AncestorMeta> = new Map();
   try {
     const limited = ancestors.slice(0, CREDIT_PROPAGATION_MAX_DEPTH);
-    const rows = await db.query<{ execution_id: string; variant_id: string }>(
-      `SELECT execution_id, variant_id FROM activity_execution_traces
+    const rows = await db.query<{ execution_id: string; variant_id: string; task_description?: string; input_impulse_shapes?: string[] }>(
+      `SELECT execution_id, variant_id, task_description, input_impulse_shapes FROM activity_execution_traces
        WHERE execution_id IN $ids AND org_id = $org_id`,
       { ids: limited, org_id: orgId },
     );
     for (const row of Array.isArray(rows) ? rows : []) {
       if (row.execution_id && row.variant_id) {
-        variantIdByExecId.set(row.execution_id, row.variant_id);
+        ancestorMetaByExecId.set(row.execution_id, {
+          variant_id: row.variant_id,
+          task_description: row.task_description,
+          input_impulse_shapes: row.input_impulse_shapes,
+        });
       }
     }
   } catch (err) {
@@ -340,14 +345,27 @@ export async function propagateCreditAlongChain(
     });
   }
 
+  let legacySkips = 0;
+
   for (let i = 0; i < Math.min(ancestors.length, CREDIT_PROPAGATION_MAX_DEPTH); i++) {
     const ancestorExecId = ancestors[i];
+    const meta = ancestorMetaByExecId.get(ancestorExecId);
     // Resolve to variant_id; fall back to ancestorExecId itself (unit test compat).
     // Normalize to strip the `activity:` prefix so the WHERE clause matches the
     // normalized form stored in variant_performance_metrics.
-    const ancestorId = normalizeActivityId(variantIdByExecId.get(ancestorExecId) ?? ancestorExecId);
+    const ancestorId = normalizeActivityId(meta?.variant_id ?? ancestorExecId);
     const depth = i + 1; // 1-indexed depth from leaf
     const decayFactor = Math.pow(CREDIT_PROPAGATION_GAMMA, depth);
+
+    // Compute per-ancestor context bucket from that ancestor's own shapes.
+    // When input_impulse_shapes is absent (legacy trace), skip the conditional
+    // write rather than inheriting the leaf's bucket.
+    let ancestorBucket: string | null = null;
+    if (meta?.input_impulse_shapes && meta.input_impulse_shapes.length > 0) {
+      ancestorBucket = computeContextBucket(meta.task_description ?? '', meta.input_impulse_shapes, orgId);
+    } else {
+      legacySkips++;
+    }
 
     let alphaDelta = 0;
     let betaDelta = 0;
@@ -366,7 +384,17 @@ export async function propagateCreditAlongChain(
       betaDelta = decayFactor;
     }
 
-    await writeAncestorDelta(ancestorId, alphaDelta, betaDelta, db, orgId, context_bucket);
+    await writeAncestorDelta(ancestorId, alphaDelta, betaDelta, db, orgId, ancestorBucket);
+  }
+
+  if (legacySkips > 0) {
+    logger.info('chain_credit_legacy_skip', {
+      event: 'chain_credit_legacy_skip',
+      org_id: orgId,
+      total_ancestors: Math.min(ancestors.length, CREDIT_PROPAGATION_MAX_DEPTH),
+      skipped: legacySkips,
+      leaf_activity_id: execution.activity_id,
+    });
   }
 }
 
@@ -461,7 +489,6 @@ export async function applyOutcomeToPosteriors(
         composition_chain: trace.composition_chain,
         success: trace.success,
         failure_mode: trace.failure_mode,
-        context_bucket: null,
       },
       db,
       orgId,

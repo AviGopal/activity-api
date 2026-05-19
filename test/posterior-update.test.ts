@@ -14,6 +14,7 @@ import {
   type TraceForPosterior,
   type ExecutionForChainCredit,
 } from '../src/lib/posterior-update';
+import { computeContextBucket } from '../src/utils/session-context';
 import type { FailureMode } from '../src/models/schemas';
 
 // ---------------------------------------------------------------------------
@@ -25,6 +26,20 @@ function makeDb(): { db: DBQueryable; calls: Array<{ sql: string; params: Record
   const db: DBQueryable = {
     async query(sql, params = {}) {
       calls.push({ sql, params });
+      return [];
+    },
+  };
+  return { db, calls };
+}
+
+/** DB mock that returns ancestor trace rows for the chain-credit SELECT. */
+type AncestorRow = { execution_id: string; variant_id: string; task_description?: string; input_impulse_shapes?: string[] };
+function makeDbWithTraces(ancestorRows: AncestorRow[]): { db: DBQueryable; calls: Array<{ sql: string; params: Record<string, unknown> }> } {
+  const calls: Array<{ sql: string; params: Record<string, unknown> }> = [];
+  const db: DBQueryable = {
+    async query(sql, params = {}) {
+      calls.push({ sql, params });
+      if (sql.includes('activity_execution_traces')) return ancestorRows as any;
       return [];
     },
   };
@@ -490,37 +505,67 @@ describe('propagateCreditAlongChain — edge cases', () => {
     expect(calls).toHaveLength(0);
   });
 
-  test('context_bucket present → also writes context_thompson_scores', async () => {
-    const { db, calls } = makeDb();
+  test('ancestor with input_impulse_shapes → writes context_thompson_scores with per-ancestor bucket', async () => {
+    const shapes = ['activityTemplate', 'goal'];
+    const expectedBucket = computeContextBucket('some task', shapes, ORG);
+    const { db, calls } = makeDbWithTraces([
+      { execution_id: 'A', variant_id: 'A', task_description: 'some task', input_impulse_shapes: shapes },
+    ]);
     await propagateCreditAlongChain(
-      {
-        activity_id: 'D',
-        composition_chain: ['A'],
-        success: true,
-        context_bucket: 'bucket-1',
-      },
+      { activity_id: 'D', composition_chain: ['A'], success: true },
       db,
       ORG,
     );
-    // Should write to both variant_performance_metrics and context_thompson_scores for A
-    const globalCalls = getGlobalCalls(calls, 'A');
-    expect(globalCalls).toHaveLength(1);
     const bucketCalls = calls.filter(
       c => c.sql.includes('context_thompson_scores') && c.params.activity_id === 'A',
     );
     expect(bucketCalls).toHaveLength(1);
-    expect(bucketCalls[0].params.context_bucket).toBe('bucket-1');
+    expect(bucketCalls[0].params.context_bucket).toBe(expectedBucket);
   });
 
-  test('context_bucket null → no context_thompson_scores write', async () => {
-    const { db, calls } = makeDb();
+  test('ancestor missing input_impulse_shapes → no context_thompson_scores write (legacy skip)', async () => {
+    const { db, calls } = makeDbWithTraces([
+      { execution_id: 'A', variant_id: 'A' }, // no input_impulse_shapes
+    ]);
     await propagateCreditAlongChain(
-      { activity_id: 'D', composition_chain: ['A'], success: true, context_bucket: null },
+      { activity_id: 'D', composition_chain: ['A'], success: true },
       db,
       ORG,
     );
     const bucketCalls = calls.filter(c => c.sql.includes('context_thompson_scores'));
     expect(bucketCalls).toHaveLength(0);
+  });
+
+  test('per-ancestor bucket isolation: 3-deep chain [A, B, C] each gets own bucket', async () => {
+    const shapesA = ['activityTemplate'];
+    const shapesB = ['executionTrace', 'goal'];
+    const shapesC = ['impulseRelevance'];
+    const bucketA = computeContextBucket('task A', shapesA, ORG);
+    const bucketB = computeContextBucket('task B', shapesB, ORG);
+    const bucketC = computeContextBucket('task C', shapesC, ORG);
+
+    const { db, calls } = makeDbWithTraces([
+      { execution_id: 'A', variant_id: 'A', task_description: 'task A', input_impulse_shapes: shapesA },
+      { execution_id: 'B', variant_id: 'B', task_description: 'task B', input_impulse_shapes: shapesB },
+      { execution_id: 'C', variant_id: 'C', task_description: 'task C', input_impulse_shapes: shapesC },
+    ]);
+    await propagateCreditAlongChain(
+      { activity_id: 'D', composition_chain: ['A', 'B', 'C'], success: true },
+      db,
+      ORG,
+    );
+
+    // C is depth 1 (closest), B depth 2, A depth 3
+    const cBucketCall = calls.find(c => c.sql.includes('context_thompson_scores') && c.params.activity_id === 'C');
+    const bBucketCall = calls.find(c => c.sql.includes('context_thompson_scores') && c.params.activity_id === 'B');
+    const aBucketCall = calls.find(c => c.sql.includes('context_thompson_scores') && c.params.activity_id === 'A');
+
+    expect(cBucketCall?.params.context_bucket).toBe(bucketC);
+    expect(bBucketCall?.params.context_bucket).toBe(bucketB);
+    expect(aBucketCall?.params.context_bucket).toBe(bucketA);
+
+    // All three buckets are distinct (otherwise the test is vacuous)
+    expect(new Set([bucketA, bucketB, bucketC]).size).toBe(3);
   });
 
   test('non-cascading failure propagates decayed β to all ancestors', async () => {
