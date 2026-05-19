@@ -477,6 +477,10 @@ export async function applyOutcomeToPosteriors(
     (alphaDelta !== 0 || betaDelta !== 0)
   ) {
     try {
+      // §7.5 Cardinality safety cap: check whether this is a new bucket before
+      // creating it. If the template already has ≥ 200 distinct signature buckets,
+      // skip the CREATE (UPDATE still proceeds for existing rows).
+      const CARDINALITY_CAP = parseInt(process.env.SIGNATURE_CARDINALITY_CAP ?? '200', 10);
       await db.query(
         `
         LET $existing = (SELECT * FROM context_thompson_scores
@@ -485,6 +489,11 @@ export async function applyOutcomeToPosteriors(
             AND signature_version = $sig_version
             AND context_bucket = $sig
           LIMIT 1);
+        LET $cardinality = (SELECT count() FROM context_thompson_scores
+          WHERE org_id = $org_id
+            AND template_id = $activity_id
+            AND signature_version = $sig_version
+          GROUP ALL)[0].count ?? 0;
         IF array::len($existing) > 0 THEN
           UPDATE context_thompson_scores
           SET alpha = alpha + $alpha_delta,
@@ -495,7 +504,7 @@ export async function applyOutcomeToPosteriors(
             AND template_id = $activity_id
             AND signature_version = $sig_version
             AND context_bucket = $sig
-        ELSE
+        ELSE IF $cardinality < $cap THEN
           CREATE context_thompson_scores CONTENT {
             org_id: $org_id,
             template_id: $activity_id,
@@ -516,6 +525,7 @@ export async function applyOutcomeToPosteriors(
           sig_version: trace.signature_version,
           alpha_delta: alphaDelta,
           beta_delta: betaDelta,
+          cap: CARDINALITY_CAP,
         },
       );
       logger.debug('posterior_update_v1_conditional', {
@@ -525,6 +535,7 @@ export async function applyOutcomeToPosteriors(
         signature_version: trace.signature_version,
         alpha_delta: alphaDelta,
         beta_delta: betaDelta,
+        cardinality_cap: CARDINALITY_CAP,
       });
     } catch (v1Err) {
       logger.warn('posterior-update: context_thompson_scores v1 write failed (non-blocking)', {

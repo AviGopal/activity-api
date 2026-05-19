@@ -30,6 +30,7 @@ import { Context, Next } from 'hono';
 import { createAuthenticatedClient } from '../db/surreal';
 import { validateApiKeyWithFallback, generateJwtToken } from '../services/auth';
 import { logger } from '../utils/logger';
+import { getOrFetchValidatedApiKey } from './auth-cache';
 
 export interface JwtAuthContext {
   jwtToken: string;
@@ -90,7 +91,23 @@ export const PUBLIC_PATHS: string[] = [
  *
  * Returns JwtAuthContext on success, null on failure.
  */
+/**
+ * Cached + dedup'd public entry point.
+ *
+ * Audit (2026-05-16): every request previously hit identity-vessel directly,
+ * tripping its 20 req/min IP rate-limit and cascading to 401s on
+ * /v2/impulses/resolve. The cache (Fix A) absorbs steady-state load; the
+ * in-flight dedupe (Fix B) absorbs bursts. See `auth-cache.ts` for layering
+ * rationale.
+ *
+ * Public signature is preserved: callers see `Promise<JwtAuthContext | null>`
+ * exactly as before. All existing behavior is unchanged on cache miss.
+ */
 async function validateApiKey(apiKey: string): Promise<JwtAuthContext | null> {
+  return getOrFetchValidatedApiKey(apiKey, _validateApiKeyUncached);
+}
+
+async function _validateApiKeyUncached(apiKey: string): Promise<JwtAuthContext | null> {
   try {
     const result = await validateApiKeyWithFallback(apiKey);
 

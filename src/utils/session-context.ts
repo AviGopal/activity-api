@@ -141,10 +141,16 @@ export interface StateSpaceSignatureInput {
 export function computeStateSpaceSignature(input: StateSpaceSignatureInput): string {
   const version = input.version ?? '1';
   const shapes = [...input.shapes].sort();
-  const missing = [...(input.missing ?? [])].sort();
 
+  // v1c is shape-only (coarse): no provenance, no missing-shapes
+  if (version === '1c') {
+    const raw = ['1c', shapes.join(''), '', ''].join('|');
+    return createHash('sha256').update(raw).digest().slice(0, 8).toString('hex');
+  }
+
+  const missing = [...(input.missing ?? [])].sort();
   let provenancePart = '';
-  if (version === '1' && input.provenance && input.provenance.length > 0) {
+  if (input.provenance && input.provenance.length > 0) {
     const sorted = [...input.provenance].sort((a, b) => {
       const sc = a.shape.localeCompare(b.shape);
       if (sc !== 0) return sc;

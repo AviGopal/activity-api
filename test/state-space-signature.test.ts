@@ -167,3 +167,47 @@ describe('computeStateSpaceSignature — canonical contract', () => {
     expect(result).toBe(sig({ shapes: ['activityTemplate'] }));
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1c coarse signatures (§7.2)
+// ---------------------------------------------------------------------------
+
+describe('computeStateSpaceSignature — v1c coarse (§7.2)', () => {
+  test('v1c ignores provenance', () => {
+    const withProv = sig({
+      shapes: ['activityTemplate', 'goal'],
+      provenance: [{ shape: 'goal', producedBy: 'activity-api' }],
+      version: '1c',
+    });
+    const noProv = sig({
+      shapes: ['activityTemplate', 'goal'],
+      version: '1c',
+    });
+    expect(withProv).toBe(noProv);
+  });
+
+  test('v1c ignores missing shapes', () => {
+    const withMissing = sig({ shapes: ['codeFile'], missing: ['goal'], version: '1c' });
+    const noMissing  = sig({ shapes: ['codeFile'], version: '1c' });
+    expect(withMissing).toBe(noMissing);
+  });
+
+  test('v1c differs from v1 for same shapes (different hash inputs)', () => {
+    const v1  = sig({ shapes: ['codeFile'], version: '1' });
+    const v1c = sig({ shapes: ['codeFile'], version: '1c' });
+    expect(v1).not.toBe(v1c);
+  });
+
+  test('v1c is deterministic and 16 chars', () => {
+    const a = sig({ shapes: ['a', 'b', 'c'], version: '1c' });
+    const b = sig({ shapes: ['a', 'b', 'c'], version: '1c' });
+    expect(a).toBe(b);
+    expect(a).toHaveLength(16);
+  });
+
+  test('v1c differs for different shape sets', () => {
+    const x = sig({ shapes: ['activityTemplate'], version: '1c' });
+    const y = sig({ shapes: ['activityTemplate', 'goal'], version: '1c' });
+    expect(x).not.toBe(y);
+  });
+});

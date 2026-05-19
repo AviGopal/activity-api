@@ -43,6 +43,7 @@ mock.module('../db/surreal', () => ({
 }));
 
 const { jwtAuthMiddleware } = await import('./jwtAuth');
+const { _resetAuthKeyCache } = await import('./auth-cache');
 
 function appWithMiddleware(): Hono {
   const app = new Hono();
@@ -55,6 +56,9 @@ describe('Phase A: jwtAuthMiddleware passes accountId from identity-vessel', () 
   beforeEach(() => {
     validateApiKeyWithFallbackImpl.mockReset();
     generateJwtTokenImpl.mockReset();
+    // Reset the 30s-TTL apiKey result cache (auth-cache.ts) so each test
+    // sees a cold cache instead of the previous test's mocked result.
+    _resetAuthKeyCache();
   });
 
   test('identity-vessel returns accountId → JwtAuthContext.accountId populated', async () => {

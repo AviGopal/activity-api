@@ -60,6 +60,7 @@ mock.module('../db/surreal', () => ({
 }));
 
 const { jwtAuthMiddleware } = await import('./jwtAuth');
+const { _resetAuthKeyCache } = await import('./auth-cache');
 
 function appWithMiddleware(): Hono {
   const app = new Hono();
@@ -72,6 +73,9 @@ describe('API-key auth fall-through when generateJwtToken returns null', () => {
   beforeEach(() => {
     validateApiKeyWithFallbackImpl.mockReset();
     generateJwtTokenImpl.mockReset();
+    // The 30s-TTL apiKey result cache (auth-cache.ts) would otherwise
+    // return the previous test's result for the same key.
+    _resetAuthKeyCache();
   });
 
   test('happy path: identity-vessel valid + generateJwtToken returns token → full context', async () => {
