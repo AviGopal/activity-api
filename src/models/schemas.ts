@@ -1680,3 +1680,172 @@ export const ActivityFeedbackResponseSchema = z.object({
 
 export type ActivityFeedbackRequest = z.infer<typeof ActivityFeedbackRequestSchema>;
 export type ActivityFeedbackResponse = z.infer<typeof ActivityFeedbackResponseSchema>;
+
+// =============================================================================
+// TEST-AUDIT LOOP SCHEMAS (OpenSpec 2026-05-18-test-audit-loop, Phase A)
+//
+// Four impulse shapes backing the test-audit loop:
+//   - test_registration         — registration block per test
+//   - test_audit_report         — audit outcome per (registration, report)
+//   - sensitivity_evidence      — one row per (test, perturbation, run)
+//   - code_modification_proposal — output of debug-failing-audit
+//
+// Field shapes match design.md §E.2 (registration) and §B.3 (audit report).
+// Audit failure subtypes are NOT a new top-level failure_mode.type — they
+// extend `verifier_negative` via `failed_evidence.audit_subtype` per §F.
+// =============================================================================
+
+export const PerturbationSchema = z.object({
+  id: z.string(),
+  description: z.string(),
+  apply: z.object({
+    input_path: z.string(),
+    transform: z.string(),
+  }),
+  expected_effect: z.enum(['pass→fail', 'fail→pass', 'metric_shift']),
+  expected_delta: z.number().optional(),
+});
+
+export const IALCriterionSchema = z.enum([
+  '#1-goals-succeed',
+  '#2-failed-goals-recover',
+  '#3-vessel-resolvers-only',
+  '#4-improved-activities',
+  '#5-composition-via-features',
+  '#6-reuse-up-improvise-down',
+]);
+
+export const GoalAlignmentEntrySchema = z.object({
+  criterion: IALCriterionSchema,
+  discrimination_claim: z.string(),
+});
+
+export const WitnessTypeSchema = z.enum([
+  'differential_solve',
+  'oracle_label',
+  'validator_consensus',
+]);
+
+// test_report — the OUTPUT of a test run. Consumed as INPUT by audit-test-report
+// per spec §A. Fields mirror the structured shape that
+// validation/scripts/test-forge-goal-completion.ts already emits (the canonical
+// caller; design.md §e of the forge-goal-completion spec). Most fields are
+// optional so grandfathered tests with minimal structured output can still
+// emit a valid report. caveats[] carries the `unregistered` tag added by Phase
+// A.3 auto-tagging; pass/fail aggregation lives in `passed`.
+export const TestReportSchema = z.object({
+  test_id: z.string(),
+  run_id: z.string(),
+  // Optional pointer to the test_registration row this report belongs to. When
+  // absent the audit machinery auto-tags caveats:["unregistered"] per spec R1.
+  test_registration_id: z.string().optional(),
+  registration_id: z.string().optional(),
+  passed: z.boolean(),
+  passes: z.array(z.record(z.unknown())).default([]),
+  witnesses: z.array(z.record(z.unknown())).default([]),
+  failure_mode: z.record(z.unknown()).nullable().optional(),
+  caveats: z.array(z.string()).default([]),
+  duration_ms: z.number().optional(),
+  cost_usd: z.number().optional(),
+  perturbation_row: z.record(z.unknown()).optional(),
+  // FLEXIBLE escape hatch: tests embed test-specific structured data here
+  // rather than expanding the schema for every new test variant.
+  details: z.record(z.unknown()).optional(),
+});
+
+export const TestRegistrationSchema = z.object({
+  id: z.string(),
+  inputs_schema: z.record(z.unknown()).default({}),
+  perturbation_schedule: z.array(PerturbationSchema).default([]),
+  perturbation_cadence: z.enum(['daily', 'weekly', 'monthly']).optional(),
+  goal_alignment: z.array(GoalAlignmentEntrySchema).default([]),
+  discrimination_claim: z.string().optional(),
+  witness_types: z.array(WitnessTypeSchema).default([]),
+  // Spec R5: cap is configurable per registration but must not exceed 4 and
+  // defaults to 2. The schema check enforces the upper bound; the default
+  // is applied at audit dispatch time, not at write time, so an absent value
+  // continues to mean "use the default" rather than locking the row to 2.
+  audit_depth_cap: z.number().int().min(1).max(4).optional(),
+});
+
+export const AuditSubtypeSchema = z.enum([
+  'audit_insensitive',
+  'audit_noisy',
+  'audit_misaligned',
+  'audit_record_incomplete',
+]);
+
+// design.md §A.1: representativeness caveats. `unregistered` is added by the
+// grandfathering path described in §E.3 (and Phase A.3 in tasks.md).
+export const AuditCaveatSchema = z.enum([
+  'single_witness',
+  'missing_sensitivity_history',
+  'unregistered',
+]);
+
+// Per-task validator output — mirrors validator-activity-convention but
+// adds the optional audit_subtype discriminator used by audit-test-report
+// task 4 (review_alignment_claim).
+export const AuditValidationResultSchema = z.object({
+  task_id: z.string(),
+  passed: z.boolean(),
+  confidence: z.number().min(0).max(1).optional(),
+  plausibility_rationale: z.string().optional(),
+  failure_mode: FailureModeSchema.optional(),
+  details: z.record(z.unknown()).optional(),
+});
+
+export const TestAuditReportSchema = z.object({
+  test_registration_id: z.string(),
+  test_report_id: z.string(),
+  passed: z.boolean(),
+  caveats: z.array(AuditCaveatSchema).default([]),
+  validation_results: z.array(AuditValidationResultSchema).default([]),
+  failed_evidence: z
+    .object({
+      audit_subtype: AuditSubtypeSchema,
+      detail: z.string(),
+      trace_ids: z.array(z.string()).default([]),
+    })
+    .optional(),
+  composition_chain: z.array(z.string()).default([]),
+});
+
+export const SensitivityEvidenceSchema = z.object({
+  test_registration_id: z.string(),
+  perturbation_id: z.string(),
+  run_id: z.string(),
+  expected_effect: z.string(),
+  observed_effect: z.string().optional(),
+  expected_delta: z.number().optional(),
+  observed_delta: z.number().optional(),
+  varied_as_predicted: z.boolean(),
+  details: z.record(z.unknown()).optional(),
+});
+
+// design.md §D.3: risk_tier `test_only` (validation/scripts/-confined) is the
+// auto-merge handoff lane; `low|medium|high` flow through the standard
+// verification_confidence gate. classification mirrors §D.2.
+export const CodeModificationProposalSchema = z.object({
+  source_audit_report_id: z.string().optional(),
+  test_registration_id: z.string().optional(),
+  target_file: z.string(),
+  diff: z.string(),
+  risk_tier: z.enum(['test_only', 'low', 'medium', 'high']),
+  risk_assessment: z.enum(['low', 'medium', 'high']).optional(),
+  classification: AuditSubtypeSchema.optional(),
+  rationale: z.string().optional(),
+  supersedes: z.array(z.string()).default([]),
+  verification_confidence: z.number().min(0).max(1).optional(),
+});
+
+export type TestReport = z.infer<typeof TestReportSchema>;
+export type Perturbation = z.infer<typeof PerturbationSchema>;
+export type GoalAlignmentEntry = z.infer<typeof GoalAlignmentEntrySchema>;
+export type TestRegistration = z.infer<typeof TestRegistrationSchema>;
+export type AuditSubtype = z.infer<typeof AuditSubtypeSchema>;
+export type AuditCaveat = z.infer<typeof AuditCaveatSchema>;
+export type AuditValidationResult = z.infer<typeof AuditValidationResultSchema>;
+export type TestAuditReport = z.infer<typeof TestAuditReportSchema>;
+export type SensitivityEvidence = z.infer<typeof SensitivityEvidenceSchema>;
+export type CodeModificationProposal = z.infer<typeof CodeModificationProposalSchema>;

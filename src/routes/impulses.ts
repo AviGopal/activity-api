@@ -3414,6 +3414,580 @@ router.post('/resolve', async (c) => {
         }
       }
 
+      // =============================================================================
+      // Test-audit loop (OpenSpec 2026-05-18-test-audit-loop, Phase A)
+      //
+      // Reads filter by org_id ($token.org_id via PERMISSIONS); writes use the
+      // executeAsAuth root-credentials path so PERMISSIONS apply uniformly
+      // across API-key and JWT contexts (mirrors the goal_verification_label
+      // case above).
+      // =============================================================================
+
+      case 'test_registration': {
+        const trPointer = pointer as typeof pointer & {
+          test_id?: string;
+          limit?: number;
+          offset?: number;
+        };
+        const limit = Math.min(Math.max(trPointer.limit ?? 100, 1), 500);
+        const offset = Math.max(trPointer.offset ?? 0, 0);
+        try {
+          const conditions: string[] = ['org_id = $org_id'];
+          const params: Record<string, unknown> = {
+            org_id: jwtAuthCtx.orgId,
+            limit,
+            offset,
+          };
+          if (trPointer.test_id) {
+            conditions.push('test_id = $test_id');
+            params.test_id = trPointer.test_id;
+          }
+          const sql = `
+            SELECT * FROM test_registration
+            WHERE ${conditions.join(' AND ')}
+            ORDER BY created_at DESC
+            LIMIT $limit START $offset
+          `;
+          const rows = await executeAsAuth<any>(jwtAuthCtx, sql, params);
+          const entries = Array.isArray(rows) ? rows : [];
+          return c.json({
+            success: true,
+            content: JSON.stringify({ total: entries.length, offset, limit, entries }),
+            metadata: {
+              shape: 'test_registration',
+              summary: `${entries.length} test_registration rows${trPointer.test_id ? ` for test ${trPointer.test_id}` : ''}`,
+              rowCount: entries.length,
+            },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          logger.error('test_registration read failed', { error: err?.message });
+          return c.json({ success: false, error: err?.message || 'read failed' } as ImpulseResolveResponse, 500);
+        }
+      }
+
+      case 'test_registration_write': {
+        const authCheck = requireAuthenticated(c);
+        if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
+        const writePointer = pointer as typeof pointer & { registrationData?: unknown };
+        if (!writePointer.registrationData) {
+          return c.json({ success: false, error: 'registrationData required for test_registration_write' } as ImpulseResolveResponse, 400);
+        }
+        try {
+          // Local import to avoid pulling test-only schemas into every route module.
+          const { TestRegistrationSchema } = await import('../models/schemas');
+          const parsed = TestRegistrationSchema.parse(writePointer.registrationData);
+          const jwtAuth = getJwtAuthFromContext(c)!;
+          const created = await executeAsAuth<any>(
+            jwtAuth,
+            `CREATE test_registration CONTENT {
+              org_id: $org_id,
+              test_id: $test_id,
+              inputs_schema: $inputs_schema,
+              perturbation_schedule: $perturbation_schedule,
+              perturbation_cadence: $perturbation_cadence,
+              goal_alignment: $goal_alignment,
+              discrimination_claim: $discrimination_claim,
+              witness_types: $witness_types,
+              audit_depth_cap: $audit_depth_cap,
+              created_at: time::now()
+            }`,
+            {
+              org_id: jwtAuth.orgId,
+              test_id: parsed.id,
+              inputs_schema: parsed.inputs_schema,
+              perturbation_schedule: parsed.perturbation_schedule,
+              perturbation_cadence: parsed.perturbation_cadence ?? null,
+              goal_alignment: parsed.goal_alignment,
+              discrimination_claim: parsed.discrimination_claim ?? null,
+              witness_types: parsed.witness_types,
+              audit_depth_cap: parsed.audit_depth_cap ?? null,
+            },
+          );
+          const row = (created || [])[0];
+          const recordId = row ? String(row.id) : null;
+          return c.json({
+            success: true,
+            content: JSON.stringify({ id: recordId, test_id: parsed.id }),
+            metadata: {
+              shape: 'test_registration_write_result',
+              summary: `test_registration created for ${parsed.id}`,
+            },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          if (err?.name === 'ZodError') {
+            return c.json({ success: false, error: `validation failed: ${err.message}` } as ImpulseResolveResponse, 400);
+          }
+          logger.error('test_registration_write failed', { error: err?.message });
+          return c.json({ success: false, error: err?.message || 'insert failed' } as ImpulseResolveResponse, 500);
+        }
+      }
+
+      case 'test_report': {
+        // Read filter contract: test_id (per-test scan), test_registration_id
+        // (per-registration scan), since (ISO time), limit/offset. Used by
+        // audit-test-report's fetch_test_report task and Phase G harness audit
+        // summary. Body fields are FLEXIBLE in the DB layer so reads return
+        // the structured outcome as-emitted.
+        const trPointer = pointer as typeof pointer & {
+          test_id?: string;
+          test_registration_id?: string;
+          since?: string;
+          limit?: number;
+          offset?: number;
+        };
+        const limit = Math.min(Math.max(trPointer.limit ?? 100, 1), 500);
+        const offset = Math.max(trPointer.offset ?? 0, 0);
+        try {
+          const conditions: string[] = ['org_id = $org_id'];
+          const params: Record<string, unknown> = {
+            org_id: jwtAuthCtx.orgId,
+            limit,
+            offset,
+          };
+          if (trPointer.test_id) {
+            conditions.push('test_id = $test_id');
+            params.test_id = trPointer.test_id;
+          }
+          if (trPointer.test_registration_id) {
+            conditions.push('test_registration_id = $tr_id');
+            params.tr_id = trPointer.test_registration_id;
+          }
+          if (trPointer.since) {
+            conditions.push('created_at >= <datetime>$since');
+            params.since = trPointer.since;
+          }
+          const sql = `
+            SELECT * FROM test_report
+            WHERE ${conditions.join(' AND ')}
+            ORDER BY created_at DESC
+            LIMIT $limit START $offset
+          `;
+          const rows = await executeAsAuth<any>(jwtAuthCtx, sql, params);
+          const entries = Array.isArray(rows) ? rows : [];
+          return c.json({
+            success: true,
+            content: JSON.stringify({ total: entries.length, offset, limit, entries }),
+            metadata: {
+              shape: 'test_report',
+              summary: `${entries.length} test_report rows${trPointer.test_id ? ` for test ${trPointer.test_id}` : ''}`,
+              rowCount: entries.length,
+            },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          logger.error('test_report read failed', { error: err?.message });
+          return c.json({ success: false, error: err?.message || 'read failed' } as ImpulseResolveResponse, 500);
+        }
+      }
+
+      case 'test_report_write': {
+        // Spec R1 auto-tagging: when reportData has neither test_registration_id
+        // nor a registration_id alias, prepend caveats:["unregistered"] (idempotent —
+        // we don't re-add if already present).
+        const authCheck = requireAuthenticated(c);
+        if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
+        // The forge-goal-completion runner sends the body inline (pointer.body),
+        // not via a reportData envelope. Accept either shape; reportData wins.
+        const writePointer = pointer as typeof pointer & { reportData?: unknown; body?: unknown };
+        const rawBody = (writePointer.reportData ?? writePointer.body) as unknown;
+        if (!rawBody) {
+          return c.json({ success: false, error: 'reportData or body required for test_report_write' } as ImpulseResolveResponse, 400);
+        }
+        try {
+          const { TestReportSchema } = await import('../models/schemas');
+          const parsed = TestReportSchema.parse(rawBody);
+          // Auto-tag unregistered: spec R1 says reports without a registration
+          // pointer get caveats:["unregistered"]. Coerce the registration_id
+          // alias (forge-goal-completion writes registration_id, not
+          // test_registration_id) into the canonical field.
+          const registrationId = parsed.test_registration_id ?? parsed.registration_id ?? null;
+          const caveats = new Set<string>(parsed.caveats ?? []);
+          if (!registrationId) caveats.add('unregistered');
+          const jwtAuth = getJwtAuthFromContext(c)!;
+          const created = await executeAsAuth<any>(
+            jwtAuth,
+            `CREATE test_report CONTENT {
+              org_id: $org_id,
+              test_id: $test_id,
+              run_id: $run_id,
+              test_registration_id: $tr_id,
+              passed: $passed,
+              passes: $passes,
+              witnesses: $witnesses,
+              failure_mode: $failure_mode,
+              caveats: $caveats,
+              duration_ms: $duration_ms,
+              cost_usd: $cost_usd,
+              perturbation_row: $perturbation_row,
+              details: $details,
+              created_at: time::now()
+            }`,
+            {
+              org_id: jwtAuth.orgId,
+              test_id: parsed.test_id,
+              run_id: parsed.run_id,
+              tr_id: registrationId,
+              passed: parsed.passed,
+              passes: parsed.passes,
+              witnesses: parsed.witnesses,
+              failure_mode: parsed.failure_mode ?? null,
+              caveats: Array.from(caveats),
+              duration_ms: parsed.duration_ms ?? null,
+              cost_usd: parsed.cost_usd ?? null,
+              perturbation_row: parsed.perturbation_row ?? null,
+              details: parsed.details ?? null,
+            },
+          );
+          const row = (created || [])[0];
+          const recordId = row ? String(row.id) : null;
+          return c.json({
+            success: true,
+            content: JSON.stringify({ id: recordId, test_id: parsed.test_id, caveats: Array.from(caveats) }),
+            metadata: {
+              shape: 'test_report_write_result',
+              summary: `test_report recorded (passed=${parsed.passed}, caveats=${Array.from(caveats).join(',') || 'none'})`,
+            },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          if (err?.name === 'ZodError') {
+            return c.json({ success: false, error: `validation failed: ${err.message}` } as ImpulseResolveResponse, 400);
+          }
+          logger.error('test_report_write failed', { error: err?.message });
+          return c.json({ success: false, error: err?.message || 'insert failed' } as ImpulseResolveResponse, 500);
+        }
+      }
+
+      case 'test_audit_report': {
+        const arPointer = pointer as typeof pointer & {
+          test_registration_id?: string;
+          test_report_id?: string;
+          passed?: boolean;
+          limit?: number;
+          offset?: number;
+        };
+        const limit = Math.min(Math.max(arPointer.limit ?? 100, 1), 500);
+        const offset = Math.max(arPointer.offset ?? 0, 0);
+        try {
+          const conditions: string[] = ['org_id = $org_id'];
+          const params: Record<string, unknown> = {
+            org_id: jwtAuthCtx.orgId,
+            limit,
+            offset,
+          };
+          if (arPointer.test_registration_id) {
+            conditions.push('test_registration_id = $tr_id');
+            params.tr_id = arPointer.test_registration_id;
+          }
+          if (arPointer.test_report_id) {
+            conditions.push('test_report_id = $report_id');
+            params.report_id = arPointer.test_report_id;
+          }
+          if (typeof arPointer.passed === 'boolean') {
+            conditions.push('passed = $passed');
+            params.passed = arPointer.passed;
+          }
+          const sql = `
+            SELECT * FROM test_audit_report
+            WHERE ${conditions.join(' AND ')}
+            ORDER BY created_at DESC
+            LIMIT $limit START $offset
+          `;
+          const rows = await executeAsAuth<any>(jwtAuthCtx, sql, params);
+          const entries = Array.isArray(rows) ? rows : [];
+          return c.json({
+            success: true,
+            content: JSON.stringify({ total: entries.length, offset, limit, entries }),
+            metadata: {
+              shape: 'test_audit_report',
+              summary: `${entries.length} test_audit_report rows`,
+              rowCount: entries.length,
+            },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          logger.error('test_audit_report read failed', { error: err?.message });
+          return c.json({ success: false, error: err?.message || 'read failed' } as ImpulseResolveResponse, 500);
+        }
+      }
+
+      case 'test_audit_report_write': {
+        const authCheck = requireAuthenticated(c);
+        if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
+        const writePointer = pointer as typeof pointer & { reportData?: unknown };
+        if (!writePointer.reportData) {
+          return c.json({ success: false, error: 'reportData required for test_audit_report_write' } as ImpulseResolveResponse, 400);
+        }
+        try {
+          const { TestAuditReportSchema } = await import('../models/schemas');
+          const parsed = TestAuditReportSchema.parse(writePointer.reportData);
+          const jwtAuth = getJwtAuthFromContext(c)!;
+          const created = await executeAsAuth<any>(
+            jwtAuth,
+            `CREATE test_audit_report CONTENT {
+              org_id: $org_id,
+              test_registration_id: $tr_id,
+              test_report_id: $report_id,
+              passed: $passed,
+              caveats: $caveats,
+              validation_results: $validation_results,
+              failed_evidence: $failed_evidence,
+              composition_chain: $composition_chain,
+              created_at: time::now()
+            }`,
+            {
+              org_id: jwtAuth.orgId,
+              tr_id: parsed.test_registration_id,
+              report_id: parsed.test_report_id,
+              passed: parsed.passed,
+              caveats: parsed.caveats,
+              validation_results: parsed.validation_results,
+              failed_evidence: parsed.failed_evidence ?? null,
+              composition_chain: parsed.composition_chain,
+            },
+          );
+          const row = (created || [])[0];
+          const recordId = row ? String(row.id) : null;
+          return c.json({
+            success: true,
+            content: JSON.stringify({ id: recordId, passed: parsed.passed }),
+            metadata: {
+              shape: 'test_audit_report_write_result',
+              summary: `test_audit_report recorded (passed=${parsed.passed})`,
+            },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          if (err?.name === 'ZodError') {
+            return c.json({ success: false, error: `validation failed: ${err.message}` } as ImpulseResolveResponse, 400);
+          }
+          logger.error('test_audit_report_write failed', { error: err?.message });
+          return c.json({ success: false, error: err?.message || 'insert failed' } as ImpulseResolveResponse, 500);
+        }
+      }
+
+      case 'sensitivity_evidence': {
+        // Read filters: test_registration_id (required for meaningful scope),
+        // perturbation_id, since (ISO datetime), limit.
+        // audit-test-report's check_sensitivity_evidence task consults this
+        // shape over a >=7-day, >=3-run window (design.md §B.2 task 3).
+        const sePointer = pointer as typeof pointer & {
+          test_registration_id?: string;
+          perturbation_id?: string;
+          since?: string;
+          limit?: number;
+          offset?: number;
+        };
+        const limit = Math.min(Math.max(sePointer.limit ?? 200, 1), 1000);
+        const offset = Math.max(sePointer.offset ?? 0, 0);
+        try {
+          const conditions: string[] = ['org_id = $org_id'];
+          const params: Record<string, unknown> = {
+            org_id: jwtAuthCtx.orgId,
+            limit,
+            offset,
+          };
+          if (sePointer.test_registration_id) {
+            conditions.push('test_registration_id = $tr_id');
+            params.tr_id = sePointer.test_registration_id;
+          }
+          if (sePointer.perturbation_id) {
+            conditions.push('perturbation_id = $pert_id');
+            params.pert_id = sePointer.perturbation_id;
+          }
+          if (sePointer.since) {
+            conditions.push('created_at >= <datetime>$since');
+            params.since = sePointer.since;
+          }
+          const sql = `
+            SELECT * FROM sensitivity_evidence
+            WHERE ${conditions.join(' AND ')}
+            ORDER BY created_at DESC
+            LIMIT $limit START $offset
+          `;
+          const rows = await executeAsAuth<any>(jwtAuthCtx, sql, params);
+          const entries = Array.isArray(rows) ? rows : [];
+          return c.json({
+            success: true,
+            content: JSON.stringify({ total: entries.length, offset, limit, entries }),
+            metadata: {
+              shape: 'sensitivity_evidence',
+              summary: `${entries.length} sensitivity_evidence rows`,
+              rowCount: entries.length,
+            },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          logger.error('sensitivity_evidence read failed', { error: err?.message });
+          return c.json({ success: false, error: err?.message || 'read failed' } as ImpulseResolveResponse, 500);
+        }
+      }
+
+      case 'sensitivity_evidence_write': {
+        const authCheck = requireAuthenticated(c);
+        if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
+        const writePointer = pointer as typeof pointer & { evidenceData?: unknown };
+        if (!writePointer.evidenceData) {
+          return c.json({ success: false, error: 'evidenceData required for sensitivity_evidence_write' } as ImpulseResolveResponse, 400);
+        }
+        try {
+          const { SensitivityEvidenceSchema } = await import('../models/schemas');
+          const parsed = SensitivityEvidenceSchema.parse(writePointer.evidenceData);
+          const jwtAuth = getJwtAuthFromContext(c)!;
+          const created = await executeAsAuth<any>(
+            jwtAuth,
+            `CREATE sensitivity_evidence CONTENT {
+              org_id: $org_id,
+              test_registration_id: $tr_id,
+              perturbation_id: $pert_id,
+              run_id: $run_id,
+              expected_effect: $expected_effect,
+              observed_effect: $observed_effect,
+              expected_delta: $expected_delta,
+              observed_delta: $observed_delta,
+              varied_as_predicted: $varied,
+              details: $details,
+              created_at: time::now()
+            }`,
+            {
+              org_id: jwtAuth.orgId,
+              tr_id: parsed.test_registration_id,
+              pert_id: parsed.perturbation_id,
+              run_id: parsed.run_id,
+              expected_effect: parsed.expected_effect,
+              observed_effect: parsed.observed_effect ?? null,
+              expected_delta: parsed.expected_delta ?? null,
+              observed_delta: parsed.observed_delta ?? null,
+              varied: parsed.varied_as_predicted,
+              details: parsed.details ?? null,
+            },
+          );
+          const row = (created || [])[0];
+          const recordId = row ? String(row.id) : null;
+          return c.json({
+            success: true,
+            content: JSON.stringify({ id: recordId }),
+            metadata: {
+              shape: 'sensitivity_evidence_write_result',
+              summary: `sensitivity_evidence recorded for perturbation ${parsed.perturbation_id}`,
+            },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          if (err?.name === 'ZodError') {
+            return c.json({ success: false, error: `validation failed: ${err.message}` } as ImpulseResolveResponse, 400);
+          }
+          logger.error('sensitivity_evidence_write failed', { error: err?.message });
+          return c.json({ success: false, error: err?.message || 'insert failed' } as ImpulseResolveResponse, 500);
+        }
+      }
+
+      case 'code_modification_proposal': {
+        const cmPointer = pointer as typeof pointer & {
+          source_audit_report_id?: string;
+          test_registration_id?: string;
+          risk_tier?: string;
+          limit?: number;
+          offset?: number;
+        };
+        const limit = Math.min(Math.max(cmPointer.limit ?? 100, 1), 500);
+        const offset = Math.max(cmPointer.offset ?? 0, 0);
+        try {
+          const conditions: string[] = ['org_id = $org_id'];
+          const params: Record<string, unknown> = {
+            org_id: jwtAuthCtx.orgId,
+            limit,
+            offset,
+          };
+          if (cmPointer.source_audit_report_id) {
+            conditions.push('source_audit_report_id = $src_id');
+            params.src_id = cmPointer.source_audit_report_id;
+          }
+          if (cmPointer.test_registration_id) {
+            conditions.push('test_registration_id = $tr_id');
+            params.tr_id = cmPointer.test_registration_id;
+          }
+          if (cmPointer.risk_tier) {
+            conditions.push('risk_tier = $risk_tier');
+            params.risk_tier = cmPointer.risk_tier;
+          }
+          const sql = `
+            SELECT * FROM code_modification_proposal
+            WHERE ${conditions.join(' AND ')}
+            ORDER BY created_at DESC
+            LIMIT $limit START $offset
+          `;
+          const rows = await executeAsAuth<any>(jwtAuthCtx, sql, params);
+          const entries = Array.isArray(rows) ? rows : [];
+          return c.json({
+            success: true,
+            content: JSON.stringify({ total: entries.length, offset, limit, entries }),
+            metadata: {
+              shape: 'code_modification_proposal',
+              summary: `${entries.length} code_modification_proposal rows`,
+              rowCount: entries.length,
+            },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          logger.error('code_modification_proposal read failed', { error: err?.message });
+          return c.json({ success: false, error: err?.message || 'read failed' } as ImpulseResolveResponse, 500);
+        }
+      }
+
+      case 'code_modification_proposal_write': {
+        const authCheck = requireAuthenticated(c);
+        if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
+        const writePointer = pointer as typeof pointer & { proposalData?: unknown };
+        if (!writePointer.proposalData) {
+          return c.json({ success: false, error: 'proposalData required for code_modification_proposal_write' } as ImpulseResolveResponse, 400);
+        }
+        try {
+          const { CodeModificationProposalSchema } = await import('../models/schemas');
+          const parsed = CodeModificationProposalSchema.parse(writePointer.proposalData);
+          const jwtAuth = getJwtAuthFromContext(c)!;
+          const created = await executeAsAuth<any>(
+            jwtAuth,
+            `CREATE code_modification_proposal CONTENT {
+              org_id: $org_id,
+              source_audit_report_id: $src_id,
+              test_registration_id: $tr_id,
+              target_file: $target_file,
+              diff: $diff,
+              risk_tier: $risk_tier,
+              risk_assessment: $risk_assessment,
+              classification: $classification,
+              rationale: $rationale,
+              supersedes: $supersedes,
+              verification_confidence: $verification_confidence,
+              created_at: time::now()
+            }`,
+            {
+              org_id: jwtAuth.orgId,
+              src_id: parsed.source_audit_report_id ?? null,
+              tr_id: parsed.test_registration_id ?? null,
+              target_file: parsed.target_file,
+              diff: parsed.diff,
+              risk_tier: parsed.risk_tier,
+              risk_assessment: parsed.risk_assessment ?? null,
+              classification: parsed.classification ?? null,
+              rationale: parsed.rationale ?? null,
+              supersedes: parsed.supersedes,
+              verification_confidence: parsed.verification_confidence ?? null,
+            },
+          );
+          const row = (created || [])[0];
+          const recordId = row ? String(row.id) : null;
+          return c.json({
+            success: true,
+            content: JSON.stringify({ id: recordId, risk_tier: parsed.risk_tier }),
+            metadata: {
+              shape: 'code_modification_proposal_write_result',
+              summary: `code_modification_proposal recorded (risk_tier=${parsed.risk_tier})`,
+            },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          if (err?.name === 'ZodError') {
+            return c.json({ success: false, error: `validation failed: ${err.message}` } as ImpulseResolveResponse, 400);
+          }
+          logger.error('code_modification_proposal_write failed', { error: err?.message });
+          return c.json({ success: false, error: err?.message || 'insert failed' } as ImpulseResolveResponse, 500);
+        }
+      }
+
       default: {
         // Unknown shape - delegate to vessel discovery
         // This follows the "Resolvers live WHERE THE DATA IS" principle

@@ -316,6 +316,31 @@ export function loadConfig(): Config {
         'activityTemplate_update',
         'activityTemplate_deprecate',
         'activityExecutionTrace_delete',
+        // Test-audit loop (OpenSpec 2026-05-18-test-audit-loop, Phase A).
+        // Four impulse shapes plus matching `_write` resolvers. Read handlers
+        // do org-scoped queries against the new tables in migration 131;
+        // write handlers persist via executeAsAuth root-credentials path so
+        // SCHEMAFULL PERMISSIONS apply uniformly across API-key and JWT auth.
+        // The accompanying meta-activities (audit-test-report,
+        // run-sensitivity-probe, debug-failing-audit) live in minibob's
+        // embedded-templates and dispatch through the standard
+        // lifecycle:execution:succeeded subscription path.
+        'test_registration',
+        'test_registration_write',
+        // test_report is the OUTPUT of a test run (consumed by audit-test-report
+        // as input). The audit-loop spec §A.1 describes audits OVER test_report
+        // impulses; the validation/scripts/test-forge-goal-completion.ts runner
+        // (and grandfathered tests in Phase F) post to `test_report_write` to
+        // persist their outcomes. Treated as a first-class shape alongside the
+        // four originally enumerated in Phase A.
+        'test_report',
+        'test_report_write',
+        'test_audit_report',
+        'test_audit_report_write',
+        'sensitivity_evidence',
+        'sensitivity_evidence_write',
+        'code_modification_proposal',
+        'code_modification_proposal_write',
       ],
     },
   };
