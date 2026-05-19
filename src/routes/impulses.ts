@@ -3468,27 +3468,31 @@ router.post('/resolve', async (c) => {
       case 'test_registration_write': {
         const authCheck = requireAuthenticated(c);
         if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
-        const writePointer = pointer as typeof pointer & { registrationData?: unknown };
-        if (!writePointer.registrationData) {
-          return c.json({ success: false, error: 'registrationData required for test_registration_write' } as ImpulseResolveResponse, 400);
+        // Mirror test_report_write: accept either `registrationData` envelope
+        // OR inline `body` (forge-goal-completion runner emits via `body`).
+        const writePointer = pointer as typeof pointer & { registrationData?: unknown; body?: unknown };
+        const rawBody = (writePointer.registrationData ?? writePointer.body) as unknown;
+        if (!rawBody) {
+          return c.json({ success: false, error: 'registrationData or body required for test_registration_write' } as ImpulseResolveResponse, 400);
         }
         try {
           // Local import to avoid pulling test-only schemas into every route module.
           const { TestRegistrationSchema } = await import('../models/schemas');
-          const parsed = TestRegistrationSchema.parse(writePointer.registrationData);
+          const parsed = TestRegistrationSchema.parse(rawBody);
           const jwtAuth = getJwtAuthFromContext(c)!;
           const created = await executeAsAuth<any>(
             jwtAuth,
+            // F-V24 / F-49: option<X> rejects JSON null — coerce to NONE.
             `CREATE test_registration CONTENT {
               org_id: $org_id,
               test_id: $test_id,
               inputs_schema: $inputs_schema,
               perturbation_schedule: $perturbation_schedule,
-              perturbation_cadence: $perturbation_cadence,
+              perturbation_cadence: IF $perturbation_cadence IS NULL THEN NONE ELSE $perturbation_cadence END,
               goal_alignment: $goal_alignment,
-              discrimination_claim: $discrimination_claim,
+              discrimination_claim: IF $discrimination_claim IS NULL THEN NONE ELSE $discrimination_claim END,
               witness_types: $witness_types,
-              audit_depth_cap: $audit_depth_cap,
+              audit_depth_cap: IF $audit_depth_cap IS NULL THEN NONE ELSE $audit_depth_cap END,
               created_at: time::now()
             }`,
             {
@@ -3603,22 +3607,26 @@ router.post('/resolve', async (c) => {
           const caveats = new Set<string>(parsed.caveats ?? []);
           if (!registrationId) caveats.add('unregistered');
           const jwtAuth = getJwtAuthFromContext(c)!;
+          // F-V24 / F-49 pattern: SurrealDB `TYPE option<X>` rejects JSON
+          // `null` — option<X> accepts X or NONE only. Coerce null→NONE in
+          // SurrealQL for every option-typed field (tr_id, failure_mode,
+          // duration_ms, cost_usd, perturbation_row, details).
           const created = await executeAsAuth<any>(
             jwtAuth,
             `CREATE test_report CONTENT {
               org_id: $org_id,
               test_id: $test_id,
               run_id: $run_id,
-              test_registration_id: $tr_id,
+              test_registration_id: IF $tr_id IS NULL THEN NONE ELSE $tr_id END,
               passed: $passed,
               passes: $passes,
               witnesses: $witnesses,
-              failure_mode: $failure_mode,
+              failure_mode: IF $failure_mode IS NULL THEN NONE ELSE $failure_mode END,
               caveats: $caveats,
-              duration_ms: $duration_ms,
-              cost_usd: $cost_usd,
-              perturbation_row: $perturbation_row,
-              details: $details,
+              duration_ms: IF $duration_ms IS NULL THEN NONE ELSE $duration_ms END,
+              cost_usd: IF $cost_usd IS NULL THEN NONE ELSE $cost_usd END,
+              perturbation_row: IF $perturbation_row IS NULL THEN NONE ELSE $perturbation_row END,
+              details: IF $details IS NULL THEN NONE ELSE $details END,
               created_at: time::now()
             }`,
             {
