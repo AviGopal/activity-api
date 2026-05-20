@@ -5047,10 +5047,41 @@ app.post('/recommend', async (c) => {
       });
     }
 
+    // Phase G5.1.1: build decision_record for the winning call.
+    // Includes winner + up to K=5 runners-up so callers can record the full
+    // selection context alongside the trace task (G5.1.2).
+    const DECISION_RECORD_K = 5;
+    const decisionCandidates = finalRecommendations
+      .slice(0, DECISION_RECORD_K + 1)
+      .map((rec: any, idx: number) => ({
+        activity_id: rec.template_id,
+        rrf_rank: idx + 1,
+        thompson_alpha: rec.selection_metadata?.alpha ?? null,
+        thompson_beta: rec.selection_metadata?.beta ?? null,
+        thompson_sample: rec.selection_metadata?.sample ?? null,
+        shape_compatible: (rec.input_shapes ?? []).length === 0 ||
+          (rec.input_shapes ?? []).every((s: string) => effectiveShapes.includes(s)),
+        exploration_slot: rec.selection_metadata?.exploration_slot ?? false,
+        score_source: rec.selection_metadata?._posterior_source ?? null,
+      }));
+    const decisionRecord = {
+      candidates: decisionCandidates,
+      selected_activity_id: filteredRecommendations[0]?.template_id ?? null,
+      rationale_tier: filteredRecommendations.length === 0
+        ? 'fallback_improvise'
+        : filteredRecommendations[0]?.selection_metadata?.exploration_slot
+          ? 'exploration'
+          : 'thompson_sample',
+      fallback_tier: fallbackTier ?? null,
+      total_candidates: finalRecommendations.length,
+    };
+
     return c.json({
       recommendations: filteredRecommendations,
       // Include fallback tier to indicate which matching strategy was used
       fallback_tier: fallbackTier,
+      // G5.1.1: decision record for upstream trace persistence (per §F.1)
+      decision_record: decisionRecord,
       // Include missing impulse suggestions if any were found
       ...(missingImpulseSuggestions.length > 0 ? {
         missing_impulses: missingImpulseSuggestions.map(s => ({
