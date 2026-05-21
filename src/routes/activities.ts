@@ -4299,6 +4299,7 @@ app.post('/recommend', async (c) => {
       expected_output_shapes = [],  // Array of expected output shapes from goal enrichment
       limit = 3,
       exclude_activities = [],  // T4: Blacklist of activity IDs to exclude
+      exclude_variant,          // G6.1.1: single variant to exclude (differential-solve)
       session_context,          // Spec 2/3/4: loaded impulse state with timestamps
       exploration_config: rawExplorationConfig,
       impulse_state_space,      // Phase 11: executor's loaded impulse pool (state-space-aware filtering)
@@ -4420,15 +4421,17 @@ app.post('/recommend', async (c) => {
       fallback_tier: fallbackTier,
     });
 
-    // T4: Filter out excluded activities (within-goal blacklisting)
-    if (exclude_activities && exclude_activities.length > 0) {
+    // T4: Filter out excluded activities (within-goal blacklisting) and G6.1.1 differential-solve variant
+    if ((exclude_activities && exclude_activities.length > 0) || exclude_variant) {
       const beforeCount = templates.length;
       const excludeSet = new Set(exclude_activities);
+      if (exclude_variant) excludeSet.add(exclude_variant);
       templates = templates.filter((t: any) => !excludeSet.has(t.id));
       logger.info('Blacklist filtering applied', {
         before: beforeCount,
         after: templates.length,
-        excluded: exclude_activities
+        excluded: exclude_activities,
+        ...(exclude_variant ? { exclude_variant } : {}),
       });
     }
 
