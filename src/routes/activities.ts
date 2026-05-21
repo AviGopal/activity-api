@@ -4422,11 +4422,14 @@ app.post('/recommend', async (c) => {
     });
 
     // T4: Filter out excluded activities (within-goal blacklisting) and G6.1.1 differential-solve variant
+    // normalizeRecordId applied so callers can pass either raw or normalized IDs
     if ((exclude_activities && exclude_activities.length > 0) || exclude_variant) {
       const beforeCount = templates.length;
-      const excludeSet = new Set(exclude_activities);
-      if (exclude_variant) excludeSet.add(exclude_variant);
-      templates = templates.filter((t: any) => !excludeSet.has(t.id));
+      const excludeSet = new Set([
+        ...exclude_activities.map((id: string) => normalizeRecordId(id)),
+        ...(exclude_variant ? [normalizeRecordId(exclude_variant)] : []),
+      ]);
+      templates = templates.filter((t: any) => !excludeSet.has(normalizeRecordId(t.id || t.variant_id)));
       logger.info('Blacklist filtering applied', {
         before: beforeCount,
         after: templates.length,
