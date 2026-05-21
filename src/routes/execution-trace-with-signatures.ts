@@ -406,16 +406,59 @@ async function queryExecutions(
     LIMIT $lim
   `;
 
+  let paradigmRows: RawExecutionRow[] = [];
   try {
     const result = await db.query(sql, params);
     const firstSet = Array.isArray(result) && result.length > 0 ? result[0] : [];
-    return Array.isArray(firstSet) ? (firstSet as RawExecutionRow[]) : [];
+    paradigmRows = Array.isArray(firstSet) ? (firstSet as RawExecutionRow[]) : [];
   } catch (err) {
     logger.warn('[execution-trace-with-signatures] execution query failed', {
       error: err instanceof Error ? err.message : String(err),
     });
-    return [];
   }
+
+  // F-V61: union with activity_execution_traces (legacy table) so that traces
+  // written by TranslatingTraceSink (forge test harness) are visible here too.
+  // The legacy table stores `execution_id` as a separate field and `id` as the
+  // record id; we remap to the same RawExecutionRow shape.
+  const seenIds = new Set(paradigmRows.map((r) => primaryIdString(r.id)));
+  // Build a separate legacy query with the same filters (activity_execution_traces
+  // shares executed_at, success, org_id field names with the paradigm table).
+  const legacySql = `
+    SELECT
+      execution_id AS id,
+      activity_id,
+      success,
+      duration_ms,
+      executed_at,
+      created_at,
+      parent_execution_id,
+      composition_chain,
+      tasks,
+      org_id
+    FROM activity_execution_traces
+    WHERE ${where.join(' AND ')}
+    ORDER BY executed_at DESC
+    LIMIT $lim
+  `;
+  let legacyRows: RawExecutionRow[] = [];
+  try {
+    const legacyResult = await db.query(legacySql, params);
+    const legacySet = Array.isArray(legacyResult) && legacyResult.length > 0 ? legacyResult[0] : [];
+    legacyRows = Array.isArray(legacySet) ? (legacySet as RawExecutionRow[]) : [];
+  } catch (err) {
+    logger.warn('[execution-trace-with-signatures] legacy execution query failed', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  // Merge: legacy rows that don't already appear in paradigm rows
+  const merged = [...paradigmRows];
+  for (const row of legacyRows) {
+    const id = primaryIdString(row.id);
+    if (id && !seenIds.has(id)) merged.push(row);
+  }
+  return merged;
 }
 
 /** Fetch impulse signatures for the given ids. Missing ids produce no row. */
