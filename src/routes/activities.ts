@@ -1204,17 +1204,17 @@ app.post('/templates', async (c) => {
       }
     `;
 
-    const upsertResult = jwtAuth?.jwtToken
-      ? await queryWithAuth(jwtAuth.jwtToken, upsertActivityQuery, upsertParams)
-      : await surrealDB.query(upsertActivityQuery, upsertParams);
+    // Use root path for the UPSERT — same pattern as F-V56 (variant_performance_metrics).
+    // queryWithAuth fails silently (returns []) when the API-key JWT is not accepted by
+    // SurrealDB's ACCESS method, even though the activity table PERMISSIONS use $token.
+    // HTTP-layer auth (validateApiKeyWithFallback) is the gating mechanism; the root DB
+    // write is safe here. (F-V64, 2026-05-21)
+    const upsertResult = await surrealDB.query(upsertActivityQuery, upsertParams);
 
     if (!upsertResult || (Array.isArray(upsertResult) && upsertResult.length === 0)) {
-      // Log a warning but don't fail — test environments mock the UPSERT to return [].
-      // In production, an empty result means PERMISSIONS blocked the write; the caller
-      // will discover the gap via a subsequent GET that returns 404.
-      logger.warn('Activity template UPSERT returned empty — PERMISSIONS may have blocked the write', {
+      // Only warn here — test mocks return [] and that is expected.
+      logger.warn('Activity template UPSERT returned empty', {
         id: activityId,
-        hasJwtToken: !!jwtAuth?.jwtToken,
       });
     }
 
