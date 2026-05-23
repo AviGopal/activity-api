@@ -2745,6 +2745,25 @@ app.post('/', async (c) => {
       forwardToLearning(sessionId, uniqueFiles, traceProjectId);
     }
 
+    // Emit execution_completed so external WS observers (e.g. development-vessel
+    // topology chain) can react without polling. Non-blocking; failure is silent.
+    void import('../websocket/broadcaster').then(({ broadcaster }) => {
+      broadcaster.emit({
+        type: 'execution_completed',
+        timestamp: new Date().toISOString(),
+        data: {
+          execution_id: trace.execution_id,
+          activity_id: trace.variant_id || (body as Record<string, unknown>)['template_id'] as string || (body as Record<string, unknown>)['activity_id'] as string || '',
+          variant_id: trace.variant_id || '',
+          success: trace.success,
+          duration_ms: trace.duration_ms || 0,
+          cost: trace.cost_usd || 0,
+          completed_at: new Date().toISOString(),
+          org_id: traceOrgId || null,
+        },
+      });
+    }).catch(() => { /* non-fatal */ });
+
     return c.json({
       success: true,
       execution_id: trace.execution_id,
