@@ -2295,7 +2295,7 @@ app.post('/executions', async (c) => {
     // (below) writes them with stratified deltas. Keeping both would double-increment.
     const insertQuery = `
       INSERT INTO variant_performance_metrics {
-        id: type::record('variant_performance_metrics', $record_id_slug),
+        id: type::thing('variant_performance_metrics', $record_id_slug),
         variant_id: $variant_id,
         activity_id: $variant_id,
         org_id: $org_id,
@@ -9200,7 +9200,7 @@ app.post('/relevance-feedback', async (c) => {
     const relevanceMetricsRecordSlug = variantMetricsRecordId(normalizedTemplateId, accountId);
     surrealDB.query(`
       INSERT INTO variant_performance_metrics {
-        id: type::record('variant_performance_metrics', $record_id_slug),
+        id: type::thing('variant_performance_metrics', $record_id_slug),
         variant_id: $variant_id,
         activity_id: $variant_id,
         org_id: $org_id,
