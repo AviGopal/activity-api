@@ -895,6 +895,13 @@ router.post('/resolve', async (c) => {
           } as ImpulseResolveResponse, 400);
         }
 
+        // Normalize templateId: callers may pass full record IDs like
+        // "activity:⟨development-vessel:coverage-tick⟩" but record::id(id)
+        // returns only the inner portion "development-vessel:coverage-tick".
+        // Strip the "activity:⟨" prefix and "⟩" suffix if present.
+        const rawTemplateId: string = pointer.templateId;
+        const normalizedTemplateId = rawTemplateId.replace(/^activity:\s*[⟨<]/, '').replace(/[⟩>]\s*$/, '').trim() || rawTemplateId;
+
         // Load template from canonical 'activity' table. Use record::id(id)
         // to extract the string portion of the composite record id (e.g.
         // `activity:\`cleanup-stale-traces-v1\`` -> 'cleanup-stale-traces-v1')
@@ -911,7 +918,7 @@ router.post('/resolve', async (c) => {
         `;
 
         const result = await executeAsAuth<any>(jwtAuthCtx, query, {
-          activity_id: pointer.templateId,
+          activity_id: normalizedTemplateId,
           orgId: jwtAuthCtx.orgId,
           org_id: jwtAuthCtx.orgId,
           account_id: jwtAuthCtx.accountId ?? null,

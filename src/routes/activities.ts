@@ -1623,12 +1623,14 @@ app.get('/templates', async (c) => {
 
       const cachedTemplates = await Promise.all(templatePromises);
 
-      // Filter out null values (cache inconsistencies)
+      // Filter out null values (individual TTL expiry)
       templates = cachedTemplates.filter((t): t is ActivityTemplate => t !== null);
 
-      // If we have cache inconsistencies, fall back to SurrealDB
-      if (templates.length < templateIdsSet.length * 0.8) {
-        logger.warn('Cache inconsistency detected, falling back to SurrealDB', {
+      // Any missing individual entry means at least one template's 3600s TTL
+      // has expired while the SET key persists indefinitely. Fall back to DB so
+      // those templates are not silently dropped from list responses.
+      if (templates.length < templateIdsSet.length) {
+        logger.info('Individual template cache expiry detected, falling back to SurrealDB', {
           expected: templateIdsSet.length,
           actual: templates.length
         });
