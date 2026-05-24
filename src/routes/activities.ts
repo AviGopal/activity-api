@@ -2385,10 +2385,13 @@ app.post('/executions', async (c) => {
       });
     });
 
-    // Step 3: Invalidate Redis cache for this template
+    // Step 3: Invalidate the individual template cache so the next list request
+    // picks up updated metrics. Do NOT remove from CACHE_LIST_KEY — the list set
+    // tracks template existence, not execution state. Removing on every trace
+    // store would cause the set to shrink as templates execute, hiding them from
+    // coverage_tick and other consumers that rely on the list for shape discovery.
     const redis = RedisClient.getInstance();
     await redis.del(`${CACHE_KEY_PREFIX}${activityIdFromRequest}`);
-    await redis.srem(CACHE_LIST_KEY, activityIdFromRequest);
 
     logger.debug('Redis cache invalidated for template', {
       activity_id: activityIdFromRequest,
@@ -4896,13 +4899,34 @@ app.post('/recommend', async (c) => {
     const reserved = exploration_ratio > 0 ? Math.max(1, Math.floor(limit * exploration_ratio)) : 0;
     const explorationPool = recommendations.filter((c: any) => c._total_executions < min_observations_threshold);
     const exploitationPool = recommendations.filter((c: any) => c._total_executions >= min_observations_threshold);
-    explorationPool.sort((a: any, b: any) => b._ucb_score - a._ucb_score);
+    explorationPool.sort((a: any, b: any) => {
+      const ucbDiff = b._ucb_score - a._ucb_score;
+      if (ucbDiff !== 0) return ucbDiff;
+      // Tiebreak by combined heuristic score so expected_output_shapes boosts surface to the top.
+      return (b.selection_metadata?.score ?? 0) - (a.selection_metadata?.score ?? 0);
+    });
     exploitationPool.sort((a: any, b: any) => b._ucb_score - a._ucb_score);
     const headSlots = limit - reserved;
     const head = exploitationPool.slice(0, headSlots);
     const tail = explorationPool.slice(0, reserved);
     const tailFill = exploitationPool.slice(headSlots, headSlots + (reserved - tail.length));
-    const finalRecommendations = [...head, ...tail, ...tailFill].slice(0, limit);
+    // Cold-start backfill: head slots unfilled (no exploited templates yet) → pull next-best from explorationPool
+    const headColdFill = head.length < headSlots
+      ? explorationPool.slice(reserved, reserved + (headSlots - head.length))
+      : [];
+    let finalRecommendations = [...head, ...headColdFill, ...tail, ...tailFill].slice(0, limit);
+
+    // When expected_output_shapes are specified, re-sort the final list by combined
+    // score so shape-boosted templates surface to the top, overriding pool-partition
+    // ordering which places the exploration slot last by construction.
+    if (expected_output_shapes.length > 0) {
+      finalRecommendations.sort((a: any, b: any) => {
+        const bOsCov = b.selection_metadata?.boost_breakdown?.output_shape_coverage ?? 0;
+        const aOsCov = a.selection_metadata?.boost_breakdown?.output_shape_coverage ?? 0;
+        if (bOsCov !== aOsCov) return bOsCov - aOsCov;
+        return (b.selection_metadata?.score ?? 0) - (a.selection_metadata?.score ?? 0);
+      });
+    }
 
     // Patch exploration_slot and clean up internal fields
     const explorationSet = new Set(explorationPool);
