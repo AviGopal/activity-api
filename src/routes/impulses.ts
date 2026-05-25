@@ -1354,7 +1354,13 @@ router.post('/resolve', async (c) => {
         // id post v1.8.0 normalization (see normalizeActivityId in execution-
         // traces.ts); we filter by exact match rather than CONTAINS so the
         // posterior is variant-precise, not parent-aggregate.
-        let query = `
+        //
+        // Scope ordering (Phase 5.2 fix): org/account-scoped rows take
+        // precedence over global baseline rows. Global rows (org_id IS NONE)
+        // are the fallback used only when the activity has no org-specific
+        // execution history. This prevents system-seeded activities from
+        // masking org-level learning.
+        const posteriorSelectClause = `
           SELECT
             count() AS total_executions,
             count(success = true) AS success_count,
@@ -1363,7 +1369,6 @@ router.post('/resolve', async (c) => {
             count(success = false) + 1 AS beta
           FROM execution
           WHERE activity_id = $variant_id
-          AND ${accountIdScopedWhere()}
         `;
         const params: Record<string, unknown> = {
           variant_id: variantId,
@@ -1371,16 +1376,28 @@ router.post('/resolve', async (c) => {
           org_id: jwtAuthCtx.orgId,
           account_id: jwtAuthCtx.accountId ?? null,
         };
+
+        let orgQuery = posteriorSelectClause + ` AND ${accountIdScopedWhere()}`;
+        let globalQuery = posteriorSelectClause + ` AND (org_id IS NONE OR org_id = NONE)`;
         if (typeof shapeSig === 'string' && shapeSig.length > 0) {
-          query += ` AND shape_signature = $shape_signature`;
+          orgQuery += ` AND shape_signature = $shape_signature`;
+          globalQuery += ` AND shape_signature = $shape_signature`;
           params.shape_signature = shapeSig;
         }
         if (typeof contextBucket === 'string' && contextBucket.length > 0) {
-          query += ` AND context_bucket = $context_bucket`;
+          orgQuery += ` AND context_bucket = $context_bucket`;
+          globalQuery += ` AND context_bucket = $context_bucket`;
           params.context_bucket = contextBucket;
         }
 
-        const rows = await executeAsAuth<any>(jwtAuthCtx, query, params);
+        let rows = await executeAsAuth<any>(jwtAuthCtx, orgQuery, params);
+        if ((rows[0]?.total_executions ?? 0) === 0) {
+          // No org-specific execution history — fall back to global baseline rows.
+          const globalRows = await executeAsAuth<any>(jwtAuthCtx, globalQuery, params);
+          if ((globalRows[0]?.total_executions ?? 0) > 0) {
+            rows = globalRows;
+          }
+        }
         const row = rows[0] || {
           total_executions: 0,
           success_count: 0,
