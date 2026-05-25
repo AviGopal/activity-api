@@ -2248,10 +2248,7 @@ app.post('/', async (c) => {
           last_executed_at = time::now()
         WHERE (record::id(id) = $activity_id OR name = $activity_id)
           AND (org_id = $org_id OR org_id = $org_id_alt)
-        RETURN {
-          id,
-          total_executions
-        }
+        RETURN { id: id, total_executions: total_executions }
       `;
 
       // NOTE: We do NOT write Thompson posteriors to the `activity` table.
