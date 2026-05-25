@@ -1234,8 +1234,11 @@ app.post('/templates', async (c) => {
     // Build metrics query with conditional project_id
     // Note: variant_performance_metrics is a legacy table but still used for Thompson Sampling
     // The v_activity_score view reads from this table
-    // UPSERT metrics to handle re-registration of existing templates
-    // Uses deterministic record ID format to ensure idempotent upserts.
+    // UPSERT metrics to handle re-registration of existing templates.
+    // Uses SET with ?? (nullish coalescing) so re-registration preserves
+    // accumulated Thompson posteriors — only fills in defaults for NEW rows.
+    // CONTENT was used here before but overwrote α/β on every bootstrap-seeder
+    // run, resetting learned posteriors (F-069).
     //
     // Phase E: record-id includes the account slug when accountId is present
     // so different accounts in the same org get distinct α/β rows on register.
@@ -1243,45 +1246,43 @@ app.post('/templates', async (c) => {
     const metricsRecordIdSlug = variantMetricsRecordId(activityId, accountId);
     const insertMetricsQuery = metricsProjectId
       ? `
-      UPSERT variant_performance_metrics:\`${metricsRecordIdSlug}\` CONTENT {
-        variant_id: $activity_id,
-        activity_id: $activity_id,
-        org_id: $org_id,
-        account_id: $account_id,
-        account_id_version: 1,
-        project_id: $project_id,
-        total_executions: 0,
-        successful_executions: 0,
-        failed_executions: 0,
-        success_rate: 0.0,
-        avg_duration_ms: 0.0,
-        avg_cost_usd: 0.0,
-        thompson_alpha: 1.0,
-        thompson_beta: 1.0,
-        total_selections: 0,
-        created_at: time::now(),
-        updated_at: time::now()
-      }
+      UPSERT variant_performance_metrics:\`${metricsRecordIdSlug}\` SET
+        variant_id = $activity_id,
+        activity_id = $activity_id,
+        org_id = $org_id,
+        account_id = $account_id,
+        account_id_version = 1,
+        project_id = $project_id,
+        total_executions = total_executions ?? 0,
+        successful_executions = successful_executions ?? 0,
+        failed_executions = failed_executions ?? 0,
+        success_rate = success_rate ?? 0.0,
+        avg_duration_ms = avg_duration_ms ?? 0.0,
+        avg_cost_usd = avg_cost_usd ?? 0.0,
+        thompson_alpha = thompson_alpha ?? 1.0,
+        thompson_beta  = thompson_beta  ?? 1.0,
+        total_selections = total_selections ?? 0,
+        created_at = created_at ?? time::now(),
+        updated_at = time::now()
     `
       : `
-      UPSERT variant_performance_metrics:\`${metricsRecordIdSlug}\` CONTENT {
-        variant_id: $activity_id,
-        activity_id: $activity_id,
-        org_id: $org_id,
-        account_id: $account_id,
-        account_id_version: 1,
-        total_executions: 0,
-        successful_executions: 0,
-        failed_executions: 0,
-        success_rate: 0.0,
-        avg_duration_ms: 0.0,
-        avg_cost_usd: 0.0,
-        thompson_alpha: 1.0,
-        thompson_beta: 1.0,
-        total_selections: 0,
-        created_at: time::now(),
-        updated_at: time::now()
-      }
+      UPSERT variant_performance_metrics:\`${metricsRecordIdSlug}\` SET
+        variant_id = $activity_id,
+        activity_id = $activity_id,
+        org_id = $org_id,
+        account_id = $account_id,
+        account_id_version = 1,
+        total_executions = total_executions ?? 0,
+        successful_executions = successful_executions ?? 0,
+        failed_executions = failed_executions ?? 0,
+        success_rate = success_rate ?? 0.0,
+        avg_duration_ms = avg_duration_ms ?? 0.0,
+        avg_cost_usd = avg_cost_usd ?? 0.0,
+        thompson_alpha = thompson_alpha ?? 1.0,
+        thompson_beta  = thompson_beta  ?? 1.0,
+        total_selections = total_selections ?? 0,
+        created_at = created_at ?? time::now(),
+        updated_at = time::now()
     `;
 
     // Phase B1: only bind account_id when non-null — SurrealDB 3.x option<string>
@@ -5287,23 +5288,22 @@ app.post('/create-goal-seeking', async (c) => {
     // different accounts in the same org keep separate posteriors.
     const metricsRecordId = variantMetricsRecordId(generated.id, accountId);
     const insertMetricsQuery = `
-      UPSERT variant_performance_metrics:\`${metricsRecordId}\` CONTENT {
-        variant_id: $activity_id,
-        activity_id: $activity_id,
-        account_id: $account_id,
-        account_id_version: 1,
-        total_executions: 0,
-        successful_executions: 0,
-        failed_executions: 0,
-        success_rate: 0.0,
-        avg_duration_ms: 0.0,
-        avg_cost_usd: 0.0,
-        thompson_alpha: 1.0,
-        thompson_beta: 1.0,
-        total_selections: 0,
-        created_at: time::now(),
-        updated_at: time::now()
-      }
+      UPSERT variant_performance_metrics:\`${metricsRecordId}\` SET
+        variant_id = $activity_id,
+        activity_id = $activity_id,
+        account_id = $account_id,
+        account_id_version = 1,
+        total_executions = total_executions ?? 0,
+        successful_executions = successful_executions ?? 0,
+        failed_executions = failed_executions ?? 0,
+        success_rate = success_rate ?? 0.0,
+        avg_duration_ms = avg_duration_ms ?? 0.0,
+        avg_cost_usd = avg_cost_usd ?? 0.0,
+        thompson_alpha = thompson_alpha ?? 1.0,
+        thompson_beta  = thompson_beta  ?? 1.0,
+        total_selections = total_selections ?? 0,
+        created_at = created_at ?? time::now(),
+        updated_at = time::now()
     `;
 
     const generatedMetricsAccountId = accountIdRecordRef(accountId);
