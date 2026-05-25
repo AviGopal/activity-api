@@ -609,7 +609,7 @@ app.get('/', async (c) => {
         status, success, error, executed_at, duration_ms, cost_usd,
         parent_execution_id, composition_chain,
         vessel_id, vessel_version,
-        failure_mode, metadata,
+        failure_mode, metadata, tags,
         output_impulse_shapes, input_impulse_shapes,
         array::len(tasks ?? []) AS task_count,
         array::len(impulse_resolutions ?? []) AS impulse_count
@@ -1643,6 +1643,8 @@ app.post('/', async (c) => {
       ...(body.vessel_version ? { vessel_version: body.vessel_version } : {}),
       ...(Array.isArray(body.impulse_resolutions) && body.impulse_resolutions.length > 0
         ? { impulse_resolutions: body.impulse_resolutions } : {}),
+      // Classification tags (e.g. "intent:topology_discovery", "intent:boredom_source").
+      ...(Array.isArray(body.tags) && body.tags.length > 0 ? { tags: body.tags } : {}),
     };
 
     // ========================================================================
@@ -1779,6 +1781,7 @@ app.post('/', async (c) => {
     // Composition tracking (from three-level activity tracing)
     if ((trace as any).parent_execution_id) optionalFields.push('parent_execution_id: $parent_execution_id');
     if ((trace as any).composition_chain) optionalFields.push('composition_chain: $composition_chain');
+    if (Array.isArray((trace as any).tags) && (trace as any).tags.length > 0) optionalFields.push('tags: $tags');
     // Vessel attribution + per-impulse resolver tracking (migration 086)
     if ((trace as any).vessel_id) optionalFields.push('vessel_id: $vessel_id');
     if ((trace as any).resolved_by_vessel_id) optionalFields.push('resolved_by_vessel_id: $resolved_by_vessel_id');

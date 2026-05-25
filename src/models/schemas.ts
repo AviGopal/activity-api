@@ -979,6 +979,9 @@ export const StoreExecutionTraceRequestSchema = z.object({
   // Failure mode taxonomy (sibling spec 2026-04-26-validators-and-failure-modes).
   // Metadata only — Thompson updates uniform; future learners may stratify by type.
   failure_mode: FailureModeSchema.optional(),
+  // Classification tags (e.g. "intent:topology_discovery", "intent:boredom_source").
+  // Written through to the stored trace for filtering and intent attribution.
+  tags: z.array(z.string()).optional(),
   // Phase A: optional account_id (OpenSpec
   // activity-api-account-id-migration-2026-04-28). Phase B handlers populate
   // it from JWT $token.account_id; legacy callers omit and the handler falls
