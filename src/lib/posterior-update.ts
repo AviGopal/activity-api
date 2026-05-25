@@ -431,7 +431,10 @@ export async function applyOutcomeToPosteriors(
 ): Promise<UpdateSummary> {
   const warnings: string[] = [];
 
-  const activityId = trace.activity_variant_id ?? trace.variant_id ?? trace.activity_id;
+  const rawActivityId = trace.activity_variant_id ?? trace.variant_id ?? trace.activity_id;
+  // Strip activity:⟨⟩ wrapper so the WHERE clause matches variant_performance_metrics rows
+  // written by the legacy path (which stores bare ids like "development-vessel:harness-run-matrix").
+  const activityId = normalizeActivityId(rawActivityId);
   const { alphaDelta, betaDelta } = computeDeltas(trace.success, trace.failure_mode, warnings);
   const failureModeType = trace.failure_mode?.type ?? null;
 
