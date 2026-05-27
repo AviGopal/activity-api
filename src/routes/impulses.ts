@@ -1348,6 +1348,12 @@ router.post('/resolve', async (c) => {
 
         const shapeSig = (pointer as any).shape_signature;
         const contextBucket = (pointer as any).context_bucket;
+        // Phase 9.6 (audit inv-029 additive observability): signature_version
+        // explicit pointer field. Defaults to 1 — current signature schema.
+        // When v2 lands the caller can pin the version explicitly.
+        const signatureVersion = typeof (pointer as any).signature_version === 'number'
+          ? (pointer as any).signature_version
+          : 1;
 
         // Reuse the same execution-table aggregate that variantMetricsSummary
         // uses, narrowed to a single variant. activity_id is the variant-level
@@ -1390,12 +1396,18 @@ router.post('/resolve', async (c) => {
           params.context_bucket = contextBucket;
         }
 
+        // Track which scope produced the answer so callers can distinguish
+        // org-specific learning from global baseline (audit inv-029 #4).
+        let resolvedScope: 'org' | 'account' | 'global' = 'global';
         let rows = await executeAsAuth<any>(jwtAuthCtx, orgQuery, params);
-        if ((rows[0]?.total_executions ?? 0) === 0) {
+        if ((rows[0]?.total_executions ?? 0) > 0) {
+          resolvedScope = (jwtAuthCtx.accountId ? 'account' : 'org');
+        } else {
           // No org-specific execution history — fall back to global baseline rows.
           const globalRows = await executeAsAuth<any>(jwtAuthCtx, globalQuery, params);
           if ((globalRows[0]?.total_executions ?? 0) > 0) {
             rows = globalRows;
+            resolvedScope = 'global';
           }
         }
         const row = rows[0] || {
@@ -1405,6 +1417,29 @@ router.post('/resolve', async (c) => {
           alpha: 1,
           beta: 1,
         };
+
+        // Phase 9.6 audit inv-029 #1: distinguish "single signature" from
+        // "aggregated across signatures". When the caller didn't specify
+        // shape_signature, we count distinct signatures contributing to the
+        // aggregate so the caller can tell α=42 under one signature from
+        // α=42 averaged over twelve.
+        let signaturesAggregated = 1;
+        let signatureForResponse: string | null = typeof shapeSig === 'string' ? shapeSig : null;
+        if (!shapeSig) {
+          try {
+            const sigCountQuery = `
+              SELECT count(DISTINCT shape_signature) AS sigs
+              FROM execution
+              WHERE activity_id = $variant_id
+                AND ${resolvedScope === 'global' ? '(org_id IS NONE OR org_id = NONE)' : accountIdScopedWhere()}
+            `;
+            const sigRows = await executeAsAuth<any>(jwtAuthCtx, sigCountQuery, params);
+            signaturesAggregated = sigRows[0]?.sigs ?? 1;
+          } catch {
+            // Best-effort — keep default of 1 if the aggregation query fails.
+          }
+          signatureForResponse = null;
+        }
 
         content = JSON.stringify(
           {
@@ -1421,6 +1456,15 @@ router.post('/resolve', async (c) => {
               sample_count: row.total_executions,
               success_count: row.success_count,
               failure_count: row.failure_count,
+              // Audit inv-029 additive observability fields (Phase 9.6):
+              //   signature: the specific signature filtered (null = aggregate)
+              //   signatures_aggregated: how many distinct signatures rolled up
+              //   signature_version: explicit version (default 1)
+              //   scope: which fallback path returned the data
+              signature: signatureForResponse,
+              signatures_aggregated: signaturesAggregated,
+              signature_version: signatureVersion,
+              scope: resolvedScope,
             },
           },
           null,
