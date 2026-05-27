@@ -3212,6 +3212,213 @@ app.get('/refusals/stats', async (c) => {
   }
 });
 
+/**
+ * POST /v2/activities/templates/auto-promote
+ *
+ * Substrate-autonomous promotion based on REAL empirical α/β accumulated
+ * from execution traces. No operator action required — this is the lift
+ * path (per operator directive 2026-05-27 "the goal is to get lift, not
+ * to insert more arbitrary operator gates").
+ *
+ * Pipeline:
+ *   1. SELECT all proposed=true activity rows
+ *   2. Join with variant_performance_metrics (real thompson_alpha/beta from
+ *      actual executions accumulated while the template sat in exploration)
+ *   3. For each candidate: total_executions >= min_samples AND
+ *      empirical_mean = α/(α+β) >= min_success_rate  → promote (set proposed=false)
+ *   4. Bus emit `template.auto_promoted` per promotion + audit-trail row
+ *
+ * Designed to be called periodically by the substrate itself (boredom-vessel
+ * goal rotation, systemd timer, etc.). The operator never invokes this.
+ */
+app.post('/templates/auto-promote', async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const min_samples = Math.max(1, Math.floor(body.min_samples ?? parseInt(process.env.AUTO_PROMOTE_MIN_SAMPLES ?? '20')));
+    const min_success_rate = Math.max(0, Math.min(1, body.min_success_rate ?? parseFloat(process.env.AUTO_PROMOTE_MIN_SUCCESS_RATE ?? '0.6')));
+    const dry_run = body.dry_run === true;
+
+    logger.info('POST /v2/activities/templates/auto-promote', {
+      min_samples, min_success_rate, dry_run,
+    });
+
+    // Step 1: fetch all proposed templates
+    const proposedRows = (await surrealDB.query<any>(
+      `SELECT meta::id(id) AS template_id, name, input_shapes, output_shapes
+         FROM activity
+        WHERE proposed = true AND (retired = false OR retired IS NONE)`,
+    )) || [];
+    const proposed: any[] = Array.isArray(proposedRows) ? proposedRows : [];
+
+    if (proposed.length === 0) {
+      return c.json({
+        success: true,
+        promoted: [],
+        considered: 0,
+        skipped: [],
+        thresholds: { min_samples, min_success_rate },
+        dry_run,
+      });
+    }
+
+    // Step 2: fetch metrics for those template_ids in one query
+    const ids = proposed.map(p => p.template_id);
+    const metricsRows = (await surrealDB.query<any>(
+      `SELECT activity_variant_id, thompson_alpha, thompson_beta, total_executions, successful_executions
+         FROM variant_performance_metrics
+        WHERE activity_variant_id IN $ids`,
+      { ids },
+    )) || [];
+    const metricsArr: any[] = Array.isArray(metricsRows) ? metricsRows : [];
+    const metricsMap = new Map<string, any>();
+    for (const m of metricsArr) {
+      const tid = String(m.activity_variant_id).replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
+      metricsMap.set(tid, m);
+    }
+
+    const promoted: any[] = [];
+    const skipped: any[] = [];
+
+    for (const p of proposed) {
+      const m = metricsMap.get(p.template_id);
+      const alpha = m?.thompson_alpha ?? 1.0;
+      const beta = m?.thompson_beta ?? 1.0;
+      const total_executions = m?.total_executions ?? 0;
+      // Strip the Beta(1,1) prior: real successes = α-1, real failures = β-1
+      const empirical_samples = Math.max(0, (alpha - 1) + (beta - 1));
+      const empirical_mean = empirical_samples > 0 ? (alpha - 1) / empirical_samples : 0;
+
+      const evidence = {
+        template_id: p.template_id,
+        name: p.name,
+        thompson_alpha: alpha,
+        thompson_beta: beta,
+        total_executions,
+        empirical_samples,
+        empirical_mean,
+      };
+
+      if (empirical_samples < min_samples) {
+        skipped.push({ ...evidence, reason: 'insufficient_empirical_samples' });
+        continue;
+      }
+      if (empirical_mean < min_success_rate) {
+        skipped.push({ ...evidence, reason: 'empirical_mean_below_threshold' });
+        continue;
+      }
+
+      if (dry_run) {
+        promoted.push({ ...evidence, action: 'would_promote', dry_run: true });
+        continue;
+      }
+
+      try {
+        await surrealDB.query(
+          `UPDATE activity:\`${p.template_id}\` SET proposed = false, updated_at = time::now()`,
+        );
+        promoted.push({ ...evidence, action: 'promoted' });
+
+        // Audit trail: bus emit + durable mirror to promote_gate_evaluations
+        // (decision: 'promote', source: 'auto_promoter')
+        void (async () => {
+          try {
+            const { broadcaster } = await import('../websocket/broadcaster');
+            broadcaster.emit({
+              type: 'template.auto_promoted' as any,
+              timestamp: new Date().toISOString(),
+              data: {
+                template_id: p.template_id,
+                source_vessel_id: 'metabob-activity-api',
+                promoter: 'autonomous',
+                evidence,
+                thresholds: { min_samples, min_success_rate },
+              },
+            });
+            broadcaster.emit({
+              type: 'activity_template.promoted' as any,
+              timestamp: new Date().toISOString(),
+              data: {
+                template_id: p.template_id,
+                source_vessel_id: 'metabob-activity-api',
+                promoter: 'autonomous',
+              },
+            });
+          } catch (err) {
+            logger.warn('auto-promote bus emit failed', {
+              template_id: p.template_id,
+              error: (err as Error).message,
+            });
+          }
+        })();
+
+        // Durable mirror — joins the auto-promote stream into the same
+        // promote_gate_evaluations audit table that operator-pulled
+        // /promote uses (iter 21). decision='promote', reason='auto_promote'.
+        void (async () => {
+          try {
+            await surrealDB.query(
+              `CREATE promote_gate_evaluations CONTENT {
+                template_id: $tid,
+                decision: 'promote',
+                reason: 'auto_promote',
+                alpha_hat: $alpha,
+                beta_hat: $beta,
+                projected_mean: $mean,
+                total_samples: $samples,
+                k_neighbors: 0,
+                threshold_mean: $threshold_mean,
+                threshold_samples: $threshold_samples,
+                neighbor_template_ids: [],
+                source_vessel_id: 'metabob-activity-api'
+              }`,
+              {
+                tid: p.template_id,
+                alpha,
+                beta,
+                mean: empirical_mean,
+                samples: Math.floor(empirical_samples),
+                threshold_mean: min_success_rate,
+                threshold_samples: min_samples,
+              },
+            );
+          } catch (err) {
+            logger.warn('auto-promote audit-trail write failed', {
+              template_id: p.template_id,
+              error: (err as Error).message,
+            });
+          }
+        })();
+      } catch (err) {
+        skipped.push({ ...evidence, reason: 'update_failed', error: (err as Error).message });
+      }
+    }
+
+    logger.info('Auto-promote complete', {
+      considered: proposed.length,
+      promoted: promoted.length,
+      skipped: skipped.length,
+      dry_run,
+    });
+
+    return c.json({
+      success: true,
+      promoted,
+      considered: proposed.length,
+      skipped,
+      thresholds: { min_samples, min_success_rate },
+      dry_run,
+    });
+  } catch (err) {
+    logger.error('POST /v2/activities/templates/auto-promote failed', {
+      error: (err as Error).message,
+    });
+    return c.json({
+      success: false,
+      error: (err as Error).message,
+    }, 500);
+  }
+});
+
 app.post('/templates/:templateId/promote', async (c) => {
   try {
     const templateId = c.req.param('templateId');
@@ -5493,18 +5700,14 @@ app.post('/recommend', async (c) => {
         return false;
       }
 
-      // Filter out proposed templates from the Thompson recommend candidate pool.
-      // Proposed templates are stored and queryable but selection-invisible until
-      // operator (or future autonomous promoter) calls POST /templates/:id/promote.
-      // Per audit investigation-028 recommendation A — capability generation safety.
-      if (template.proposed === true) {
-        logger.debug('Filtering out proposed (unpromoted) template', {
-          template_id: templateId,
-          template_name: template.name || template.variant_name,
-        });
-        return false;
-      }
-
+      // Proposed templates are NOT filtered out here. They flow into the
+      // exploration pool only (see exploitationPool partition below). This is
+      // the substrate-autonomous lift path: substrate-authored templates get
+      // selected for real execution under exploration weight, accumulate
+      // empirical α/β, and the autonomous-promote endpoint (no operator action
+      // required) flips proposed=false once empirical evidence clears the
+      // threshold. Per operator directive 2026-05-27 — lift is gate-removal,
+      // not gate-relocation.
       return true;
     });
 
@@ -5687,6 +5890,7 @@ app.post('/recommend', async (c) => {
           output_schema: template.output_schema || null,
           _ucb_score: computed_ucb_score,
           _total_executions: rawTotalExecs,
+          _proposed: template.proposed === true,
           selection_metadata: {
             method: 'thompson_sampling',
             score_source: posteriorSource,
@@ -5704,6 +5908,7 @@ app.post('/recommend', async (c) => {
             score: sample,
             ucb_score: computed_ucb_score,
             exploration_slot: false, // patched after pool partitioning
+            proposed_template: false, // patched after pool partitioning
             // Semantic matching quality
             tag_match_quality: tagMatchQuality,
             heuristic_boost: totalBoost,
@@ -5766,8 +5971,16 @@ app.post('/recommend', async (c) => {
 
     // UCB pool partitioning: split into exploration/exploitation, assemble final list
     const reserved = exploration_ratio > 0 ? Math.max(1, Math.floor(limit * exploration_ratio)) : 0;
-    const explorationPool = recommendations.filter((c: any) => c._total_executions < min_observations_threshold);
-    const exploitationPool = recommendations.filter((c: any) => c._total_executions >= min_observations_threshold);
+    // Proposed templates are exploration-only — they may have any
+    // _total_executions but stay out of the exploitation pool until the
+    // autonomous-promote endpoint flips proposed=false based on real
+    // empirical evidence.
+    const explorationPool = recommendations.filter((c: any) =>
+      c._proposed === true || c._total_executions < min_observations_threshold
+    );
+    const exploitationPool = recommendations.filter((c: any) =>
+      c._proposed !== true && c._total_executions >= min_observations_threshold
+    );
     explorationPool.sort((a: any, b: any) => {
       const ucbDiff = b._ucb_score - a._ucb_score;
       if (ucbDiff !== 0) return ucbDiff;
@@ -5801,8 +6014,14 @@ app.post('/recommend', async (c) => {
     const explorationSet = new Set(explorationPool);
     for (const rec of finalRecommendations) {
       rec.selection_metadata.exploration_slot = explorationSet.has(rec);
+      // Surface the proposed-template marker so traces can identify
+      // exploration selections that landed on substrate-authored templates.
+      // The autonomous-promote endpoint uses real empirical α/β
+      // (variant_performance_metrics) accumulated by these selections.
+      rec.selection_metadata.proposed_template = (rec as any)._proposed === true;
       delete (rec as any)._ucb_score;
       delete (rec as any)._total_executions;
+      delete (rec as any)._proposed;
     }
 
     // Generate correlation IDs for selection-to-execution linkage
