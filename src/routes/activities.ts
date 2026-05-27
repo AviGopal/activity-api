@@ -3120,8 +3120,10 @@ app.post('/templates/:templateId/promote', async (c) => {
       proposed?: boolean;
       name?: string;
       tasks?: Array<{ id?: string; resolver?: string }>;
+      input_shapes?: string[];
+      output_shapes?: string[];
     }>(
-      `SELECT id, proposed, name, tasks FROM activity:\`${cleanId}\` LIMIT 1`,
+      `SELECT id, proposed, name, tasks, input_shapes, output_shapes FROM activity:\`${cleanId}\` LIMIT 1`,
     );
 
     const row = Array.isArray(existing) && existing.length > 0 ? existing[0] : null;
@@ -3305,6 +3307,276 @@ app.post('/templates/:templateId/promote', async (c) => {
           action: "refused",
           templateId: cleanId,
           refusal: refusalData,
+        }, 422);
+      }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Promote-gate evaluation (audit inv-030, opus iter-015)
+    //
+    // After the resolver-existence check passes, project a forward-selection
+    // success rate by averaging the Beta posteriors of the K=5 templates
+    // most similar to this one (Jaccard on inputShapes ∪ outputShapes).
+    // Refuse if the projected mean < 0.6 or total samples < 10 or K=0.
+    //
+    // Composes with iter 14 (hallucinated-resolver refusal) + iter 16
+    // (thompson_posterior observability fields) using the same refusal
+    // event + durable storage infrastructure from iter 8 + iter 13.
+    //
+    // Configurable via env (defaults from inv-030):
+    //   PROMOTE_GATE_K (default 5)
+    //   PROMOTE_GATE_THRESHOLD_MEAN (default 0.6)
+    //   PROMOTE_GATE_THRESHOLD_SAMPLES (default 10)
+    //   PROMOTE_GATE_DISABLED (default false; "true" → bypass gate; for shadow-mode tuning)
+    // ──────────────────────────────────────────────────────────────────────
+    const gateDisabled = (process.env.PROMOTE_GATE_DISABLED ?? "false").toLowerCase() === "true";
+    if (!gateDisabled) {
+      const K = parseInt(process.env.PROMOTE_GATE_K ?? "5", 10);
+      const thresholdMean = parseFloat(process.env.PROMOTE_GATE_THRESHOLD_MEAN ?? "0.6");
+      const thresholdSamples = parseInt(process.env.PROMOTE_GATE_THRESHOLD_SAMPLES ?? "10", 10);
+
+      const probeShapes = new Set<string>([
+        ...(row.input_shapes ?? []),
+        ...(row.output_shapes ?? []),
+      ]);
+
+      let neighbors: Array<{
+        template_id: string;
+        similarity: number;
+        alpha: number;
+        beta: number;
+        sample_count: number;
+      }> = [];
+
+      if (probeShapes.size > 0) {
+        try {
+          // Two queries (SurrealDB doesn't support relational joins with
+          // table aliases at this grammar version):
+          //   (a) activity rows with shapes
+          //   (b) variant_performance_metrics rows with α/β/sample_count
+          // Join in app code by template id. The metrics table is the
+          // canonical source for posteriors per the thompson_posterior
+          // resolver — the activity table's thompson_* fields aren't
+          // updated by trace writes.
+          const [activityRows, metricsRows] = await Promise.all([
+            surrealDB.query<{
+              id: string;
+              input_shapes?: string[];
+              output_shapes?: string[];
+            }>(
+              `SELECT id, input_shapes, output_shapes
+                FROM activity
+                WHERE (proposed = false OR proposed IS NONE)
+                  AND (retired = false OR retired IS NONE)
+                  AND meta::id(id) != $cleanId`,
+              { cleanId },
+            ),
+            surrealDB.query<{
+              activity_id?: string;
+              variant_id?: string;
+              thompson_alpha?: number;
+              thompson_beta?: number;
+              total_executions?: number;
+            }>(
+              `SELECT activity_id, variant_id, thompson_alpha, thompson_beta, total_executions
+                FROM variant_performance_metrics
+                WHERE total_executions > 0`,
+            ),
+          ]);
+
+          // Build lookup: template-id → (α, β, sample_count). Both
+          // activity_id and variant_id keys map to the same row.
+          const metricsById = new Map<string, { alpha: number; beta: number; sample_count: number }>();
+          for (const m of metricsRows ?? []) {
+            const aid = String(m.activity_id ?? "");
+            const vid = String(m.variant_id ?? "");
+            const entry = {
+              alpha: m.thompson_alpha ?? 1,
+              beta: m.thompson_beta ?? 1,
+              sample_count: m.total_executions ?? 0,
+            };
+            if (aid) metricsById.set(aid, entry);
+            if (vid) metricsById.set(vid, entry);
+          }
+
+          const candidates = (activityRows ?? []).map((a) => {
+            const rawId = String(a.id ?? "");
+            const tid = rawId.replace(/^activity:⟨(.+)⟩$/, "$1").replace(/^activity:/, "");
+            const m = metricsById.get(tid) ?? metricsById.get(rawId);
+            return {
+              id: rawId,
+              input_shapes: a.input_shapes,
+              output_shapes: a.output_shapes,
+              thompson_alpha: m?.alpha,
+              thompson_beta: m?.beta,
+              total_executions: m?.sample_count,
+            };
+          });
+
+          // Compute Jaccard similarity, take templates with similarity > 0 and sample_count > 0
+          const scored = (candidates ?? [])
+            .map((c) => {
+              const cShapes = new Set<string>([
+                ...(c.input_shapes ?? []),
+                ...(c.output_shapes ?? []),
+              ]);
+              if (cShapes.size === 0) return null;
+              let intersection = 0;
+              for (const s of probeShapes) if (cShapes.has(s)) intersection++;
+              const union = probeShapes.size + cShapes.size - intersection;
+              const similarity = union > 0 ? intersection / union : 0;
+              if (similarity === 0) return null;
+              const sampleCount = c.total_executions ?? 0;
+              if (sampleCount === 0) return null;
+              const rawId = String(c.id ?? "");
+              const tid = rawId.replace(/^activity:⟨(.+)⟩$/, "$1").replace(/^activity:/, "");
+              return {
+                template_id: tid,
+                similarity,
+                alpha: c.thompson_alpha ?? 1,
+                beta: c.thompson_beta ?? 1,
+                sample_count: sampleCount,
+              };
+            })
+            .filter((x): x is NonNullable<typeof x> => x !== null)
+            .sort((a, b) => b.similarity - a.similarity)
+            .slice(0, K);
+          neighbors = scored;
+        } catch (err) {
+          logger.warn("promote-gate: neighbor query failed; failing closed", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+          neighbors = []; // treat as cold-start (K=0)
+        }
+      }
+
+      // Weighted Beta-Binomial projection with Jeffreys-baseline stripping:
+      //   α̂ = 1 + Σ_i (w_i · (α_i − 1)) / Σ_i w_i
+      //   β̂ = 1 + Σ_i (w_i · (β_i − 1)) / Σ_i w_i
+      // The −1 strips the Beta(1,1) prior so we average EVIDENCE, not double-counted
+      // priors. The leading +1 re-introduces a single Jeffreys baseline.
+      let alphaHat = 1;
+      let betaHat = 1;
+      let totalSamples = 0;
+      let weightSum = 0;
+      let evidenceAlpha = 0;
+      let evidenceBeta = 0;
+      for (const n of neighbors) {
+        weightSum += n.similarity;
+        evidenceAlpha += n.similarity * (n.alpha - 1);
+        evidenceBeta += n.similarity * (n.beta - 1);
+        totalSamples += n.sample_count;
+      }
+      if (weightSum > 0) {
+        alphaHat = 1 + evidenceAlpha / weightSum;
+        betaHat = 1 + evidenceBeta / weightSum;
+      }
+      const projectedMean = alphaHat / (alphaHat + betaHat);
+
+      // Decide
+      let gateDecision: 'promote' | 'refused' = 'promote';
+      let gateReason: string | null = null;
+      if (neighbors.length === 0) {
+        gateDecision = 'refused';
+        gateReason = 'cold_start_no_similar';
+      } else if (totalSamples < thresholdSamples) {
+        gateDecision = 'refused';
+        gateReason = 'insufficient_neighbor_evidence';
+      } else if (projectedMean < thresholdMean) {
+        gateDecision = 'refused';
+        gateReason = 'projected_mean_below_threshold';
+      }
+
+      if (gateDecision === 'refused') {
+        const refusedAtIso = new Date().toISOString();
+        const gateRefusalData = {
+          type: 'promote_gate_below_threshold' as const,
+          template_id: cleanId,
+          reason: gateReason ?? 'unknown',
+          projection: {
+            alpha_hat: Math.round(alphaHat * 1000) / 1000,
+            beta_hat: Math.round(betaHat * 1000) / 1000,
+            mean: Math.round(projectedMean * 1000) / 1000,
+            total_samples: totalSamples,
+            K: neighbors.length,
+          },
+          threshold: { mean: thresholdMean, samples: thresholdSamples },
+          neighbors: neighbors.map((n) => ({
+            template_id: n.template_id,
+            similarity: Math.round(n.similarity * 1000) / 1000,
+            alpha: n.alpha,
+            beta: n.beta,
+            sample_count: n.sample_count,
+          })),
+          notes:
+            'Promote-gate refusal — IAL §27.S.6 push-away. Projected forward-selection mean ' +
+            'falls below threshold under weighted Beta-Binomial projection over K nearest ' +
+            'templates by Jaccard shape similarity. Cold-start (K=0) is also fail-closed.',
+        };
+        logger.info('promote: refused by gate', {
+          templateId: cleanId,
+          reason: gateReason,
+          K: neighbors.length,
+          projectedMean,
+          totalSamples,
+        });
+
+        // Bus emit (existing infrastructure from iter 8)
+        void (async () => {
+          try {
+            const { broadcaster } = await import('../websocket/broadcaster');
+            broadcaster.emit({
+              type: 'intervention.refused' as any,
+              timestamp: refusedAtIso,
+              data: {
+                source_vessel_id: 'metabob-activity-api',
+                refusal_type: gateRefusalData.type,
+                template_id: cleanId,
+                reason: gateRefusalData.reason,
+                projection: gateRefusalData.projection,
+                neighbors: gateRefusalData.neighbors.map(n => n.template_id),
+              },
+            });
+          } catch (err) {
+            logger.warn('promote-gate bus emit failed', {
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        })();
+        // Durable write (existing refusal_events table from iter 13)
+        void (async () => {
+          try {
+            const summary = `template_id=${cleanId} reason=${gateReason} K=${neighbors.length} mean=${Math.round(projectedMean * 1000) / 1000} samples=${totalSamples}`.slice(0, 200);
+            await surrealDB.query(
+              `CREATE refusal_events CONTENT {
+                refusal_type: $refusal_type,
+                source_vessel_id: 'metabob-activity-api',
+                expected_output_shapes: $expected_output_shapes,
+                candidates_examined: $candidates_examined,
+                task_description: $task_description,
+                reason: $reason,
+                refused_at: time::now()
+              }`,
+              {
+                refusal_type: gateRefusalData.type,
+                expected_output_shapes: [...(row.output_shapes ?? [])],
+                candidates_examined: neighbors.length,
+                task_description: summary,
+                reason: gateRefusalData.notes,
+              },
+            );
+          } catch (err) {
+            logger.warn('promote-gate refusal SurrealDB write failed', {
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        })();
+
+        return c.json({
+          success: false,
+          action: 'refused',
+          templateId: cleanId,
+          refusal: gateRefusalData,
         }, 422);
       }
     }
