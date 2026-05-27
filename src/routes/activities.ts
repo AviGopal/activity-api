@@ -3153,19 +3153,33 @@ app.post('/templates/:templateId/promote', async (c) => {
     // The discovery-vessel endpoint returns all currently-advertised shapes
     // across all registered vessels; built-ins are hardcoded because they
     // aren't advertised through discovery.
+    // Per audit F-139 (inv-054): the prior allowlist included CI/deployment
+    // resolvers (helmfile_sync, docker_build_push, scaffold_vessel_skeleton)
+    // that are NOT registered in the single-container substrate's goal-host.
+    // A template referencing these names would pass promotion but fail
+    // execution (resolver_not_registered at engine.ts). The fix narrows the
+    // built-in set to resolvers ACTUALLY registered by goal-host on the
+    // substrate (verified by reading hosts/goal-host.ts:598-655 +
+    // goal-host-vessel/src/index.ts built-in registrations).
+    //
+    // For multi-substrate deployments that DO ship the CI resolvers, those
+    // vessels can advertise them via discovery-vessel and the allowlist
+    // picks them up from /registry/shapes — no source change needed.
     const builtInResolvers = new Set<string>([
       // Engine special token (not a resolver, dispatched by engine.ts directly)
       "compose",
-      // ias-executor-ts resolvers/* registered by goal-host
+      // ias-executor-ts resolvers actually registered in substrate goal-host
       "activity", "iteration", "llm-prompt", "impulse-resolve", "validation",
-      "helmfile_sync", "impulse_pool_selection", "producer_selection",
-      "impulse_preparation", "wire_discovery_registration", "wire_auth_blueprint",
-      "scaffold_vessel_skeleton", "docker_build_push", "learning_signal_writer",
-      "verify_three_invariants",
+      "impulse_pool_selection", "producer_selection", "impulse_preparation",
+      "wire_discovery_registration", "wire_auth_blueprint",
+      "learning_signal_writer", "verify_three_invariants",
       // goal-host wiring (file_read, bash, llm)
       "file_read", "bash", "llm",
       // goal-host-vessel built-ins
       "activity_recommendation", "impulse_cooccurrence",
+      // (Removed per F-139: helmfile_sync, docker_build_push,
+      // scaffold_vessel_skeleton — these are CI/deployment resolvers
+      // not registered in the local substrate's goal-host.)
     ]);
 
     const tasks = row.tasks ?? [];
