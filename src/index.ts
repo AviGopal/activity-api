@@ -25,6 +25,7 @@ import vesselRegistryRoutes from './routes/vessel-registry';
 import connectionsRoutes from './routes/connections';
 import ribosomeRoutes from './routes/ribosome';
 import shapesRoutes from './routes/shapes';
+import eventsRouter from './routes/events';
 import { broadcaster } from './websocket/broadcaster';
 import type { ServerWebSocket } from 'bun';
 import packageJson from '../package.json';
@@ -217,6 +218,11 @@ app.route('/v2/impulses', impulsesRoutes);
 
 // Shape registry routes (POST /v2/shapes, GET /v2/shapes, GET /v2/shapes/:name, etc.)
 app.route('/v2/shapes', shapesRoutes);
+
+// Substrate event bus publish (openspec 2026-05-27-neutral-emitter-lifecycle-bus).
+// POST /v2/events/publish — accepts <source>.<noun>.<verb> typed events from
+// any authenticated vessel; forwards to the WS broadcaster.
+app.route('/v2/events', eventsRouter);
 
 // Boredom queue routes (GET /boredom-tasks, POST /v2/activities/boredom/enqueue, POST /v2/vessels/register)
 app.route('/', boredomRoutes);

@@ -3,8 +3,25 @@
  * Matches dashboard types (activity-dashboard/src/lib/types.ts)
  */
 
+/**
+ * Canonical WS message types maintained by activity-api. The string union covers
+ * substrate-internal event types emitted by activity-api itself (execution_*,
+ * template_*, task.*, tool.call, impulse.resolved).
+ *
+ * Generic `<source>.<noun>.<verb>` event types published via POST /v2/events/publish
+ * by other vessels (e.g. lifecycle.task.pre_binding, vessel.registered) ride on the
+ * same broadcaster but are typed as plain string. The regex validation lives at
+ * the publish-route boundary, not in this type.
+ */
+export type SubstrateEventType =
+  | 'execution_started' | 'execution_completed'
+  | 'template_updated' | 'pod_status_changed'
+  | 'ci_result' | 'feedback_recorded' | 'variant_created' | 'template_retired'
+  | 'task.started' | 'task.completed' | 'tool.call' | 'impulse.resolved'
+  | string; // open-ended for bus-published events
+
 export interface WebSocketMessage {
-  type: 'execution_started' | 'execution_completed' | 'template_updated' | 'pod_status_changed' | 'ci_result' | 'feedback_recorded' | 'variant_created' | 'template_retired' | 'task.started' | 'task.completed' | 'tool.call' | 'impulse.resolved';
+  type: SubstrateEventType;
   timestamp?: string;
   sequence?: number;  // Event sequence number for catchup protocol
   data: any;
