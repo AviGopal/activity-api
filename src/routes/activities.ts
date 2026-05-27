@@ -3115,8 +3115,13 @@ app.post('/templates/:templateId/promote', async (c) => {
     // Read first so we can return 404 cleanly. Use root because PERMISSIONS
     // on the activity table require $token, and the promote endpoint runs
     // under the standard API-key middleware (validateApiKeyWithFallback).
-    const existing = await surrealDB.query<{ id: string; proposed?: boolean; name?: string }>(
-      `SELECT id, proposed, name FROM activity:\`${cleanId}\` LIMIT 1`,
+    const existing = await surrealDB.query<{
+      id: string;
+      proposed?: boolean;
+      name?: string;
+      tasks?: Array<{ id?: string; resolver?: string }>;
+    }>(
+      `SELECT id, proposed, name, tasks FROM activity:\`${cleanId}\` LIMIT 1`,
     );
 
     const row = Array.isArray(existing) && existing.length > 0 ? existing[0] : null;
@@ -3136,6 +3141,158 @@ app.post('/templates/:templateId/promote', async (c) => {
         proposed: false,
         action: 'already_promoted',
       });
+    }
+
+    // Pre-promote validation: refuse to promote templates that reference
+    // unregistered resolvers (audit F-134, inv-053 — proposal non-executability
+    // with hallucinated resolver names). This is a §27.S.6 push-away point —
+    // the substrate refuses an operator intervention with cited evidence
+    // rather than silently registering a non-executable template.
+    //
+    // Allowlist = discovery-vessel advertised shapes ∪ ias-executor-ts built-ins.
+    // The discovery-vessel endpoint returns all currently-advertised shapes
+    // across all registered vessels; built-ins are hardcoded because they
+    // aren't advertised through discovery.
+    const builtInResolvers = new Set<string>([
+      // Engine special token (not a resolver, dispatched by engine.ts directly)
+      "compose",
+      // ias-executor-ts resolvers/* registered by goal-host
+      "activity", "iteration", "llm-prompt", "impulse-resolve", "validation",
+      "helmfile_sync", "impulse_pool_selection", "producer_selection",
+      "impulse_preparation", "wire_discovery_registration", "wire_auth_blueprint",
+      "scaffold_vessel_skeleton", "docker_build_push", "learning_signal_writer",
+      "verify_three_invariants",
+      // goal-host wiring (file_read, bash, llm)
+      "file_read", "bash", "llm",
+      // goal-host-vessel built-ins
+      "activity_recommendation", "impulse_cooccurrence",
+    ]);
+
+    const tasks = row.tasks ?? [];
+    const taskResolvers = tasks
+      .map((t) => (typeof t?.resolver === "string" ? t.resolver : ""))
+      .filter((r) => r.length > 0);
+
+    if (taskResolvers.length > 0) {
+      // Fetch discovery-vessel registry shapes (the authoritative list of
+      // resolvers advertised by any registered vessel).
+      let discoveryShapes: Set<string> = new Set();
+      try {
+        const discoveryEndpoint = process.env.DISCOVERY_VESSEL_ENDPOINT ?? "http://127.0.0.1:8100";
+        const discResp = await fetch(`${discoveryEndpoint}/registry/shapes`, {
+          headers: { Authorization: `ApiKey ${process.env.METABOB_API_KEY ?? ""}` },
+          signal: AbortSignal.timeout(2000),
+        });
+        if (discResp.ok) {
+          const discData = await discResp.json() as { shapes?: string[] };
+          discoveryShapes = new Set(discData.shapes ?? []);
+        }
+      } catch (err) {
+        logger.warn("promote: discovery fetch failed; using built-ins only", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+
+      // Strip vessel-prefixed forms ("development-vessel:foo" → "foo") since
+      // dev-vessel proxy resolvers register both qualified and unqualified ids.
+      const normalize = (r: string): string => r.includes(":") ? r.split(":").slice(-1)[0]! : r;
+      const unregistered: Array<{ task_id: string; resolver: string }> = [];
+      for (const t of tasks) {
+        const r = typeof t?.resolver === "string" ? t.resolver : "";
+        if (!r) continue;
+        const bare = normalize(r);
+        if (builtInResolvers.has(r) || builtInResolvers.has(bare)) continue;
+        if (discoveryShapes.has(r) || discoveryShapes.has(bare)) continue;
+        unregistered.push({ task_id: t.id ?? "?", resolver: r });
+      }
+
+      if (unregistered.length > 0) {
+        const refusalData = {
+          type: "hallucinated_resolvers_in_template" as const,
+          template_id: cleanId,
+          unregistered_resolvers: unregistered,
+          discovery_shapes_examined: discoveryShapes.size,
+          builtins_examined: builtInResolvers.size,
+          reason:
+            `Template '${cleanId}' references ${unregistered.length} resolver(s) not present in ` +
+            `the discovery-vessel registry (${discoveryShapes.size} advertised shapes) nor in the ` +
+            `ias-executor-ts built-in set. Promoting would land a non-executable template in ` +
+            `Thompson selection. Push-away refusal per IAL §27.S.6.`,
+          suggestion:
+            `Replace the unregistered resolvers with registered equivalents, OR register a ` +
+            `vessel that advertises these shapes, then retry promotion. ` +
+            `See /v2/activities/templates/${cleanId} for the full template.`,
+        };
+        logger.info("promote: refused — hallucinated resolvers", {
+          templateId: cleanId,
+          unregistered_count: unregistered.length,
+          unregistered: unregistered.slice(0, 5),
+        });
+
+        // Bus emit + durable write (same pattern as the recommend-refusal path)
+        const refusedAtIso = new Date().toISOString();
+        void (async () => {
+          try {
+            const { broadcaster } = await import("../websocket/broadcaster");
+            broadcaster.emit({
+              type: "intervention.refused" as any,
+              timestamp: refusedAtIso,
+              data: {
+                source_vessel_id: "metabob-activity-api",
+                refusal_type: refusalData.type,
+                template_id: cleanId,
+                unregistered_resolvers: refusalData.unregistered_resolvers,
+                reason: refusalData.reason,
+                suggestion: refusalData.suggestion,
+              },
+            });
+          } catch (err) {
+            logger.warn("promote refusal bus emit failed", {
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        })();
+        void (async () => {
+          try {
+            // For the durable record we reuse refusal_events. We don't have
+            // expected_output_shapes here — instead we attribute the refusal
+            // to the template_id field and surface the unregistered resolver
+            // list in the task_description summary so auditors can reconstruct.
+            const summary = `template_id=${cleanId} unregistered=${unregistered.map(u => u.resolver).join(",")}`.slice(0, 200);
+            await surrealDB.query(
+              `CREATE refusal_events CONTENT {
+                refusal_type: $refusal_type,
+                source_vessel_id: 'metabob-activity-api',
+                expected_output_shapes: $expected_output_shapes,
+                candidates_examined: $candidates_examined,
+                task_description: $task_description,
+                reason: $reason,
+                suggestion: $suggestion,
+                refused_at: time::now()
+              }`,
+              {
+                refusal_type: refusalData.type,
+                expected_output_shapes: [], // not shape-related; field required by schema
+                candidates_examined: discoveryShapes.size + builtInResolvers.size,
+                task_description: summary,
+                reason: refusalData.reason,
+                suggestion: refusalData.suggestion,
+              },
+            );
+          } catch (err) {
+            logger.warn("promote refusal SurrealDB write failed", {
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        })();
+
+        return c.json({
+          success: false,
+          action: "refused",
+          templateId: cleanId,
+          refusal: refusalData,
+        }, 422);
+      }
     }
 
     await surrealDB.query(
