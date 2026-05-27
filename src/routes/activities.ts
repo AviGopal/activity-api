@@ -3487,6 +3487,54 @@ app.post('/templates/:templateId/promote', async (c) => {
         gateReason = 'projected_mean_below_threshold';
       }
 
+      // Emit `promote_gate.evaluated` on EVERY promote attempt (allow AND
+      // refuse paths). This is the audit-trail data inv-030 §7 calls for
+      // and enables the §calibration experiment without needing a separate
+      // shadow-mode run: subscribers (auditors, future analyzers) can
+      // accumulate gate decisions and post-hoc-join against
+      // variant_performance_metrics to compute the calibration table
+      // (gate-said vs subsequent-success-rate). Fire-and-forget.
+      const gateEvaluatedAtIso = new Date().toISOString();
+      const gateEvaluation = {
+        decision: gateDecision,
+        reason: gateReason,
+        template_id: cleanId,
+        template_input_shapes: row.input_shapes ?? [],
+        template_output_shapes: row.output_shapes ?? [],
+        projection: {
+          alpha_hat: Math.round(alphaHat * 1000) / 1000,
+          beta_hat: Math.round(betaHat * 1000) / 1000,
+          mean: Math.round(projectedMean * 1000) / 1000,
+          total_samples: totalSamples,
+          K: neighbors.length,
+        },
+        threshold: { mean: thresholdMean, samples: thresholdSamples },
+        neighbors: neighbors.map((n) => ({
+          template_id: n.template_id,
+          similarity: Math.round(n.similarity * 1000) / 1000,
+          alpha: n.alpha,
+          beta: n.beta,
+          sample_count: n.sample_count,
+        })),
+      };
+      void (async () => {
+        try {
+          const { broadcaster } = await import('../websocket/broadcaster');
+          broadcaster.emit({
+            type: 'promote_gate.evaluated' as any,
+            timestamp: gateEvaluatedAtIso,
+            data: {
+              source_vessel_id: 'metabob-activity-api',
+              ...gateEvaluation,
+            },
+          });
+        } catch (err) {
+          logger.warn('promote-gate evaluation bus emit failed', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      })();
+
       if (gateDecision === 'refused') {
         const refusedAtIso = new Date().toISOString();
         const gateRefusalData = {
