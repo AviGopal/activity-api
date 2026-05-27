@@ -3474,13 +3474,20 @@ app.post('/templates/:templateId/promote', async (c) => {
           // canonical source for posteriors per the thompson_posterior
           // resolver — the activity table's thompson_* fields aren't
           // updated by trace writes.
+          // F-143 fix: use meta::id() to project a guaranteed bare-string
+          // id, so candidate-template lookup against variant_performance_metrics
+          // (whose activity_id/variant_id are already bare strings like
+          // "development-vessel:coverage-tick") joins correctly. The prior
+          // `String(a.id)` form returned a RecordId object stringification
+          // that didn't match the bare-name keys, leading to K=0 always
+          // (investigation-057 §F-143).
           const [activityRows, metricsRows] = await Promise.all([
             surrealDB.query<{
-              id: string;
+              tid: string;
               input_shapes?: string[];
               output_shapes?: string[];
             }>(
-              `SELECT id, input_shapes, output_shapes
+              `SELECT meta::id(id) AS tid, input_shapes, output_shapes
                 FROM activity
                 WHERE (proposed = false OR proposed IS NONE)
                   AND (retired = false OR retired IS NONE)
@@ -3516,11 +3523,10 @@ app.post('/templates/:templateId/promote', async (c) => {
           }
 
           const candidates = (activityRows ?? []).map((a) => {
-            const rawId = String(a.id ?? "");
-            const tid = rawId.replace(/^activity:⟨(.+)⟩$/, "$1").replace(/^activity:/, "");
-            const m = metricsById.get(tid) ?? metricsById.get(rawId);
+            const tid = String(a.tid ?? "");
+            const m = metricsById.get(tid);
             return {
-              id: rawId,
+              id: tid,
               input_shapes: a.input_shapes,
               output_shapes: a.output_shapes,
               thompson_alpha: m?.alpha,
@@ -3544,10 +3550,8 @@ app.post('/templates/:templateId/promote', async (c) => {
               if (similarity === 0) return null;
               const sampleCount = c.total_executions ?? 0;
               if (sampleCount === 0) return null;
-              const rawId = String(c.id ?? "");
-              const tid = rawId.replace(/^activity:⟨(.+)⟩$/, "$1").replace(/^activity:/, "");
               return {
-                template_id: tid,
+                template_id: String(c.id ?? ""),
                 similarity,
                 alpha: c.thompson_alpha ?? 1,
                 beta: c.thompson_beta ?? 1,
