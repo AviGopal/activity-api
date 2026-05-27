@@ -1016,6 +1016,11 @@ app.post('/templates', async (c) => {
       scope: validated.scope || 'org',
       // Public templates are discoverable by all orgs (ribosome-generated templates)
       public: validated.public ?? false,
+      // Proposed: stored, queryable, observable — but excluded from Thompson recommend
+      // candidate pool. Substrate-authored writes (ribosome, make-activity) flip this on
+      // to land templates safely in the registry without affecting selection. An operator
+      // (or future autonomous promoter) flips it off via POST /templates/:id/promote.
+      proposed: validated.proposed ?? false,
     };
 
     // Add org_id only if provided (optional field, let schema handle default)
@@ -2983,6 +2988,97 @@ app.get('/metrics', async (c) => {
  *   executions_by_day: Array<{date: string, count: number, success_count: number}>
  * }
  */
+/**
+ * POST /templates/:templateId/promote
+ *
+ * Flip a proposed template's `proposed` flag from true to false, making it
+ * eligible for Thompson recommendation selection. Counterpart to writes
+ * that set `proposed: true` (audit investigation-028 recommendation A —
+ * capability generation safety).
+ *
+ * Idempotent: calling promote on an already-promoted template returns the
+ * existing record. Returns 404 if the template doesn't exist.
+ */
+app.post('/templates/:templateId/promote', async (c) => {
+  try {
+    const templateId = c.req.param('templateId');
+    if (!templateId || templateId.trim() === '') {
+      return c.json({ error: 'templateId is required' }, 400);
+    }
+
+    // Strip activity: prefix + angle-bracket / backtick wrapping so we always
+    // target the canonical bare-name record (same normalisation as the
+    // POST /templates UPSERT).
+    const cleanId = templateId.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '').trim();
+
+    logger.info('POST /v2/activities/templates/:templateId/promote', {
+      templateId: cleanId,
+    });
+
+    // Read first so we can return 404 cleanly. Use root because PERMISSIONS
+    // on the activity table require $token, and the promote endpoint runs
+    // under the standard API-key middleware (validateApiKeyWithFallback).
+    const existing = await surrealDB.query<{ id: string; proposed?: boolean; name?: string }>(
+      `SELECT id, proposed, name FROM activity:\`${cleanId}\` LIMIT 1`,
+    );
+
+    const row = Array.isArray(existing) && existing.length > 0 ? existing[0] : null;
+    if (!row) {
+      return c.json({
+        success: false,
+        error: 'template not found',
+        templateId: cleanId,
+      }, 404);
+    }
+
+    if (row.proposed !== true) {
+      // Already promoted (or never proposed). Idempotent return.
+      return c.json({
+        success: true,
+        templateId: cleanId,
+        proposed: false,
+        action: 'already_promoted',
+      });
+    }
+
+    await surrealDB.query(
+      `UPDATE activity:\`${cleanId}\` SET proposed = false, updated_at = time::now()`,
+    );
+
+    logger.info('Template promoted', { templateId: cleanId, name: row.name });
+
+    // Bus emit (best-effort; ride the substrate event bus per
+    // openspec/changes/2026-05-27-neutral-emitter-lifecycle-bus).
+    void (async () => {
+      try {
+        const { broadcaster } = await import('../websocket/broadcaster');
+        broadcaster.emit({
+          type: 'activity_template.promoted' as any,
+          timestamp: new Date().toISOString(),
+          data: { template_id: cleanId, source_vessel_id: 'metabob-activity-api' },
+        });
+      } catch (err) {
+        logger.warn('promote bus emit failed', { error: (err as Error).message });
+      }
+    })();
+
+    return c.json({
+      success: true,
+      templateId: cleanId,
+      proposed: false,
+      action: 'promoted',
+    });
+  } catch (err) {
+    logger.error('POST /templates/:templateId/promote failed', {
+      error: (err as Error).message,
+    });
+    return c.json({
+      success: false,
+      error: (err as Error).message,
+    }, 500);
+  }
+});
+
 app.get('/templates/:templateId/metrics', async (c) => {
   try {
     const templateId = c.req.param('templateId');
@@ -4635,6 +4731,18 @@ app.post('/recommend', async (c) => {
           template_id: templateId,
           template_name: template.name || template.variant_name,
           retired_reason: template.retired_reason,
+        });
+        return false;
+      }
+
+      // Filter out proposed templates from the Thompson recommend candidate pool.
+      // Proposed templates are stored and queryable but selection-invisible until
+      // operator (or future autonomous promoter) calls POST /templates/:id/promote.
+      // Per audit investigation-028 recommendation A — capability generation safety.
+      if (template.proposed === true) {
+        logger.debug('Filtering out proposed (unpromoted) template', {
+          template_id: templateId,
+          template_name: template.name || template.variant_name,
         });
         return false;
       }

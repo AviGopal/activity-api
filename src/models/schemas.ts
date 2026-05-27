@@ -204,6 +204,12 @@ export const CreateTemplateRequestSchema = z.object({
   scope: z.enum(['global', 'org', 'project']).default('global'),
   // Public templates are discoverable by all orgs (ribosome-generated templates)
   public: z.boolean().default(false),
+  // Proposed templates are STORED in the registry but EXCLUDED from Thompson recommendation
+  // candidate pools (per audit investigation-028 recommendation A — capability generation
+  // safety). Substrate-authored writes (ribosome, make-activity) set proposed=true so the
+  // template is observable but selection-invisible until an operator (or future autonomous
+  // promoter) calls POST /v2/activities/templates/:id/promote to flip it to false.
+  proposed: z.boolean().default(false),
   org_id: z.string().nullable().optional(),
   // Phase A: optional account_id; populated by Phase B handlers from JWT $token.account_id.
   account_id: z.string().nullable().optional(),
