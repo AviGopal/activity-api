@@ -2999,6 +2999,103 @@ app.get('/metrics', async (c) => {
  * Idempotent: calling promote on an already-promoted template returns the
  * existing record. Returns 404 if the template doesn't exist.
  */
+/**
+ * GET /v2/activities/refusals/stats
+ *
+ * Sustained-window refusal aggregation for IAL §27.S.6 push-away
+ * measurement. Per audit F-129 (inv-053): the bus emit is hot/ephemeral;
+ * this endpoint reads the durable refusal_events table (migration 140) and
+ * returns aggregate counts auditors can run post-hoc.
+ *
+ * Query params:
+ *   - window_seconds (default 86400 = 24h) — lookback from now
+ *   - org_id (optional) — filter to a single org; default scopes to JWT org
+ *
+ * Response:
+ *   {
+ *     window_seconds,
+ *     since,
+ *     until,
+ *     total: number,
+ *     by_type: { [refusal_type]: count, ... },
+ *     by_shape: { [shape]: count, ... },
+ *     top_recent: [up to 10 most recent refusals],
+ *   }
+ */
+app.get('/refusals/stats', async (c) => {
+  try {
+    const url = new URL(c.req.url);
+    const windowSeconds = parseInt(url.searchParams.get('window_seconds') ?? '86400', 10);
+    const safeWindow = Number.isFinite(windowSeconds) && windowSeconds > 0 ? windowSeconds : 86400;
+    const since = new Date(Date.now() - safeWindow * 1000).toISOString();
+    const until = new Date().toISOString();
+
+    const jwtAuth = getJwtAuthFromContext(c);
+    const filterOrg = url.searchParams.get('org_id') ?? jwtAuth?.orgId ?? null;
+
+    // Fetch all refusals in the window. We aggregate client-side — cheap
+    // for typical refusal volumes (single-digit per hour even under load).
+    const rows = await surrealDB.query<{
+      refusal_type: string;
+      expected_output_shapes: string[];
+      candidates_examined: number;
+      task_description: string | null;
+      org_id: string | null;
+      refused_at: string;
+    }>(
+      filterOrg
+        ? `SELECT refusal_type, expected_output_shapes, candidates_examined, task_description,
+                  org_id, refused_at
+             FROM refusal_events
+             WHERE refused_at >= $since AND (org_id = $org_id OR org_id IS NONE)
+             ORDER BY refused_at DESC`
+        : `SELECT refusal_type, expected_output_shapes, candidates_examined, task_description,
+                  org_id, refused_at
+             FROM refusal_events
+             WHERE refused_at >= $since
+             ORDER BY refused_at DESC`,
+      { since, org_id: filterOrg },
+    );
+
+    const byType: Record<string, number> = {};
+    const byShape: Record<string, number> = {};
+    for (const r of rows ?? []) {
+      byType[r.refusal_type] = (byType[r.refusal_type] ?? 0) + 1;
+      for (const shape of r.expected_output_shapes ?? []) {
+        byShape[shape] = (byShape[shape] ?? 0) + 1;
+      }
+    }
+
+    const topRecent = (rows ?? []).slice(0, 10).map(r => ({
+      refusal_type: r.refusal_type,
+      expected_output_shapes: r.expected_output_shapes,
+      candidates_examined: r.candidates_examined,
+      task_description: r.task_description,
+      org_id: r.org_id,
+      refused_at: r.refused_at,
+    }));
+
+    return c.json({
+      window_seconds: safeWindow,
+      since,
+      until,
+      filter_org_id: filterOrg,
+      total: rows?.length ?? 0,
+      by_type: byType,
+      by_shape: byShape,
+      top_recent: topRecent,
+    });
+  } catch (err) {
+    logger.error('GET /v2/activities/refusals/stats failed', {
+      error: (err as Error).message,
+    });
+    return c.json({
+      error: 'Failed to query refusal stats',
+      message: (err as Error).message,
+    }, 500);
+  }
+});
+
 app.post('/templates/:templateId/promote', async (c) => {
   try {
     const templateId = c.req.param('templateId');
@@ -5275,25 +5372,30 @@ app.post('/recommend', async (c) => {
         // turns it into an observable closure-property signal — counting
         // refusals over a sustained window is the §27.S.6 push-away measure.
         //
-        // Event type: intervention.refused. 2-segment form matches the bus
-        // taxonomy ([a-z][a-z0-9_]*\.[a-z][a-z0-9_]*). Bus emit failures are
-        // logged but never block; the HTTP response still carries the refusal
-        // JSON for the same-thread caller (goal-host's throw path).
+        // F-129 full closure (audit inv-053): durable SurrealDB write to
+        // refusal_events table runs alongside the bus emit. Bus is hot
+        // (live subscribers), DB is cold (post-hoc queryable). Together
+        // they cover both ephemeral reactivity and sustained-window
+        // measurement.
         const refusalForEmit = refusal;
+        const refusedAtIso = new Date().toISOString();
+        const taskDescForRecord = typeof task_description === 'string'
+          ? task_description.slice(0, 200)
+          : null;
+
+        // Bus emit — ephemeral, hot reactivity signal
         void (async () => {
           try {
             const { broadcaster } = await import('../websocket/broadcaster');
             broadcaster.emit({
               type: 'intervention.refused' as any,
-              timestamp: new Date().toISOString(),
+              timestamp: refusedAtIso,
               data: {
                 source_vessel_id: 'metabob-activity-api',
                 refusal_type: refusalForEmit.type,
                 expected_output_shapes: refusalForEmit.expected_output_shapes,
                 candidates_examined: refusalForEmit.candidates_examined,
-                task_description: typeof task_description === 'string'
-                  ? task_description.slice(0, 200)
-                  : null,
+                task_description: taskDescForRecord,
                 reason: refusalForEmit.reason,
                 suggestion: refusalForEmit.suggestion,
                 org_id: orgId,
@@ -5301,6 +5403,55 @@ app.post('/recommend', async (c) => {
             });
           } catch (err) {
             logger.warn('refusal bus emit failed', {
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        })();
+
+        // Durable write — post-hoc queryable, sustained-window measurement.
+        // SurrealDB's option<string> rejects literal NULL — omit nullable
+        // fields when their value is null rather than sending JSON null.
+        const accountIdForRecord = getJwtAuthFromContext(c)?.accountId ?? null;
+        void (async () => {
+          try {
+            const fields: string[] = [
+              "refusal_type: $refusal_type",
+              "source_vessel_id: 'metabob-activity-api'",
+              "expected_output_shapes: $expected_output_shapes",
+              "candidates_examined: $candidates_examined",
+              "refused_at: time::now()",
+            ];
+            const params: Record<string, unknown> = {
+              refusal_type: refusalForEmit.type,
+              expected_output_shapes: refusalForEmit.expected_output_shapes,
+              candidates_examined: refusalForEmit.candidates_examined,
+            };
+            if (taskDescForRecord !== null) {
+              fields.push("task_description: $task_description");
+              params.task_description = taskDescForRecord;
+            }
+            if (refusalForEmit.reason) {
+              fields.push("reason: $reason");
+              params.reason = refusalForEmit.reason;
+            }
+            if (refusalForEmit.suggestion) {
+              fields.push("suggestion: $suggestion");
+              params.suggestion = refusalForEmit.suggestion;
+            }
+            if (orgId) {
+              fields.push("org_id: $org_id");
+              params.org_id = orgId;
+            }
+            if (accountIdForRecord) {
+              fields.push("account_id: $account_id");
+              params.account_id = accountIdForRecord;
+            }
+            await surrealDB.query(
+              `CREATE refusal_events CONTENT { ${fields.join(", ")} }`,
+              params,
+            );
+          } catch (err) {
+            logger.warn('refusal SurrealDB write failed', {
               error: err instanceof Error ? err.message : String(err),
             });
           }
