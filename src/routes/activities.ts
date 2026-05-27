@@ -3000,6 +3000,122 @@ app.get('/metrics', async (c) => {
  * existing record. Returns 404 if the template doesn't exist.
  */
 /**
+ * GET /v2/activities/promote-gate/stats
+ *
+ * Sustained-window promote-gate evaluation aggregation for inv-030
+ * §calibration. Reads the durable promote_gate_evaluations table
+ * (migration 141), which mirrors every bus-emitted promote_gate.evaluated
+ * event so subscribers don't need to be live during every promote attempt.
+ *
+ * Audit's calibration experiment: join (gate-decision, projection) against
+ * subsequent variant_performance_metrics to compute the over/under
+ * permissive verdict. This endpoint serves the gate-side data; the join
+ * is the caller's responsibility (per template_id).
+ *
+ * Query params:
+ *   - window_seconds (default 86400 = 24h)
+ *   - org_id (optional override; default scopes to JWT)
+ *
+ * Response:
+ *   {
+ *     window_seconds, since, until,
+ *     total: number,
+ *     by_decision: { promote, refused },
+ *     by_reason: { [reason]: count, ... },  // refused breakdown only
+ *     mean_projected_mean: number,           // averaged across rows
+ *     mean_k: number,                        // average neighbor count
+ *     top_recent: [up to 10 most recent evaluations with full projection],
+ *   }
+ */
+app.get('/promote-gate/stats', async (c) => {
+  try {
+    const url = new URL(c.req.url);
+    const windowSeconds = parseInt(url.searchParams.get('window_seconds') ?? '86400', 10);
+    const safeWindow = Number.isFinite(windowSeconds) && windowSeconds > 0 ? windowSeconds : 86400;
+    const since = new Date(Date.now() - safeWindow * 1000).toISOString();
+    const until = new Date().toISOString();
+
+    const jwtAuth = getJwtAuthFromContext(c);
+    const filterOrg = url.searchParams.get('org_id') ?? jwtAuth?.orgId ?? null;
+
+    const rows = await surrealDB.query<{
+      template_id: string;
+      decision: string;
+      reason: string | null;
+      alpha_hat: number;
+      beta_hat: number;
+      projected_mean: number;
+      total_samples: number;
+      k_neighbors: number;
+      org_id: string | null;
+      evaluated_at: string;
+      neighbor_template_ids: string[];
+    }>(
+      filterOrg
+        ? `SELECT template_id, decision, reason, alpha_hat, beta_hat, projected_mean,
+                  total_samples, k_neighbors, org_id, evaluated_at, neighbor_template_ids
+             FROM promote_gate_evaluations
+             WHERE evaluated_at >= $since AND (org_id = $org_id OR org_id IS NONE)
+             ORDER BY evaluated_at DESC`
+        : `SELECT template_id, decision, reason, alpha_hat, beta_hat, projected_mean,
+                  total_samples, k_neighbors, org_id, evaluated_at, neighbor_template_ids
+             FROM promote_gate_evaluations
+             WHERE evaluated_at >= $since
+             ORDER BY evaluated_at DESC`,
+      { since, org_id: filterOrg },
+    );
+
+    const byDecision: { promote: number; refused: number } = { promote: 0, refused: 0 };
+    const byReason: Record<string, number> = {};
+    let meanSum = 0;
+    let kSum = 0;
+    for (const r of rows ?? []) {
+      if (r.decision === 'promote') byDecision.promote++;
+      else byDecision.refused++;
+      if (r.reason) byReason[r.reason] = (byReason[r.reason] ?? 0) + 1;
+      meanSum += r.projected_mean ?? 0;
+      kSum += r.k_neighbors ?? 0;
+    }
+    const n = rows?.length ?? 0;
+    const topRecent = (rows ?? []).slice(0, 10).map(r => ({
+      template_id: r.template_id,
+      decision: r.decision,
+      reason: r.reason,
+      projection: {
+        alpha_hat: r.alpha_hat,
+        beta_hat: r.beta_hat,
+        mean: r.projected_mean,
+        total_samples: r.total_samples,
+        K: r.k_neighbors,
+      },
+      neighbor_template_ids: r.neighbor_template_ids,
+      evaluated_at: r.evaluated_at,
+    }));
+
+    return c.json({
+      window_seconds: safeWindow,
+      since,
+      until,
+      filter_org_id: filterOrg,
+      total: n,
+      by_decision: byDecision,
+      by_reason: byReason,
+      mean_projected_mean: n > 0 ? Math.round((meanSum / n) * 1000) / 1000 : 0,
+      mean_k: n > 0 ? Math.round((kSum / n) * 100) / 100 : 0,
+      top_recent: topRecent,
+    });
+  } catch (err) {
+    logger.error('GET /v2/activities/promote-gate/stats failed', {
+      error: (err as Error).message,
+    });
+    return c.json({
+      error: 'Failed to query promote-gate stats',
+      message: (err as Error).message,
+    }, 500);
+  }
+});
+
+/**
  * GET /v2/activities/refusals/stats
  *
  * Sustained-window refusal aggregation for IAL §27.S.6 push-away
@@ -3530,6 +3646,60 @@ app.post('/templates/:templateId/promote', async (c) => {
           });
         } catch (err) {
           logger.warn('promote-gate evaluation bus emit failed', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      })();
+
+      // Durable mirror (migration 141, audit inv-030 §calibration). Same
+      // hot/cold split as iter 13's refusal_events for intervention.refused:
+      // bus is for live reactivity, table is for sustained-window post-hoc
+      // analysis. Fire-and-forget; nulls are omitted to satisfy SurrealDB's
+      // option<string> "no JSON null" quirk (same approach as refusal_events
+      // write).
+      void (async () => {
+        try {
+          const fields: string[] = [
+            "template_id: $template_id",
+            "decision: $decision",
+            "alpha_hat: $alpha_hat",
+            "beta_hat: $beta_hat",
+            "projected_mean: $projected_mean",
+            "total_samples: $total_samples",
+            "k_neighbors: $k_neighbors",
+            "threshold_mean: $threshold_mean",
+            "threshold_samples: $threshold_samples",
+            "neighbor_template_ids: $neighbor_template_ids",
+            "source_vessel_id: 'metabob-activity-api'",
+            "evaluated_at: time::now()",
+          ];
+          const params: Record<string, unknown> = {
+            template_id: cleanId,
+            decision: gateDecision,
+            alpha_hat: gateEvaluation.projection.alpha_hat,
+            beta_hat: gateEvaluation.projection.beta_hat,
+            projected_mean: gateEvaluation.projection.mean,
+            total_samples: gateEvaluation.projection.total_samples,
+            k_neighbors: gateEvaluation.projection.K,
+            threshold_mean: gateEvaluation.threshold.mean,
+            threshold_samples: gateEvaluation.threshold.samples,
+            neighbor_template_ids: gateEvaluation.neighbors.map((n) => n.template_id),
+          };
+          if (gateReason) {
+            fields.push("reason: $reason");
+            params.reason = gateReason;
+          }
+          const evalOrgId = getJwtAuthFromContext(c)?.orgId ?? null;
+          if (evalOrgId) {
+            fields.push("org_id: $org_id");
+            params.org_id = evalOrgId;
+          }
+          await surrealDB.query(
+            `CREATE promote_gate_evaluations CONTENT { ${fields.join(', ')} }`,
+            params,
+          );
+        } catch (err) {
+          logger.warn('promote-gate evaluation SurrealDB write failed', {
             error: err instanceof Error ? err.message : String(err),
           });
         }
