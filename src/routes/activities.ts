@@ -4439,7 +4439,7 @@ app.post('/recommend', async (c) => {
     );
 
     let templates: any[] = fallbackResult.activities;
-    const fallbackTier = fallbackResult.tier;
+    let fallbackTier: string | null | undefined = fallbackResult.tier;
 
     logger.info('Templates fetched for recommendation', {
       count: templates.length,
@@ -5099,6 +5099,68 @@ app.post('/recommend', async (c) => {
       });
     }
 
+    // Refusal guard (push-away closure, IAL §27.S.6): if the caller specified
+    // expected_output_shapes AND no candidate template's output_shapes intersects
+    // with the request, refuse rather than silently fall back to the highest-α
+    // template. Without this guard, the recommender returns a confidently-wrong
+    // pick from prior-on-everything posterior (validated by operator probe
+    // 2026-05-27 "Disrupt application" — selected probe-reachable-unlearned
+    // for a document-QA goal with shapes the catalogue had no producer for).
+    //
+    // Semantic: a refusal is a structured "no producer" response. The caller
+    // (goal-host, observer, operator tool) is expected to:
+    //   - propagate as a goal failure rather than dispatching, OR
+    //   - emit a human_in_the_loop_required impulse, OR
+    //   - seed the missing templates via create-shape-provider-goal.
+    //
+    // Compatible with existing callers: `recommendations` is set to [] which
+    // triggers the existing "no template id returned" error path in goal-host
+    // (hosts/goal-host.ts:runGoal). Callers that read the `refusal` field get
+    // structured rationale; legacy callers see an empty recommendations array
+    // and an explicit `fallback_tier: "refused"`.
+    let refusal: {
+      type: string;
+      expected_output_shapes: string[];
+      reason: string;
+      candidates_examined: number;
+      suggestion: string;
+    } | null = null;
+
+    if (expected_output_shapes.length > 0) {
+      // Refusal triggers only when NO template IN THE FULL CANDIDATE POOL emits
+      // any of the requested shapes. Checking just finalRecommendations would
+      // wrongly refuse when a real producer exists but didn't make the limit=N
+      // top slice. validTemplates is the full pre-ranking pool.
+      const expectedSet = new Set(expected_output_shapes);
+      const anyProducerInPool = validTemplates.some((t: any) => {
+        const shapes = (t.output_shapes ?? []) as string[];
+        return shapes.some((s) => expectedSet.has(s));
+      });
+      if (!anyProducerInPool) {
+        refusal = {
+          type: 'no_producer_for_expected_shapes',
+          expected_output_shapes,
+          reason:
+            'No template in the full candidate pool emits any of the requested output_shapes. ' +
+            'Selector refused rather than falling back to highest-α prior, which would ' +
+            'produce a confidently-wrong execution (push-away closure, IAL §27.S.6).',
+          candidates_examined: validTemplates.length,
+          suggestion:
+            'Seed a producer template for the requested shapes, or supply a ' +
+            'targetTemplateId to bypass recommendation, or escalate via ' +
+            'create-shape-provider-goal for recursive shape production.',
+        };
+        // Empty the recommendations so existing callers fail rather than dispatch.
+        finalRecommendations = [];
+        filteredRecommendations = [];
+        fallbackTier = 'refused';
+        logger.info('Recommendation refused — no producer for expected shapes', {
+          expected_output_shapes,
+          candidates_examined: refusal.candidates_examined,
+        });
+      }
+    }
+
     // Phase G5.1.1: build decision_record for the winning call.
     // Includes winner + up to K=5 runners-up so callers can record the full
     // selection context alongside the trace task (G5.1.2).
@@ -5119,11 +5181,13 @@ app.post('/recommend', async (c) => {
     const decisionRecord = {
       candidates: decisionCandidates,
       selected_activity_id: filteredRecommendations[0]?.template_id ?? null,
-      rationale_tier: filteredRecommendations.length === 0
-        ? 'fallback_improvise'
-        : filteredRecommendations[0]?.selection_metadata?.exploration_slot
-          ? 'exploration'
-          : 'thompson_sample',
+      rationale_tier: refusal
+        ? 'refused'
+        : filteredRecommendations.length === 0
+          ? 'fallback_improvise'
+          : filteredRecommendations[0]?.selection_metadata?.exploration_slot
+            ? 'exploration'
+            : 'thompson_sample',
       fallback_tier: fallbackTier ?? null,
       total_candidates: finalRecommendations.length,
     };
@@ -5132,6 +5196,9 @@ app.post('/recommend', async (c) => {
       recommendations: filteredRecommendations,
       // Include fallback tier to indicate which matching strategy was used
       fallback_tier: fallbackTier,
+      // Push-away closure: present when selector refused rather than dispatch
+      // a wrong template. See IAL §27.S.6 + operator probe 2026-05-27.
+      ...(refusal ? { refusal } : {}),
       // G5.1.1: decision record for upstream trace persistence (per §F.1)
       decision_record: decisionRecord,
       // Include missing impulse suggestions if any were found
