@@ -5266,6 +5266,45 @@ app.post('/recommend', async (c) => {
           expected_output_shapes,
           candidates_examined: refusal.candidates_examined,
         });
+
+        // Audit-grade emit: publish the refusal as a substrate-bus event so
+        // auditors can count, attribute, and verify refusals over time. Per
+        // audit F-129 (inv-052): IAL §27.S.6 requires active substrate refusal
+        // via auditable events with cited evidence, not just a JSON field on
+        // an HTTP response. This makes the refusal queryable on the bus and
+        // turns it into an observable closure-property signal — counting
+        // refusals over a sustained window is the §27.S.6 push-away measure.
+        //
+        // Event type: intervention.refused. 2-segment form matches the bus
+        // taxonomy ([a-z][a-z0-9_]*\.[a-z][a-z0-9_]*). Bus emit failures are
+        // logged but never block; the HTTP response still carries the refusal
+        // JSON for the same-thread caller (goal-host's throw path).
+        const refusalForEmit = refusal;
+        void (async () => {
+          try {
+            const { broadcaster } = await import('../websocket/broadcaster');
+            broadcaster.emit({
+              type: 'intervention.refused' as any,
+              timestamp: new Date().toISOString(),
+              data: {
+                source_vessel_id: 'metabob-activity-api',
+                refusal_type: refusalForEmit.type,
+                expected_output_shapes: refusalForEmit.expected_output_shapes,
+                candidates_examined: refusalForEmit.candidates_examined,
+                task_description: typeof task_description === 'string'
+                  ? task_description.slice(0, 200)
+                  : null,
+                reason: refusalForEmit.reason,
+                suggestion: refusalForEmit.suggestion,
+                org_id: orgId,
+              },
+            });
+          } catch (err) {
+            logger.warn('refusal bus emit failed', {
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        })();
       }
     }
 
