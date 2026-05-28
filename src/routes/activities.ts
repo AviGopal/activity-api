@@ -3321,8 +3321,11 @@ app.post('/templates/auto-promote', async (c) => {
       }
 
       try {
+        // `activity` is a VIEW over `activity_template`; UPDATE on the view
+        // does not propagate to the underlying table in SurrealDB 3.x. Write
+        // directly to `activity_template` to persist the promotion.
         await surrealDB.query(
-          `UPDATE activity:\`${p.template_id}\` SET proposed = false, updated_at = time::now()`,
+          `UPDATE activity_template:\`${p.template_id}\` SET proposed = false, updated_at = time::now()`,
         );
         promoted.push({ ...evidence, action: 'promoted' });
 
@@ -4018,8 +4021,9 @@ app.post('/templates/:templateId/promote', async (c) => {
       }
     }
 
+    // `activity` is a VIEW — write to underlying table to persist.
     await surrealDB.query(
-      `UPDATE activity:\`${cleanId}\` SET proposed = false, updated_at = time::now()`,
+      `UPDATE activity_template:\`${cleanId}\` SET proposed = false, updated_at = time::now()`,
     );
 
     logger.info('Template promoted', { templateId: cleanId, name: row.name });
