@@ -3261,19 +3261,27 @@ app.post('/templates/auto-promote', async (c) => {
       });
     }
 
-    // Step 2: fetch metrics for those template_ids in one query
+    // Step 2: fetch metrics for those template_ids.
+    // variant_performance_metrics records are keyed as
+    //   variant_performance_metrics:⟨<template_id_with_colons_as_underscores>⟩
+    // and activity_variant_id field is NULL (not populated by the write path).
+    // So we fetch ALL vpm records and join by normalised record ID in code.
     const ids = proposed.map(p => p.template_id);
     const metricsRows = (await surrealDB.query<any>(
-      `SELECT activity_variant_id, thompson_alpha, thompson_beta, total_executions, successful_executions
-         FROM variant_performance_metrics
-        WHERE activity_variant_id IN $ids`,
-      { ids },
+      `SELECT meta::id(id) AS vpm_key, thompson_alpha, thompson_beta, total_executions, successful_executions
+         FROM variant_performance_metrics`,
     )) || [];
     const metricsArr: any[] = Array.isArray(metricsRows) ? metricsRows : [];
     const metricsMap = new Map<string, any>();
     for (const m of metricsArr) {
-      const tid = String(m.activity_variant_id).replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
-      metricsMap.set(tid, m);
+      // vpm_key uses underscores where template_id uses colons (e.g.
+      // "development-vessel_draft-gap-closing-activity" → "development-vessel:draft-gap-closing-activity").
+      // Single-replace is safe: template names use hyphens as word-separators,
+      // so the only underscores are the colon-substitutes inserted by the write path.
+      const templateId = String(m.vpm_key ?? '').replace(/_/g, ':');
+      metricsMap.set(templateId, m);
+      // Also store under the raw underscore key as a fallback.
+      metricsMap.set(String(m.vpm_key ?? ''), m);
     }
 
     const promoted: any[] = [];
