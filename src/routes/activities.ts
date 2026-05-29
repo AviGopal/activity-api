@@ -3322,10 +3322,11 @@ app.post('/templates/auto-promote', async (c) => {
 
       try {
         // `activity` is a VIEW over `activity_template`; UPDATE on the view
-        // does not propagate to the underlying table in SurrealDB 3.x. Write
-        // directly to `activity_template` to persist the promotion.
+        // `activity` is a VIEW and activity_template is empty. Use WHERE clause
+        // to match by meta::id since backtick-notation UPDATE finds no records.
         await surrealDB.query(
-          `UPDATE activity_template:\`${p.template_id}\` SET proposed = false, updated_at = time::now()`,
+          `UPDATE activity SET proposed = false, updated_at = time::now() WHERE meta::id(id) = $tid`,
+          { tid: p.template_id },
         );
         promoted.push({ ...evidence, action: 'promoted' });
 
@@ -4021,9 +4022,10 @@ app.post('/templates/:templateId/promote', async (c) => {
       }
     }
 
-    // `activity` is a VIEW — write to underlying table to persist.
+    // Use WHERE clause — backtick-notation UPDATE finds no records on this table.
     await surrealDB.query(
-      `UPDATE activity_template:\`${cleanId}\` SET proposed = false, updated_at = time::now()`,
+      `UPDATE activity SET proposed = false, updated_at = time::now() WHERE meta::id(id) = $tid`,
+      { tid: cleanId },
     );
 
     logger.info('Template promoted', { templateId: cleanId, name: row.name });
