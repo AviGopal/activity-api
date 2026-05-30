@@ -5102,12 +5102,46 @@ type TieredFallbackResult = {
 };
 
 /**
+ * F25 — Filter activities whose declared input_shapes can be satisfied by the
+ * caller's providedShapes pool. An activity matches if either:
+ *   - it has no declared input_shapes (backwards-compatible default), OR
+ *   - every element of input_shapes is present in providedShapes
+ *
+ * This mirrors the satisfiability check at lines 278-303 (discover-by-shapes)
+ * which is used internally by slot-binding. The two recommendation paths now
+ * apply the same discipline, closing the architectural asymmetry where
+ * /recommend would route to templates the engine then rejected at pre-flight.
+ *
+ * Conservative semantics: callers fall through to the next tier when the
+ * satisfiable-only filter would yield too few results, rather than failing
+ * the request outright. This preserves operator-class goal coverage via FTS
+ * fallback while still preferring dispatchable templates when available.
+ */
+function filterBySatisfiableInputShapes(
+  activities: ParadigmActivity[],
+  providedShapes: string[],
+): ParadigmActivity[] {
+  if (!activities || activities.length === 0) return activities;
+  const providedSet = new Set(providedShapes);
+  return activities.filter((a) => {
+    const inputs =
+      ((a as { input_shapes?: string[] }).input_shapes) ??
+      ((a as { inputShapes?: string[] }).inputShapes) ??
+      [];
+    if (!inputs || inputs.length === 0) return true;
+    return inputs.every((s: string) => providedSet.has(s));
+  });
+}
+
+/**
  * Tiered fallback for activity recommendations
  * Each tier progressively relaxes constraints to ensure results
  *
  * Tier 1: Exact match - shapes + category + tags
  * Tier 2: Compatible - shapes optional, category soft match
+ *         (F25: now also applies input_shapes satisfiability filter)
  * Tier 3: FTS fallback - search by goal description
+ *         (F25: also applies satisfiability filter to merged results)
  *
  * @param shapes - Available impulse shapes for filtering
  * @param category - Optional category filter
@@ -5278,9 +5312,40 @@ async function getActivitiesWithTieredFallback(
     jwtToken
   );
 
-  if (tier2Result.data && tier2Result.data.length >= minResults) {
-    logger.info('[tiered-fallback] Tier 2 (compatible) succeeded', {
+  // F25: prefer satisfiable templates so the recommender doesn't return
+  // candidates the engine will reject at pre-flight. If filtering yields
+  // enough candidates, return only those; otherwise fall through to FTS.
+  const tier2Satisfiable = filterBySatisfiableInputShapes(
+    tier2Result.data ?? [],
+    shapes ?? [],
+  );
+
+  if (tier2Satisfiable && tier2Satisfiable.length >= minResults) {
+    logger.info('[tiered-fallback] Tier 2 (compatible, F25 satisfiable-input filter) succeeded', {
+      originalCount: tier2Result.data?.length ?? 0,
+      satisfiableCount: tier2Satisfiable.length,
+      providedShapes: shapes ?? [],
+      path: tier2Result.path,
+      latency_ms: tier2Result.latency_ms,
+    });
+
+    return {
+      activities: tier2Satisfiable,
+      tier: 'compatible',
+    };
+  }
+
+  // F25 follow-up: if satisfiable filtering produced too few but raw Tier 2
+  // produced enough AND the caller provided no shapes (operator goal with no
+  // pre-seeded impulses), accept the broader result rather than failing — the
+  // engine pre-flight will still reject unsatisfiable templates, but at least
+  // the recommender returns candidates whose semantic match was strongest.
+  // This preserves backwards-compatible behavior while logging that the
+  // operator-facing dispatch may still hit F25 manifestations.
+  if (tier2Result.data && tier2Result.data.length >= minResults && (!shapes || shapes.length === 0)) {
+    logger.warn('[tiered-fallback] Tier 2 (compatible) returning unsatisfiable-eligible result — caller provided no shapes; engine may pre-flight reject', {
       resultCount: tier2Result.data.length,
+      satisfiableCount: tier2Satisfiable?.length ?? 0,
       path: tier2Result.path,
       latency_ms: tier2Result.latency_ms,
     });
@@ -5308,27 +5373,48 @@ async function getActivitiesWithTieredFallback(
 
     if (denseResults.length > 0) {
       const merged = mergeByRRF(ftsData as ParadigmActivity[], denseResults as ParadigmActivity[]);
-      logger.info('[tiered-fallback] Tier 3 (FTS+dense hybrid) succeeded', {
+      // F25: prefer satisfiable templates in merged FTS+dense candidates.
+      // When caller provided shapes, keep only templates whose inputs can be
+      // satisfied; otherwise return the merged list with a logged caveat.
+      const mergedSatisfiable = filterBySatisfiableInputShapes(merged, shapes ?? []);
+      const chosen =
+        shapes && shapes.length > 0 && mergedSatisfiable.length > 0
+          ? mergedSatisfiable
+          : merged;
+      logger.info('[tiered-fallback] Tier 3 (FTS+dense hybrid, F25 satisfiable-input filter) succeeded', {
         ftsCount: ftsData.length,
         denseCount: denseResults.length,
         mergedCount: merged.length,
+        satisfiableCount: mergedSatisfiable.length,
+        appliedFilter: shapes && shapes.length > 0 && mergedSatisfiable.length > 0,
         searchQuery: goalDescription.substring(0, 50),
       });
       return {
-        activities: merged,
+        activities: chosen,
         tier: 'fts_hybrid',
       };
     }
 
     if (ftsData.length > 0) {
-      logger.info('[tiered-fallback] Tier 3 (FTS) succeeded', {
+      // F25: same satisfiability preference at FTS-only path.
+      const ftsSatisfiable = filterBySatisfiableInputShapes(
+        ftsData as ParadigmActivity[],
+        shapes ?? [],
+      );
+      const chosen =
+        shapes && shapes.length > 0 && ftsSatisfiable.length > 0
+          ? ftsSatisfiable
+          : (ftsData as ParadigmActivity[]);
+      logger.info('[tiered-fallback] Tier 3 (FTS, F25 satisfiable-input filter) succeeded', {
         resultCount: ftsData.length,
+        satisfiableCount: ftsSatisfiable.length,
+        appliedFilter: shapes && shapes.length > 0 && ftsSatisfiable.length > 0,
         searchQuery: goalDescription.substring(0, 50),
         topScore: ftsData[0]?.fts_score,
         latency_ms: tier3Result.latency_ms,
       });
       return {
-        activities: ftsData,
+        activities: chosen,
         tier: 'fts',
       };
     }
