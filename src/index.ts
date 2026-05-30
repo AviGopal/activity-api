@@ -224,6 +224,12 @@ app.route('/v2/shapes', shapesRoutes);
 // any authenticated vessel; forwards to the WS broadcaster.
 app.route('/v2/events', eventsRouter);
 
+// F17 goal-template mismatch detector (inv-079).
+// In-process broadcaster subscriber — fires on lifecycle:execution:succeeded,
+// emits keyword.mapping.proposal when goal and template tags diverge.
+import { startGoalTemplateMismatchDetector } from './learners/goal-template-mismatch';
+startGoalTemplateMismatchDetector();
+
 // Boredom queue routes (GET /boredom-tasks, POST /v2/activities/boredom/enqueue, POST /v2/vessels/register)
 app.route('/', boredomRoutes);
 

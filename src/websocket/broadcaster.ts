@@ -26,6 +26,9 @@ class WebSocketBroadcaster {
   private eventSequence: number = 0;
   private eventHistory: WebSocketMessage[] = [];
   private readonly MAX_HISTORY_SIZE = 1000;  // Keep last 1000 events for catchup
+  /** In-process subscribers: handlers registered via subscribe() receive every emitted
+   *  event synchronously before WS fan-out. Fire-and-forget; errors are logged only. */
+  private inProcessSubscribers: Array<(msg: WebSocketMessage) => void> = [];
 
   /**
    * Add client to broadcaster
@@ -52,7 +55,23 @@ class WebSocketBroadcaster {
    * Broadcast message to all connected clients
    * Automatically assigns sequence number and stores in history for catchup
    */
+  /** Register an in-process handler called on every emitted event.
+   *  Returns an unsubscribe function. Errors in handlers are caught and logged. */
+  subscribe(handler: (msg: WebSocketMessage) => void): () => void {
+    this.inProcessSubscribers.push(handler);
+    return () => {
+      const idx = this.inProcessSubscribers.indexOf(handler);
+      if (idx !== -1) this.inProcessSubscribers.splice(idx, 1);
+    };
+  }
+
   emit(message: WebSocketMessage): void {
+    // Notify in-process subscribers first (synchronous, fire-and-forget).
+    for (const sub of this.inProcessSubscribers) {
+      try { sub(message); } catch (err: any) {
+        logger.warn('[WebSocket] in-process subscriber error', { error: err?.message });
+      }
+    }
     // Assign sequence number for fine-grained events
     if (
       message.type === 'task.started' ||
