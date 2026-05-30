@@ -1204,7 +1204,7 @@ app.post('/templates', async (c) => {
     const upsertActivityQuery = `
       UPSERT activity:\`${activityId}\` CONTENT {
         ${upsertFields},
-        created_at: time::now(),
+        created_at: created_at ?? time::now(),
         updated_at: time::now()
       }
     `;
