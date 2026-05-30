@@ -2688,6 +2688,12 @@ router.post('/resolve', async (c) => {
             diff,
           });
 
+          // Invalidate template caches — UPDATE mutates row fields, so both
+          // per-template body and LIST set must be dropped. Per-key
+          // completeness rule (src/utils/template-cache.ts).
+          const { invalidateTemplateCache } = await import('../utils/template-cache');
+          await invalidateTemplateCache(templateId);
+
           return c.json({
             success: true,
             content: JSON.stringify({ template: afterRow, auditImpulseId: auditId }),
@@ -2771,6 +2777,12 @@ router.post('/resolve', async (c) => {
             account_id: jwtAuth.accountId ?? null,
             reason,
           });
+
+          // Invalidate template caches — deprecate flips `deprecated` on
+          // the row, so both per-template body and LIST set must be dropped.
+          // Per-key completeness rule (src/utils/template-cache.ts).
+          const { invalidateTemplateCache } = await import('../utils/template-cache');
+          await invalidateTemplateCache(templateId);
 
           return c.json({
             success: true,

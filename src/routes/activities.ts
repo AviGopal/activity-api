@@ -13,6 +13,7 @@ import { Hono } from 'hono';
 import beta from '@stdlib/random-base-beta';
 import { surrealDB, queryWithAuth } from '../db/surreal';
 import { RedisClient } from '../db/redis';
+import { invalidateTemplateCache, invalidateTemplateCacheMany } from '../utils/template-cache';
 import { logger } from '../utils/logger';
 import { ensureTags, computeTagPrefixes, deriveCategory } from '../utils/tags';
 import { analyzeTaskSemantics } from '../utils/semantic-tags';
@@ -1309,12 +1310,12 @@ app.post('/templates', async (c) => {
       id: activityId,
     });
 
-    // Invalidate Redis cache so the new template appears in list queries
-    const redis = RedisClient.getInstance();
-    await redis.del(CACHE_LIST_KEY);
-    logger.debug('Redis template list cache invalidated after template registration', {
-      id: activityId,
-    });
+    // Invalidate Redis cache so the new template appears in list queries.
+    // POST /templates uses UPSERT semantics — a repeat call against an
+    // existing id overwrites the row, so the per-template key must also
+    // be dropped or GETs return the pre-UPSERT body until TTL.
+    // See src/utils/template-cache.ts for the per-key-completeness rule.
+    await invalidateTemplateCache(activityId);
 
     // Fire-and-forget: generate dense embeddings for the new activity
     Promise.resolve().then(async () => {
@@ -3412,6 +3413,15 @@ app.post('/templates/auto-promote', async (c) => {
       dry_run,
     });
 
+    // Bulk-invalidate template caches for every row actually promoted
+    // (skip on dry-run — no DB mutation happened). Per-key completeness
+    // rule — see src/utils/template-cache.ts.
+    if (!dry_run && promoted.length > 0) {
+      await invalidateTemplateCacheMany(
+        promoted.map((p: any) => p.template_id).filter((id: any) => typeof id === 'string'),
+      );
+    }
+
     return c.json({
       success: true,
       promoted,
@@ -4028,6 +4038,11 @@ app.post('/templates/:templateId/promote', async (c) => {
       { tid: cleanId },
     );
 
+    // Invalidate template caches — promote flips `proposed` on the row, so
+    // both the per-template body and the LIST set need refresh. Per-key
+    // completeness rule — see src/utils/template-cache.ts.
+    await invalidateTemplateCache(cleanId);
+
     logger.info('Template promoted', { templateId: cleanId, name: row.name });
 
     // Bus emit (best-effort; ride the substrate event bus per
@@ -4548,6 +4563,11 @@ app.post('/:id/variants', async (c) => {
         message: 'Variant creation returned null. Template may not exist or maximum variants reached.',
       }, 500);
     }
+
+    // Invalidate Redis template cache so the new variant appears in LIST
+    // GETs and any prior per-id stub is dropped. Per-key completeness rule
+    // — see src/utils/template-cache.ts.
+    await invalidateTemplateCache(variantResult.variantId);
 
     // Emit variant_created event via WebSocket
     // Phase G1 (2026-04-28): tenancy fields surfaced for filtering.
@@ -6666,9 +6686,9 @@ app.post('/create-goal-seeking', async (c) => {
       category: generated.category,
     });
 
-    // Invalidate cache
-    const redis = RedisClient.getInstance();
-    await redis.del(CACHE_LIST_KEY);
+    // Invalidate cache — both LIST and per-template key (in case an id
+    // collision overwrites an existing entry). Per-key completeness rule.
+    await invalidateTemplateCache(generated.id);
 
     return c.json({
       status: 'success',
