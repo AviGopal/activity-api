@@ -1048,7 +1048,15 @@ app.post('/templates', async (c) => {
     let inputShapesProvided = false;
     let outputShapesProvided = false;
 
-    if (validated.input_shapes?.length) {
+    // Distinguish "explicitly empty" ([]) from "not provided" (undefined).
+    // F25 precondition-rejection (concept_pFSLV6s5s3lQ) traced to this branch:
+    // source templates that declare `inputShapes: []` (e.g. ingest-doc-as-concepts,
+    // drain-pending-substrate-gaps, draft-gap-closing-activity) fell into the
+    // shape-inference path below because `[].length === 0` is falsy. Inference
+    // then merged unwanted shapes (`goal`, `source_code`, `sql_schema`, ...) into
+    // input_shapes, after which filterBySatisfiableInputShapes rejected the
+    // template at /recommend and the engine pre-flight-rejected dispatches.
+    if (Array.isArray(validated.input_shapes)) {
       activityRecord.input_shapes = validated.input_shapes;
       inputShapesProvided = true;
     } else if (validated.input_schema?.required) {
