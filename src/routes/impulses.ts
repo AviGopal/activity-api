@@ -763,7 +763,16 @@ router.post('/resolve', async (c) => {
     }
     const jwtAuthCtx = getJwtAuthFromContext(c)!;
 
-    const body = await c.req.json();
+    const rawBody = await c.req.json();
+    // Accept both forms (vessel_resolve_handler_dual_form, concept_y-CPpfVcAhL0):
+    //   flat:    { pointer: { type, ... } }
+    //   wrapped: { impulse: { pointer: { type, ... } } }  ← compliant impulse-contract
+    // Mirrors goal-host-vessel/src/index.ts handleResolve. The wrapped form is
+    // the canonical impulse-contract dispatch used by discovery-routed and
+    // MCP-fronted callers; the flat form is the historical convenience shape.
+    const body = (rawBody && typeof rawBody === 'object' && (rawBody as any).impulse?.pointer && !(rawBody as any).pointer)
+      ? { ...(rawBody as any), pointer: (rawBody as any).impulse.pointer }
+      : rawBody;
     const validated = ImpulseResolveRequestSchema.parse(body);
 
     logger.info('POST /v2/impulses/resolve', {
