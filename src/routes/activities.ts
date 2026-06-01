@@ -2154,6 +2154,14 @@ app.post('/executions', async (c) => {
     if (validated.metadata) {
       executionRecord.metadata = validated.metadata;
     }
+    // Propagate failure_mode from the engine into the trace row. The field
+    // is already DEFINE'd on activity_execution_traces since migration 091;
+    // without this assignment the schema validation accepted the payload but
+    // the row wrote with failure_mode=null. Refusal reasons disappear from
+    // audit-from-trace path otherwise.
+    if (validated.failure_mode) {
+      executionRecord.failure_mode = validated.failure_mode;
+    }
 
     // Build dynamic query with only provided fields
     // org_id is string, project_id needs type::record() casting for SurrealDB

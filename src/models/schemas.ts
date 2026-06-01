@@ -301,6 +301,17 @@ export const ExecutionRecordSchema = z.object({
     pointer: z.record(z.unknown()),
   })).optional(),
   metadata: z.record(z.unknown()).optional(),
+  // Engine-emitted failure_mode (per FailureModeSchema). The activity_execution_
+  // traces table has had this field defined since migration 091; without it
+  // declared in the request schema, Zod strips the payload and refusal
+  // reasons (e.g. evaluation_evidence verifier_negative) are silently lost
+  // from the trace store, making the audit-from-trace requirement impossible
+  // to meet.
+  failure_mode: z.object({
+    type: z.string(),
+    reason: z.string().optional(),
+    context: z.record(z.unknown()).optional(),
+  }).passthrough().optional(),
 }).refine(
   data => data.activity_id || data.variant_id,
   { message: 'Either activity_id or variant_id must be provided' }
