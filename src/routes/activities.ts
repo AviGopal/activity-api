@@ -1043,6 +1043,13 @@ app.post('/templates', async (c) => {
       activityRecord.tasks = activityTasks;
     }
 
+    // Persist template-declared variables. Without this, composition tasks
+    // whose configs use {{name}} interpolation can't bind at execute time
+    // and the engine halts after the first non-interpolated task.
+    if (validated.variables && validated.variables.length > 0) {
+      activityRecord.variables = validated.variables;
+    }
+
     // Add input/output shapes for paradigm alignment
     // Priority: 1. Explicit shapes, 2. Legacy schema conversion, 3. Inference from template
     let inputShapesProvided = false;

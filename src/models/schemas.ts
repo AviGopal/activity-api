@@ -246,6 +246,10 @@ export const CreateTemplateRequestSchema = z.object({
   }).optional(),
   // Schema confidence for template generation (goal-execution-foundation-alignment)
   schema_confidence: z.number().min(0).max(1).optional(),
+  // Template-declared variables interpolated as {{name}} in task configs.
+  // Without persisting these, composition tasks fail to bind interpolated values
+  // at execute time and abort after the first non-interpolated task.
+  variables: z.array(z.record(z.any())).optional(),
 }).refine(
   data => data.tags?.length || data.category,
   { message: 'Either tags or category must be provided' }
