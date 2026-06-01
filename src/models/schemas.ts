@@ -879,12 +879,20 @@ export const ExecutionTraceDataSchema = z.object({
 // 2026-04-26-validators-and-failure-modes.
 //
 // Variants:
-//   verifier_negative — a validator/check rejected the output.
-//   budget_exhausted  — cost or duration budget exceeded.
-//   safety_breach     — depth or cycle safety guard tripped.
-//   cascading         — failure caused by an upstream task; recursively
-//                       carries the upstream failure_mode when known.
-//   user_abort        — user cancelled the execution.
+//   verifier_negative      — a validator/check rejected the output.
+//   budget_exhausted       — cost or duration budget exceeded.
+//   safety_breach          — depth or cycle safety guard tripped.
+//   cascading              — failure caused by an upstream task; recursively
+//                            carries the upstream failure_mode when known.
+//   user_abort             — user cancelled the execution.
+//   prediction_disagreement — a substrate-authored activity emitted a prediction
+//                             (intentLabel / trajectoryPrediction / assistanceAction)
+//                             and the observed continuation diverged. Carries a
+//                             discriminated `context` payload identifying which of
+//                             three sub-cases tripped (intent_inconsistency,
+//                             trajectory_divergence, action_no_effect). Phase 3 of
+//                             the obsidian-meta-skill-prototype (2026-06-01-closed-
+//                             loop-learning-and-verification) populates this.
 //
 // Note on recursive typing: zod's discriminatedUnion + z.lazy combination
 // produces `any` for the recursive `upstream_failure_mode` field at the
@@ -898,6 +906,43 @@ const VerifierEvidenceSchema = z.object({
   details: z.string().optional(),
   location: z.string().optional(),
 });
+
+// prediction_disagreement.context discriminated union (three sub-cases).
+// Phase 3 of the obsidian-meta-skill-prototype: every miss from
+// `predict-and-verify` populates one of these three context shapes. The
+// posterior treatment in `lib/posterior-update.ts` reads `context.sub_type`
+// to apply the β scaling described in spec
+// `2026-06-01-closed-loop-learning-and-verification`:
+//   * action_no_effect          → β = 1.0 (full penalty)
+//   * intent_inconsistency      → β = 0.5 (half penalty — guess was wrong)
+//   * trajectory_divergence     → β = 0.5 (half penalty — guess was wrong)
+const IntentInconsistencyContextSchema = z.object({
+  sub_type: z.literal("intent_inconsistency"),
+  intent_label: z.string(),
+  consistency_set: z.array(z.string()),
+  observed_continuation_signature: z.string(),
+});
+
+const TrajectoryDivergenceContextSchema = z.object({
+  sub_type: z.literal("trajectory_divergence"),
+  predicted_signatures: z.array(z.string()),
+  observed_signature: z.string(),
+  horizon_events: z.number().int().positive(),
+  divergence_index: z.number().int().nonnegative(),
+});
+
+const ActionNoEffectContextSchema = z.object({
+  sub_type: z.literal("action_no_effect"),
+  command_id: z.string(),
+  pre_signature: z.string(),
+  post_signature: z.string(),
+});
+
+export const PredictionDisagreementContextSchema = z.discriminatedUnion("sub_type", [
+  IntentInconsistencyContextSchema,
+  TrajectoryDivergenceContextSchema,
+  ActionNoEffectContextSchema,
+]);
 
 export const FailureModeSchema: z.ZodType<unknown> = z.lazy(() =>
   z.discriminatedUnion("type", [
@@ -933,8 +978,39 @@ export const FailureModeSchema: z.ZodType<unknown> = z.lazy(() =>
       reason: z.string(),
       abort_source: z.string(),
     }),
+    z.object({
+      type: z.literal("prediction_disagreement"),
+      reason: z.string(),
+      // The substrate-authored activity whose declared output shape produced
+      // the prediction that failed verification. Optional because Phase 1
+      // wrote the schema slot with looser shape and pre-existing callers may
+      // still populate `prediction_disagreement` without this hint.
+      authored_activity_id: z.string().optional(),
+      context: PredictionDisagreementContextSchema,
+    }),
   ])
 );
+
+export type PredictionDisagreementContext =
+  | {
+      sub_type: "intent_inconsistency";
+      intent_label: string;
+      consistency_set: string[];
+      observed_continuation_signature: string;
+    }
+  | {
+      sub_type: "trajectory_divergence";
+      predicted_signatures: string[];
+      observed_signature: string;
+      horizon_events: number;
+      divergence_index: number;
+    }
+  | {
+      sub_type: "action_no_effect";
+      command_id: string;
+      pre_signature: string;
+      post_signature: string;
+    };
 
 export type FailureMode =
   | {
@@ -967,6 +1043,12 @@ export type FailureMode =
       type: "user_abort";
       reason: string;
       abort_source: string;
+    }
+  | {
+      type: "prediction_disagreement";
+      reason: string;
+      authored_activity_id?: string;
+      context: PredictionDisagreementContext;
     };
 
 export const StoreExecutionTraceRequestSchema = z.object({

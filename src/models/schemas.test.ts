@@ -113,6 +113,74 @@ describe('FailureModeSchema', () => {
     expect(parsed).toBeDefined();
   });
 
+  test('accepts prediction_disagreement with intent_inconsistency context', () => {
+    const parsed = FailureModeSchema.parse({
+      type: 'prediction_disagreement',
+      reason: 'observed continuation outside consistency_set',
+      authored_activity_id: 'authored:foo',
+      context: {
+        sub_type: 'intent_inconsistency',
+        intent_label: 'note-taking',
+        consistency_set: ['sig-A', 'sig-B'],
+        observed_continuation_signature: 'sig-Z',
+      },
+    });
+    expect(parsed).toBeDefined();
+  });
+
+  test('accepts prediction_disagreement with trajectory_divergence context', () => {
+    const parsed = FailureModeSchema.parse({
+      type: 'prediction_disagreement',
+      reason: 'observed sequence diverged from prediction',
+      context: {
+        sub_type: 'trajectory_divergence',
+        predicted_signatures: ['s1', 's2', 's3'],
+        observed_signature: 's1,s2,sX',
+        horizon_events: 3,
+        divergence_index: 2,
+      },
+    });
+    expect(parsed).toBeDefined();
+  });
+
+  test('accepts prediction_disagreement with action_no_effect context', () => {
+    const parsed = FailureModeSchema.parse({
+      type: 'prediction_disagreement',
+      reason: 'assistanceAction produced no state change',
+      context: {
+        sub_type: 'action_no_effect',
+        command_id: 'cmd.open-vault',
+        pre_signature: 'sig-A',
+        post_signature: 'sig-A',
+      },
+    });
+    expect(parsed).toBeDefined();
+  });
+
+  test('rejects prediction_disagreement with unknown sub_type', () => {
+    const result = FailureModeSchema.safeParse({
+      type: 'prediction_disagreement',
+      reason: 'bogus',
+      context: { sub_type: 'mystery_sub_case' },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  test('rejects prediction_disagreement with horizon_events non-positive', () => {
+    const result = FailureModeSchema.safeParse({
+      type: 'prediction_disagreement',
+      reason: 'bad horizon',
+      context: {
+        sub_type: 'trajectory_divergence',
+        predicted_signatures: ['s1'],
+        observed_signature: 's2',
+        horizon_events: 0,
+        divergence_index: 0,
+      },
+    });
+    expect(result.success).toBe(false);
+  });
+
   test('rejects cross-variant fields (verifier_negative carrying budget_type)', () => {
     const result = FailureModeSchema.safeParse({
       type: 'verifier_negative',

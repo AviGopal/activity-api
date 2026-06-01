@@ -194,6 +194,109 @@ describe('applyOutcomeToPosteriors — delta rules', () => {
     expect(writeCall).toBeUndefined();
   });
 
+  test('prediction_disagreement.action_no_effect → beta_delta=1.0 (full penalty)', async () => {
+    const { db, calls } = makeDb();
+    const fm: FailureMode = {
+      type: 'prediction_disagreement',
+      reason: 'assistanceAction produced no state change',
+      authored_activity_id: 'authored:foo',
+      context: {
+        sub_type: 'action_no_effect',
+        command_id: 'obs.cmd.open-vault',
+        pre_signature: 'sig-A',
+        post_signature: 'sig-A',
+      },
+    };
+    const summary = await applyOutcomeToPosteriors(
+      makeTrace({ success: false, failure_mode: fm }),
+      db,
+      ORG,
+    );
+
+    expect(summary.alpha_delta).toBe(0);
+    expect(summary.beta_delta).toBe(1);
+    expect(summary.failure_mode_type).toBe('prediction_disagreement');
+    expect(summary.warnings).toHaveLength(0);
+    const writeCall = calls.find(c => c.sql.includes('variant_performance_metrics'));
+    expect(writeCall).toBeDefined();
+    expect(writeCall!.params.beta_delta).toBe(1);
+  });
+
+  test('prediction_disagreement.intent_inconsistency → beta_delta=0.5 (half penalty)', async () => {
+    const { db, calls } = makeDb();
+    const fm: FailureMode = {
+      type: 'prediction_disagreement',
+      reason: 'observed continuation outside consistency_set',
+      authored_activity_id: 'authored:bar',
+      context: {
+        sub_type: 'intent_inconsistency',
+        intent_label: 'note-taking',
+        consistency_set: ['sig-X', 'sig-Y'],
+        observed_continuation_signature: 'sig-Z',
+      },
+    };
+    const summary = await applyOutcomeToPosteriors(
+      makeTrace({ success: false, failure_mode: fm }),
+      db,
+      ORG,
+    );
+
+    expect(summary.alpha_delta).toBe(0);
+    expect(summary.beta_delta).toBe(0.5);
+    expect(summary.failure_mode_type).toBe('prediction_disagreement');
+    expect(summary.warnings).toHaveLength(0);
+    const writeCall = calls.find(c => c.sql.includes('variant_performance_metrics'));
+    expect(writeCall).toBeDefined();
+    expect(writeCall!.params.beta_delta).toBe(0.5);
+  });
+
+  test('prediction_disagreement.trajectory_divergence → beta_delta=0.5 (half penalty)', async () => {
+    const { db } = makeDb();
+    const fm: FailureMode = {
+      type: 'prediction_disagreement',
+      reason: 'observed sequence diverged from prediction',
+      context: {
+        sub_type: 'trajectory_divergence',
+        predicted_signatures: ['s1', 's2', 's3'],
+        observed_signature: 's1,s2,sX',
+        horizon_events: 3,
+        divergence_index: 2,
+      },
+    };
+    const summary = await applyOutcomeToPosteriors(
+      makeTrace({ success: false, failure_mode: fm }),
+      db,
+      ORG,
+    );
+
+    expect(summary.alpha_delta).toBe(0);
+    expect(summary.beta_delta).toBe(0.5);
+    expect(summary.failure_mode_type).toBe('prediction_disagreement');
+    expect(summary.warnings).toHaveLength(0);
+  });
+
+  test('prediction_disagreement with absent context.sub_type → beta_delta=0.5 + warning', async () => {
+    const { db } = makeDb();
+    // Bypass schema typing: simulate an old trace pre-Phase-3 that carried the
+    // top-level type but no discriminated sub_type yet.
+    const fm = {
+      type: 'prediction_disagreement',
+      reason: 'legacy',
+      context: {},
+    } as unknown as FailureMode;
+    const summary = await applyOutcomeToPosteriors(
+      makeTrace({ success: false, failure_mode: fm }),
+      db,
+      ORG,
+    );
+
+    expect(summary.alpha_delta).toBe(0);
+    expect(summary.beta_delta).toBe(0.5);
+    expect(summary.failure_mode_type).toBe('prediction_disagreement');
+    expect(summary.warnings.length).toBe(1);
+    expect(summary.warnings[0]).toContain('unknown sub_type');
+  });
+
   test('null failure_mode on failed trace → beta_delta=1 + warning', async () => {
     const { db } = makeDb();
     const summary = await applyOutcomeToPosteriors(

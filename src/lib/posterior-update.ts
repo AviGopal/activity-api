@@ -166,6 +166,35 @@ function computeDeltas(
       // No signal — user cancelled; treat as neutral
       return { alphaDelta: 0, betaDelta: 0 };
 
+    case 'prediction_disagreement': {
+      // Phase 3 (2026-06-01-closed-loop-learning-and-verification):
+      // β scaling depends on the sub_case inside context. Mirrors the
+      // confidence-tier scaling from 2026-05-31-display-failure-mode-extensions.
+      //   * action_no_effect          → β = 1.0 (action confidently dispatched,
+      //                                          world did not change — full penalty)
+      //   * intent_inconsistency      → β = 0.5 (substrate produced a guess; guess
+      //                                          was wrong but no action misfired)
+      //   * trajectory_divergence     → β = 0.5 (same — guess-wrong, half penalty)
+      const ctx = (failureMode as unknown as {
+        context?: { sub_type?: string };
+      }).context;
+      const subType = ctx?.sub_type;
+      if (subType === 'action_no_effect') {
+        return { alphaDelta: 0, betaDelta: 1 };
+      }
+      if (subType === 'intent_inconsistency' || subType === 'trajectory_divergence') {
+        return { alphaDelta: 0, betaDelta: 0.5 };
+      }
+      // Unknown / missing sub_type — default conservatively to the half-penalty
+      // rather than full, since the half is the more common case (2 of 3
+      // sub-cases) and prediction_disagreement always represents a guess that
+      // was wrong rather than a validator rejection.
+      warnings.push(
+        `prediction_disagreement with unknown sub_type "${subType ?? "<absent>"}", defaulting to β=0.5`,
+      );
+      return { alphaDelta: 0, betaDelta: 0.5 };
+    }
+
     default:
       // Future failure modes default to the strict penalty
       warnings.push(`unknown failure_mode.type "${(failureMode as any).type}", defaulting to verifier_negative`);
