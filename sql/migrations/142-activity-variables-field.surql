@@ -1,0 +1,29 @@
+-- =============================================================================
+-- Migration 142: activity.variables field declaration
+-- =============================================================================
+--
+-- The `activity` table is SCHEMAFULL (per 071/074/099 OVERWRITE statements).
+-- Without an explicit DEFINE FIELD, SurrealDB silently drops any payload field
+-- not declared in the schema during UPSERT. Templates seeded with
+-- `variables: [{name, description, type?}]` had their variables array
+-- discarded at the storage layer even when the POST handler tried to persist
+-- it (see CreateTemplateRequestSchema + activityRecord.variables fix in the
+-- accompanying handler / schemas changes).
+--
+-- This migration makes the variables field durable across container rebuilds:
+-- before this, the field had to be DEFINE'd by hand on each fresh
+-- SurrealDB volume.
+--
+-- TYPE option<array> FLEXIBLE — option because templates without variables
+-- are valid; FLEXIBLE so SurrealDB doesn't require us to declare the inner
+-- shape of each variable record. Same pattern as `tasks` field (migration
+-- 054).
+--
+-- Without this field, the engine cannot bind {{var}} interpolation in
+-- composition tasks at execute time. Single-task templates still work
+-- because they have no inter-task interpolation. Multi-task templates that
+-- pass values between tasks via variables (publish-substrate-authored-
+-- artifact and any future composition) abort silently after task 1.
+-- =============================================================================
+
+DEFINE FIELD IF NOT EXISTS variables ON activity TYPE option<array> FLEXIBLE;
