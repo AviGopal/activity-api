@@ -53,6 +53,9 @@ app.use('/*', cors({
     'https://internal.metabob.com',
     'https://app.metabob.com',
     'https://metabobproject.github.io',  // Dashboard on GitHub Pages
+    'app://obsidian.md',                 // Obsidian desktop plugin
+    'http://localhost',
+    'http://127.0.0.1',
   ],
   credentials: true,
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
