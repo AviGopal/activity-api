@@ -481,11 +481,12 @@ function getGlobalCalls(
 describe('propagateCreditAlongChain — 18.4.5: success on 4-deep chain', () => {
   // Chain A→B→C→D. D is the leaf (already credited by applyOutcomeToPosteriors).
   // composition_chain stores ancestors root-first: [A, B, C] (D is NOT in chain).
-  // Chain propagation should give:
-  //   depth 1 (C): α += γ^1 = 0.5
-  //   depth 2 (B): α += γ^2 = 0.25
-  //   depth 3 (A): α += γ^3 = 0.125
-  test('success: C gets α+=0.5, B gets α+=0.25, A gets α+=0.125', async () => {
+  // TD(λ) with λ=0.7 (concept_iae171XpW50_; raised from 0.5 to reduce
+  // chain-root starvation while preserving variance reduction):
+  //   depth 1 (C): α += λ^1 = 0.7
+  //   depth 2 (B): α += λ^2 = 0.49
+  //   depth 3 (A): α += λ^3 = 0.343
+  test('success: C gets α+=0.7, B gets α+=0.49, A gets α+=0.343', async () => {
     const { db, calls } = makeDb();
 
     const execution: ExecutionForChainCredit = {
@@ -500,19 +501,19 @@ describe('propagateCreditAlongChain — 18.4.5: success on 4-deep chain', () => 
     // C is at depth 1 (closest ancestor) — reversed chain is [C, B, A]
     const cCalls = getGlobalCalls(calls, 'C');
     expect(cCalls).toHaveLength(1);
-    expect(cCalls[0].params.alpha_delta).toBeCloseTo(0.5);
+    expect(cCalls[0].params.alpha_delta).toBeCloseTo(0.7);
     expect(cCalls[0].params.beta_delta).toBe(0);
 
     // B is at depth 2
     const bCalls = getGlobalCalls(calls, 'B');
     expect(bCalls).toHaveLength(1);
-    expect(bCalls[0].params.alpha_delta).toBeCloseTo(0.25);
+    expect(bCalls[0].params.alpha_delta).toBeCloseTo(0.49);
     expect(bCalls[0].params.beta_delta).toBe(0);
 
     // A is at depth 3
     const aCalls = getGlobalCalls(calls, 'A');
     expect(aCalls).toHaveLength(1);
-    expect(aCalls[0].params.alpha_delta).toBeCloseTo(0.125);
+    expect(aCalls[0].params.alpha_delta).toBeCloseTo(0.343);
     expect(aCalls[0].params.beta_delta).toBe(0);
 
     // D is the leaf — not in composition_chain, propagateCreditAlongChain does not write it
@@ -547,7 +548,7 @@ describe('propagateCreditAlongChain — 18.4.6: cascading failure on 4-deep chai
   // Chain A→B→C→D. D fails with cascading, upstream_task_id points at a task
   // in B. Heuristic: propagate β to the direct parent (C, depth 1) only.
   // A receives nothing per spec 18.4.3.
-  test('cascading: only direct parent (C, depth-1) gets β+=0.5', async () => {
+  test('cascading: only direct parent (C, depth-1) gets β+=λ^1=0.7', async () => {
     const { db, calls } = makeDb();
 
     const fm: FailureMode = {
@@ -565,11 +566,11 @@ describe('propagateCreditAlongChain — 18.4.6: cascading failure on 4-deep chai
 
     await propagateCreditAlongChain(execution, db, ORG);
 
-    // C is at depth 1 — gets β += γ^1 = 0.5
+    // C is at depth 1 — gets β += λ^1 = 0.7
     const cCalls = getGlobalCalls(calls, 'C');
     expect(cCalls).toHaveLength(1);
     expect(cCalls[0].params.alpha_delta).toBe(0);
-    expect(cCalls[0].params.beta_delta).toBeCloseTo(0.5);
+    expect(cCalls[0].params.beta_delta).toBeCloseTo(0.7);
 
     // B is at depth 2 — receives nothing for cascading
     const bCalls = getGlobalCalls(calls, 'B');
@@ -634,11 +635,11 @@ describe('propagateCreditAlongChain — edge cases', () => {
       db,
       ORG,
     );
-    // B depth 1: β += 0.5; A depth 2: β += 0.25
+    // TD(λ=0.7) — B depth 1: β += λ^1 = 0.7; A depth 2: β += λ^2 = 0.49
     const bCalls = getGlobalCalls(calls, 'B');
-    expect(bCalls[0].params.beta_delta).toBeCloseTo(0.5);
+    expect(bCalls[0].params.beta_delta).toBeCloseTo(0.7);
     const aCalls = getGlobalCalls(calls, 'A');
-    expect(aCalls[0].params.beta_delta).toBeCloseTo(0.25);
+    expect(aCalls[0].params.beta_delta).toBeCloseTo(0.49);
   });
 });
 
@@ -679,15 +680,15 @@ describe('propagateCreditAlongChain — §5: per-ancestor v1 signatures', () => 
     expect(cSigCall).toBeDefined();
     expect(cSigCall!.params.sig).toBe(sigC);
     expect(cSigCall!.params.sig_version).toBe(1);
-    expect(cSigCall!.params.alpha_delta).toBeCloseTo(0.5);
+    expect(cSigCall!.params.alpha_delta).toBeCloseTo(0.7);
 
     expect(bSigCall).toBeDefined();
     expect(bSigCall!.params.sig).toBe(sigB);
-    expect(bSigCall!.params.alpha_delta).toBeCloseTo(0.25);
+    expect(bSigCall!.params.alpha_delta).toBeCloseTo(0.49);
 
     expect(aSigCall).toBeDefined();
     expect(aSigCall!.params.sig).toBe(sigA);
-    expect(aSigCall!.params.alpha_delta).toBeCloseTo(0.125);
+    expect(aSigCall!.params.alpha_delta).toBeCloseTo(0.343);
   });
 
   test('partial ancestor_signatures: only ancestors with entries get conditional writes', async () => {
@@ -734,7 +735,7 @@ describe('applyOutcomeToPosteriors — composition_chain fire-and-forget wiring'
     await new Promise(r => setTimeout(r, 10));
     const ancestorBCalls = getGlobalCalls(calls, 'ancestor-B');
     expect(ancestorBCalls).toHaveLength(1);
-    expect(ancestorBCalls[0].params.alpha_delta).toBeCloseTo(0.5);
+    expect(ancestorBCalls[0].params.alpha_delta).toBeCloseTo(0.7);
   });
 
   test('trace without composition_chain does NOT trigger extra writes', async () => {

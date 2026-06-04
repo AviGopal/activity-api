@@ -22,6 +22,7 @@
 import { logger } from '../utils/logger';
 import { normalizeActivityId } from '../db/paradigm';
 import type { FailureMode } from '../models/schemas';
+import { seedPriorFromConcepts } from './prior-seed';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -68,8 +69,35 @@ export interface TraceForPosterior {
 /** Maximum number of ancestors to credit/blame (counted from the leaf). */
 const CREDIT_PROPAGATION_MAX_DEPTH = 4;
 
-/** Exponential decay factor per hop away from the leaf. */
-const CREDIT_PROPAGATION_GAMMA = 0.5;
+/**
+ * TD(λ) eligibility-trace decay applied per ancestor depth.
+ *
+ * Substrate anchor: concept_iae171XpW50_ (eligibility_trace_credit_propagation).
+ * Sutton 1988 / Sutton-Barto Ch. 12. Δα_{s_t-k, a_t-k} = λ^k · r, λ ∈ (0,1).
+ *
+ * Env override: TD_LAMBDA. Default 0.7 — the variance/bias sweet spot for the
+ * typical chain depth observed in this substrate (mean 2-3, capped at 4).
+ * Values outside (0, 1) fall back to the default with a warn-log.
+ *
+ * Prior name was CREDIT_PROPAGATION_GAMMA at 0.5; that constant played the
+ * eligibility-trace λ role, not the per-step discount γ — renamed to match
+ * Sutton-Barto convention.
+ */
+const TD_LAMBDA_DEFAULT = 0.7;
+const TD_LAMBDA: number = (() => {
+  const raw = process.env.TD_LAMBDA;
+  if (raw === undefined || raw === '') return TD_LAMBDA_DEFAULT;
+  const parsed = parseFloat(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed >= 1) {
+    logger.warn('td_lambda_invalid', {
+      event: 'td_lambda_invalid',
+      raw,
+      fallback: TD_LAMBDA_DEFAULT,
+    });
+    return TD_LAMBDA_DEFAULT;
+  }
+  return parsed;
+})();
 
 /**
  * Minimal execution descriptor for chain-credit propagation.
@@ -296,6 +324,7 @@ async function writeAncestorDelta(
 
   if (signature != null) {
     try {
+      const seed = await seedPriorFromConcepts(ancestorId, signature, orgId);
       await db.query(
         `
         LET $existing = (SELECT * FROM context_thompson_scores
@@ -310,8 +339,8 @@ async function writeAncestorDelta(
         ELSE
           CREATE context_thompson_scores CONTENT {
             org_id: $org_id, template_id: $activity_id, context_bucket: $sig,
-            signature_version: $sig_version, alpha: 1.0 + $alpha_delta,
-            beta: 1.0 + $beta_delta, n_observations: 1,
+            signature_version: $sig_version, alpha: $alpha0 + $alpha_delta,
+            beta: $beta0 + $beta_delta, n_observations: 1,
             last_updated_at: time::now(), created_at: time::now()
           }
         END
@@ -323,6 +352,8 @@ async function writeAncestorDelta(
           sig_version: signatureVersion,
           alpha_delta: alphaDelta,
           beta_delta: betaDelta,
+          alpha0: seed.alpha0,
+          beta0: seed.beta0,
         },
       );
     } catch (err) {
@@ -398,7 +429,7 @@ export async function propagateCreditAlongChain(
     // normalized form stored in variant_performance_metrics.
     const ancestorId = normalizeActivityId(meta?.variant_id ?? ancestorExecId);
     const depth = i + 1; // 1-indexed depth from leaf
-    const decayFactor = Math.pow(CREDIT_PROPAGATION_GAMMA, depth);
+    const decayFactor = Math.pow(TD_LAMBDA, depth);
 
     // Use per-ancestor v1 signature when available.
     // When absent (transition period), skip the conditional write for this ancestor.
@@ -513,6 +544,7 @@ export async function applyOutcomeToPosteriors(
       // creating it. If the template already has ≥ 200 distinct signature buckets,
       // skip the CREATE (UPDATE still proceeds for existing rows).
       const CARDINALITY_CAP = parseInt(process.env.SIGNATURE_CARDINALITY_CAP ?? '200', 10);
+      const seed = await seedPriorFromConcepts(activityId, trace.signature, orgId);
       await db.query(
         `
         LET $existing = (SELECT * FROM context_thompson_scores
@@ -542,8 +574,8 @@ export async function applyOutcomeToPosteriors(
             template_id: $activity_id,
             context_bucket: $sig,
             signature_version: $sig_version,
-            alpha: 1.0 + $alpha_delta,
-            beta:  1.0 + $beta_delta,
+            alpha: $alpha0 + $alpha_delta,
+            beta:  $beta0 + $beta_delta,
             n_observations: 1,
             last_updated_at: time::now(),
             created_at: time::now()
@@ -558,6 +590,8 @@ export async function applyOutcomeToPosteriors(
           alpha_delta: alphaDelta,
           beta_delta: betaDelta,
           cap: CARDINALITY_CAP,
+          alpha0: seed.alpha0,
+          beta0: seed.beta0,
         },
       );
       logger.debug('posterior_update_v1_conditional', {
@@ -568,6 +602,8 @@ export async function applyOutcomeToPosteriors(
         alpha_delta: alphaDelta,
         beta_delta: betaDelta,
         cardinality_cap: CARDINALITY_CAP,
+        prior_seed_source: seed.source,
+        prior_seed_neighbors: seed.neighbor_count ?? 0,
       });
     } catch (v1Err) {
       logger.warn('posterior-update: context_thompson_scores v1 write failed (non-blocking)', {
