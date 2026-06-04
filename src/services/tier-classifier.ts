@@ -26,12 +26,29 @@ const DETERMINISTIC_RESOLVERS: ReadonlySet<string> = new Set([
   'wire_auth_blueprint',
   'learning_signal_writer',
   'verify_three_invariants',
-  // goal-host wiring
+  // goal-host / drafter prompt rules — these are the substrate's primary
+  // deterministic resolver names per draft-gap-closing-activity.ts
+  // RESOLVER RULE 1 ("Use ONLY these resolver names").
+  'fs_read',
+  'fs_write',
   'file_read',
+  'http_fetch',
+  'json_path_extract',
   'bash',
-  // goal-host-vessel built-ins
+  // git resolvers (per dev-vessel scaffold)
+  'git_status',
+  'git_diff',
+  'git_log',
+  'git_add',
+  'git_commit',
+  // activity-api built-ins seen in seed templates
+  'activity_fetch',
+  'activity_create_variant',
   'activity_recommendation',
   'impulse_cooccurrence',
+  // resolver-tier-named deterministic substrate resolvers
+  'systemd_restart',
+  'docker_cp',
 ]);
 
 const LLM_RESOLVERS: ReadonlySet<string> = new Set([
