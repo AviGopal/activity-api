@@ -23,6 +23,7 @@ import { logger } from '../utils/logger';
 import { normalizeActivityId } from '../db/paradigm';
 import type { FailureMode } from '../models/schemas';
 import { seedPriorFromConcepts } from './prior-seed';
+import { classifyTemplateTiers, type ResolverTier } from '../services/tier-classifier';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -44,6 +45,17 @@ export interface TraceForPosterior {
   tasks?: Array<{
     input_impulse_ids?: string[];
     output_impulse_ids?: string[];
+    /**
+     * Resolver tier classification carried on the trace for M4 tier-restricted
+     * bandit gating. When every task is `deterministic`, the variant_performance_metrics
+     * UPDATE is skipped (degenerate posterior); chain-credit propagation still fires.
+     * Missing field defaults to stochastic treatment (conservative).
+     */
+    resolver_tier?: ResolverTier;
+    /** Resolver id; used as fallback when resolver_tier is absent. */
+    resolver?: string;
+    /** LLM-prompt marker; treated as stochastic by the classifier when resolver is absent. */
+    prompt?: unknown;
   }>;
   org_id?: string;
   cost_usd?: number;
@@ -126,6 +138,14 @@ export interface UpdateSummary {
   failure_mode_type: string | null;
   impulse_relevance_writes: number;
   warnings: string[];
+  /**
+   * Reason the variant_performance_metrics UPDATE was skipped, if any.
+   * `'all_deterministic'` — every task in the trace is deterministic-tier;
+   * the cell-local Beta posterior would capture upstream uncertainty rather
+   * than informative signal (M4 tier-restricted bandit).
+   * Absent when the UPDATE ran normally.
+   */
+  skipped_reason?: 'all_deterministic';
 }
 
 // ---------------------------------------------------------------------------
@@ -498,10 +518,42 @@ export async function applyOutcomeToPosteriors(
   const { alphaDelta, betaDelta } = computeDeltas(trace.success, trace.failure_mode, warnings);
   const failureModeType = trace.failure_mode?.type ?? null;
 
+  // M4 tier-restricted bandit: when every task on the trace is deterministic,
+  // the cell-local Beta posterior captures propagated upstream uncertainty
+  // rather than cell-local signal. Skip the variant_performance_metrics UPDATE
+  // (and the v1 conditional write); chain-credit propagation still fires
+  // unchanged so upstream stochastic ancestors continue to learn.
+  //
+  // If the trace omits `resolver_tier` on every task, the synthetic template
+  // has no tier info and the classifier conservatively returns
+  // `all_stochastic` — i.e. existing behaviour is preserved.
+  const tierClass = classifyTemplateTiers({
+    tasks: (trace.tasks ?? []).map((t) => {
+      // Prefer pre-classified resolver_tier when present.
+      if (t?.resolver_tier === 'deterministic') {
+        // Provide a synthetic deterministic resolver name from the canonical set.
+        return { resolver: 'bash' };
+      }
+      if (t?.resolver_tier === 'llm') {
+        return { resolver: 'llm' };
+      }
+      if (t?.resolver_tier === 'pattern') {
+        // Pattern tier is stochastic; classifier returns 'pattern' for unknown
+        // resolver strings, which counts as stochastic in classifyTemplateTiers.
+        return { resolver: '__pattern_tier__' };
+      }
+      // No pre-classified tier: pass through resolver / prompt fields and let
+      // classifyTemplateTiers decide.
+      return { resolver: t?.resolver, prompt: t?.prompt };
+    }),
+  });
+  const skipVariantUpdate = tierClass === 'all_deterministic';
+
   // Atomic UPDATE — mirrors the pattern in execution-traces.ts:2235
   // Uses variant_performance_metrics (not activity_template) to avoid the
   // BM25 FTS scorer regression (F-V46, SurrealDB 3.0).
-  if (alphaDelta !== 0 || betaDelta !== 0) {
+  // M4: skip the UPDATE entirely for all-deterministic templates.
+  if (!skipVariantUpdate && (alphaDelta !== 0 || betaDelta !== 0)) {
     try {
       await db.query(
         `
@@ -534,7 +586,11 @@ export async function applyOutcomeToPosteriors(
   }
 
   // v1 conditional context_thompson_scores write — stratified deltas, signature-keyed
+  // M4: skip the v1 conditional write for all-deterministic templates as well;
+  // it shares the same degenerate-posterior justification as the unconditional
+  // variant_performance_metrics UPDATE above.
   if (
+    !skipVariantUpdate &&
     trace.signature &&
     typeof trace.signature_version === 'number' &&
     (alphaDelta !== 0 || betaDelta !== 0)
@@ -630,6 +686,7 @@ export async function applyOutcomeToPosteriors(
     failure_mode_type: failureModeType,
     impulse_relevance_writes: impulseRelevanceWrites,
     warnings,
+    ...(skipVariantUpdate ? { skipped_reason: 'all_deterministic' as const } : {}),
   };
 
   emitPosteriorUpdateMetric(summary);

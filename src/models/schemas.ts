@@ -523,6 +523,14 @@ export const ImpulseRelevanceRecordRequestSchema = z.object({
   resolver_tier: z.string().optional(),
   resolver_name: z.string().optional(),
   resolution_latency_ms: z.number().int().optional(),
+  // M3 background trace replay (concept_YinkepAheImS):
+  // when this record originates from a counterfactual LLM-judged replay,
+  // `source` identifies the path ("background_replay"), `replay_trace_id`
+  // names the historical trace consumed, and `replay_weight` carries the
+  // shrinkage factor (default 0.3) so consumers can audit the provenance.
+  source: z.string().optional(),
+  replay_trace_id: z.string().optional(),
+  replay_weight: z.number().min(0).max(1).optional(),
 });
 
 export const ImpulseRelevanceQuerySchema = z.object({

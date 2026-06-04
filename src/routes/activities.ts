@@ -128,6 +128,7 @@ import {
 import { broadcaster } from '../websocket/broadcaster';
 import { autoCreateVariantIfNeeded, checkAndRetireTemplate } from '../services/variant-creator';
 import { applyOutcomeToPosteriors } from '../lib/posterior-update';
+import { classifyTemplateTiers } from '../services/tier-classifier';
 
 const app = new Hono();
 
@@ -1324,6 +1325,31 @@ app.post('/templates', async (c) => {
     logger.info('Template registered successfully', {
       id: activityId,
     });
+
+    // Emit WS event so consumers (e.g. ribosome-vessel TemplateReplayObserver)
+    // can react to new templates. Documented in docs/API_REFERENCE.md:2093.
+    // Fire-and-forget; the broadcaster swallows per-client errors.
+    try {
+      broadcaster.emit({
+        type: 'template_created',
+        timestamp: new Date().toISOString(),
+        data: {
+          template_id: activityId,
+          activity_id: activityId,
+          name: activityName ?? null,
+          input_shapes: Array.isArray(activityRecord.input_shapes) ? activityRecord.input_shapes : [],
+          output_shapes: Array.isArray(activityRecord.output_shapes) ? activityRecord.output_shapes : [],
+          tasks: Array.isArray(activityRecord.tasks) ? activityRecord.tasks : [],
+          org_id: orgId ?? null,
+          account_id: accountId ?? null,
+        },
+      });
+    } catch (err) {
+      logger.warn('Failed to broadcast template_created', {
+        id: activityId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
 
     // Invalidate Redis cache so the new template appears in list queries.
     // POST /templates uses UPSERT semantics — a repeat call against an
@@ -6188,8 +6214,20 @@ app.post('/recommend', async (c) => {
         // 10.15 promotes DB-side as the source-of-truth once K-S parity
         // (10.13) is verified and the recommend query is restructured to
         // pull samples in the same batch as α/β.
-        const sample = betaSample(alphaBlended, betaBlended);
-        const sampleSource = 'app_fallback' as const;
+        // M4 tier-restricted bandit: deterministic-only templates skip
+        // Thompson sampling and dispatch with uniform priority. Their cells
+        // have degenerate transition kernels; a Beta posterior on them
+        // captures propagated upstream uncertainty, not cell-local signal.
+        const tierClass = classifyTemplateTiers(template);
+        let sample: number;
+        let sampleSource: 'app_fallback' | 'tier_uniform';
+        if (tierClass === 'all_deterministic') {
+          sample = 1.0;
+          sampleSource = 'tier_uniform';
+        } else {
+          sample = betaSample(alphaBlended, betaBlended);
+          sampleSource = 'app_fallback';
+        }
 
         const rawTotalExecs = scores?.total_executions ?? 0;
         const rawSuccesses = scores?.successes ?? 0;
@@ -6232,6 +6270,7 @@ app.post('/recommend', async (c) => {
             // After 10.15 promotes DB-side, this label flips to 'db'
             // (or stays 'app_fallback' on the explicit override path).
             sample_source: sampleSource,
+            tier_class: tierClass,
             score: sample,
             ucb_score: computed_ucb_score,
             exploration_slot: false, // patched after pool partitioning
@@ -8548,6 +8587,11 @@ app.post('/impulse-relevance', async (c) => {
       success: validated.execution_succeeded,
       org_id: relevanceOrgId,
       account_id: relevanceAccountId,
+      // M3: surface replay provenance on the log line so the audit trail
+      // is searchable even before persistence-side migration lands.
+      ...(validated.source ? { source: validated.source } : {}),
+      ...(validated.replay_trace_id ? { replay_trace_id: validated.replay_trace_id } : {}),
+      ...(validated.replay_weight !== undefined ? { replay_weight: validated.replay_weight } : {}),
     });
 
     // Check if metric exists for this (impulse, variant, task, tenant) tuple.

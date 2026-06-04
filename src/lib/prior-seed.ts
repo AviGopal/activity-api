@@ -17,12 +17,14 @@
  */
 
 import { logger } from '../utils/logger';
+import { computeEmbeddingConditionedPrior } from '../services/embedding-prior';
 
 export interface SeededPrior {
   alpha0: number;
   beta0: number;
-  source: 'concepts' | 'fallback';
+  source: 'concepts' | 'fallback' | 'embedding_model';
   neighbor_count?: number;
+  model_version?: string;
 }
 
 const FALLBACK: SeededPrior = { alpha0: 1, beta0: 1, source: 'fallback' };
@@ -38,8 +40,22 @@ export async function seedPriorFromConcepts(
   templateId: string,
   signature: string | null,
   orgId: string,
+  embedding?: number[],
 ): Promise<SeededPrior> {
   if (process.env.PRIOR_SEED_ENABLED === 'false') return FALLBACK;
+
+  // M1 integration hook (concept_vugylIHzIMvk): when EMBEDDING_PRIOR_ENABLED
+  // is true and a per-cell embedding is provided, route through the
+  // embedding-conditioned θ-scored prior INSTEAD OF the concept-db neighbor
+  // query. Falls through to the concept-db path on fallback so callers
+  // never lose prior seeding.
+  if (process.env.EMBEDDING_PRIOR_ENABLED === 'true' && Array.isArray(embedding) && embedding.length > 0) {
+    const m1 = await computeEmbeddingConditionedPrior(embedding, orgId);
+    if (m1.source === 'embedding_model') {
+      return { alpha0: m1.α0, beta0: m1.β0, source: 'embedding_model', model_version: m1.model_version };
+    }
+    // else: fall through to concept-db path
+  }
 
   const url = process.env.CONCEPT_DB_URL;
   if (!url) return FALLBACK;
