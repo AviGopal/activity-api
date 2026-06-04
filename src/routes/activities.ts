@@ -3237,6 +3237,176 @@ app.get('/refusals/stats', async (c) => {
 });
 
 /**
+ * GET /v2/activities/topology-coverage
+ *
+ * Returns a summary of which (pool-signature × template) pairs have been
+ * observed, how many templates have been tried per signature, and what
+ * percentage of the space is still unexplored. Useful for validating that
+ * topology exploration is making progress.
+ *
+ * Queries context_thompson_scores WHERE signature_version = 1.
+ * When no v1 rows exist (cold start), returns a structured cold-start message
+ * rather than an error.
+ *
+ * Response shape:
+ * {
+ *   distinct_pool_signatures: number,
+ *   total_v1_observations: number,
+ *   avg_templates_per_signature: number,
+ *   max_templates_per_signature: number,
+ *   min_templates_per_signature: number,
+ *   top_signatures: Array<{
+ *     pool_signature: string,
+ *     observation_count: number,
+ *     success_rate: number,
+ *     top_templates: string[]
+ *   }>,
+ *   dark_signature_count: number,
+ *   oldest_observation: string | null,
+ *   newest_observation: string | null,
+ *   status?: "cold_start",
+ *   message?: string
+ * }
+ */
+app.get('/topology-coverage', async (c) => {
+  try {
+    const jwtAuth = getJwtAuthFromContext(c);
+    const orgId = jwtAuth?.orgId ?? null;
+
+    // Fetch all v1 rows. We aggregate client-side — the table is bounded by
+    // (org × template × signature) so even large deployments stay tractable.
+    const rows = await surrealDB.query<{
+      template_id: string;
+      context_bucket: string;
+      alpha: number;
+      beta: number;
+      n_observations: number;
+      last_updated_at: string | null;
+      created_at: string | null;
+    }>(
+      orgId
+        ? `SELECT template_id, context_bucket, alpha, beta, n_observations,
+                  last_updated_at, created_at
+             FROM context_thompson_scores
+             WHERE signature_version = 1 AND org_id = $org_id
+             ORDER BY n_observations DESC`
+        : `SELECT template_id, context_bucket, alpha, beta, n_observations,
+                  last_updated_at, created_at
+             FROM context_thompson_scores
+             WHERE signature_version = 1
+             ORDER BY n_observations DESC`,
+      { org_id: orgId },
+    );
+
+    if (!rows || rows.length === 0) {
+      return c.json({
+        distinct_pool_signatures: 0,
+        total_v1_observations: 0,
+        avg_templates_per_signature: 0,
+        max_templates_per_signature: 0,
+        min_templates_per_signature: 0,
+        top_signatures: [],
+        dark_signature_count: 0,
+        oldest_observation: null,
+        newest_observation: null,
+        status: 'cold_start',
+        message:
+          'No precondition-conditioned observations yet. Ensure executors send ' +
+          'impulse_state_space with /recommend calls.',
+      });
+    }
+
+    // Group by pool signature (context_bucket)
+    const sigMap = new Map<string, {
+      templates: Set<string>;
+      totalObs: number;
+      alphaSum: number;
+      betaSum: number;
+      templateObsCounts: Map<string, number>;
+    }>();
+
+    let totalObs = 0;
+    let oldestTs: string | null = null;
+    let newestTs: string | null = null;
+
+    for (const row of rows) {
+      const sig = row.context_bucket;
+      let entry = sigMap.get(sig);
+      if (!entry) {
+        entry = { templates: new Set(), totalObs: 0, alphaSum: 0, betaSum: 0, templateObsCounts: new Map() };
+        sigMap.set(sig, entry);
+      }
+      entry.templates.add(row.template_id);
+      entry.totalObs += row.n_observations ?? 0;
+      entry.alphaSum += row.alpha ?? 1;
+      entry.betaSum += row.beta ?? 1;
+      entry.templateObsCounts.set(row.template_id, (entry.templateObsCounts.get(row.template_id) ?? 0) + (row.n_observations ?? 0));
+      totalObs += row.n_observations ?? 0;
+
+      const ts = row.last_updated_at ?? row.created_at ?? null;
+      if (ts) {
+        if (!oldestTs || ts < oldestTs) oldestTs = ts;
+        if (!newestTs || ts > newestTs) newestTs = ts;
+      }
+    }
+
+    const sigCounts = Array.from(sigMap.values()).map(e => e.templates.size);
+    const avgTemplates = sigCounts.length > 0
+      ? sigCounts.reduce((a, b) => a + b, 0) / sigCounts.length
+      : 0;
+    const maxTemplates = sigCounts.length > 0 ? Math.max(...sigCounts) : 0;
+    const minTemplates = sigCounts.length > 0 ? Math.min(...sigCounts) : 0;
+
+    // A "dark" signature is one with only one template ever tried (unexplored breadth)
+    const darkSignatureCount = sigCounts.filter(n => n <= 1).length;
+
+    // Top 10 pool signatures by total observation count
+    const topSignatures = Array.from(sigMap.entries())
+      .sort((a, b) => b[1].totalObs - a[1].totalObs)
+      .slice(0, 10)
+      .map(([sig, entry]) => {
+        // success_rate approximated from alpha/(alpha+beta) across all templates in this sig
+        const meanAlpha = entry.alphaSum / Math.max(entry.templates.size, 1);
+        const meanBeta  = entry.betaSum  / Math.max(entry.templates.size, 1);
+        const successRate = meanAlpha / (meanAlpha + meanBeta);
+
+        // Top templates by obs count for this signature
+        const topTemplates = Array.from(entry.templateObsCounts.entries())
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 5)
+          .map(([tid]) => tid);
+
+        return {
+          pool_signature: sig,
+          observation_count: entry.totalObs,
+          success_rate: Math.round(successRate * 1000) / 1000,
+          top_templates: topTemplates,
+        };
+      });
+
+    return c.json({
+      distinct_pool_signatures: sigMap.size,
+      total_v1_observations: totalObs,
+      avg_templates_per_signature: Math.round(avgTemplates * 100) / 100,
+      max_templates_per_signature: maxTemplates,
+      min_templates_per_signature: minTemplates,
+      top_signatures: topSignatures,
+      dark_signature_count: darkSignatureCount,
+      oldest_observation: oldestTs,
+      newest_observation: newestTs,
+    });
+  } catch (err) {
+    logger.error('GET /v2/activities/topology-coverage failed', {
+      error: (err as Error).message,
+    });
+    return c.json({
+      error: 'Failed to query topology coverage',
+      message: (err as Error).message,
+    }, 500);
+  }
+});
+
+/**
  * POST /v2/activities/templates/auto-promote
  *
  * Substrate-autonomous promotion based on REAL empirical α/β accumulated
@@ -6038,6 +6208,16 @@ app.post('/recommend', async (c) => {
           _ucb_score: computed_ucb_score,
           _total_executions: rawTotalExecs,
           _proposed: template.proposed === true,
+          // Topology-exploration signal (Change 2 — additive observability).
+          // `exploration` is patched to true after pool partitioning when the
+          // recommendation lands in the explorationPool (low observations or
+          // proposed template). `pool_signature` is the v1 state-space hash
+          // computed from impulse_state_space; null when caller omits it.
+          // `signature_observations` is how many times this (template ×
+          // pool-signature) pair has been tried; 0 means first contact.
+          exploration: false, // patched after pool partitioning
+          pool_signature: stateSpaceSig ?? null,
+          signature_observations: sigRow?.n_observations ?? 0,
           selection_metadata: {
             method: 'thompson_sampling',
             score_source: posteriorSource,
@@ -6160,12 +6340,17 @@ app.post('/recommend', async (c) => {
     // Patch exploration_slot and clean up internal fields
     const explorationSet = new Set(explorationPool);
     for (const rec of finalRecommendations) {
-      rec.selection_metadata.exploration_slot = explorationSet.has(rec);
+      const isExploration = explorationSet.has(rec);
+      rec.selection_metadata.exploration_slot = isExploration;
       // Surface the proposed-template marker so traces can identify
       // exploration selections that landed on substrate-authored templates.
       // The autonomous-promote endpoint uses real empirical α/β
       // (variant_performance_metrics) accumulated by these selections.
       rec.selection_metadata.proposed_template = (rec as any)._proposed === true;
+      // Patch the top-level exploration signal (Change 2 — topology observability).
+      // Mirrors exploration_slot but lives at the top level so callers (goal-host,
+      // Obsidian dashboard) can read it without inspecting selection_metadata.
+      (rec as any).exploration = isExploration;
       delete (rec as any)._ucb_score;
       delete (rec as any)._total_executions;
       delete (rec as any)._proposed;

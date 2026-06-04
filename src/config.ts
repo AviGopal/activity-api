@@ -268,6 +268,14 @@ export function loadConfig(): Config {
         // Supports filtering by templateId, signatureVersion, minObservations.
         // Powers harness discrimination stat (§6) and operator inspection.
         'contextThompsonScores',
+        // topologyCoverage: read-only summary of (pool-signature × template)
+        // exploration coverage. Backed by GET /v2/activities/topology-coverage;
+        // returns distinct_pool_signatures, total_v1_observations,
+        // avg_templates_per_signature, top_signatures, dark_signature_count,
+        // and oldest/newest timestamps. Returns cold_start status when no v1
+        // rows exist. Used by the Obsidian dashboard and topology-exploration
+        // boredom goals to verify the substrate is making exploration progress.
+        'topologyCoverage',
         // mcpTool: discovery-to-tools bridge. Activity-api currently exposes
         // its write surface through *_write impulse shapes (the preferred
         // dispatch path per docs/specs/discovery-to-tools-bridge.md
