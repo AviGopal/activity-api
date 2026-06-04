@@ -23,6 +23,7 @@ import { logger } from '../utils/logger';
 import { normalizeActivityId } from '../db/paradigm';
 import type { FailureMode } from '../models/schemas';
 import { seedPriorFromConcepts } from './prior-seed';
+import { lookupEmbeddingForSignature } from './embedding-lookup-cache';
 import { classifyTemplateTiers, type ResolverTier } from '../services/tier-classifier';
 
 // ---------------------------------------------------------------------------
@@ -344,7 +345,16 @@ async function writeAncestorDelta(
 
   if (signature != null) {
     try {
-      const seed = await seedPriorFromConcepts(ancestorId, signature, orgId);
+      // M1 hook (concept_vugylIHzIMvk): when EMBEDDING_PRIOR_ENABLED is true,
+      // look up the per-cell embedding from concept-db (LRU-cached) and pass
+      // it through so seedPriorFromConcepts routes to the θ-scored prior
+      // instead of the concept-neighbor query. Falls back gracefully on miss.
+      let embedding: number[] | undefined;
+      if (process.env.EMBEDDING_PRIOR_ENABLED === 'true') {
+        const e = await lookupEmbeddingForSignature(signature, orgId);
+        if (e) embedding = e;
+      }
+      const seed = await seedPriorFromConcepts(ancestorId, signature, orgId, embedding);
       await db.query(
         `
         LET $existing = (SELECT * FROM context_thompson_scores
@@ -600,7 +610,13 @@ export async function applyOutcomeToPosteriors(
       // creating it. If the template already has ≥ 200 distinct signature buckets,
       // skip the CREATE (UPDATE still proceeds for existing rows).
       const CARDINALITY_CAP = parseInt(process.env.SIGNATURE_CARDINALITY_CAP ?? '200', 10);
-      const seed = await seedPriorFromConcepts(activityId, trace.signature, orgId);
+      // M1 hook (concept_vugylIHzIMvk): same pattern as the chain-credit path.
+      let embedding: number[] | undefined;
+      if (process.env.EMBEDDING_PRIOR_ENABLED === 'true' && trace.signature) {
+        const e = await lookupEmbeddingForSignature(trace.signature, orgId);
+        if (e) embedding = e;
+      }
+      const seed = await seedPriorFromConcepts(activityId, trace.signature, orgId, embedding);
       await db.query(
         `
         LET $existing = (SELECT * FROM context_thompson_scores

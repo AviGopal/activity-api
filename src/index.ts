@@ -233,6 +233,44 @@ app.route('/v2/events', eventsRouter);
 import { startGoalTemplateMismatchDetector } from './learners/goal-template-mismatch';
 startGoalTemplateMismatchDetector();
 
+// M1 continuous-training observer (concept_KKwxHmPfEMSY). Opt-in via
+// EMBEDDING_PRIOR_OBSERVER_ENABLED=true. Subscribes to task.completed events,
+// buffers eligible (variant, signature) cells, and fits θ_α/θ_β to
+// embedding_prior_weights when the count/time trigger trips.
+if (process.env.EMBEDDING_PRIOR_OBSERVER_ENABLED === 'true') {
+  void (async () => {
+    try {
+      const { startEmbeddingPriorTrainer } = await import('./services/embedding-prior-trainer');
+      const { broadcaster } = await import('./websocket/broadcaster');
+      const { lookupEmbeddingForSignature } = await import('./lib/embedding-lookup-cache');
+      const { surrealDB } = await import('./db/surreal');
+      // @ts-ignore — scripts/ lives outside tsconfig rootDir; runtime is fine.
+      const { writeWeights } = await import('../scripts/m1-train');
+      startEmbeddingPriorTrainer({
+        broadcaster,
+        loadContextScore: async (variantId, signature) => {
+          const rows = await surrealDB.query<{
+            total_executions: number;
+            alpha: number;
+            beta: number;
+          }>(
+            `SELECT total_executions, alpha, beta FROM context_thompson_scores
+             WHERE template_id = $vid AND context_bucket = $sig LIMIT 1`,
+            { vid: variantId, sig: signature },
+          );
+          return rows[0] ?? null;
+        },
+        lookupEmbedding: lookupEmbeddingForSignature,
+        writeWeights: ({ modelVersion, featureDim, thetaAlpha, thetaBeta, nTrainingSamples, orgId }) =>
+          writeWeights({ modelVersion, featureDim, thetaAlpha, thetaBeta, nTrainingSamples, orgId }),
+      });
+    } catch (err: any) {
+      // Never let observer wiring kill the server.
+      console.warn('[m1-observer] startup failed:', err?.message);
+    }
+  })();
+}
+
 // Boredom queue routes (GET /boredom-tasks, POST /v2/activities/boredom/enqueue, POST /v2/vessels/register)
 app.route('/', boredomRoutes);
 
