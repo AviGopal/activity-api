@@ -151,7 +151,7 @@ describe('POST /v2/impulses/resolve → activityTemplate_deprecate (404 vs 403)'
     expect(body.error).toContain('not found');
   });
 
-  test('existing global-scope row + non-admin caller returns 403 admin-required', async () => {
+  test('existing global-scope row + non-admin caller without evidence returns 422 insufficient_evidence', async () => {
     withExistenceRow({
       id: 'activity:foo',
       scope: 'global',
@@ -162,11 +162,35 @@ describe('POST /v2/impulses/resolve → activityTemplate_deprecate (404 vs 403)'
       type: 'activityTemplate_deprecate',
       templateId: 'foo',
     });
-    expect(status).toBe(403);
+    // Policy change 2026-06-04: rescind admin-only RBAC; substrate can
+    // deprecate global templates when Thompson evidence is supplied.
+    expect(status).toBe(422);
     expect(body.success).toBe(false);
-    expect(body.error).toContain('admin scope required');
-    // No UPDATE should have been issued.
+    expect(body.error).toContain('insufficient_evidence');
     expect(queryLog.some((q) => q.sql.includes('UPDATE activity'))).toBe(false);
+  });
+
+  test('existing global-scope row + non-admin caller WITH sufficient evidence returns 200', async () => {
+    withExistenceRow({
+      id: 'activity:foo-2',
+      scope: 'global',
+      org_id: 'org-other',
+    });
+    const app = buildAppWithStubAuth({ orgId: 'org-test', isAdmin: false });
+    const { status, body } = await resolve(app, {
+      type: 'activityTemplate_deprecate',
+      templateId: 'foo-2',
+      reason: 'winner dominates over 20 runs each',
+      evidence: {
+        reason: 'winner dominates over 20 runs each',
+        winner_alpha: 18, winner_beta: 2,
+        loser_alpha: 5, loser_beta: 15,
+        loser_samples: 20,
+      },
+    });
+    expect(status).toBe(200);
+    expect(body.success).toBe(true);
+    expect(queryLog.some((q) => q.sql.includes('UPDATE activity'))).toBe(true);
   });
 
   test('existing other-org row + non-admin caller returns 403 different-org', async () => {
@@ -240,7 +264,7 @@ describe('POST /v2/impulses/resolve → activityTemplate_update (404 vs 403)', (
     expect(body.error).toContain('not found');
   });
 
-  test('existing global-scope row + non-admin returns 403 admin-required', async () => {
+  test('existing global-scope row + non-admin without evidence returns 422', async () => {
     withExistenceRow({
       id: 'activity:foo',
       scope: 'global',
@@ -253,9 +277,28 @@ describe('POST /v2/impulses/resolve → activityTemplate_update (404 vs 403)', (
       templateId: 'foo',
       updates: { name: 'renamed' },
     });
-    expect(status).toBe(403);
-    expect(body.error).toContain('admin scope required');
+    expect(status).toBe(422);
+    expect(body.error).toContain('insufficient_evidence');
     expect(queryLog.some((q) => q.sql.includes('UPDATE activity'))).toBe(false);
+  });
+
+  test('existing global-scope row + non-admin WITH reason-only evidence returns 200', async () => {
+    withExistenceRow({
+      id: 'activity:foo-3',
+      scope: 'global',
+      org_id: 'org-other',
+      name: 'orig',
+    });
+    const app = buildAppWithStubAuth({ orgId: 'org-test', isAdmin: false });
+    const { status, body } = await resolve(app, {
+      type: 'activityTemplate_update',
+      templateId: 'foo-3',
+      updates: { name: 'renamed' },
+      evidence: { reason: 'rename for consistency with shape contract' },
+    });
+    expect(status).toBe(200);
+    expect(body.success).toBe(true);
+    expect(queryLog.some((q) => q.sql.includes('UPDATE activity'))).toBe(true);
   });
 
   test('existing other-org row + non-admin returns 403 different-org', async () => {

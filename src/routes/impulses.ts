@@ -142,6 +142,100 @@ async function executeAsAuth<T>(
 }
 
 /**
+ * Evidence gate for template lifecycle operations (`_update`, `_deprecate`).
+ *
+ * Substrate-callable replacement for the prior RBAC-only gate that required
+ * admin-scope to mutate global-scope templates. The substrate accumulates
+ * Thompson posteriors over real workload; that signal is the natural safety
+ * mechanism for promote/deprecate. Admin scope still works as the override
+ * path (no evidence required) — this gate only fires for non-admin callers
+ * hitting global-scope rows.
+ *
+ * MIN_SAMPLES and MIN_DELTA defaults are conservative: 10 samples on the
+ * losing variant + winner success rate ≥0.15 above loser. Override via
+ * env vars `TEMPLATE_LIFECYCLE_MIN_SAMPLES` / `TEMPLATE_LIFECYCLE_MIN_DELTA`.
+ *
+ * Returns null when evidence passes (operation may proceed); otherwise a
+ * structured rejection payload for the caller to log + retry with stronger
+ * evidence.
+ */
+const EVIDENCE_MIN_SAMPLES = Number(process.env['TEMPLATE_LIFECYCLE_MIN_SAMPLES'] ?? 10);
+const EVIDENCE_MIN_DELTA = Number(process.env['TEMPLATE_LIFECYCLE_MIN_DELTA'] ?? 0.15);
+
+type TemplateLifecycleEvidence = {
+  winner_alpha?: number;
+  winner_beta?: number;
+  winner_samples?: number;
+  loser_alpha?: number;
+  loser_beta?: number;
+  loser_samples?: number;
+  confidence_threshold?: number;
+  reason?: string;
+  source_trace_ids?: string[];
+};
+
+export function validateEvidenceGate(
+  evidence: TemplateLifecycleEvidence | undefined,
+  operation: 'update' | 'deprecate',
+): { ok: true } | { ok: false; insufficient_evidence: { required: Record<string, unknown>; provided: TemplateLifecycleEvidence | null } } {
+  const provided: TemplateLifecycleEvidence | null = (evidence && typeof evidence === 'object') ? evidence : null;
+  if (!provided) {
+    return {
+      ok: false,
+      insufficient_evidence: {
+        required: { evidence: 'object', reason: 'string (non-empty)', note: `non-admin callers must supply Thompson evidence for ${operation}` },
+        provided: null,
+      },
+    };
+  }
+  if (!provided.reason || typeof provided.reason !== 'string' || provided.reason.trim().length === 0) {
+    return {
+      ok: false,
+      insufficient_evidence: { required: { reason: 'non-empty string' }, provided },
+    };
+  }
+  if (operation === 'deprecate') {
+    const wAlpha = Number(provided.winner_alpha ?? NaN);
+    const wBeta = Number(provided.winner_beta ?? NaN);
+    const lAlpha = Number(provided.loser_alpha ?? NaN);
+    const lBeta = Number(provided.loser_beta ?? NaN);
+    const lSamples = Number(provided.loser_samples ?? (lAlpha + lBeta - 2));
+    const minDelta = Number(provided.confidence_threshold ?? EVIDENCE_MIN_DELTA);
+    if ([wAlpha, wBeta, lAlpha, lBeta].some((n) => !Number.isFinite(n) || n <= 0)) {
+      return {
+        ok: false,
+        insufficient_evidence: {
+          required: { winner_alpha: '>0', winner_beta: '>0', loser_alpha: '>0', loser_beta: '>0' },
+          provided,
+        },
+      };
+    }
+    if (!Number.isFinite(lSamples) || lSamples < EVIDENCE_MIN_SAMPLES) {
+      return {
+        ok: false,
+        insufficient_evidence: {
+          required: { loser_samples: `>= ${EVIDENCE_MIN_SAMPLES}` },
+          provided: { ...provided, loser_samples: lSamples },
+        },
+      };
+    }
+    const winnerMean = wAlpha / (wAlpha + wBeta);
+    const loserMean = lAlpha / (lAlpha + lBeta);
+    const delta = winnerMean - loserMean;
+    if (delta < minDelta) {
+      return {
+        ok: false,
+        insufficient_evidence: {
+          required: { posterior_delta: `>= ${minDelta}` },
+          provided: { ...provided, confidence_threshold: minDelta },
+        },
+      };
+    }
+  }
+  return { ok: true };
+}
+
+/**
  * Emit an upkeepAuditLog impulse for a destructive operation. Non-blocking —
  * a failure to audit never fails the operation (the log is best-effort, the
  * underlying op has already succeeded in SQL). See migration 077 for schema.
@@ -160,6 +254,13 @@ async function emitUpkeepAudit(payload: {
   account_id?: string | null;
   reason?: string;
   diff?: Record<string, unknown>;
+  // Evidence-gate fields (2026-06-04): when the substrate invokes a template
+  // lifecycle mutation with Thompson posteriors, both the evidence body and
+  // the gate verdict are persisted alongside the operation for auditability.
+  // authority distinguishes admin_scope (admin override), evidence_gate
+  // (substrate-callable via Thompson), and org_scope (org-local row).
+  evidence?: TemplateLifecycleEvidence;
+  authority?: 'admin_scope' | 'evidence_gate' | 'org_scope';
 }): Promise<string | null> {
   const auditId = `upkeep-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
   const audit = { ...payload, performed_at: new Date().toISOString() };
@@ -2608,6 +2709,7 @@ router.post('/resolve', async (c) => {
         const updatePointer = pointer as typeof pointer & {
           templateId?: string;
           updates?: Record<string, unknown>;
+          evidence?: TemplateLifecycleEvidence;
         };
         if (!updatePointer.templateId || !updatePointer.updates) {
           return c.json({ success: false, error: 'templateId and updates (object) required for activityTemplate_update' } as ImpulseResolveResponse, 400);
@@ -2625,6 +2727,7 @@ router.post('/resolve', async (c) => {
         const jwtAuth = getJwtAuthFromContext(c)!;
         const templateId = updatePointer.templateId;
         const updates = updatePointer.updates;
+        const updateEvidence = updatePointer.evidence;
 
         // Helper: is this caller an admin?
         const isAdmin = jwtAuth.role === 'admin' ||
@@ -2652,20 +2755,34 @@ router.post('/resolve', async (c) => {
 
           const isGlobal = beforeRow.scope === 'global';
           const sameOrg = beforeRow.org_id === jwtAuth.orgId;
+          // Evidence gate: non-admin callers may mutate global-scope rows
+          // when they supply auditable evidence (Thompson posteriors + reason).
+          // This rescinds the prior operator-only RBAC restriction; the
+          // substrate's own posteriors are the natural safety mechanism.
+          let evidenceUsed: TemplateLifecycleEvidence | null = null;
           if (isGlobal && !isAdmin) {
-            return c.json({ success: false, error: 'Forbidden: admin scope required for global-scope templates' } as ImpulseResolveResponse, 403);
+            const verdict = validateEvidenceGate(updateEvidence, 'update');
+            if (!verdict.ok) {
+              return c.json({
+                success: false,
+                error: 'insufficient_evidence: non-admin callers must supply auditable evidence for global-scope template updates',
+                metadata: { insufficient_evidence: verdict.insufficient_evidence } as any,
+              } as ImpulseResolveResponse, 422);
+            }
+            evidenceUsed = updateEvidence ?? null;
           }
           if (!isGlobal && !sameOrg) {
             return c.json({ success: false, error: 'Forbidden: template belongs to a different org' } as ImpulseResolveResponse, 403);
           }
 
-          // Phase B2: dual-tenant scoping in the UPDATE WHERE clause. Mirror
-          // the read-time scope so account-bearing callers can update both
-          // their account-scoped rows and any legacy org-scoped rows that
-          // predate the migration.
+          // Phase B2: dual-tenant scoping in the UPDATE WHERE clause. When the
+          // evidence gate cleared the row for a non-admin caller, treat it as
+          // admin-equivalent for the UPDATE WHERE (the evidence is now the
+          // authority). evidenceCleared is the in-band flag for that path.
+          const evidenceCleared = isGlobal && !isAdmin && evidenceUsed !== null;
           const after = await executeAsAuth<any>(
             jwtAuth,
-            `UPDATE activity MERGE $updates WHERE record::id(id) = $id AND (${accountIdScopedWhere()} OR (scope = 'global' AND $isAdmin = true)) RETURN AFTER`,
+            `UPDATE activity MERGE $updates WHERE record::id(id) = $id AND (${accountIdScopedWhere()} OR (scope = 'global' AND ($isAdmin = true OR $evidenceCleared = true))) RETURN AFTER`,
             {
               id: templateId,
               updates,
@@ -2673,6 +2790,7 @@ router.post('/resolve', async (c) => {
               org_id: jwtAuth.orgId,
               account_id: jwtAuth.accountId ?? null,
               isAdmin,
+              evidenceCleared,
             },
           );
           const afterRow = (after || [])[0];
@@ -2695,6 +2813,8 @@ router.post('/resolve', async (c) => {
             // log dual-writes alongside its target.
             account_id: jwtAuth.accountId ?? null,
             diff,
+            evidence: evidenceUsed ?? undefined,
+            authority: isAdmin ? 'admin_scope' : (evidenceUsed ? 'evidence_gate' : 'org_scope'),
           });
 
           // Invalidate template caches — UPDATE mutates row fields, so both
@@ -2721,6 +2841,7 @@ router.post('/resolve', async (c) => {
         const deprecatePointer = pointer as typeof pointer & {
           templateId?: string;
           reason?: string;
+          evidence?: TemplateLifecycleEvidence;
         };
         if (!deprecatePointer.templateId) {
           return c.json({ success: false, error: 'templateId required for activityTemplate_deprecate' } as ImpulseResolveResponse, 400);
@@ -2729,6 +2850,11 @@ router.post('/resolve', async (c) => {
         const jwtAuth = getJwtAuthFromContext(c)!;
         const templateId = deprecatePointer.templateId;
         const reason = deprecatePointer.reason;
+        // Allow reason to live either at the pointer top-level (legacy) or
+        // inside evidence.reason. Either satisfies the gate.
+        const deprecateEvidence: TemplateLifecycleEvidence | undefined = deprecatePointer.evidence
+          ? { ...deprecatePointer.evidence, reason: deprecatePointer.evidence.reason ?? reason }
+          : (reason ? { reason } : undefined);
 
         // Spec 6: admin check for global template deprecation
         const isAdminDep = jwtAuth.role === 'admin' ||
@@ -2753,23 +2879,38 @@ router.post('/resolve', async (c) => {
 
           const isGlobal = existingRow.scope === 'global';
           const sameOrg = existingRow.org_id === jwtAuth.orgId;
+          // Evidence gate (substrate-callable deprecate): non-admin callers
+          // may deprecate global-scope rows when Thompson posteriors show
+          // the winner's mean success rate is at least MIN_DELTA above the
+          // loser's, AND the loser has at least MIN_SAMPLES observed runs.
+          let depEvidenceUsed: TemplateLifecycleEvidence | null = null;
           if (isGlobal && !isAdminDep) {
-            return c.json({ success: false, error: 'Forbidden: admin scope required for global-scope templates' } as ImpulseResolveResponse, 403);
+            const verdict = validateEvidenceGate(deprecateEvidence, 'deprecate');
+            if (!verdict.ok) {
+              return c.json({
+                success: false,
+                error: 'insufficient_evidence: non-admin callers must supply Thompson evidence for global-scope template deprecation',
+                metadata: { insufficient_evidence: verdict.insufficient_evidence } as any,
+              } as ImpulseResolveResponse, 422);
+            }
+            depEvidenceUsed = deprecateEvidence ?? null;
           }
           if (!isGlobal && !sameOrg) {
             return c.json({ success: false, error: 'Forbidden: template belongs to a different org' } as ImpulseResolveResponse, 403);
           }
 
           // Phase B2: dual-tenant scoping in deprecate UPDATE.
+          const depEvidenceCleared = isGlobal && !isAdminDep && depEvidenceUsed !== null;
           const after = await executeAsAuth<any>(
             jwtAuth,
-            `UPDATE activity SET deprecated = true, updated_at = time::now() WHERE record::id(id) = $id AND (${accountIdScopedWhere()} OR (scope = 'global' AND $isAdmin = true)) RETURN AFTER`,
+            `UPDATE activity SET deprecated = true, updated_at = time::now() WHERE record::id(id) = $id AND (${accountIdScopedWhere()} OR (scope = 'global' AND ($isAdmin = true OR $evidenceCleared = true))) RETURN AFTER`,
             {
               id: templateId,
               orgId: jwtAuth.orgId,
               org_id: jwtAuth.orgId,
               account_id: jwtAuth.accountId ?? null,
               isAdmin: isAdminDep,
+              evidenceCleared: depEvidenceCleared,
             },
           );
           const afterRow = (after || [])[0];
@@ -2785,6 +2926,8 @@ router.post('/resolve', async (c) => {
             org_id: jwtAuth.orgId,
             account_id: jwtAuth.accountId ?? null,
             reason,
+            evidence: depEvidenceUsed ?? undefined,
+            authority: isAdminDep ? 'admin_scope' : (depEvidenceUsed ? 'evidence_gate' : 'org_scope'),
           });
 
           // Invalidate template caches — deprecate flips `deprecated` on
