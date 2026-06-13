@@ -544,6 +544,59 @@ describe('propagateCreditAlongChain — 18.4.5: success on 4-deep chain', () => 
   });
 });
 
+describe('propagateCreditAlongChain — §7: horizontal-composition sibling averaging', () => {
+  // When k compose_parallel siblings share an identical chain, each fires this
+  // propagation; sibling_group_size=k divides every per-ancestor delta by k so
+  // the k siblings sum to a single (averaged) ancestor update — no k-fold inflation.
+  test('success with sibling_group_size=3 → each ancestor delta divided by 3', async () => {
+    const { db, calls } = makeDb();
+
+    await propagateCreditAlongChain(
+      {
+        activity_id: 'D',
+        composition_chain: ['A', 'B', 'C'],
+        success: true,
+        sibling_group_size: 3,
+      },
+      db,
+      ORG,
+    );
+
+    // C depth 1: λ^1 / 3 = 0.7/3; B depth 2: 0.49/3; A depth 3: 0.343/3
+    expect(getGlobalCalls(calls, 'C')[0].params.alpha_delta).toBeCloseTo(0.7 / 3);
+    expect(getGlobalCalls(calls, 'B')[0].params.alpha_delta).toBeCloseTo(0.49 / 3);
+    expect(getGlobalCalls(calls, 'A')[0].params.alpha_delta).toBeCloseTo(0.343 / 3);
+  });
+
+  test('absent sibling_group_size behaves as divisor 1 (unchanged)', async () => {
+    const { db, calls } = makeDb();
+    await propagateCreditAlongChain(
+      { activity_id: 'D', composition_chain: ['A', 'B', 'C'], success: true },
+      db,
+      ORG,
+    );
+    expect(getGlobalCalls(calls, 'C')[0].params.alpha_delta).toBeCloseTo(0.7);
+  });
+
+  test('sibling_group_size on failure → β delta divided by k too', async () => {
+    const { db, calls } = makeDb();
+    await propagateCreditAlongChain(
+      {
+        activity_id: 'D',
+        composition_chain: ['A', 'B', 'C'],
+        success: false,
+        failure_mode: { type: 'verifier_negative', reason: 'x', context: {} } as any,
+        sibling_group_size: 2,
+      },
+      db,
+      ORG,
+    );
+    // verifier_negative → β to all ancestors, each halved by k=2
+    expect(getGlobalCalls(calls, 'C')[0].params.beta_delta).toBeCloseTo(0.7 / 2);
+    expect(getGlobalCalls(calls, 'A')[0].params.beta_delta).toBeCloseTo(0.343 / 2);
+  });
+});
+
 describe('propagateCreditAlongChain — 18.4.6: cascading failure on 4-deep chain', () => {
   // Chain A→B→C→D. D fails with cascading, upstream_task_id points at a task
   // in B. Heuristic: propagate β to the direct parent (C, depth 1) only.

@@ -2406,6 +2406,12 @@ app.post('/', async (c) => {
           cost_usd: trace.cost_usd as number,
           ...(resolvedCompositionChain.length > 0 ? { composition_chain: resolvedCompositionChain } : {}),
           ...(v1Sig ? { signature: v1Sig, signature_version: v1SigVersion } : {}),
+          // §7 horizontal-composition fan-out width, surfaced from the engine via
+          // body.metadata.siblingGroupSize, so chain-credit averages over siblings
+          // instead of k-fold-summing at shared ancestors.
+          ...(typeof (body.metadata as { siblingGroupSize?: unknown } | undefined)?.siblingGroupSize === 'number'
+            ? { sibling_group_size: (body.metadata as { siblingGroupSize: number }).siblingGroupSize }
+            : {}),
         },
         surrealDB,
         trace.org_id as string,

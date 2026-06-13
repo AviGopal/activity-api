@@ -73,6 +73,13 @@ export interface TraceForPosterior {
   signature?: string;
   /** Must accompany signature; typically 1 for v1 signatures. */
   signature_version?: number;
+  /**
+   * Horizontal-composition (§7) fan-out width, surfaced from the engine via
+   * the persisted trace's body.metadata.siblingGroupSize. When a compose_parallel
+   * task dispatched k siblings, each sibling trace carries k here so chain-credit
+   * averages instead of k-fold-summing at shared ancestors. Absent ⇒ 1.
+   */
+  sibling_group_size?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +137,16 @@ export interface ExecutionForChainCredit {
    * (expected during the transition period; log at debug, never warn).
    */
   ancestor_signatures?: Record<string, { signature: string; signature_version: number }>;
+  /**
+   * Horizontal-composition fan-out width (SUBSTRATE_AS_MDP §7). When a
+   * `compose_parallel` task dispatches k sibling trajectories, all k share an
+   * identical composition_chain and each fires this propagation independently —
+   * which would credit every shared ancestor k-fold. Set to k so each sibling's
+   * per-ancestor delta is divided by k; the k siblings then sum to a single
+   * (averaged) ancestor update. Absent / ≤1 ⇒ no division (every legacy +
+   * vertical-compose trace is unaffected).
+   */
+  sibling_group_size?: number;
 }
 
 export interface UpdateSummary {
@@ -428,6 +445,12 @@ export async function propagateCreditAlongChain(
   // We walk from the end of the chain (closest ancestor = depth 1).
   const ancestors = [...composition_chain].reverse(); // [C, B, A, ...]
 
+  // §7 horizontal-composition averaging: k sibling trajectories share this exact
+  // chain, so divide each sibling's per-ancestor delta by the fan-out width to
+  // avoid k-fold inflation at every shared ancestor. Default 1 ⇒ unchanged for
+  // all legacy and vertical-compose traces.
+  const siblingDivisor = Math.max(1, execution.sibling_group_size ?? 1);
+
   // Batch-resolve execution IDs to variant IDs.
   type AncestorMeta = { variant_id: string };
   let ancestorMetaByExecId: Map<string, AncestorMeta> = new Map();
@@ -472,17 +495,17 @@ export async function propagateCreditAlongChain(
     let betaDelta = 0;
 
     if (success) {
-      alphaDelta = decayFactor;
+      alphaDelta = decayFactor / siblingDivisor;
     } else if (isCascading) {
       // For cascading: propagate β only to the direct parent (depth 1).
       // Ancestors beyond depth 1 are not causally implicated by this heuristic.
       if (depth === 1) {
-        betaDelta = decayFactor;
+        betaDelta = decayFactor / siblingDivisor;
       }
       // depth > 1: skip (A receives nothing per spec 18.4.3 heuristic)
     } else {
       // All other failure types: decayed β to all ancestors
-      betaDelta = decayFactor;
+      betaDelta = decayFactor / siblingDivisor;
     }
 
     await writeAncestorDelta(ancestorId, alphaDelta, betaDelta, db, orgId, ancestorSig, ancestorSigVersion);
@@ -716,6 +739,7 @@ export async function applyOutcomeToPosteriors(
         composition_chain: trace.composition_chain,
         success: trace.success,
         failure_mode: trace.failure_mode,
+        sibling_group_size: trace.sibling_group_size,
       },
       db,
       orgId,
