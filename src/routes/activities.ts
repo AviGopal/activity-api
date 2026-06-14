@@ -3504,6 +3504,30 @@ app.post('/templates/auto-promote', async (c) => {
       metricsMap.set(String(m.vpm_key ?? ''), m);
     }
 
+    // Trace-store evidence map (ONE aggregate query, not per-template). Powers
+    // the deterministic-activity fallback below: activities whose tasks are all
+    // deterministic never get a vpm posterior, but carry real success evidence
+    // in the trace store. Keyed by normalised activity_id (strip `activity:`
+    // prefix + `⟨…⟩` record-ref wrapping).
+    const traceStatsMap = new Map<string, { total: number; succ: number }>();
+    try {
+      const traceRows = (await surrealDB.query<any>(
+        `SELECT activity_id,
+                count() AS total,
+                count(status = 'success' OR status = 'completed' OR success = true) AS succ
+           FROM activity_execution_traces
+          GROUP BY activity_id`,
+      )) || [];
+      for (const r of (Array.isArray(traceRows) ? traceRows : [])) {
+        const norm = String(r.activity_id ?? '')
+          .replace(/^activity:/, '')
+          .replace(/⟨|⟩/g, '');
+        if (norm) traceStatsMap.set(norm, { total: Number(r.total ?? 0), succ: Number(r.succ ?? 0) });
+      }
+    } catch (err) {
+      logger.warn('auto-promote trace-evidence map build failed', { error: (err as Error).message });
+    }
+
     const promoted: any[] = [];
     const skipped: any[] = [];
 
@@ -3511,10 +3535,37 @@ app.post('/templates/auto-promote', async (c) => {
       const m = metricsMap.get(p.template_id);
       const alpha = m?.thompson_alpha ?? 1.0;
       const beta = m?.thompson_beta ?? 1.0;
-      const total_executions = m?.total_executions ?? 0;
+      let total_executions = m?.total_executions ?? 0;
       // Strip the Beta(1,1) prior: real successes = α-1, real failures = β-1
-      const empirical_samples = Math.max(0, (alpha - 1) + (beta - 1));
-      const empirical_mean = empirical_samples > 0 ? (alpha - 1) / empirical_samples : 0;
+      let empirical_samples = Math.max(0, (alpha - 1) + (beta - 1));
+      let empirical_mean = empirical_samples > 0 ? (alpha - 1) / empirical_samples : 0;
+      let evidence_source = 'thompson_posterior';
+
+      // Deterministic-activity fallback. An activity whose tasks are ALL
+      // deterministic never gets a vpm posterior — `applyOutcomeToPosteriors`
+      // skips the UPDATE for degenerate posteriors (posterior-update.ts:49-53).
+      // Such activities (e.g. a single-resolver concept-priming wrapper) still
+      // carry real success evidence in the trace store. Without this fallback
+      // they can NEVER auto-promote (empirical_samples stays 0), so the
+      // author→exercise→promote loop only ever graduated stochastic (LLM-tier)
+      // activities. Count trace-store successes so deterministic authored
+      // activities graduate on execution evidence, not Thompson α/β.
+      // Trace-store ground truth augments the vpm posterior whenever vpm is
+      // insufficient. Two cases this fixes: (1) all-deterministic activities
+      // never get a vpm row (posterior UPDATE skipped); (2) activities executed
+      // via light-dispatch / out-of-band paths that don't credit vpm, so the vpm
+      // row UNDER-counts real executions. The `tr.total > empirical_samples`
+      // guard only lets traces win when they carry MORE observations than vpm,
+      // so a well-sampled stochastic posterior is never overridden by raw counts.
+      if (empirical_samples < min_samples) {
+        const tr = traceStatsMap.get(p.template_id);
+        if (tr && tr.total > empirical_samples) {
+          empirical_samples = tr.total;
+          empirical_mean = tr.total > 0 ? tr.succ / tr.total : 0;
+          total_executions = tr.total;
+          evidence_source = 'trace_store';
+        }
+      }
 
       const evidence = {
         template_id: p.template_id,
@@ -3524,6 +3575,7 @@ app.post('/templates/auto-promote', async (c) => {
         total_executions,
         empirical_samples,
         empirical_mean,
+        evidence_source,
       };
 
       if (empirical_samples < min_samples) {
