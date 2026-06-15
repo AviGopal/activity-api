@@ -490,8 +490,28 @@ app.get('/', async (c) => {
     const successParam = c.req.query('success');
     const limitParam = parseInt(c.req.query('limit') || '50', 10);
     const offsetParam = parseInt(c.req.query('offset') || '0', 10);
-    const startDate = c.req.query('start_date');
-    const endDate = c.req.query('end_date');
+    // `start_date` is the canonical param; `since` is an alias honored for
+    // callers (boredom-vessel's idle/analysis queries) that pass a recency
+    // bound. Both accept an ISO-8601 datetime OR an epoch value (ms or s),
+    // since boredom sends `Date.now() - window` (epoch millis). Coercing here
+    // keeps the hot-path query bounded to a NARROW recent window instead of
+    // silently dropping the filter and scanning the full 30-day default
+    // window (~all rows) — the loop's rate limiter. SurrealDB does not
+    // index-optimize `executed_at >= X ORDER BY executed_at DESC` (it
+    // range-scans then sorts), so a narrow window is what keeps this fast.
+    const coerceToIso = (raw: string | undefined): string | undefined => {
+      if (!raw) return undefined;
+      const trimmed = raw.trim();
+      if (/^\d+$/.test(trimmed)) {
+        const n = Number(trimmed);
+        // < 1e12 → looks like epoch seconds; otherwise epoch millis.
+        const ms = n < 1e12 ? n * 1000 : n;
+        return new Date(ms).toISOString();
+      }
+      return trimmed; // already ISO (or a value SurrealDB will reject loudly)
+    };
+    const startDate = coerceToIso(c.req.query('start_date') ?? c.req.query('since'));
+    const endDate = coerceToIso(c.req.query('end_date'));
     const includeSelection = c.req.query('include_selection') === 'true';
 
     // Validate and cap limit
@@ -603,6 +623,15 @@ app.get('/', async (c) => {
     // per row. Individual traces are fetched fully on demand via the single-
     // trace endpoint. This is the primary contributor to OOMKills when the
     // table grows large (SELECT * scans all JSONB columns into memory).
+    //
+    // `array::len(tasks ?? [])` / `array::len(impulse_resolutions ?? [])` were
+    // REMOVED from this projection: array::len forces SurrealDB to deserialize
+    // the full multi-KB `tasks` and `impulse_resolutions` JSONB arrays for
+    // every candidate row — re-introducing exactly the per-row JSONB load this
+    // projection was built to avoid (measured ~3.5s on a narrow window where
+    // execution_id-only is 35ms). The counts are instead read cheaply from the
+    // denormalised `metadata.task_count` the executor already writes; callers
+    // needing exact impulse counts use the single-trace endpoint.
     const query = `
       SELECT
         id, execution_id, activity_id, variant_id, org_id, account_id,
@@ -611,8 +640,7 @@ app.get('/', async (c) => {
         vessel_id, vessel_version,
         failure_mode, metadata, tags,
         output_impulse_shapes, input_impulse_shapes,
-        array::len(tasks ?? []) AS task_count,
-        array::len(impulse_resolutions ?? []) AS impulse_count
+        (metadata.task_count ?? 0) AS task_count
       FROM activity_execution_traces
       ${whereClause}
       ORDER BY executed_at DESC
