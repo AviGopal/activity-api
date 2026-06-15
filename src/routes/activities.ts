@@ -8869,8 +8869,17 @@ app.post('/impulse-relevance', async (c) => {
     // (impulse, variant, task) triple.
     const relevanceJwtAuth = getJwtAuthFromContext(c);
     const sessionForRelevance = (c.get as any)('session') as SessionData | undefined;
+    // When invoked through the internal write-delegation path
+    // (POST /v2/impulses/resolve → impulseRelevance_write), the inner sub-router
+    // has no auth middleware, so getJwtAuthFromContext() returns null here.
+    // delegateWriteToRouter injects the outer ApiKey-resolved org into body.org_id;
+    // honour it before falling back to null, otherwise the CREATE writes a NULL
+    // org_id and SurrealDB rejects it against the non-optional TYPE string field
+    // (the ribosome replay-observer path 500s 100% of the time without this).
     const relevanceOrgId =
-      relevanceJwtAuth?.orgId ?? sessionForRelevance?.org_id ?? null;
+      relevanceJwtAuth?.orgId ??
+      sessionForRelevance?.org_id ??
+      (typeof body?.org_id === 'string' ? body.org_id : null);
     const relevanceAccountId: string | null =
       relevanceJwtAuth?.accountId ?? null;
 
