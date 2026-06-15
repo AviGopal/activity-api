@@ -1894,6 +1894,200 @@ app.get('/public', async (c) => {
 });
 
 /**
+ * GET /v2/activities/templates/proposed-for-exercise
+ *
+ * Internal endpoint for the boredom-vessel exerciser. Surfaces a bounded,
+ * deduped set of proposed gap-closing templates that are backlogged at
+ * total_executions=0 because nothing exercises them. The standard
+ * `GET /templates` handler caps at 100 rows and won't surface the backlog;
+ * this endpoint fetches the full proposed set server-side (root path, like
+ * auto-promote), dedups by gap_class, and returns a light projection.
+ *
+ * Read-only. Registered BEFORE `/templates/:variantId` so Hono matches the
+ * static path first rather than capturing `proposed-for-exercise` as a variantId.
+ */
+app.get('/templates/proposed-for-exercise', async (c) => {
+  try {
+    const limitStr = c.req.query('limit') || '40';
+    let limit = parseInt(limitStr, 10);
+    if (isNaN(limit) || limit < 1) {
+      limit = 40;
+    }
+    limit = Math.min(limit, 100);
+
+    // Strip SurrealDB record-id wrapping: `activity:⟨X⟩` → `X`, `activity:X` → `X`.
+    const normalizeId = (raw: unknown): string | null => {
+      if (typeof raw !== 'string' || raw.length === 0) return null;
+      let id = raw;
+      if (id.startsWith('activity:')) id = id.slice('activity:'.length);
+      // Strip angle-bracket wrappers (both the unicode ⟨⟩ and ascii fallbacks).
+      id = id.replace(/^[⟨<`]+/, '').replace(/[⟩>`]+$/, '');
+      return id.length > 0 ? id : null;
+    };
+
+    // Collapse the volatile tail so two drafts of the same gap share a gap_class.
+    // Loop until stable: drafts accumulate CHAINED tails (e.g.
+    // `...-1781017392143-1781335379035-1781338862033`) when re-drafted, so a
+    // single strip leaves residual epochs and dedup under-collapses (917 spurious
+    // classes). Strip ISO timestamps, epoch-ms, and `-v2` version suffixes
+    // repeatedly until none remain.
+    const gapClassOf = (id: string): string => {
+      let gc = id;
+      // Collapse autogen markers first: `auto-<epoch>-<rand>` carries the epoch
+      // MID-id (not as a trailing segment), so the tail-strip below would miss
+      // it and every autogen draft would be its own class. Map them all to `auto`.
+      gc = gc.replace(/auto-\d{10,}(-[a-z0-9]+)*/gi, 'auto');
+      let prev = '';
+      while (gc !== prev && gc.length > 0) {
+        prev = gc;
+        gc = gc.replace(/-\d{4}-\d{2}-\d{2}T[\d:.\-]+Z?$/i, ''); // ISO timestamp tail
+        gc = gc.replace(/-\d{10,}$/, '');                        // epoch-ms tail
+        gc = gc.replace(/-v\d+$/i, '');                          // version tail (-v2)
+        gc = gc.replace(/[-_]exec_[a-z0-9]+$/i, '');             // execution-marker tail (exec_<rand>)
+      }
+      return gc;
+    };
+
+    // A gap_class is "named" iff there's a non-trivial semantic body after the
+    // prefix. Empty (`gap-closing:`) or all-punctuation bodies are malformed
+    // autogen drafts with no real gap name — not worth exercising.
+    const hasName = (gapClass: string): boolean => {
+      const body = gapClass
+        .replace(/^gap-closing:/, '')
+        .replace(/^proposed_pattern_authored_/, '');
+      return /[a-z]{2,}/i.test(body);
+    };
+
+    // Fetch all proposed, non-retired, non-deprecated templates (root path).
+    // `meta::id(id) AS tid` yields the id as a plain string — the JS SurrealDB
+    // client otherwise deserializes `id` as a RecordId object, which would make
+    // every row fail the string-typed normalizer.
+    const rows = (await surrealDB.query<any>(
+      `SELECT meta::id(id) AS tid, name, tasks, input_shapes, output_shapes, metrics
+         FROM activity
+        WHERE proposed = true
+          AND (retired = false OR retired IS NONE)
+          AND (deprecated = false OR deprecated IS NONE)`,
+    )) || [];
+    const proposed: any[] = Array.isArray(rows) ? rows : [];
+
+    // Representative per gap_class, keeping the most-promotable draft.
+    const FAILED_OUT_MIN_SAMPLES = 5;
+    const PROMOTE_SUCCESS_RATE = 0.6;
+    const seenClasses = new Set<string>();
+    const byClass = new Map<string, { id: string; gap_class: string; resolvers: string[]; executions: number; successes: number; failures: number }>();
+    let backlogTotal = 0;
+
+    for (const row of proposed) {
+      try {
+        // Prefer the string `tid` (meta::id); fall back to `id` for safety.
+        const norm = normalizeId(typeof row?.tid === 'string' ? row.tid : row?.id);
+        if (!norm) continue;
+        if (!(norm.startsWith('gap-closing:') || norm.startsWith('proposed_pattern_authored_'))) {
+          continue;
+        }
+
+        // Exclude lifecycle-event meta-drafts: gap-closing activities authored
+        // ABOUT the lifecycle (promote/unload/deprecate) of OTHER activities.
+        // These are recursion artifacts from lifecycle events being mis-detected
+        // as capability gaps, not real gaps — exercising them burns cycles and
+        // never yields a usable capability. (A prune of these proposals is a
+        // separate hygiene step.)
+        const classBody = norm
+          .replace(/^gap-closing:/, '')
+          .replace(/^proposed_pattern_authored_/, '');
+        if (classBody.startsWith('activity-lifecycle-')) {
+          continue;
+        }
+
+        const gap_class = gapClassOf(norm);
+        if (!hasName(gap_class)) {
+          continue; // malformed/unnamed autogen draft — no real gap to close
+        }
+
+        backlogTotal++;
+
+        // Thompson posterior split: successes = alpha-1, failures = beta-1.
+        const m = row?.metrics ?? {};
+        const alpha = typeof m.thompson_alpha === 'number' ? m.thompson_alpha : 1;
+        const beta = typeof m.thompson_beta === 'number' ? m.thompson_beta : 1;
+        const successes = Math.max(0, alpha - 1);
+        const failures = Math.max(0, beta - 1);
+        const empiricalSamples = successes + failures;
+        const executions = (typeof m.total_executions === 'number' && Number.isFinite(m.total_executions))
+          ? Math.max(m.total_executions, empiricalSamples)
+          : empiricalSamples;
+        const successRate = empiricalSamples > 0 ? successes / empiricalSamples : null;
+        // A draft exercised enough times that still fails the promotion bar has
+        // had its chance — exclude it so it can't dominate its class forever (the
+        // confident-broken-cell trap). A sibling draft of the class can still run.
+        const failedOut = empiricalSamples >= FAILED_OUT_MIN_SAMPLES
+          && successRate !== null && successRate < PROMOTE_SUCCESS_RATE;
+
+        seenClasses.add(gap_class);
+        if (failedOut) continue;
+
+        const resolvers: string[] = Array.isArray(row?.tasks)
+          ? row.tasks
+              .map((t: any) => (t && typeof t.resolver === 'string' ? t.resolver : null))
+              .filter((r: string | null): r is string => r !== null)
+          : [];
+
+        const cand = { id: norm, gap_class, resolvers, executions, successes, failures };
+        const existing = byClass.get(gap_class);
+        // Best rep = most proven (successes), then closest to threshold
+        // (executions), then fewest failures.
+        if (!existing
+            || cand.successes > existing.successes
+            || (cand.successes === existing.successes && cand.executions > existing.executions)
+            || (cand.successes === existing.successes && cand.executions === existing.executions && cand.failures < existing.failures)) {
+          byClass.set(gap_class, cand);
+        }
+      } catch {
+        // Skip rows we can't parse — never throw on malformed data.
+        continue;
+      }
+    }
+
+    const distinctClasses = byClass.size;
+    // Classes seen but with every draft failed-out — surfaced so the caller can
+    // observe "drafts exist but none are promotable" (a re-draft signal).
+    const failedOutClasses = Array.from(seenClasses).filter((gc) => !byClass.has(gc)).length;
+
+    // Order: most-proven & closest-to-threshold first (one more run promotes it),
+    // then fewer failures, then stable by gap_class. A fresh all-zero backlog
+    // falls through to gap_class order — every class gets a first shot.
+    const representatives = Array.from(byClass.values()).sort((a, b) => {
+      if (b.successes !== a.successes) return b.successes - a.successes;
+      if (b.executions !== a.executions) return b.executions - a.executions;
+      if (a.failures !== b.failures) return a.failures - b.failures;
+      return a.gap_class < b.gap_class ? -1 : a.gap_class > b.gap_class ? 1 : 0;
+    });
+
+    const templates = representatives.slice(0, limit).map((r) => ({
+      id: r.id, gap_class: r.gap_class, resolvers: r.resolvers, executions: r.executions,
+    }));
+
+    return c.json({
+      templates,
+      total: templates.length,
+      backlog_total: backlogTotal,
+      distinct_classes: distinctClasses,
+      failed_out_classes: failedOutClasses,
+    });
+  } catch (error: any) {
+    logger.error('GET /v2/activities/templates/proposed-for-exercise failed', {
+      error: error?.message,
+      stack: error?.stack,
+    });
+    return c.json({
+      error: 'Failed to fetch proposed templates for exercise',
+      message: error?.message,
+    }, 500);
+  }
+});
+
+/**
  * GET /v2/activities/templates/:variantId
  * Get specific template variant by ID
  */
@@ -3457,6 +3651,13 @@ app.post('/templates/auto-promote', async (c) => {
     const min_samples = Math.max(1, Math.floor(body.min_samples ?? parseInt(process.env.AUTO_PROMOTE_MIN_SAMPLES ?? '20')));
     const min_success_rate = Math.max(0, Math.min(1, body.min_success_rate ?? parseFloat(process.env.AUTO_PROMOTE_MIN_SUCCESS_RATE ?? '0.6')));
     const dry_run = body.dry_run === true;
+    // Opt-in autonomous hygiene: deprecate drafts exercised enough times
+    // (>= prune_min_samples) yet still below the success bar — they are
+    // structurally non-viable (e.g. always no_op / validation_rejected) and
+    // would otherwise clutter the backlog and the exercise rotation forever.
+    // Off by default; the boredom exerciser enables it.
+    const prune_failed_out = body.prune_failed_out === true;
+    const prune_min_samples = Math.max(1, Math.floor(body.prune_min_samples ?? 8));
 
     logger.info('POST /v2/activities/templates/auto-promote', {
       min_samples, min_success_rate, dry_run,
@@ -3530,6 +3731,7 @@ app.post('/templates/auto-promote', async (c) => {
 
     const promoted: any[] = [];
     const skipped: any[] = [];
+    const pruned: any[] = [];
 
     for (const p of proposed) {
       const m = metricsMap.get(p.template_id);
@@ -3583,6 +3785,42 @@ app.post('/templates/auto-promote', async (c) => {
         continue;
       }
       if (empirical_mean < min_success_rate) {
+        // Failed-out draft: exercised enough and still below the bar. Deprecate
+        // it (autonomous backlog hygiene) when pruning is enabled; else skip.
+        if (prune_failed_out && empirical_samples >= prune_min_samples) {
+          if (dry_run) {
+            pruned.push({ ...evidence, action: 'would_prune', reason: 'failed_out', dry_run: true });
+            continue;
+          }
+          try {
+            await surrealDB.query(
+              `UPDATE activity SET proposed = false, deprecated = true, retired = true, updated_at = time::now() WHERE meta::id(id) = $tid`,
+              { tid: p.template_id },
+            );
+            pruned.push({ ...evidence, action: 'pruned', reason: 'failed_out' });
+            // decision must be INSIDE ['promote','refused'] (schema ASSERT); a
+            // prune is a refusal-to-promote + deprecate, so record it as
+            // 'refused' with a distinguishing reason so the trail stays visible.
+            void surrealDB.query(
+              `CREATE promote_gate_evaluations CONTENT {
+                template_id: $tid, decision: 'refused', reason: 'failed_out_pruned',
+                alpha_hat: $alpha, beta_hat: $beta, projected_mean: $mean,
+                total_samples: $samples, k_neighbors: 0,
+                threshold_mean: $threshold_mean, threshold_samples: $threshold_samples,
+                neighbor_template_ids: [], source_vessel_id: 'metabob-activity-api',
+                evaluated_at: time::now(), created_at: time::now()
+              }`,
+              {
+                tid: p.template_id, alpha, beta, mean: empirical_mean,
+                samples: Math.floor(empirical_samples), threshold_mean: min_success_rate,
+                threshold_samples: prune_min_samples,
+              },
+            ).catch((err) => logger.warn('auto-promote prune audit write failed', { template_id: p.template_id, error: (err as Error).message }));
+          } catch (err) {
+            skipped.push({ ...evidence, reason: 'prune_update_failed', error: (err as Error).message });
+          }
+          continue;
+        }
         skipped.push({ ...evidence, reason: 'empirical_mean_below_threshold' });
         continue;
       }
@@ -3653,7 +3891,9 @@ app.post('/templates/auto-promote', async (c) => {
                 threshold_mean: $threshold_mean,
                 threshold_samples: $threshold_samples,
                 neighbor_template_ids: [],
-                source_vessel_id: 'metabob-activity-api'
+                source_vessel_id: 'metabob-activity-api',
+                evaluated_at: time::now(),
+                created_at: time::now()
               }`,
               {
                 tid: p.template_id,
@@ -3680,25 +3920,27 @@ app.post('/templates/auto-promote', async (c) => {
     logger.info('Auto-promote complete', {
       considered: proposed.length,
       promoted: promoted.length,
+      pruned: pruned.length,
       skipped: skipped.length,
       dry_run,
     });
 
-    // Bulk-invalidate template caches for every row actually promoted
-    // (skip on dry-run — no DB mutation happened). Per-key completeness
-    // rule — see src/utils/template-cache.ts.
-    if (!dry_run && promoted.length > 0) {
+    // Bulk-invalidate template caches for every row actually mutated (promoted
+    // or pruned). Skip on dry-run — no DB mutation happened. Per-key
+    // completeness rule — see src/utils/template-cache.ts.
+    if (!dry_run && (promoted.length > 0 || pruned.length > 0)) {
       await invalidateTemplateCacheMany(
-        promoted.map((p: any) => p.template_id).filter((id: any) => typeof id === 'string'),
+        [...promoted, ...pruned].map((p: any) => p.template_id).filter((id: any) => typeof id === 'string'),
       );
     }
 
     return c.json({
       success: true,
       promoted,
+      pruned,
       considered: proposed.length,
       skipped,
-      thresholds: { min_samples, min_success_rate },
+      thresholds: { min_samples, min_success_rate, prune_failed_out, prune_min_samples },
       dry_run,
     });
   } catch (err) {
