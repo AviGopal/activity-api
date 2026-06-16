@@ -3785,6 +3785,33 @@ app.post('/templates/auto-promote', async (c) => {
         continue;
       }
       if (empirical_mean < min_success_rate) {
+        // Trace-store viability guard. Prune is meant for STRUCTURALLY non-viable
+        // drafts (always no_op / validation_rejected). The vpm posterior, however,
+        // can be dragged below the bar by NON-execution signal — e.g. impulse /
+        // engagement relevance writes (`/impulse-relevance` bumps the same
+        // thompson_alpha/beta). An activity that genuinely EXECUTES successfully
+        // must never be auto-retired as "failed_out" just because a downstream
+        // relevance signal is negative. If the trace store shows healthy real
+        // execution success over enough observations, refuse to prune and let it
+        // continue toward promotion on execution evidence.
+        // Engagement / relevance writes inflate the vpm sample count ABOVE the
+        // real execution count, so prune can fire with few real executions. Guard
+        // on execution ground truth: any clean real-execution evidence (≥1 trace,
+        // success rate at/above bar) means the draft is NOT structurally
+        // non-viable, regardless of how few — the low posterior is contamination.
+        const trViab = traceStatsMap.get(p.template_id);
+        if (trViab && trViab.total >= 1) {
+          const trRate = trViab.total > 0 ? trViab.succ / trViab.total : 0;
+          if (trRate >= min_success_rate) {
+            skipped.push({
+              ...evidence,
+              reason: 'prune_refused_trace_store_viable',
+              trace_total: trViab.total,
+              trace_success_rate: trRate,
+            });
+            continue;
+          }
+        }
         // Failed-out draft: exercised enough and still below the bar. Deprecate
         // it (autonomous backlog hygiene) when pruning is enabled; else skip.
         if (prune_failed_out && empirical_samples >= prune_min_samples) {
