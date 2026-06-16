@@ -859,6 +859,18 @@ if (exemplarSelectorEnabled) {
   });
 }
 
+// Trace retention sweep — stratified bounded reservoir over activity_execution_traces.
+// Default-disabled and dry-run-by-default; bounds the Recorded trace store so the
+// execution-traces hot path (and thus the learning loop's posterior reads) stays fast.
+// Env: TRACE_RETENTION_ENABLED, TRACE_RETENTION_DRY_RUN, TRACE_RETENTION_INTERVAL_MS,
+//      TRACE_RETENTION_HOT_WINDOW_MS, TRACE_RETENTION_DEFAULT_{SUCCESS,FAILURE}_CAP,
+//      TRACE_RETENTION_DELETE_BATCH, TRACE_RETENTION_ACTIVITIES, TRACE_RETENTION_OVERRIDES.
+import('./services/trace-retention').then(({ startTraceRetentionSweep }) => {
+  startTraceRetentionSweep();
+}).catch(err => {
+  logger.error('[Server] Failed to start trace retention sweep', { error: err.message });
+});
+
 // Learning-track classifier — runs immediately on startup then every 6h (default).
 // Classifies activity templates as 'learning' | 'system' | 'unclassified' based on
 // observed trace signals. Env: LEARNING_TRACK_CADENCE_MS, LEARNING_TRACK_CLASSIFIER_ENABLED.
