@@ -3404,7 +3404,7 @@ router.post('/resolve', async (c) => {
         const limit = Math.min(Math.max(sp.limit ?? 3, 1), 25);
         const successOnly = sp.success_only !== false; // default true
         const since = sp.since
-          ? `<datetime> '${String(sp.since).replace(/[^0-9TZ:.\\-]/g, '')}'`
+          ? `type::datetime('${String(sp.since).replace(/[^0-9TZ:.\\-]/g, '')}')`
           : "time::now() - 30d";
         const queryFragment = (sp.query || '').replace(/[^A-Za-z0-9_\- ]+/g, ' ').trim();
 

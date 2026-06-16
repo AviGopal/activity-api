@@ -18,8 +18,11 @@
  *    an explicit configured list of activity_ids and use direct
  *    `WHERE ... GROUP ALL count()` per stratum (reliable).
  *  - created_at is a SurrealDB `datetime` (verified via type::is::datetime), NOT a
- *    string — comparing it against a string literal silently matches nothing, so the
- *    ISO cutoff must be cast with `<datetime>$cut`.
+ *    string — comparing it against a string literal silently matches nothing. Convert
+ *    the ISO cutoff with the `type::datetime($cut)` FUNCTION, NOT the `<datetime>$cut`
+ *    CAST: the cast is an "Unsupported value" to the query planner and forces a full
+ *    table scan (Iterate Table, ~610ms on 72k rows), whereas type::datetime() keeps the
+ *    (activity_id,status) index live (Iterate Index, ~120ms). Verified via EXPLAIN.
  *  - Deletes go through the ROOT path (surrealDB.query), never queryWithAuth — the
  *    table's PERMISSIONS would otherwise drop the delete silently.
  *  - rand::float() is evaluated per-record in a WHERE clause → uniform reservoir.
@@ -106,7 +109,7 @@ function policyFor(cfg: TraceRetentionConfig, activityId: string): StratumPolicy
 async function countCold(activityId: string, status: string, coldCutoffIso: string): Promise<number> {
   const rows = await surrealDB.query<{ count: number }>(
     `SELECT count() FROM ${TABLE}
-       WHERE activity_id = $aid AND status = $st AND created_at < <datetime>$cut
+       WHERE activity_id = $aid AND status = $st AND created_at < type::datetime($cut)
        GROUP ALL`,
     { aid: activityId, st: status, cut: coldCutoffIso },
   );
@@ -169,7 +172,7 @@ export async function runTraceRetentionSweep(
           const ids = await surrealDB.query<unknown>(
             `SELECT VALUE id FROM ${TABLE}
                WHERE activity_id = $aid AND status = $st
-                 AND created_at < <datetime>$cut AND rand::float() >= $keepProb
+                 AND created_at < type::datetime($cut) AND rand::float() >= $keepProb
                LIMIT $batch`,
             { aid: activityId, st: status, cut: coldCutoffIso, keepProb, batch: thisBatch },
           );

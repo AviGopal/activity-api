@@ -579,7 +579,7 @@ app.get('/', async (c) => {
 
     // Filter by date range
     if (startDate) {
-      whereConditions.push('executed_at >= $start_date');
+      whereConditions.push('executed_at >= type::datetime($start_date)');
       params.start_date = startDate;
     } else {
       // Default to the last 30 days when no start_date is provided.
@@ -587,12 +587,12 @@ app.get('/', async (c) => {
       // instead of scanning all 25k+ historical rows (OOMKill prevention).
       // Clients needing older data can pass ?start_date=<iso> explicitly.
       const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
-      whereConditions.push('executed_at >= $start_date');
+      whereConditions.push('executed_at >= type::datetime($start_date)');
       params.start_date = thirtyDaysAgo;
     }
 
     if (endDate) {
-      whereConditions.push('executed_at <= $end_date');
+      whereConditions.push('executed_at <= type::datetime($end_date)');
       params.end_date = endDate;
     }
 
@@ -1163,12 +1163,12 @@ app.get('/selection-events', async (c) => {
     }
 
     if (startDate) {
-      whereConditions.push('selected_at >= $start_date');
+      whereConditions.push('selected_at >= type::datetime($start_date)');
       params.start_date = startDate;
     }
 
     if (endDate) {
-      whereConditions.push('selected_at <= $end_date');
+      whereConditions.push('selected_at <= type::datetime($end_date)');
       params.end_date = endDate;
     }
 
@@ -2861,12 +2861,12 @@ app.get('/selection-outcomes', async (c) => {
     }
 
     if (startDate) {
-      selectionConditions.push('sel.selected_at >= $start_date');
+      selectionConditions.push('sel.selected_at >= type::datetime($start_date)');
       params.start_date = startDate;
     }
 
     if (endDate) {
-      selectionConditions.push('sel.selected_at <= $end_date');
+      selectionConditions.push('sel.selected_at <= type::datetime($end_date)');
       params.end_date = endDate;
     }
 
