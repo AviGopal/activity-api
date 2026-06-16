@@ -15,6 +15,18 @@
 -- narrows each query to one small stratum; the residual created_at range filter then
 -- scans only that stratum, which is cheap.
 -- Reversible: REMOVE INDEX idx_aet_activity_status ON activity_execution_traces
+--
+-- OPERATIONAL CAVEAT (verified 2026-06-16): this bare DEFINE INDEX is instant on an
+-- EMPTY table (~36ms) and is then maintained incrementally as rows arrive — which is
+-- the only path it runs on a fresh deploy. But a bulk DEFINE INDEX on an ALREADY
+-- POPULATED activity_execution_traces does NOT complete on SurrealDB+RocksDB here
+-- (observed: >60min at 100% single-core, never finishing, even fully isolated). The
+-- init-database bootstrap pre-marks this migration applied when traces already exist,
+-- so it never hangs a deploy — but that also means an existing populated DB will NOT
+-- get the index from this migration. To add it to a populated table, use the
+-- incremental rebuild (id-safe, ~80s/72K): copy table -> verify -> DELETE rows (keeps
+-- schema+indexes) -> DEFINE INDEX on the now-empty table -> re-INSERT from the copy
+-- (round-trips original ids) -> verify -> drop the copy. Do NOT retry a bulk DEFINE.
 
 USE NS `activity-system` DB `learning_loop`;
 
