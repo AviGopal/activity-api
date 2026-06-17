@@ -1692,7 +1692,15 @@ app.get('/templates', async (c) => {
       logger.info('Template list cache miss, loading from SurrealDB');
       
       const lockKey = 'lock:templates:refresh';
-      const cacheKey = CACHE_LIST_KEY;
+      // NOTE: this caller's cache is a SET (CACHE_LIST_KEY) of ids plus per-id
+      // string blobs — NOT a single serialized blob under one key. withLock's
+      // contention fast-path GETs `cacheKey` as a string and JSON.parses it, so
+      // passing CACHE_LIST_KEY made the loser thread do a string GET against a
+      // SET → WRONGTYPE. The fast-path is structurally dead for this caller (it
+      // could never reconstruct the template array from a single GET), so we
+      // pass a dedicated key that is never written: the GET is a clean miss and
+      // the waiter simply falls through to the authoritative query.
+      const cacheKey = 'activity:templates:list:blob-unused';
       
       // Use distributed lock to prevent cache stampede
       templates = await redis.withLock(

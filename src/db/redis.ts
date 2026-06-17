@@ -222,14 +222,24 @@ export class RedisClient {
       logger.debug('Lock held by another process, waiting for cache refresh', { lockKey });
       await new Promise(resolve => setTimeout(resolve, 100)); // Wait 100ms
 
-      // Check if cache was populated by lock holder
-      const cached = await this.get(cacheKey);
-      if (cached) {
-        logger.debug('Cache refreshed by lock holder', { cacheKey });
-        return JSON.parse(cached) as T;
+      // Check if cache was populated by lock holder. This is a best-effort
+      // OPTIMIZATION — it must never fail the request. The contention-path read
+      // can throw WRONGTYPE when cacheKey holds a non-string type (e.g. the
+      // templates path passes the SET key `activity:templates:list`), and a
+      // string GET against a SET 500s the whole list endpoint. JSON.parse can
+      // also throw on a non-serialized value. In every such case, fall through
+      // to the authoritative query rather than propagating a 5xx.
+      try {
+        const cached = await this.get(cacheKey);
+        if (cached) {
+          logger.debug('Cache refreshed by lock holder', { cacheKey });
+          return JSON.parse(cached) as T;
+        }
+      } catch (error) {
+        logger.warn('Cache fast-path read failed, falling through to query', { cacheKey, error });
       }
 
-      // Cache still empty - fall through to query without lock
+      // Cache still empty (or unreadable) - fall through to query without lock
       logger.warn('Cache refresh failed, falling through to query', { cacheKey });
       return await fn();
     }
