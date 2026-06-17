@@ -667,30 +667,58 @@ localEmbeddingService.init().then(async () => {
   }
 
   logger.info('[LocalEmbedding] Starting backfill for activities without embeddings');
-  let offset = 0;
   const batchSize = 50;
   let totalProcessed = 0;
+  let queryRetries = 0;
+  const MAX_QUERY_RETRIES = 6;
+
+  // The shared root SurrealDB connection can be transiently un-authed in the
+  // first moments after startup ("IAM error: Not enough permissions" -> the
+  // connection resets and reconnects on the next call). The backfill fires
+  // right after model load and used to hit that window, throw on the first
+  // SELECT, and `break` permanently -- leaving the entire corpus without
+  // embeddings until the next restart (which re-raced). Let the connection
+  // settle, then retry transient failures instead of aborting the whole pass.
+  await new Promise((r) => setTimeout(r, 3000));
 
   for (;;) {
     let rows: any[];
     try {
       rows = await surrealDBForBackfill.query<any>(
-        `SELECT id, name, description FROM activity WHERE name_embedding IS NONE LIMIT $limit START $offset`,
-        { limit: batchSize, offset }
+        `SELECT meta::id(id) AS rid, name, description FROM activity WHERE name_embedding IS NONE LIMIT $limit`,
+        { limit: batchSize }
       );
+      queryRetries = 0; // reset the retry budget after any successful page
     } catch (err) {
-      logger.warn('[LocalEmbedding] Backfill query failed', {
-        error: err instanceof Error ? err.message : String(err),
+      queryRetries++;
+      const msg = err instanceof Error ? err.message : String(err);
+      if (queryRetries > MAX_QUERY_RETRIES) {
+        logger.error('[LocalEmbedding] Backfill aborted after repeated query failures', {
+          error: msg,
+          attempts: queryRetries,
+        });
+        break;
+      }
+      logger.warn('[LocalEmbedding] Backfill query failed -- retrying after reconnect', {
+        error: msg,
+        attempt: queryRetries,
       });
-      break;
+      // The connection auto-resets on the failed call; back off and retry the
+      // SAME offset (we never advanced past a failed page).
+      await new Promise((r) => setTimeout(r, 2000 * queryRetries));
+      continue;
     }
 
     if (!rows || rows.length === 0) break;
 
+    const processedBefore = totalProcessed;
     for (const row of rows) {
       try {
-        const rawId = typeof row.id === 'object' ? JSON.stringify(row.id) : String(row.id);
-        const plainId = rawId.replace(/^activity:/, '').replace(/[⟨⟩`"]/g, '');
+        // Use meta::id(id) from the SELECT directly. row.id can arrive as a
+        // RecordId object; JSON.stringify-ing it produced a mangled id that made
+        // `UPDATE type::thing(...)` silently match no record (no throw), so rows
+        // stayed in the IS NONE set and were reprocessed forever.
+        const plainId = String(row.rid);
         const nameText = row.name || plainId;
         const nameVec = await localEmbeddingService.embed(nameText);
         const updates: Record<string, any> = { name_embedding: Array.from(nameVec) };
@@ -700,7 +728,7 @@ localEmbeddingService.init().then(async () => {
         }
         const setClause = Object.keys(updates).map(k => `${k} = $${k}`).join(', ');
         await surrealDBForBackfill.query(
-          `UPDATE type::record("activity", $id) SET ${setClause}`,
+          `UPDATE type::thing("activity", $id) SET ${setClause}`,
           { id: plainId, ...updates }
         );
         totalProcessed++;
@@ -715,8 +743,18 @@ localEmbeddingService.init().then(async () => {
       }
     }
 
-    offset += batchSize;
-    if (rows.length < batchSize) break; // Last page
+    // No START offset: each successful UPDATE removes a row from the
+    // `name_embedding IS NONE` set, so the next SELECT returns the next
+    // un-embedded batch. A START offset would skip rows as the set shrinks
+    // underneath the cursor (the original bug: backfill stalled far short of
+    // the corpus). Guard against an infinite loop when a page makes zero
+    // progress (e.g. rows whose embed repeatedly throws).
+    if (totalProcessed === processedBefore) {
+      logger.warn('[LocalEmbedding] Backfill made no progress on a non-empty page; aborting', {
+        page_size: rows.length,
+      });
+      break;
+    }
   }
 
   logger.info('[LocalEmbedding] Backfill complete', { totalProcessed });

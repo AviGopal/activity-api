@@ -1371,7 +1371,7 @@ app.post('/templates', async (c) => {
         }
         const setClause = Object.keys(updates).map(k => `${k} = $${k}`).join(', ');
         await surrealDB.query(
-          `UPDATE type::record("activity", $id) SET ${setClause}`,
+          `UPDATE type::thing("activity", $id) SET ${setClause}`,
           { id: activityId, ...updates }
         );
         logger.debug('[embedding] Wrote embeddings for new activity', { id: activityId });
