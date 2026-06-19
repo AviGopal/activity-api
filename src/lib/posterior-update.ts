@@ -197,13 +197,49 @@ interface Deltas {
   betaDelta: number;
 }
 
+// Graded-yield success reward (κ⁻¹ / metric-spread lever, 2026-06-19).
+// A binary success update (α+=1) pins every variant's Beta posterior at mean≈1
+// under the substrate's ~98% success rate, collapsing the metric's resolution
+// (κ⁻¹) so Thompson cannot tell a good variant from a great one. Instead a
+// successful execution contributes a GRADED yield ∈ [YIELD_FLOOR, 1] reflecting
+// per-execution quality (cost-efficiency + output productivity), applied as the
+// standard fractional-observation Beta update α+=yield, β+=(1-yield). Successes
+// stay well above failures (yield ≥ floor ≫ 0) but spread out so posterior means
+// differ by real value. Deterministic-tier cells are skipped from the managed
+// posterior anyway (M4), so this targets exactly the stochastic (LLM) cells κ⁻¹
+// measures. Gate: GRADED_YIELD_SUCCESS=0 restores the legacy binary update.
+const GRADED_YIELD_ENABLED = process.env.GRADED_YIELD_SUCCESS !== '0';
+const YIELD_FLOOR = 0.5;        // a success always credits at least this much α
+const YIELD_COST_REF = 0.02;    // $0.02 → cost component 0.5 (free → 1.0)
+const YIELD_PROD_REF = 4;       // ≥4 output impulses → productivity 1.0
+
+export function successYield(trace: {
+  cost_usd?: number;
+  tasks?: Array<{ output_impulse_ids?: string[] }>;
+}): number {
+  const cost = typeof trace.cost_usd === 'number' && trace.cost_usd > 0 ? trace.cost_usd : 0;
+  const costScore = 1 / (1 + cost / YIELD_COST_REF);          // free → 1, expensive → →0
+  const tasks = trace.tasks ?? [];
+  const outputs = tasks.reduce((sum, t) => sum + (t.output_impulse_ids?.length ?? 0), 0);
+  const productivity = Math.min(1, outputs / YIELD_PROD_REF);
+  const quality = 0.5 * costScore + 0.5 * productivity;
+  const y = YIELD_FLOOR + (1 - YIELD_FLOOR) * quality;
+  return Math.max(YIELD_FLOOR, Math.min(1, y));
+}
+
 function computeDeltas(
   success: boolean,
   failureMode: FailureMode | null | undefined,
   warnings: string[],
+  trace?: { cost_usd?: number; tasks?: Array<{ output_impulse_ids?: string[] }> },
 ): Deltas {
   if (success) {
-    // Successful execution — regardless of failure_mode (defensive)
+    // Graded-yield reward — see successYield. Falls back to the binary update when
+    // disabled or when no trace context is available (defensive).
+    if (GRADED_YIELD_ENABLED && trace) {
+      const y = successYield(trace);
+      return { alphaDelta: y, betaDelta: 1 - y };
+    }
     return { alphaDelta: 1, betaDelta: 0 };
   }
 
@@ -548,7 +584,7 @@ export async function applyOutcomeToPosteriors(
   // Strip activity:⟨⟩ wrapper so the WHERE clause matches variant_performance_metrics rows
   // written by the legacy path (which stores bare ids like "development-vessel:harness-run-matrix").
   const activityId = normalizeActivityId(rawActivityId);
-  const { alphaDelta, betaDelta } = computeDeltas(trace.success, trace.failure_mode, warnings);
+  const { alphaDelta, betaDelta } = computeDeltas(trace.success, trace.failure_mode, warnings, trace);
   const failureModeType = trace.failure_mode?.type ?? null;
 
   // M4 tier-restricted bandit: when every task on the trace is deterministic,
