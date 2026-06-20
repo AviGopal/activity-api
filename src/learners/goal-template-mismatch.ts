@@ -18,7 +18,7 @@
 import { broadcaster } from '../websocket/broadcaster';
 import { analyzeTaskSemantics } from '../utils/semantic-tags';
 import { logger } from '../utils/logger';
-import type { WebSocketMessage } from '../websocket/broadcaster';
+import type { WebSocketMessage } from '../websocket/types';
 
 // Minimum tag-match quality below which we consider the selection a mismatch.
 const MISMATCH_THRESHOLD = 0.2;
