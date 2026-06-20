@@ -4765,10 +4765,14 @@ app.get('/metrics/aggregate', async (c) => {
     const totalTemplates = ((totalTemplatesResult[0] as any)?.total) || 0;
 
     // Count templates that have been executed
+    // Distinct count via subquery: array::distinct(activity_id) under GROUP ALL
+    // receives a scalar per row (not a collected array) and throws
+    // "Incorrect arguments for function array::distinct()". Group by activity_id
+    // first (one row per distinct id), then count the rows.
     const executedTemplatesResult = await surrealDB.query(`
-      SELECT array::len(array::distinct(activity_id)) AS executed_count
-      FROM activity_execution_traces
-      GROUP ALL
+      SELECT count() AS executed_count FROM (
+        SELECT activity_id FROM activity_execution_traces GROUP BY activity_id
+      ) GROUP ALL
     `);
     const templatesExecuted = ((executedTemplatesResult[0] as any)?.executed_count) || 0;
     const templatesNeverExecuted = totalTemplates - templatesExecuted;
