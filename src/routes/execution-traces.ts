@@ -1928,11 +1928,17 @@ app.post('/', async (c) => {
     // trace. Handles minibob's L1/L2 meta-trace write-order race where
     // children land before parent. Single best-effort UPDATE — we never fail
     // the just-succeeded insert on a backfill error.
-    await backfillChildCompositionChains(
+    // Off the response hot path: best-effort + idempotent, so detach it rather
+    // than awaiting a UPDATE on every insert (it ran even when there were no
+    // children to backfill).
+    void backfillChildCompositionChains(
       trace.execution_id,
       resolvedCompositionChain,
       jwtAuth?.jwtToken,
-    );
+    ).catch((e) => logger.warn('backfillChildCompositionChains failed (non-blocking)', {
+      execution_id: trace.execution_id,
+      error: e instanceof Error ? e.message : String(e),
+    }));
 
     // Emit fine-grained WebSocket events for real-time execution visualization
     if (body.execution_trace?.tasks && Array.isArray(body.execution_trace.tasks)) {
@@ -2174,14 +2180,24 @@ app.post('/', async (c) => {
         vessel_version: body.vessel_version,
       };
 
-      const paradigmResult = await insertExecution(paradigmExecution, jwtAuth?.jwtToken);
-      if (paradigmResult) {
-        logger.info('[paradigm] Execution trace also written to execution table', {
-          id: trace.execution_id,
-          activity_id: trace.variant_id,
-          path: 'dual-write',
+      // Dual-write STAYS enabled, but detached from the response hot path so the
+      // trace-ingest response no longer blocks on a second full-trace insert.
+      void insertExecution(paradigmExecution, jwtAuth?.jwtToken)
+        .then((paradigmResult) => {
+          if (paradigmResult) {
+            logger.info('[paradigm] Execution trace also written to execution table', {
+              id: trace.execution_id,
+              activity_id: trace.variant_id,
+              path: 'dual-write',
+            });
+          }
+        })
+        .catch((paradigmError) => {
+          logger.warn('[paradigm] Dual-write to execution table failed (non-blocking)', {
+            execution_id: trace.execution_id,
+            error: paradigmError instanceof Error ? paradigmError.message : String(paradigmError),
+          });
         });
-      }
       } catch (paradigmError) {
         // Don't fail the request if paradigm write fails - legacy write succeeded
         logger.warn('[paradigm] Dual-write to execution table failed (non-blocking)', {

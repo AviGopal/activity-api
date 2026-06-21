@@ -320,31 +320,33 @@ async function writeImpulseRelevancePenalty(
     }
   }
 
-  if (taskImpulseIds.length === 0) return 0;
+  // Dedup: a trace can reference the same impulse across tasks.
+  const uniqueIds = [...new Set(taskImpulseIds)];
+  if (uniqueIds.length === 0) return 0;
 
-  // Best-effort: fire-and-forget per id. One failure doesn't abort the rest.
-  let written = 0;
-  for (const impulseId of taskImpulseIds) {
-    try {
-      await db.query(
-        `
-        UPDATE impulse_relevance_metrics
-        SET times_failed = (times_failed ?? 0) + 1,
-            updated_at   = time::now()
-        WHERE impulse_id = $impulse_id
-          AND org_id     = $org_id
-        `,
-        { impulse_id: impulseId, org_id: orgId },
-      );
-      written++;
-    } catch (err) {
-      logger.warn('posterior-update: impulse_relevance_metrics update failed (non-blocking)', {
-        impulse_id: impulseId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+  // Batched single UPDATE over the whole id set instead of N sequential awaited
+  // round-trips. The constantly-failing autonomous loop made this per-id loop
+  // the single dominant DB query (~2950 UPDATEs in a 400-line log window,
+  // pinning SurrealDB); the IN-list collapses it to one statement per trace.
+  try {
+    await db.query(
+      `
+      UPDATE impulse_relevance_metrics
+      SET times_failed = (times_failed ?? 0) + 1,
+          updated_at   = time::now()
+      WHERE impulse_id IN $impulse_ids
+        AND org_id     = $org_id
+      `,
+      { impulse_ids: uniqueIds, org_id: orgId },
+    );
+    return uniqueIds.length;
+  } catch (err) {
+    logger.warn('posterior-update: batched impulse_relevance_metrics update failed (non-blocking)', {
+      count: uniqueIds.length,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return 0;
   }
-  return written;
 }
 
 // ---------------------------------------------------------------------------

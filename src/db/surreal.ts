@@ -7,6 +7,67 @@ import { Surreal } from 'surrealdb';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 
+// ---------------------------------------------------------------------------
+// DB throughput / contention instrumentation (single chokepoint: every root
+// query passes through SurrealDBClient.query). Low overhead: O(1) per query;
+// the only sort is over a bounded rolling window at scrape time. Exposed via
+// getDbStats() -> GET /metrics/db so the substrate can self-detect contention
+// (the class of issue that pinned SurrealDB on 2026-06-20).
+// ---------------------------------------------------------------------------
+interface DbOpStat { count: number; sumMs: number; }
+class DbStats {
+  inFlight = 0;
+  total = 0;
+  errors = 0;
+  slow = 0; // queries slower than SLOW_MS
+  sumMs = 0;
+  maxMs = 0;
+  startedAt = Date.now();
+  byOp: Record<string, DbOpStat> = {};
+  private recent: number[] = [];
+  private readonly RECENT_CAP = 500;
+  static readonly SLOW_MS = 1000;
+
+  record(sql: string, ms: number, ok: boolean): void {
+    this.total++;
+    this.sumMs += ms;
+    if (ms > this.maxMs) this.maxMs = ms;
+    if (!ok) this.errors++;
+    if (ms > DbStats.SLOW_MS) this.slow++;
+    const op = (sql.trim().split(/\s+/, 1)[0] || 'OTHER').toUpperCase();
+    const e = this.byOp[op] ?? (this.byOp[op] = { count: 0, sumMs: 0 });
+    e.count++; e.sumMs += ms;
+    this.recent.push(ms);
+    if (this.recent.length > this.RECENT_CAP) this.recent.shift();
+  }
+
+  snapshot() {
+    const sorted = [...this.recent].sort((a, b) => a - b);
+    const pct = (q: number) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))]! : 0;
+    const uptimeS = Math.max(1, (Date.now() - this.startedAt) / 1000);
+    return {
+      in_flight: this.inFlight,
+      total_queries: this.total,
+      errors: this.errors,
+      error_rate: this.total ? +(this.errors / this.total).toFixed(4) : 0,
+      slow_queries: this.slow, // > 1000ms
+      qps: +(this.total / uptimeS).toFixed(2),
+      latency_ms: {
+        mean: this.total ? +(this.sumMs / this.total).toFixed(1) : 0,
+        p50: +pct(0.5).toFixed(1),
+        p95: +pct(0.95).toFixed(1),
+        p99: +pct(0.99).toFixed(1),
+        max: +this.maxMs.toFixed(1),
+        window: sorted.length,
+      },
+      by_op: Object.fromEntries(Object.entries(this.byOp).map(([k, v]) => [k, { count: v.count, mean_ms: +(v.sumMs / v.count).toFixed(1) }])),
+      uptime_s: Math.round(uptimeS),
+    };
+  }
+}
+export const dbStats = new DbStats();
+export function getDbStats() { return dbStats.snapshot(); }
+
 class SurrealDBClient {
   private db: Surreal | null = null;
   private connecting: Promise<void> | null = null;
@@ -87,34 +148,24 @@ class SurrealDBClient {
       throw new Error('SurrealDB not connected');
     }
 
+    const __t0 = performance.now();
+    dbStats.inFlight++;
     try {
-      logger.info('Executing SurrealDB query', {
-        sql,
-        params,
-        paramsStringified: JSON.stringify(params),
-        namespace: config.surrealdb.namespace,
-        database: config.surrealdb.database
-      });
+      // Per-statement logging is on the hot path (every query); keep it at debug
+      // and drop the JSON.stringify(params) + raw-result serialization that fired
+      // 3x per statement and flooded journald under load.
+      logger.debug('Executing SurrealDB query', { sql });
       const result = await this.db.query(sql, params);
-
-      logger.info('Raw SurrealDB query result', {
-        resultType: typeof result,
-        resultIsArray: Array.isArray(result),
-        resultLength: Array.isArray(result) ? result.length : 'N/A',
-        firstElement: Array.isArray(result) && result.length > 0 ? result[0] : null,
-      });
 
       // SurrealDB returns array of result sets, we typically want the first one
       const firstResult = Array.isArray(result) && result.length > 0 ? result[0] : [];
 
-      logger.info('Extracted first result', {
-        firstResultType: typeof firstResult,
-        firstResultIsArray: Array.isArray(firstResult),
-        firstResultLength: Array.isArray(firstResult) ? firstResult.length : 'N/A',
-      });
-
+      dbStats.record(sql, performance.now() - __t0, true);
+      dbStats.inFlight--;
       return firstResult as T[];
     } catch (error) {
+      dbStats.record(sql, performance.now() - __t0, false);
+      dbStats.inFlight--;
       const err = error as Error;
 
       // SurrealDB WebSocket reconnects without re-authenticating, leaving the root

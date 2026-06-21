@@ -31,7 +31,7 @@ import type { ServerWebSocket } from 'bun';
 import packageJson from '../package.json';
 import { discoveryClient } from './services/discovery-client';
 import { localEmbeddingService } from './services/embedding-service';
-import { surrealDB as surrealDBForBackfill } from './db/surreal';
+import { surrealDB as surrealDBForBackfill, getDbStats } from './db/surreal';
 
 // Define app-wide environment type with jwtAuth context variable
 type AppEnv = {
@@ -100,6 +100,11 @@ app.use('/v2/*', async (c, next) => {
 
 // Health check endpoint (no auth required)
 // Deep health check: verifies Redis and SurrealDB connectivity
+// DB throughput / contention metrics (no auth — scrapeable like /health).
+// Surfaces the single-chokepoint query stats so contention (high in_flight /
+// p95 / slow_queries / error_rate) is observable instead of silent.
+app.get('/metrics/db', (c) => c.json(getDbStats()));
+
 app.get('/health', async (c) => {
   const healthStatus: any = {
     service: 'metabob-activity-api',
