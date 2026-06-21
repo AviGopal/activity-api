@@ -1787,6 +1787,34 @@ app.post('/', async (c) => {
       });
     }
 
+    // Derive the v1 state-space signature BEFORE the INSERT so it lands ATOMICALLY
+    // on the trace row (signature is option<string>, migration 145). Doing it here
+    // — rather than a post-insert UPDATE — avoids a race where the freshly-inserted
+    // row isn't yet visible to a follow-up UPDATE under high-volume subscriber-trace
+    // bursts (which silently no-op'd, leaving the row's signature null). The cts
+    // conditional-posterior write still derives independently in the score-update
+    // path; this one makes the decision-topology coordinate observable on the trace.
+    {
+      const meta = ((trace as any).metadata ?? {}) as Record<string, unknown>;
+      const rawSig = meta.state_space_signature;
+      const rawVer = meta.signature_version;
+      if (typeof rawSig === 'string' && /^[0-9a-f]{16}$/.test(rawSig) &&
+          typeof rawVer === 'number' && Number.isInteger(rawVer) && rawVer >= 1) {
+        (trace as any).signature = rawSig;
+        (trace as any).signature_version = rawVer;
+      } else if (Array.isArray(trace.input_impulse_shapes) && trace.input_impulse_shapes.length > 0) {
+        try {
+          const { computeStateSpaceSignature } = await import('../utils/session-context');
+          (trace as any).signature = computeStateSpaceSignature({
+            shapes: trace.input_impulse_shapes as string[],
+            provenance: Array.isArray(meta.provenance) ? (meta.provenance as any) : [],
+            missing: Array.isArray(meta.missing_shapes) ? (meta.missing_shapes as any) : [],
+          });
+          (trace as any).signature_version = 1;
+        } catch { /* non-blocking */ }
+      }
+    }
+
     // Insert into database
     // Build query dynamically to avoid NULL vs NONE issues for optional fields
     const optionalFields: string[] = [];
@@ -1803,6 +1831,11 @@ app.post('/', async (c) => {
     if (trace.improvisation) optionalFields.push('improvisation: $improvisation');
     if (trace.input_impulse_shapes) optionalFields.push('input_impulse_shapes: $input_impulse_shapes');
     if (trace.output_impulse_shapes) optionalFields.push('output_impulse_shapes: $output_impulse_shapes');
+    // v1 state-space signature (derived just above) — landed atomically in the INSERT.
+    if ((trace as any).signature) {
+      optionalFields.push('signature: $signature');
+      optionalFields.push('signature_version: $signature_version');
+    }
     if (trace.metadata) optionalFields.push('metadata: $metadata');
     // Selection-to-execution correlation
     if ((trace as any).correlation_id) optionalFields.push('correlation_id: $correlation_id');
