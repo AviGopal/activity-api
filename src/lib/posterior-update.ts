@@ -308,7 +308,10 @@ function computeDeltas(
 // Impulse-relevance side-write for verifier_negative
 // ---------------------------------------------------------------------------
 
-async function writeImpulseRelevancePenalty(
+const RELEVANCE_SINK_ENDPOINT =
+  process.env.RELEVANCE_SINK_ENDPOINT ?? "http://127.0.0.1:8255";
+
+export async function writeImpulseRelevancePenalty(
   trace: TraceForPosterior,
   db: DBQueryable,
   orgId: string,
@@ -324,29 +327,16 @@ async function writeImpulseRelevancePenalty(
   const uniqueIds = [...new Set(taskImpulseIds)];
   if (uniqueIds.length === 0) return 0;
 
-  // Batched single UPDATE over the whole id set instead of N sequential awaited
-  // round-trips. The constantly-failing autonomous loop made this per-id loop
-  // the single dominant DB query (~2950 UPDATEs in a 400-line log window,
-  // pinning SurrealDB); the IN-list collapses it to one statement per trace.
-  try {
-    await db.query(
-      `
-      UPDATE impulse_relevance_metrics
-      SET times_failed = (times_failed ?? 0) + 1,
-          updated_at   = time::now()
-      WHERE impulse_id IN $impulse_ids
-        AND org_id     = $org_id
-      `,
-      { impulse_ids: uniqueIds, org_id: orgId },
-    );
-    return uniqueIds.length;
-  } catch (err) {
-    logger.warn('posterior-update: batched impulse_relevance_metrics update failed (non-blocking)', {
-      count: uniqueIds.length,
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return 0;
-  }
+  // Fire-and-forget to the relevance-sink vessel — do not block the hot path
+  fetch(`${RELEVANCE_SINK_ENDPOINT}/penalty`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ impulse_ids: uniqueIds, org_id: orgId }),
+  }).catch(() => {
+    // swallow errors; penalty writes are best-effort
+  });
+
+  return uniqueIds.length;
 }
 
 // ---------------------------------------------------------------------------
