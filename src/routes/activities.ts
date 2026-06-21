@@ -6709,6 +6709,58 @@ app.post('/recommend', async (c) => {
       });
     }
 
+    // INTERPOSABLE SELECTION (SUBSTRATE_AS_REPRESENTATION §1: "selection = choosing a
+    // tangent direction within A(s)"). The default Thompson path above is UNCHANGED
+    // (behavior-preserving — the live loop never sees a difference). When the caller
+    // opts in with `selector` (any registered strategy other than 'thompson'), project
+    // the candidates into the uniform ChoiceSet and let an INTERPOSED reasoning process
+    // (cost-minimizer, greedy-exploit, deterministic, or a composed selector) RE-RANK
+    // them. This is the swap point that makes the selection mechanism self-assembling:
+    // the choice of HOW to choose is itself a pluggable, composable activity.
+    const requestedSelector =
+      typeof (body as Record<string, unknown>).selector === 'string'
+        ? ((body as Record<string, unknown>).selector as string)
+        : null;
+    if (requestedSelector && requestedSelector !== 'thompson' && finalRecommendations.length > 1) {
+      try {
+        const { projectToChoice, select } = await import('../lib/selection/choice');
+        const choiceSet = {
+          goal: typeof (body as Record<string, unknown>).goal === 'string'
+            ? ((body as Record<string, unknown>).goal as string) : undefined,
+          required_shapes: expected_output_shapes,
+          state_signature: stateSpaceSig ?? null,
+          available_shapes: Array.isArray(impulse_state_space)
+            ? (impulse_state_space as Array<Record<string, unknown>>).map((e) => (e.shape ?? e) as string).filter(Boolean)
+            : [],
+          choices: finalRecommendations.map((r: Record<string, unknown>) => projectToChoice(r)),
+          generated_at: new Date().toISOString(),
+        };
+        const ranked = select(choiceSet, requestedSelector);
+        if (ranked.length > 0) {
+          const order = new Map(ranked.map((rc, i) => [rc.choice.id, i]));
+          finalRecommendations.sort((a: Record<string, unknown>, b: Record<string, unknown>) =>
+            (order.get(a.template_id as string) ?? 1e9) - (order.get(b.template_id as string) ?? 1e9));
+          for (const r of finalRecommendations as Array<Record<string, unknown>>) {
+            const rc = ranked.find((x) => x.choice.id === r.template_id);
+            if (rc) {
+              r.selection_metadata = {
+                ...(r.selection_metadata as Record<string, unknown>),
+                interposed_selector: requestedSelector,
+                interposed_score: rc.score,
+                interposed_rationale: rc.rationale,
+              };
+            }
+          }
+          logger.info('Interposed selector applied', { selector: requestedSelector, top: ranked[0]?.choice.id });
+        }
+      } catch (selErr) {
+        logger.warn('interposed selector failed (non-blocking, kept thompson order)', {
+          selector: requestedSelector,
+          error: selErr instanceof Error ? selErr.message : String(selErr),
+        });
+      }
+    }
+
     // Patch exploration_slot and clean up internal fields
     const explorationSet = new Set(explorationPool);
     for (const rec of finalRecommendations) {
