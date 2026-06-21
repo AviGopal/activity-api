@@ -141,7 +141,7 @@ class SurrealDBClient {
     return this.connecting;
   }
 
-  async query<T = any>(sql: string, params?: Record<string, any>, _isRetry = false): Promise<T[]> {
+  async query<T = any>(sql: string, params?: Record<string, any>, _isRetry = false, _conflictRetries = 0): Promise<T[]> {
     await this.connect();
 
     if (!this.db) {
@@ -185,6 +185,27 @@ class SurrealDBClient {
         this.db = null;
         this.connecting = null;
         return await this.query<T>(sql, params, true);
+      }
+
+      // Optimistic-concurrency write conflicts ("Failed to commit transaction due to
+      // a read or write conflict. This transaction can be retried") happen when
+      // concurrent transactions touch the same rows — posterior updates, the v1
+      // context_thompson_scores cells, and trace ingest all converge on hot rows
+      // under load. SurrealDB aborts (full rollback) and explicitly marks these
+      // RETRYABLE; the increment did NOT apply, so a retry is safe and idempotent.
+      // Without it the write is dropped (callers swallow it non-blocking), so the
+      // LEARNING STORE silently fails to accumulate under contention — variant
+      // posteriors and the state-signature cells never land, and the topology cannot
+      // self-assemble. Retry a few times with small exponential backoff so the
+      // learning writes win instead of losing the race.
+      if (
+        _conflictRetries < 4 &&
+        (err.message.includes('read or write conflict') ||
+          err.message.includes('Failed to commit transaction'))
+      ) {
+        const backoffMs = 25 * Math.pow(2, _conflictRetries); // 25, 50, 100, 200ms
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        return await this.query<T>(sql, params, _isRetry, _conflictRetries + 1);
       }
 
       logger.error('SurrealDB query failed', {

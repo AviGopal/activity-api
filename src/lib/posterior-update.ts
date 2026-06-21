@@ -25,6 +25,11 @@ import type { FailureMode } from '../models/schemas';
 import { seedPriorFromConcepts } from './prior-seed';
 import { lookupEmbeddingForSignature } from './embedding-lookup-cache';
 import { classifyTemplateTiers, type ResolverTier } from '../services/tier-classifier';
+import { enqueueVariantDelta, installPosteriorFlushOnShutdown } from './posterior-aggregator';
+
+// Install the SIGTERM/SIGINT flush hook once on module load so buffered α/β
+// deltas are written out on shutdown rather than lost.
+installPosteriorFlushOnShutdown();
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -614,7 +619,17 @@ export async function applyOutcomeToPosteriors(
   // Uses variant_performance_metrics (not activity_template) to avoid the
   // BM25 FTS scorer regression (F-V46, SurrealDB 3.0).
   // M4: skip the UPDATE entirely for all-deterministic templates.
-  if (!skipVariantUpdate && (alphaDelta !== 0 || betaDelta !== 0)) {
+  // 2026-06-21 write-contention fix: route the hot-row α/β increment through the
+  // coalescing aggregator (collapses N concurrent +δ on the same row into one
+  // +Σδ flush) so concurrent executions of the same template no longer abort each
+  // other with read/write conflicts. enqueueVariantDelta returns true when it
+  // accepted the delta (coalescing ON); the `&& !` then skips the synchronous
+  // UPDATE below. With POSTERIOR_COALESCE=0 it returns false → sync fallback.
+  if (
+    !skipVariantUpdate &&
+    (alphaDelta !== 0 || betaDelta !== 0) &&
+    !enqueueVariantDelta(activityId, orgId, alphaDelta, betaDelta)
+  ) {
     try {
       await db.query(
         `
