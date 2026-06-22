@@ -513,6 +513,20 @@ app.get('/', async (c) => {
     const startDate = coerceToIso(c.req.query('start_date') ?? c.req.query('since'));
     const endDate = coerceToIso(c.req.query('end_date'));
     const includeSelection = c.req.query('include_selection') === 'true';
+    // Opt-in narrow projection for the list view (2026-06-21). The DEFAULT
+    // projection is left WIDE and unchanged — many autonomous consumers
+    // (development-vessel resolvers, boredom-vessel) read `metadata`,
+    // `composition_chain`, `failure_mode`, and `input/output_impulse_shapes`
+    // off this list response, so narrowing the default would silently break
+    // them. Callers that only need a list summary (id/status/timing) can pass
+    // `?fields=summary` (alias `?detail=false`) to skip per-row hydration of
+    // the fat JSONB columns. Measured ~13% faster on a 30-day/20-row page
+    // (8.4s → 7.3s); the residual cost is the 30-day window iteration, which
+    // is intentional (OOMKill bound) and out of scope here.
+    const fieldsParam = c.req.query('fields');
+    const detailParam = c.req.query('detail');
+    const summaryProjection =
+      fieldsParam === 'summary' || detailParam === 'false';
 
     // Validate and cap limit
     const limit = Math.min(Math.max(limitParam, 1), 500);
@@ -632,15 +646,29 @@ app.get('/', async (c) => {
     // execution_id-only is 35ms). The counts are instead read cheaply from the
     // denormalised `metadata.task_count` the executor already writes; callers
     // needing exact impulse counts use the single-trace endpoint.
-    const query = `
-      SELECT
+    // Narrow (opt-in) projection drops the fat JSONB columns — `metadata`,
+    // `composition_chain`, `failure_mode` (replaced by a scalar
+    // `failure_mode_type` summary), and the `*_impulse_shapes` arrays — so the
+    // DB does not hydrate them per row. `failure_mode.type` is kept as a cheap
+    // scalar so summary consumers can still bucket by failure category.
+    const selectFields = summaryProjection
+      ? `
+        id, execution_id, activity_id, variant_id, org_id, account_id,
+        status, success, error, executed_at, duration_ms, cost_usd,
+        parent_execution_id,
+        vessel_id, vessel_version, tags,
+        failure_mode.type AS failure_mode_type,
+        (metadata.task_count ?? 0) AS task_count`
+      : `
         id, execution_id, activity_id, variant_id, org_id, account_id,
         status, success, error, executed_at, duration_ms, cost_usd,
         parent_execution_id, composition_chain,
         vessel_id, vessel_version,
         failure_mode, metadata, tags,
         output_impulse_shapes, input_impulse_shapes,
-        (metadata.task_count ?? 0) AS task_count
+        (metadata.task_count ?? 0) AS task_count`;
+    const query = `
+      SELECT${selectFields}
       FROM activity_execution_traces
       ${whereClause}
       ORDER BY executed_at DESC
@@ -1345,11 +1373,42 @@ export async function backfillChildCompositionChains(
   // migration 081 + minibob composition-chain.ts contract).
   const newChain: string[] = [...insertedCompositionChain, insertedExecutionId];
   try {
+    // Perf gate (2026-06-21): the common case is a trace with NO children to
+    // backfill (most inserts are leaves or arrive parent-first). Probe that
+    // case with a cheap *indexed* existence check before touching the UPDATE.
+    //
+    // `parent_execution_id` is indexed (idx_activity_executions_parent /
+    // idx_aet_parent_execution_id) so this probe is `Iterate Index` (~700µs).
+    // The UPDATE's previous `array::len(composition_chain) = 0` predicate is
+    // NON-indexable, so the planner fell back to `Iterate Table` — a full
+    // ~160K-row scan (~1.1s) on EVERY trace ingest, even when the parent has
+    // no children at all. Skipping the UPDATE on the empty probe removes that
+    // full scan from the steady-state hot path.
+    const probeSql = `
+        SELECT VALUE id FROM activity_execution_traces
+        WHERE parent_execution_id = $parent_execution_id
+        LIMIT 1
+      `;
+    const probeParams = { parent_execution_id: insertedExecutionId };
+    const probe = jwtToken
+      ? await queryWithAuth<unknown>(jwtToken, probeSql, probeParams)
+      : await surrealDB.query<unknown>(probeSql, probeParams);
+    if (!Array.isArray(probe) || probe.length === 0) {
+      // No children of this insert exist — nothing to backfill. Common case.
+      return;
+    }
+
     // Single statement. SurrealQL handles the row scan; no app-side loop.
-    // The `composition_chain IS NONE OR array::len(composition_chain) = 0`
-    // clause is the idempotency guard — we never overwrite a populated
-    // chain (those children already had a parent at their insert time and
-    // the insert-time helper resolved them correctly).
+    // The `composition_chain IS NONE OR composition_chain = []` clause is the
+    // idempotency guard — we never overwrite a populated chain (those children
+    // already had a parent at their insert time and the insert-time helper
+    // resolved them correctly).
+    //
+    // `composition_chain = []` replaces the prior `array::len(...) = 0`: the
+    // empty-array equality IS index-eligible (idx_..._composition_chain), so
+    // combined with the indexed `parent_execution_id` the planner does an
+    // index union (`Iterate Index`) instead of a full table scan. Verified via
+    // EXPLAIN 2026-06-21.
     //
     // activity_execution_traces FOR update PERMISSIONS require $auth.org_id
     // (migration 099); use the inbound JWT when available so the UPDATE
@@ -1358,7 +1417,7 @@ export async function backfillChildCompositionChains(
         UPDATE activity_execution_traces
         SET composition_chain = $new_chain
         WHERE parent_execution_id = $parent_execution_id
-          AND (composition_chain IS NONE OR array::len(composition_chain) = 0)
+          AND (composition_chain IS NONE OR composition_chain = [])
       `;
     const updateParams = {
       parent_execution_id: insertedExecutionId,

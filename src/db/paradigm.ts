@@ -1205,16 +1205,6 @@ export async function queryActivitiesByFTS(
 }
 
 /**
- * Compute cosine similarity between two L2-normalised Float32Arrays.
- * Because both vectors are unit-normalised, cosine == dot product.
- */
-function cosine(a: Float32Array, b: Float32Array): number {
-  let dot = 0;
-  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
-  return dot;
-}
-
-/**
  * Query activities using local dense embeddings (all-MiniLM-L6-v2, 384-dim).
  *
  * Fetches all candidate rows that have at least one embedding field populated,
@@ -1343,11 +1333,42 @@ export async function queryActivitiesByDense(
       }
     }
 
+    // In-DB cosine scan. Previously this pulled every candidate row WITH its
+    // two 384-dim float arrays (~48 MB over the wire for ~2300 rows) into Node
+    // and computed cosine in JS. SurrealDB's `vector::similarity::cosine`
+    // computes the same unit-vector dot product in-engine, so we push the
+    // scoring + ORDER BY + LIMIT into the DB and project the embeddings OUT of
+    // the result set (`OMIT name_embedding, description_embedding`). The
+    // returned rows are otherwise identical to the old `SELECT *` shape, so
+    // callers (mergeByRRF, the recommend tiered-fallback path) are unchanged.
+    //
+    // Semantics match the prior JS exactly:
+    //   - score is the MAX cosine over the two embeddings (`Math.max`),
+    //   - only a 384-dim embedding contributes (length guard),
+    //   - missing / wrong-dim embeddings floor at 0 (`let score = 0`).
+    // The length guard is load-bearing: `vector::similarity::cosine` ERRORS
+    // (aborting the whole query) on a dimension mismatch, so a non-384 vector
+    // must never reach the function — the IF returns -1 for those, which loses
+    // to the 0 floor and is dropped by ORDER BY dense_score DESC.
+    params.query_vec = Array.from(queryVec);
+    const queryDim = queryVec.length;
+    params.query_dim = queryDim;
     const query = `
-      SELECT *, name_embedding, description_embedding
+      SELECT *,
+        math::max([
+          0,
+          IF array::len(name_embedding) = $query_dim
+            THEN vector::similarity::cosine(name_embedding, $query_vec) ELSE -1 END,
+          IF array::len(description_embedding) = $query_dim
+            THEN vector::similarity::cosine(description_embedding, $query_vec) ELSE -1 END
+        ]) AS dense_score
+        OMIT name_embedding, description_embedding
       FROM activity
       WHERE ${whereClauses.join(' AND ')}
+      ORDER BY dense_score DESC
+      LIMIT $limit
     `;
+    params.limit = limit;
 
     const rows: any[] = jwtToken
       ? await queryWithAuth<any>(jwtToken, query, params)
@@ -1358,21 +1379,8 @@ export async function queryActivitiesByDense(
       return [];
     }
 
-    // Score each row in-process
-    const scored = rows.map((row: any) => {
-      let score = 0;
-      if (row.name_embedding && row.name_embedding.length === 384) {
-        score = Math.max(score, cosine(queryVec, new Float32Array(row.name_embedding)));
-      }
-      if (row.description_embedding && row.description_embedding.length === 384) {
-        score = Math.max(score, cosine(queryVec, new Float32Array(row.description_embedding)));
-      }
-      return { ...row, dense_score: score };
-    });
-
-    const results = scored
-      .sort((a: any, b: any) => b.dense_score - a.dense_score)
-      .slice(0, limit);
+    // Scoring, sort, and cap already happened in-DB; pass rows through.
+    const results = rows as (ParadigmActivity & { dense_score: number })[];
 
     logger.info('[paradigm] queryActivitiesByDense: completed (scan)', {
       searchQuery: searchQuery.substring(0, 50),

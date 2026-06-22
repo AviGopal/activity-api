@@ -366,24 +366,32 @@ async function writeAncestorDelta(
 ): Promise<void> {
   if (alphaDelta === 0 && betaDelta === 0) return;
 
+  // Route the ancestor VPM delta through the coalescing aggregator just like the
+  // leaf write (applyOutcomeToPosteriors). Chain-credit fans out to ≤4 ancestor
+  // hot rows per composed trace; sending those as direct read-modify-write UPDATEs
+  // reintroduced exactly the optimistic-concurrency conflict storm the coalescer
+  // was built to remove. enqueueVariantDelta folds them into Σδ; it returns false
+  // only when coalescing is disabled, in which case we fall back to the sync UPDATE.
   try {
-    await db.query(
-      `
-      UPDATE variant_performance_metrics
-      SET
-        thompson_alpha = (thompson_alpha ?? 1) + $alpha_delta,
-        thompson_beta  = (thompson_beta  ?? 1) + $beta_delta,
-        updated_at     = time::now()
-      WHERE variant_id = $activity_id
-        AND org_id     = $org_id
-      `,
-      {
-        activity_id: ancestorId,
-        org_id: orgId,
-        alpha_delta: alphaDelta,
-        beta_delta: betaDelta,
-      },
-    );
+    if (!enqueueVariantDelta(ancestorId, orgId, alphaDelta, betaDelta)) {
+      await db.query(
+        `
+        UPDATE variant_performance_metrics
+        SET
+          thompson_alpha = (thompson_alpha ?? 1) + $alpha_delta,
+          thompson_beta  = (thompson_beta  ?? 1) + $beta_delta,
+          updated_at     = time::now()
+        WHERE variant_id = $activity_id
+          AND org_id     = $org_id
+        `,
+        {
+          activity_id: ancestorId,
+          org_id: orgId,
+          alpha_delta: alphaDelta,
+          beta_delta: betaDelta,
+        },
+      );
+    }
   } catch (err) {
     logger.warn('posterior-update: chain credit write to variant_performance_metrics failed', {
       ancestor_id: ancestorId,
@@ -489,10 +497,16 @@ export async function propagateCreditAlongChain(
   let ancestorMetaByExecId: Map<string, AncestorMeta> = new Map();
   try {
     const limited = ancestors.slice(0, CREDIT_PROPAGATION_MAX_DEPTH);
+    // NOTE: do NOT add `AND org_id = $org_id` here. execution_id has a UNIQUE
+    // index (idx_activity_executions_execution_id); the moment org_id is in the
+    // WHERE the SurrealDB planner switches to the low-selectivity org index and
+    // scans the entire org partition (~2s on 160K rows vs ~27ms point lookup —
+    // EXPLAIN-verified 2026-06-21). The $ids come from THIS execution's own
+    // composition_chain, so they are already org-scoped by provenance.
     const rows = await db.query<{ execution_id: string; variant_id: string }>(
       `SELECT execution_id, variant_id FROM activity_execution_traces
-       WHERE execution_id IN $ids AND org_id = $org_id`,
-      { ids: limited, org_id: orgId },
+       WHERE execution_id IN $ids`,
+      { ids: limited },
     );
     for (const row of Array.isArray(rows) ? rows : []) {
       if (row.execution_id && row.variant_id) {
