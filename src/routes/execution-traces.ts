@@ -91,6 +91,8 @@ export function normalizePersistedTask(task: any): {
   resolver_tier?: string;
   success?: boolean;
   cost_usd?: number;
+  consumed_from_task_ids?: string[];
+  child_activity_id?: string;
 } {
   const { input_impulse_ids: inputImpulseIds, output_impulse_ids: outputImpulseIds } =
     extractTaskImpulseIds(task);
@@ -124,6 +126,16 @@ export function normalizePersistedTask(task: any): {
   }
   if (typeof task?.cost_usd === 'number') {
     out.cost_usd = task.cost_usd;
+  }
+  // Option-B placeholder-provenance (FLEXIBLE tasks column rides these through):
+  // which producer tasks this task consumed via {{placeholders}}, and the
+  // activity a dispatch task ran. Feeds the composition-edge reconcile's
+  // genuine producer->consumer edge derivation.
+  if (Array.isArray(task?.consumed_from_task_ids) && task.consumed_from_task_ids.length > 0) {
+    out.consumed_from_task_ids = task.consumed_from_task_ids.filter((x: unknown) => typeof x === 'string');
+  }
+  if (typeof task?.child_activity_id === 'string' && task.child_activity_id.length > 0) {
+    out.child_activity_id = task.child_activity_id;
   }
 
   return out;
