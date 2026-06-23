@@ -439,12 +439,15 @@ app.post('/', async (c) => {
       const createQuery = `
         CREATE goal_execution_paths CONTENT {
           goal_hash: $goal_hash,
+          org_id: $org_id,
           goal_text: $goal_text,
           goal_category: $goal_category,
           path_activities: $path_activities,
           path_signature: $path_signature,
           endpoint_output_shapes: $endpoint_output_shapes,
           total_executions: 1,
+          execution_count: 1,
+          success_count: $successful_executions,
           successful_executions: $successful_executions,
           failed_executions: $failed_executions,
           thompson_alpha: $thompson_alpha,
@@ -463,6 +466,7 @@ app.post('/', async (c) => {
 
       const created = await surrealDB.query<GoalExecutionPath[]>(createQuery, {
         goal_hash: goalHash,
+        org_id: (body as any).org_id ?? 'public',
         goal_text: validated.goal_text,
         goal_category: validated.goal_category,
         path_activities: validated.path_activities,
