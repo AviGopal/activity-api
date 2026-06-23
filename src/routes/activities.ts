@@ -6178,6 +6178,29 @@ app.post('/recommend', async (c) => {
     let templates: any[] = fallbackResult.activities;
     let fallbackTier: string | null | undefined = fallbackResult.tier;
 
+    // Scaffold/gaming exclusion (2026-06-22): compose-* wrappers (compose-topology
+    // -tick scaffold — record wrapper->child + hub edges, not genuine producer->
+    // consumer composition) and genuine-edge-probe (λ₁-gaming machinery) are never
+    // the right answer for a goal. They pollute selection — they keep being minted
+    // fresh with Beta(1,1) priors so per-goal Thompson penalty can't keep up — and
+    // are WHY goals select goal-irrelevant scaffold and never reach. Exclude them
+    // at the candidate gate so genuine capability activities surface, goals reach,
+    // and the action-space mesh connects. (Internal scaffold flows dispatch via
+    // target_template_id, which bypasses /recommend, so this only affects
+    // goal-driven selection.)
+    {
+      const beforeScaffold = templates.length;
+      templates = templates.filter((t: any) => {
+        const id = String((t && (t.id || t.variant_id)) || '');
+        return !id.includes('compose-') && !id.includes('genuine-edge-probe');
+      });
+      if (templates.length !== beforeScaffold) {
+        logger.info('Scaffold exclusion applied to recommend candidates', {
+          before: beforeScaffold, after: templates.length,
+        });
+      }
+    }
+
     logger.info('Templates fetched for recommendation', {
       count: templates.length,
       fallback_tier: fallbackTier,
