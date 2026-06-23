@@ -47,6 +47,7 @@ interface ActivityTask {
   };
   subagent?: string;
   impulseReferences?: string[];
+  inputImpulses?: string[];
   outputImpulses?: string[];
 }
 

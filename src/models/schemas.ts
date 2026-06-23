@@ -95,6 +95,14 @@ export const TemplateTaskSchema = z.object({
   inputShapes: z.array(z.string()).optional(),
   optionalInputShapes: z.array(z.string()).optional(),
   outputShapes: z.array(z.string()).optional(),
+  // Named-input/output slots (Idiom-6 ribosome closure). The engine stamps a
+  // task's output impulse with metadata.outputImpulseKey = outputImpulses[i], and
+  // a downstream task that declares the same slot in `inputImpulses` has it pulled
+  // into context.inputImpulses so `{{impulse:<slot>}}` placeholders resolve.
+  // inputImpulses MUST be persisted symmetrically with outputImpulses — Zod strips
+  // unknown keys, so omitting it here silently dropped the field on write and broke
+  // the named-slot data flow (synthesize/write tasks received zero input impulses).
+  inputImpulses: z.array(z.string()).optional(),
   outputImpulses: z.array(z.string()).optional(),
   retry: z.object({
     // Accept both snake_case (from MiniBob MCP) and camelCase (from ribosome)
