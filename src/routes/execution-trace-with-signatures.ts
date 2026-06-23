@@ -82,6 +82,14 @@ export interface ExecutionTraceTaskEntry {
    *  paradigm `execution.trace.tasks` array) will populate it. */
   input_impulse_ids: string[];
   output_impulse_ids: string[];
+  /** Per-task structure a template-reconstructing consumer (ribosome-extract)
+   *  needs. The signature-focused projection historically dropped these; they're
+   *  populated when the source row carries them (notably the execution_trace_content
+   *  tasks read on an execution_id point-lookup). */
+  resolver?: string;
+  description?: string;
+  input_shapes?: string[];
+  output_shapes?: string[];
 }
 
 export interface ExecutionTraceHydrated {
@@ -313,6 +321,7 @@ function extractTasks(row: RawExecutionRow): ExecutionTraceTaskEntry[] {
         : []),
     ];
 
+    const tt = t as Record<string, unknown>;
     out.push({
       task_id,
       task_index: i,
@@ -321,6 +330,11 @@ function extractTasks(row: RawExecutionRow): ExecutionTraceTaskEntry[] {
       completed_at: toIsoOrUndefined(t.completed_at) ?? toIsoOrUndefined(t.completedAt),
       input_impulse_ids: Array.from(new Set(inputImpulseIds)),
       output_impulse_ids: Array.from(new Set(outputImpulseIds)),
+      // Carry per-task structure for template reconstruction (ribosome-extract).
+      resolver: (typeof tt.resolver_id === 'string' && tt.resolver_id) || (typeof tt.resolver === 'string' && tt.resolver) || undefined,
+      description: typeof tt.description === 'string' ? tt.description : undefined,
+      input_shapes: toStringArray(tt.inputShapes ?? tt.input_shapes),
+      output_shapes: toStringArray(tt.outputShapes ?? tt.output_shapes),
     });
   }
   return out;
@@ -561,6 +575,39 @@ export async function runExecutionTraceWithSignatures(
 
   const execRows = await queryExecutions(db, input, auth);
 
+  // SLIM POINT-LOOKUP (execution_id, e.g. ribosome-extract): the per-task
+  // structure (resolver/inputShapes/outputShapes/description) lives in the split
+  // execution_trace_content table, which the AET/execution rows above DON'T carry
+  // — so without this the consumer got task_count:0 and synthesised a structureless
+  // template. Read the content tasks (point lookup on the indexed execution_id) and
+  // graft them onto the row, AND skip the heavy per-impulse signature hydration the
+  // ribosome doesn't need. Metadata-first slim read: tasks from where they live, no
+  // signature scan.
+  let skipSignatures = false;
+  if (input.execution_id && execRows.length > 0) {
+    skipSignatures = true;
+    const row0 = execRows[0] as RawExecutionRow;
+    const hasTasks = Array.isArray(row0.tasks) && row0.tasks.length > 0;
+    if (!hasTasks) {
+      try {
+        const contentRes = await db.query<Array<Array<{ tasks?: unknown }>>>(
+          `SELECT tasks FROM execution_trace_content WHERE execution_id = $eid LIMIT 1;`,
+          { eid: input.execution_id },
+        );
+        const contentTasks = Array.isArray(contentRes) && Array.isArray(contentRes[0]) && contentRes[0][0]
+          ? (contentRes[0][0] as { tasks?: unknown }).tasks
+          : null;
+        if (Array.isArray(contentTasks) && contentTasks.length > 0) {
+          row0.tasks = contentTasks;
+        }
+      } catch (err) {
+        logger.warn('[execution-trace-with-signatures] content-tasks read failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
   // Collect every impulse id across all rows (input + output) for a single
   // batched impulse lookup. Keeps us at exactly 2 DB round trips regardless of
   // trace count.
@@ -570,11 +617,9 @@ export async function runExecutionTraceWithSignatures(
     for (const id of toStringArray(row.output_impulses)) allImpulseIds.add(id);
   }
 
-  const signatureMap = await queryImpulseSignatures(
-    db,
-    Array.from(allImpulseIds),
-    auth,
-  );
+  const signatureMap = skipSignatures
+    ? new Map<string, ImpulseSignature>()
+    : await queryImpulseSignatures(db, Array.from(allImpulseIds), auth);
 
   const tracesRaw: ExecutionTraceHydrated[] = execRows.map((row) => {
     const input_impulses = toStringArray(row.input_impulses);
