@@ -54,6 +54,9 @@ export interface ExecutionTraceWithSignaturesInput {
   success_only?: boolean;
   /** Filter by `duration_ms >= min_duration_ms`. */
   min_duration_ms?: number;
+  /** Return THIS specific execution's signature (exact-match on execution_id).
+   *  Used by ribosome-extract to fetch the precise reached trace. */
+  execution_id?: string;
 }
 
 export interface ImpulseSignature {
@@ -193,7 +196,16 @@ export function parseInput(raw: unknown): ExecutionTraceWithSignaturesInput & {
     min_duration_ms = n;
   }
 
-  return { since, limit, activity_template_id, success_only, min_duration_ms };
+  // execution_id: when provided, return THAT specific execution's signature
+  // (used by ribosome-extract to fetch the exact reached trace). Without this the
+  // resolver ignored execution_id and returned whatever ran most recently, so the
+  // ribosome synthesised templates from the WRONG trace.
+  const execution_id =
+    typeof input.execution_id === 'string' && input.execution_id.length > 0
+      ? input.execution_id
+      : undefined;
+
+  return { since, limit, activity_template_id, success_only, min_duration_ms, execution_id };
 }
 
 // ---------------------------------------------------------------------------
@@ -362,7 +374,15 @@ async function queryExecutions(
     since: input.since,
     lim: input.limit,
   };
-  const where: string[] = ['executed_at >= type::datetime($since)'];
+  // When a specific execution_id is requested (ribosome-extract fetching the exact
+  // reached trace), do a POINT LOOKUP on execution_id and SKIP the `since` window —
+  // otherwise the executed_at>=since scan walks ~38K rows/24h before filtering, and
+  // the heavy per-impulse signature hydration pushes the whole call past the
+  // caller's 8s http_fetch timeout (the silent task[0] failure that kept the
+  // ribosome from ever minting). execution_id is far more selective.
+  const where: string[] = input.execution_id
+    ? []
+    : ['executed_at >= type::datetime($since)'];
 
   if (auth.authType === 'apikey') {
     // Phase B3: dual-tenant scoping. Match on account_id when present;
@@ -372,6 +392,12 @@ async function queryExecutions(
     );
     params.orgId = auth.orgId;
     params.account_id = auth.accountId ?? null;
+  }
+  if (input.execution_id) {
+    // Exact-execution lookup (ribosome-extract). Accept both bare and
+    // record-prefixed forms; match execution_id field, not the record id.
+    where.push('execution_id = $executionId');
+    params.executionId = String(input.execution_id).replace(/^activity_execution_traces:/, '');
   }
   if (input.activity_template_id) {
     where.push('activity_id = $activityId');
@@ -407,14 +433,23 @@ async function queryExecutions(
   `;
 
   let paradigmRows: RawExecutionRow[] = [];
-  try {
-    const result = await db.query(sql, params);
-    const firstSet = Array.isArray(result) && result.length > 0 ? result[0] : [];
-    paradigmRows = Array.isArray(firstSet) ? (firstSet as RawExecutionRow[]) : [];
-  } catch (err) {
-    logger.warn('[execution-trace-with-signatures] execution query failed', {
-      error: err instanceof Error ? err.message : String(err),
-    });
+  // Skip the paradigm `execution`-table query for execution_id point-lookups: that
+  // table keys on the record `id`, not an `execution_id` field, so the filter
+  // can't use an index and scans the whole table (~26s — the silent task[0]
+  // timeout). Substrate traces (TranslatingTraceSink) live in the legacy
+  // activity_execution_traces table, which IS indexed on execution_id and served
+  // the raw row in 0.24s. So for a specific execution, the fast legacy query below
+  // is sufficient.
+  if (!input.execution_id) {
+    try {
+      const result = await db.query(sql, params);
+      const firstSet = Array.isArray(result) && result.length > 0 ? result[0] : [];
+      paradigmRows = Array.isArray(firstSet) ? (firstSet as RawExecutionRow[]) : [];
+    } catch (err) {
+      logger.warn('[execution-trace-with-signatures] execution query failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   // F-V61: union with activity_execution_traces (legacy table) so that traces
@@ -438,7 +473,7 @@ async function queryExecutions(
       org_id
     FROM activity_execution_traces
     WHERE ${where.join(' AND ')}
-    ORDER BY executed_at DESC
+    ${input.execution_id ? '' : 'ORDER BY executed_at DESC'}
     LIMIT $lim
   `;
   let legacyRows: RawExecutionRow[] = [];
