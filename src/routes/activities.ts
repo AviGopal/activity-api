@@ -5784,13 +5784,28 @@ async function getActivitiesWithTieredFallback(
               const id = String((r as any).id);
               if (!seen.has(id)) { seen.add(id); ordered.push(r); }
             }
+            // 2026-06-23 shape-feasibility fix: the blended FTS/dense hits
+            // are prepended without passing through the satisfiability
+            // filter, so text-relevant-but-shape-infeasible activities
+            // dominate the top even when real shapes are provided. Apply
+            // the same filter Tier 1 used against the same `shapes`. Only
+            // adopt the filtered list if it still meets minResults; else
+            // fall back to the unfiltered `ordered` (never underfill —
+            // matches the file's existing tier-fallthrough philosophy).
+            const feasible = filterBySatisfiableInputShapes(ordered, shapes);
+            const chosen = feasible.length >= minResults ? feasible : ordered;
             logger.info('[tiered-fallback] Tier 1 (exact) + Tier 3 (FTS+dense) blended', {
               tier1Count: tier1Result.data.length,
               ftsCount: ftsRows.length,
               denseCount: denseBlend.length,
               blendedTotal: ordered.length,
+              feasibleCount: feasible.length,
+              chosenCount: chosen.length,
             });
-            return { activities: ordered, tier: denseBlend.length > 0 ? 'fts_hybrid' : 'fts' };
+            // Tier 1 exact-shape supplied the base set; label the path
+            // 'exact' rather than 'fts_hybrid'/'fts' so observers/learners
+            // see the true selection path.
+            return { activities: chosen, tier: 'exact' };
           }
         } catch (blendErr) {
           logger.warn('[tiered-fallback] Tier 3 blend failed; falling through to Tier 1 only', {
