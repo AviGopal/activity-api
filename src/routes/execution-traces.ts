@@ -79,6 +79,55 @@ export function extractTaskImpulseIds(task: any): {
   return { input_impulse_ids, output_impulse_ids };
 }
 
+/**
+ * C6: best-effort recovery of the input shape-set for v1 state-space signature
+ * derivation. The canonical source is `input_impulse_shapes`, but that field is
+ * populated on only ~4% of traces — which starved `context_thompson_scores` of
+ * conditional posteriors. This widens coverage by falling back, in priority
+ * order, to shape sets already present on the trace:
+ *   1. `input_impulse_shapes` (canonical — the decision-time pool)
+ *   2. per-task `tasks[].input_impulse_shapes` / `inputShapes` (decision-time, per-task)
+ *   3. `output_impulse_shapes` + `output_impulses[].shape` + per-task output shapes
+ *      (the produced pool — a proxy when no input pool was recorded)
+ * Returns a de-duplicated array; empty when nothing usable is found. Pure /
+ * non-throwing; callers wrap the signature compute in try/catch regardless.
+ */
+export function deriveSignatureShapes(trace: any): string[] {
+  const collect = (...arrs: unknown[]): string[] => {
+    const out: string[] = [];
+    for (const a of arrs) {
+      if (Array.isArray(a)) {
+        for (const s of a) if (typeof s === 'string' && s.length > 0) out.push(s);
+      }
+    }
+    return out;
+  };
+  const dedupe = (arr: string[]): string[] => [...new Set(arr)];
+  const tasks: any[] = Array.isArray(trace?.tasks) ? trace.tasks : [];
+
+  // 1. canonical input pool
+  const directInput = collect(trace?.input_impulse_shapes);
+  if (directInput.length > 0) return dedupe(directInput);
+
+  // 2. per-task input shapes
+  const taskInput = collect(
+    ...tasks.map((t: any) => t?.input_impulse_shapes),
+    ...tasks.map((t: any) => t?.inputShapes),
+  );
+  if (taskInput.length > 0) return dedupe(taskInput);
+
+  // 3. produced pool (output shapes) as a proxy
+  const produced = collect(
+    trace?.output_impulse_shapes,
+    Array.isArray(trace?.output_impulses)
+      ? trace.output_impulses.map((o: any) => o?.shape)
+      : [],
+    ...tasks.map((t: any) => t?.output_impulse_shapes),
+    ...tasks.map((t: any) => t?.outputShapes),
+  );
+  return dedupe(produced);
+}
+
 export function normalizePersistedTask(task: any): {
   task_id: string;
   description?: string;
@@ -1873,16 +1922,22 @@ app.post('/', async (c) => {
           typeof rawVer === 'number' && Number.isInteger(rawVer) && rawVer >= 1) {
         (trace as any).signature = rawSig;
         (trace as any).signature_version = rawVer;
-      } else if (Array.isArray(trace.input_impulse_shapes) && trace.input_impulse_shapes.length > 0) {
-        try {
-          const { computeStateSpaceSignature } = await import('../utils/session-context');
-          (trace as any).signature = computeStateSpaceSignature({
-            shapes: trace.input_impulse_shapes as string[],
-            provenance: Array.isArray(meta.provenance) ? (meta.provenance as any) : [],
-            missing: Array.isArray(meta.missing_shapes) ? (meta.missing_shapes as any) : [],
-          });
-          (trace as any).signature_version = 1;
-        } catch { /* non-blocking */ }
+      } else {
+        // C6: widen signature coverage beyond the ~4% of traces that carry
+        // input_impulse_shapes. Fall back to per-task / output shape sets already
+        // on the trace so a v1 signature lands for the majority of traces.
+        const sigShapes = deriveSignatureShapes(trace);
+        if (sigShapes.length > 0) {
+          try {
+            const { computeStateSpaceSignature } = await import('../utils/session-context');
+            (trace as any).signature = computeStateSpaceSignature({
+              shapes: sigShapes,
+              provenance: Array.isArray(meta.provenance) ? (meta.provenance as any) : [],
+              missing: Array.isArray(meta.missing_shapes) ? (meta.missing_shapes as any) : [],
+            });
+            (trace as any).signature_version = 1;
+          } catch { /* non-blocking */ }
+        }
       }
     }
 
@@ -2532,16 +2587,22 @@ app.post('/', async (c) => {
             typeof rawVer === 'number' && Number.isInteger(rawVer) && rawVer >= 1) {
           v1Sig = rawSig;
           v1SigVersion = rawVer;
-        } else if (Array.isArray(body.input_impulse_shapes) && body.input_impulse_shapes.length > 0) {
-          try {
-            const { computeStateSpaceSignature } = await import('../utils/session-context');
-            v1Sig = computeStateSpaceSignature({
-              shapes: body.input_impulse_shapes,
-              provenance: Array.isArray((body as any).metadata?.provenance) ? (body as any).metadata.provenance : [],
-              missing: Array.isArray((body as any).metadata?.missing_shapes) ? (body as any).metadata.missing_shapes : [],
-            });
-            v1SigVersion = 1;
-          } catch { /* non-blocking */ }
+        } else {
+          // C6: widen coverage — fall back to per-task / output shapes already on
+          // the trace when input_impulse_shapes is absent, so the cts conditional
+          // posterior is keyed (and matches the recommend read-side derivation).
+          const sigShapes = deriveSignatureShapes(trace);
+          if (sigShapes.length > 0) {
+            try {
+              const { computeStateSpaceSignature } = await import('../utils/session-context');
+              v1Sig = computeStateSpaceSignature({
+                shapes: sigShapes,
+                provenance: Array.isArray((body as any).metadata?.provenance) ? (body as any).metadata.provenance : [],
+                missing: Array.isArray((body as any).metadata?.missing_shapes) ? (body as any).metadata.missing_shapes : [],
+              });
+              v1SigVersion = 1;
+            } catch { /* non-blocking */ }
+          }
         }
       }
 

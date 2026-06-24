@@ -6331,13 +6331,25 @@ app.post('/recommend', async (c) => {
     let stateSpaceSig: string | null = null;
     const sigScoresMap = new Map<string, { alpha: number; beta: number; n_observations: number }>();
 
-    if (Array.isArray(impulse_state_space) && impulse_state_space.length > 0 && activityIds.length > 0) {
+    // C6: derive the v1 state-space signature SERVER-SIDE from effectiveShapes
+    // (impulse_shapes ∪ implied) so conditional posteriors are keyed even when the
+    // caller (e.g. goal-host) omits impulse_state_space. When impulse_state_space IS
+    // supplied we still use it for provenance/shape detail (richer signature); otherwise
+    // we fall back to the shape set already computed above. Same helper as the write
+    // path (execution-traces.ts) so read/write keys match byte-for-byte.
+    const hasStateSpace = Array.isArray(impulse_state_space) && impulse_state_space.length > 0;
+    const sigShapes = hasStateSpace
+      ? (impulse_state_space as any[]).map((e: any) => e.shape ?? e).filter(Boolean)
+      : effectiveShapes;
+    if (sigShapes.length > 0 && activityIds.length > 0) {
       try {
         stateSpaceSig = computeStateSpaceSignature({
-          shapes: impulse_state_space.map((e: any) => e.shape ?? e).filter(Boolean),
-          provenance: impulse_state_space
-            .filter((e: any) => e.produced_by || e.produced_at_task_id)
-            .map((e: any) => ({ shape: e.shape ?? e, producedBy: e.produced_by ?? e.produced_at_task_id })),
+          shapes: sigShapes,
+          provenance: hasStateSpace
+            ? (impulse_state_space as any[])
+                .filter((e: any) => e.produced_by || e.produced_at_task_id)
+                .map((e: any) => ({ shape: e.shape ?? e, producedBy: e.produced_by ?? e.produced_at_task_id }))
+            : [],
           missing: [],  // blocking_shapes computed later; signature uses present pool
         });
 
@@ -6565,7 +6577,15 @@ app.post('/recommend', async (c) => {
         // When state-space-signature row has enough observations, use it directly.
         let posteriorSource: string = blendWeight > 0 ? 'context_bucketed' : scoreMethod;
         const sigRow = sigScoresMap.get(activityId);
-        if (sigRow && sigRow.n_observations >= SIGNATURE_SAMPLING_FLOOR) {
+        // C6: apply the conditional (signature-keyed) posterior only when it has
+        // enough observations AND there are ≥2 candidates — so the signature
+        // DIFFERENTIATES between arms, never collapses a single-candidate set onto
+        // one posterior. Falls back to the global/context-bucketed posterior otherwise.
+        if (
+          sigRow &&
+          sigRow.n_observations >= SIGNATURE_SAMPLING_FLOOR &&
+          validTemplates.length >= 2
+        ) {
           alphaBlended = sigRow.alpha + totalBoost;
           betaBlended  = sigRow.beta  + impulseBetaPenalty;
           posteriorSource = 'conditional';
