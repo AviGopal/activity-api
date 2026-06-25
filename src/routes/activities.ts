@@ -88,6 +88,7 @@ import {
   type ImpulseStateEntry,
 } from '../services/recommendation';
 import { generateActivity } from '../services/activity-generator';
+import { applyReputationFactor } from '../services/thompson-sampling';
 import {
   ExecutionRecordSchema,
   CreateTemplateRequestSchema,
@@ -6328,6 +6329,16 @@ app.post('/recommend', async (c) => {
     const SIGNATURE_SAMPLING_FLOOR = parseInt(
       process.env.RECOMMEND_SIGNATURE_SAMPLING_FLOOR ?? '5', 10
     );
+    // Cross-signature reputation penalty (2026-06-25 composition-gap lever 3).
+    // Env-flag-gated, default OFF: when unset/falsey, the reputation factor is
+    // always 1.0 (current behavior byte-for-byte preserved). See
+    // applyReputationFactor() in services/thompson-sampling.ts.
+    const CROSS_SIG_REPUTATION_PENALTY =
+      process.env.CROSS_SIG_REPUTATION_PENALTY === '1' ||
+      process.env.CROSS_SIG_REPUTATION_PENALTY === 'true';
+    const CROSS_SIG_MIN_GLOBAL_OBS = parseInt(
+      process.env.CROSS_SIG_REPUTATION_MIN_GLOBAL_OBS ?? '5', 10
+    );
     let stateSpaceSig: string | null = null;
     const sigScoresMap = new Map<string, { alpha: number; beta: number; n_observations: number }>();
 
@@ -6618,6 +6629,33 @@ app.post('/recommend', async (c) => {
         } else {
           sample = betaSample(alphaBlended, betaBlended);
           sampleSource = 'app_fallback';
+        }
+
+        // Cross-signature reputation penalty (lever 3). Re-inject the
+        // signature-agnostic global reputation proportional to how much the
+        // context blend discounted it, damping the gamed-signature escape
+        // without double-damping the fresh-signature regime. No-op (factor 1.0)
+        // when the env flag is off, when blendWeight==0, or when the global
+        // posterior is missing / below the observation floor. `scores` holds
+        // the per-template, per-org global aggregate from v_activity_score —
+        // no extra DB read.
+        const reputationFactor = applyReputationFactor(
+          blendWeight,
+          scores?.alpha,
+          scores?.beta,
+          { enabled: CROSS_SIG_REPUTATION_PENALTY, minObs: CROSS_SIG_MIN_GLOBAL_OBS }
+        );
+        if (CROSS_SIG_REPUTATION_PENALTY && reputationFactor < 1.0) {
+          const muG = (scores?.alpha != null && scores?.beta != null && (scores.alpha + scores.beta) > 0)
+            ? scores.alpha / (scores.alpha + scores.beta)
+            : null;
+          logger.debug('Cross-signature reputation penalty applied', {
+            template_id: activityId,
+            blendWeight,
+            mu_g: muG,
+            reputationFactor,
+          });
+          sample = sample * reputationFactor;
         }
 
         const rawTotalExecs = scores?.total_executions ?? 0;

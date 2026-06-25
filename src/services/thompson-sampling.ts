@@ -246,3 +246,55 @@ export function validateOutputShapes(
 
   return metadata;
 }
+
+/**
+ * Cross-signature reputation penalty (2026-06-25 composition-gap lever 3).
+ *
+ * Re-injects a template's signature-agnostic GLOBAL reputation proportional to
+ * how much the context blend discounted it, damping the "gamed-signature
+ * escape" (a template with strong LOCAL alpha on one signature it games escapes
+ * its bad GLOBAL reputation because the blend downweights global). Computes a
+ * factor in [0,1] that scales the drawn Thompson sample:
+ *
+ *   mu_g            = alphaGlobal / (alphaGlobal + betaGlobal)
+ *   reputationFactor = 1 - blendWeight * (1 - mu_g)
+ *   sample'          = sample * reputationFactor
+ *
+ * Deliberately NOT a flat `sample *= mu_g`: that double-damps the fresh-signature
+ * regime (blendWeight=0), where global is already the Beta param. Here
+ * blendWeight=0 => factor=1.0 (no-op), and worse global / more local override =>
+ * stronger damping. factor <= 1, so it can only damp, never amplify.
+ *
+ * Guards (all preserve novelty / exploration):
+ * - disabled flag                          => 1.0 (current behavior, no-op)
+ * - blendWeight <= 0                        => 1.0 (no double-damp)
+ * - missing global posterior               => 1.0 (no bad reputation to damp)
+ * - global observations below minObs floor => 1.0 (one unlucky failure ≠ bad rep)
+ *
+ * `minObs` is measured as `alphaGlobal + betaGlobal - 2` (observations above the
+ * Beta(1,1) prior), matching `nContext` upstream.
+ *
+ * @returns reputationFactor in [0,1]; multiply the drawn sample by this.
+ */
+export function applyReputationFactor(
+  blendWeight: number,
+  alphaGlobal: number | null | undefined,
+  betaGlobal: number | null | undefined,
+  opts: { enabled: boolean; minObs?: number }
+): number {
+  if (!opts.enabled) return 1.0;
+  if (!(blendWeight > 0)) return 1.0;
+  if (alphaGlobal == null || betaGlobal == null) return 1.0;
+
+  const minObs = opts.minObs ?? 5;
+  const globalObs = alphaGlobal + betaGlobal - 2;
+  if (globalObs < minObs) return 1.0;
+
+  const denom = alphaGlobal + betaGlobal;
+  if (!(denom > 0)) return 1.0;
+  const muG = alphaGlobal / denom;
+
+  const factor = 1 - blendWeight * (1 - muG);
+  // Defensive clamp to [0,1].
+  return Math.max(0, Math.min(1, factor));
+}
