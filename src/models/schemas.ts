@@ -448,8 +448,12 @@ export const CompositionEdgeSchema = z.object({
 });
 
 export const CompositionRecordRequestSchema = z.object({
-  parent_activity_id: z.string(),
-  child_activity_id: z.string(),
+  // A composition edge with an empty/absent parent or child id is not a real edge:
+  // it writes a meaningless row that the SCHEMAFULL `ASSERT $value != NONE` lets
+  // through (it permits "") and that the reconcile/spectral-gap readers then trip
+  // over. Require a non-empty string at the boundary. (2026-06-26)
+  parent_activity_id: z.string().min(1),
+  child_activity_id: z.string().min(1),
   execution_id: z.string(),
   goal_context: z.string().optional(),
   success: z.boolean(),

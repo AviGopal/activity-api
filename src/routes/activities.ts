@@ -139,6 +139,41 @@ const CACHE_KEY_PREFIX = 'activity:template:';
 const CACHE_LIST_KEY = 'activity:templates:list';
 
 // =============================================================================
+// Composition-edge classification (C7 — SUBSTRATE_AS_DYNAMICS §3-4)
+// =============================================================================
+// A composition edge is durably tagged at WRITE time so the selection gate and
+// the spectral-gap reader can rely on a persisted column instead of re-deriving
+// "genuine vs scaffold" heuristically on every read. Classification by endpoint
+// name, with hub taking priority over scaffold (a lifecycle-hub spoke is never a
+// real capability edge even if the other endpoint looks like a wrapper):
+//   - 'hub'      : either endpoint is a lifecycle hub (validator-dispatch /
+//                  slot-binding) — nests under every execution, carries no
+//                  capability-to-capability credit.
+//   - 'scaffold' : either endpoint is wrapper/dispatch-nesting machinery
+//                  (compose-* wrappers, genuine-edge-probe λ₁-gaming trio) —
+//                  records wrapper→child, not producer→consumer.
+//   - 'genuine'  : neither — a real producer-shape → consumer-shape capability
+//                  edge. This is the honest λ₁ (credit-mixing) signal.
+// Mirrors the read-time heuristics in scripts/substrate/spectral-gap.ts
+// (touchesHook) and the recommend scaffold-exclusion gate below, so a row tagged
+// here and a legacy row classified heuristically agree.
+const COMPOSITION_HUB_MARKERS = ['validator-dispatch', 'slot-binding'];
+const COMPOSITION_SCAFFOLD_MARKERS = ['compose-', 'genuine-edge-probe'];
+export type CompositionEdgeKind = 'genuine' | 'scaffold' | 'hub';
+export function classifyCompositionEdge(
+  parentActivityId: string | null | undefined,
+  childActivityId: string | null | undefined,
+): CompositionEdgeKind {
+  const p = String(parentActivityId || '');
+  const ch = String(childActivityId || '');
+  const touchesHub = COMPOSITION_HUB_MARKERS.some((h) => p.includes(h) || ch.includes(h));
+  if (touchesHub) return 'hub';
+  const touchesScaffold = COMPOSITION_SCAFFOLD_MARKERS.some((s) => p.includes(s) || ch.includes(s));
+  if (touchesScaffold) return 'scaffold';
+  return 'genuine';
+}
+
+// =============================================================================
 // Phase B1: account_id dual-write helpers
 // =============================================================================
 // See OpenSpec change activity-api-account-id-migration-2026-04-28.
@@ -6081,6 +6116,7 @@ app.post('/recommend', async (c) => {
       session_context,          // Spec 2/3/4: loaded impulse state with timestamps
       exploration_config: rawExplorationConfig,
       impulse_state_space,      // Phase 11: executor's loaded impulse pool (state-space-aware filtering)
+      state_signature: callerStateSignature,  // C6 read-back: caller-supplied state-space signature (overrides server-side derivation for the cts lookup)
       // NOTE: pointer_state_space is intentionally NOT destructured — derived server-side
     } = body;
 
@@ -6207,6 +6243,14 @@ app.post('/recommend', async (c) => {
     {
       const beforeScaffold = templates.length;
       templates = templates.filter((t: any) => {
+        // C7: PREFER a durable edge_kind/genuine tag when the candidate carries one
+        // (forward-compatible — candidate rows joined with composition-edge data will
+        // surface it); fall back to the template-id heuristic for untagged candidates
+        // (the common case — recommend candidates are templates, not edge rows). A
+        // candidate tagged hub/scaffold is excluded; one tagged genuine is kept even
+        // if its id happens to match a marker substring.
+        if (t && typeof t.genuine === 'boolean') return t.genuine;
+        if (t && typeof t.edge_kind === 'string' && t.edge_kind.length > 0) return t.edge_kind === 'genuine';
         const id = String((t && (t.id || t.variant_id)) || '');
         return !id.includes('compose-') && !id.includes('genuine-edge-probe');
       });
@@ -6349,12 +6393,22 @@ app.post('/recommend', async (c) => {
     // we fall back to the shape set already computed above. Same helper as the write
     // path (execution-traces.ts) so read/write keys match byte-for-byte.
     const hasStateSpace = Array.isArray(impulse_state_space) && impulse_state_space.length > 0;
+    // C6 read-back: when the caller already knows the recorded state-space
+    // signature (a 16-hex hash from computeStateSpaceSignature, e.g. threaded
+    // back from a prior trace), use it DIRECTLY as the cts lookup key instead of
+    // re-deriving it. This closes the read path for callers that carry the
+    // signature forward; when absent we fall back to server-side derivation from
+    // the shape pool (byte-identical to the write path) — preserving prior behavior.
+    const callerSig =
+      typeof callerStateSignature === 'string' && /^[0-9a-f]{16}$/.test(callerStateSignature)
+        ? callerStateSignature
+        : null;
     const sigShapes = hasStateSpace
       ? (impulse_state_space as any[]).map((e: any) => e.shape ?? e).filter(Boolean)
       : effectiveShapes;
-    if (sigShapes.length > 0 && activityIds.length > 0) {
+    if ((callerSig || sigShapes.length > 0) && activityIds.length > 0) {
       try {
-        stateSpaceSig = computeStateSpaceSignature({
+        stateSpaceSig = callerSig ?? computeStateSpaceSignature({
           shapes: sigShapes,
           provenance: hasStateSpace
             ? (impulse_state_space as any[])
@@ -7449,6 +7503,21 @@ app.post('/composition', async (c) => {
     const body = await c.req.json();
     const validated = CompositionRecordRequestSchema.parse(body);
 
+    // Defense-in-depth: never persist an edge with a missing/blank parent or child id.
+    // The SCHEMAFULL `child_activity_id`/`parent_activity_id ASSERT $value != NONE`
+    // does NOT reject "" or whitespace, and a NONE that slips in aborts the whole
+    // composition-edge-reconcile run on first read ("Found NONE for field
+    // child_activity_id ... expected a string"). Skip-and-warn instead of writing
+    // a corrupt edge. (2026-06-26)
+    if (!validated.parent_activity_id?.trim() || !validated.child_activity_id?.trim()) {
+      logger.warn('Skipping composition edge with missing parent/child id', {
+        parent: validated.parent_activity_id,
+        child: validated.child_activity_id,
+        execution_id: validated.execution_id,
+      });
+      return c.json({ success: false, skipped: true, reason: 'missing parent or child activity id' }, 400);
+    }
+
     // Phase B1: pull account_id from JWT auth context for dual-write.
     const compositionJwtAuth = getJwtAuthFromContext(c);
     const compositionAccountId: string | null = compositionJwtAuth?.accountId ?? null;
@@ -7478,6 +7547,13 @@ app.post('/composition', async (c) => {
     // Generate edge_id for composition_impulse_flow records
     const edgeId = `${validated.parent_activity_id}:${validated.child_activity_id}`;
 
+    // C7: classify the edge at write time so readers prefer the persisted column.
+    const compositionEdgeKind = classifyCompositionEdge(
+      validated.parent_activity_id,
+      validated.child_activity_id,
+    );
+    const compositionEdgeIsGenuine = compositionEdgeKind === 'genuine';
+
     if (existing && existing.length > 0 && existing[0]) {
       // Update existing edge
       const current = existing[0];
@@ -7499,6 +7575,8 @@ app.post('/composition', async (c) => {
         'output_impulse_shapes = $output_impulse_shapes',
         'account_id = $account_id',
         'account_id_version = 1',
+        'edge_kind = $edge_kind',
+        'genuine = $genuine',
       ];
 
       const updateParams: Record<string, any> = {
@@ -7510,6 +7588,8 @@ app.post('/composition', async (c) => {
         input_impulse_shapes: validated.input_impulse_shapes || [],
         output_impulse_shapes: validated.output_impulse_shapes || [],
         account_id: compositionAccountId,
+        edge_kind: compositionEdgeKind,
+        genuine: compositionEdgeIsGenuine,
       };
 
       // Add optional fields only if they have values
@@ -7572,6 +7652,8 @@ app.post('/composition', async (c) => {
         output_impulse_shapes: validated.output_impulse_shapes || [],
         account_id: compositionAccountId,
         account_id_version: 1,
+        edge_kind: compositionEdgeKind,
+        genuine: compositionEdgeIsGenuine,
       };
 
       // Add optional fields only if they have values
@@ -8185,6 +8267,21 @@ app.post('/composition/edges', async (c) => {
       success: body.success,
     };
 
+    // Defense-in-depth: this inline schema does NOT validate, so an undefined/null/blank
+    // parent or child id would flow straight into the CREATE below and write a row whose
+    // SCHEMAFULL child_activity_id is NONE — which then aborts the whole
+    // composition-edge-reconcile run on first read. Reject it here. (2026-06-26)
+    if (
+      typeof validated.parent_activity_id !== 'string' || !validated.parent_activity_id.trim() ||
+      typeof validated.child_activity_id !== 'string' || !validated.child_activity_id.trim()
+    ) {
+      logger.warn('Skipping composition/edges with missing parent/child id', {
+        parent: validated.parent_activity_id,
+        child: validated.child_activity_id,
+      });
+      return c.json({ success: false, skipped: true, reason: 'missing parent or child activity id' }, 400);
+    }
+
     logger.info('POST /v2/activities/composition/edges', {
       parent: validated.parent_activity_id,
       child: validated.child_activity_id,
@@ -8350,6 +8447,8 @@ app.post('/composition/edges', async (c) => {
             weight = (IF($success, success_count + 1, success_count)) / (execution_count + 1),
             account_id = $account_id,
             account_id_version = 1,
+            edge_kind = $edge_kind,
+            genuine = $genuine,
             updated_at = time::now()
           WHERE parent_activity_id = $parent AND child_activity_id = $child
         ) ELSE (
@@ -8361,16 +8460,24 @@ app.post('/composition/edges', async (c) => {
             weight = IF($success, 1.0, 0.0),
             account_id = $account_id,
             account_id_version = 1,
+            edge_kind = $edge_kind,
+            genuine = $genuine,
             created_at = time::now(),
             updated_at = time::now()
         ) END;
       `;
 
+      const compatEdgeKind = classifyCompositionEdge(
+        validated.parent_activity_id,
+        validated.child_activity_id,
+      );
       await surrealDB.query(compatQuery, {
         parent: validated.parent_activity_id,
         child: validated.child_activity_id,
         success: validated.success,
         account_id: jwtAuth.accountId ?? null,
+        edge_kind: compatEdgeKind,
+        genuine: compatEdgeKind === 'genuine',
       });
     } catch (compatError: any) {
       // Non-critical - log and continue
