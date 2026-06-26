@@ -163,6 +163,15 @@ export type CompositionEdgeKind = 'genuine' | 'scaffold' | 'hub';
 export function classifyCompositionEdge(
   parentActivityId: string | null | undefined,
   childActivityId: string | null | undefined,
+  // Recurrence/shape evidence supplied by WRITE-path callers. When present, a
+  // non-marker edge is 'genuine' ONLY with empirical proof — it has recurred with
+  // success (the data demonstrably flowed enough to succeed repeatedly) OR a shape
+  // the parent produces is one the child consumes. A brand-new/unproven non-marker
+  // edge is 'scaffold' until it earns 'genuine'. This is the honest λ₁ signal: the
+  // bare node-name verdict (no opts) marked EVERY non-wrapper pair genuine, which
+  // inflated the genuine count ~3× with single-shot/observer noise. Read-time
+  // callers pass no opts and keep the legacy node-name verdict (backward-compatible).
+  opts?: { executionCount?: number; successCount?: number; shapeFlow?: boolean },
 ): CompositionEdgeKind {
   const p = String(parentActivityId || '');
   const ch = String(childActivityId || '');
@@ -170,6 +179,11 @@ export function classifyCompositionEdge(
   if (touchesHub) return 'hub';
   const touchesScaffold = COMPOSITION_SCAFFOLD_MARKERS.some((s) => p.includes(s) || ch.includes(s));
   if (touchesScaffold) return 'scaffold';
+  if (opts) {
+    const ec = opts.executionCount ?? 0, sc = opts.successCount ?? 0;
+    const recurring = ec >= 5 && sc >= 3;
+    return (recurring || opts.shapeFlow === true) ? 'genuine' : 'scaffold';
+  }
   return 'genuine';
 }
 
@@ -7548,9 +7562,14 @@ app.post('/composition', async (c) => {
     const edgeId = `${validated.parent_activity_id}:${validated.child_activity_id}`;
 
     // C7: classify the edge at write time so readers prefer the persisted column.
+    // Recurrence-gate 'genuine': project the post-write counts from the existing row
+    // (a brand-new edge is 0+1 → unproven → 'scaffold' until it recurs with success).
+    const _curEc = Number((existing && existing[0] && (existing[0] as any).execution_count) || 0);
+    const _curSc = Number((existing && existing[0] && (existing[0] as any).success_count) || 0);
     const compositionEdgeKind = classifyCompositionEdge(
       validated.parent_activity_id,
       validated.child_activity_id,
+      { executionCount: _curEc + 1, successCount: _curSc + (validated.success ? 1 : 0) },
     );
     const compositionEdgeIsGenuine = compositionEdgeKind === 'genuine';
 
@@ -8467,9 +8486,20 @@ app.post('/composition/edges', async (c) => {
         ) END;
       `;
 
+      // Recurrence-gate 'genuine' here too (this endpoint increments in-DB, so read
+      // the current counts and project +1). Keeps both edge-write paths consistent
+      // — otherwise this dual-write would clobber the primary path's verdict.
+      const _cex = await surrealDB.query<any[]>(
+        `SELECT execution_count, success_count FROM activity_composition_graph WHERE parent_activity_id = $p AND child_activity_id = $c LIMIT 1`,
+        { p: validated.parent_activity_id, c: validated.child_activity_id },
+      );
+      const _crow = Array.isArray(_cex) ? (_cex as any[])[0] : undefined;
+      const _cec = Number((_crow && _crow.execution_count) || 0);
+      const _csc = Number((_crow && _crow.success_count) || 0);
       const compatEdgeKind = classifyCompositionEdge(
         validated.parent_activity_id,
         validated.child_activity_id,
+        { executionCount: _cec + 1, successCount: _csc + (validated.success ? 1 : 0) },
       );
       await surrealDB.query(compatQuery, {
         parent: validated.parent_activity_id,

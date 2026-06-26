@@ -3466,4 +3466,34 @@ app.get('/calibration-summary', async (c) => {
   }
 });
 
+// Patch the reach-gate verdict onto an already-persisted trace. POST '/' INSERTs
+// the trace BEFORE the goal-host reach gate runs (the gate is post-execution), so
+// `reached` / `completion_shapes` can only be written back here, keyed by
+// execution_id. This lands the decision-outcome on the trace row so per-signature
+// reach-rate is queryable (join `reached` against `signature`) — the C6
+// selection-quality metric. Root write on purpose: an org-scoped UPDATE would
+// silently no-op for ApiKey callers whose org differs from the trace's org — the
+// exact silent-drop class this whole pass removes. (2026-06-26)
+app.post('/reach', async (c) => {
+  try {
+    const body = await c.req.json();
+    const execId = body.execution_id;
+    if (!execId || typeof body.reached !== 'boolean') {
+      return c.json({ error: 'execution_id (string) and reached (bool) required' }, 400);
+    }
+    const completion_shapes: string[] = Array.isArray(body.completion_shapes)
+      ? body.completion_shapes.map(String)
+      : [];
+    const res = await surrealDB.query(
+      `UPDATE activity_execution_traces SET reached = $reached, completion_shapes = $completion_shapes WHERE execution_id = $execution_id`,
+      { reached: body.reached, completion_shapes, execution_id: String(execId) },
+    );
+    const updated = Array.isArray(res) && Array.isArray(res[0]) ? (res[0] as unknown[]).length : (Array.isArray(res) ? res.length : 0);
+    return c.json({ success: true, execution_id: String(execId), reached: body.reached, updated }, 200);
+  } catch (err) {
+    logger.warn('[reach-patch] failed to persist reach verdict on trace', { error: err instanceof Error ? err.message : String(err) });
+    return c.json({ success: false, error: err instanceof Error ? err.message : String(err) }, 500);
+  }
+});
+
 export default app;
