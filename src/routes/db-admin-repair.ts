@@ -255,6 +255,32 @@ export async function resolveRepairOrPrune(
     return bad(cat);
   }
 
+  // SNAPSHOT-BEFORE-DESTRUCTIVE (autonomous reversibility): for any op that DELETES or
+  // mutates rows, capture the affected rows to /workspace/db-backups BEFORE touching
+  // them, so a bad autonomous prune/repair is recoverable WITHOUT operator action. The
+  // snapshot is FAIL-SAFE: if we cannot back the rows up, we ABORT — never delete data
+  // we can't restore. Soft-deprecate prune is reversible by design (un-deprecate) so it
+  // is exempt. (2026-06-28)
+  let backupPath: string | null = null;
+  if (mode === 'hard_delete' || (operation === 'repair' && /\b(DELETE|UPDATE)\b/i.test(mutate.sql))) {
+    // Derive a SELECT for the same target rows from the DELETE/UPDATE predicate.
+    const m = mutate.sql.match(/^\s*DELETE\s+(\S+)\s+WHERE\s+(.+)$/is)
+      ?? mutate.sql.match(/^\s*UPDATE\s+(\S+)\s+SET\s+.+?\s+WHERE\s+(.+)$/is);
+    if (!m) {
+      await ctx.writeAudit({ operation, params: pointer ?? {}, pattern: patternName, applied: false, actor, impact_count: affected, detail: { error: 'snapshot_abort: could not derive backup SELECT from mutate predicate', mode } });
+      return bad('db_admin: aborting destructive op — could not derive a pre-mutation backup query. No rows touched.');
+    }
+    try {
+      const rows = await ctx.surrealDB.query<any>(`SELECT * FROM ${m[1]} WHERE ${m[2]} LIMIT ${maxRows}`, mutate.params);
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      backupPath = `/workspace/db-backups/${stamp}-${operation}-${patternName}.json`;
+      await Bun.write(backupPath, JSON.stringify({ at: new Date().toISOString(), operation, pattern: patternName, table: m[1], predicate: m[2], affected_count: affected, rows }, null, 0));
+    } catch (err: any) {
+      await ctx.writeAudit({ operation, params: pointer ?? {}, pattern: patternName, applied: false, actor, impact_count: affected, detail: { error: `snapshot_abort: ${err?.message}`, mode } });
+      return bad(`db_admin: aborting destructive op — pre-mutation backup failed (${err?.message}). No rows touched. Data is never deleted without a recoverable snapshot.`);
+    }
+  }
+
   try {
     await ctx.surrealDB.query<any>(mutate.sql, mutate.params);
   } catch (err: any) {
@@ -276,11 +302,11 @@ export async function resolveRepairOrPrune(
     applied: true,
     actor,
     impact_count: affected,
-    detail: { mode, before: affected, after: afterCount, description: base.description },
+    detail: { mode, before: affected, after: afterCount, description: base.description, backup_path: backupPath },
   });
 
   return ok(
-    { ...base, applied: true, mode, before: affected, after: afterCount },
+    { ...base, applied: true, mode, before: affected, after: afterCount, backup_path: backupPath },
     `db_admin_${operation}_applied`,
     `${operation} applied (${mode}): ${affected} -> ${afterCount ?? '?'} rows (${patternName})`,
   );
