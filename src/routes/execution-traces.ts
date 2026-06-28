@@ -3466,6 +3466,52 @@ app.get('/calibration-summary', async (c) => {
   }
 });
 
+// Append goal-host WALK deliberation steps onto an already-persisted trace, keyed
+// by execution_id. The walk's reasoning (backward-chain decisions, bridge/decomp
+// authoring, gap-detection, per-step pick + the considered-but-rejected candidate
+// set) was previously console.log-only and lost to learning; this lands it durably
+// so the substrate can learn from HOW it reaches goals, not just outcomes.
+//
+// REUSE, NOT a new schema: the steps are appended into the trace's existing
+// FLEXIBLE `impulse_resolutions[]` array (migration 094 — TYPE array<object>
+// FLEXIBLE), each tagged `{ deliberation: true, shape, ... }`. No new table, no new
+// SCHEMAFULL field (which would silently drop). Each step carries its own
+// `input_impulse_ids` (the pool shapes/ids the decision saw) so co-occurrence /
+// Thompson can later condition on the reasoning. Root write on purpose, same
+// rationale as /reach below — an org-scoped UPDATE would silently no-op for ApiKey
+// callers whose org differs from the trace's org. Strictly additive + non-fatal:
+// a failed append never affects the walk. (2026-06-27)
+app.post('/deliberation', async (c) => {
+  try {
+    const body = await c.req.json();
+    const execId = body.execution_id;
+    const steps = Array.isArray(body.steps) ? body.steps : [];
+    if (!execId || steps.length === 0) {
+      return c.json({ error: 'execution_id (string) and non-empty steps[] required' }, 400);
+    }
+    // Bound the payload defensively (the walk already caps, this is belt-and-braces):
+    // at most 60 steps, candidate lists already truncated client-side.
+    const tagged = steps.slice(0, 60).map((s: Record<string, unknown>) => ({
+      ...s,
+      deliberation: true,
+      resolver_tier: 'deliberation',
+      recorded_at: new Date().toISOString(),
+    }));
+    // Append to the existing FLEXIBLE impulse_resolutions[] (concat, preserve prior).
+    const res = await surrealDB.query(
+      `UPDATE activity_execution_traces
+         SET impulse_resolutions = array::concat(impulse_resolutions ?? [], $steps)
+       WHERE execution_id = $execution_id`,
+      { steps: tagged, execution_id: String(execId) },
+    );
+    const updated = Array.isArray(res) && Array.isArray(res[0]) ? (res[0] as unknown[]).length : (Array.isArray(res) ? res.length : 0);
+    return c.json({ success: true, execution_id: String(execId), appended: tagged.length, updated }, 200);
+  } catch (err) {
+    logger.warn('[deliberation-patch] failed to append deliberation steps on trace', { error: err instanceof Error ? err.message : String(err) });
+    return c.json({ success: false, error: err instanceof Error ? err.message : String(err) }, 500);
+  }
+});
+
 // Patch the reach-gate verdict onto an already-persisted trace. POST '/' INSERTs
 // the trace BEFORE the goal-host reach gate runs (the gate is post-execution), so
 // `reached` / `completion_shapes` can only be written back here, keyed by
