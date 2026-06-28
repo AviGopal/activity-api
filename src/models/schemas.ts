@@ -1965,6 +1965,32 @@ export const CodeModificationProposalSchema = z.object({
   verification_confidence: z.number().min(0).max(1).optional(),
 });
 
+// Hierarchical signature clustering (learning-rate mechanism 8).
+// Spec: openspec/changes/2026-06-04-learning-rate-8-hierarchical-signature-clustering/
+//       (task D1.5). Additive schema only — no selector/posterior wiring here.
+//
+// signature_embedding: dense (all-MiniLM-L6-v2, 384-dim, L2-normalised)
+// embedding of a state-space signature, keyed by (signature_version, signature).
+export const SignatureEmbeddingSchema = z.object({
+  org_id: z.string(),
+  signature: z.string(),
+  signature_version: z.number().int().default(0),
+  embedding: z.array(z.number()).length(384),
+  embedded_at: z.string().optional(),
+});
+
+// signature_cluster_assignment: HDBSCAN cluster label per signature, keyed by
+// (signature_version, signature). `contaminated` flags clusters whose member
+// signatures have divergent empirical success rates (selector ignores them).
+export const SignatureClusterAssignmentSchema = z.object({
+  org_id: z.string(),
+  signature: z.string(),
+  signature_version: z.number().int().default(0),
+  cluster_id: z.string(),
+  assigned_at: z.string().optional(),
+  contaminated: z.boolean().default(false),
+});
+
 export type TestReport = z.infer<typeof TestReportSchema>;
 export type Perturbation = z.infer<typeof PerturbationSchema>;
 export type GoalAlignmentEntry = z.infer<typeof GoalAlignmentEntrySchema>;
@@ -1975,3 +2001,5 @@ export type AuditValidationResult = z.infer<typeof AuditValidationResultSchema>;
 export type TestAuditReport = z.infer<typeof TestAuditReportSchema>;
 export type SensitivityEvidence = z.infer<typeof SensitivityEvidenceSchema>;
 export type CodeModificationProposal = z.infer<typeof CodeModificationProposalSchema>;
+export type SignatureEmbedding = z.infer<typeof SignatureEmbeddingSchema>;
+export type SignatureClusterAssignment = z.infer<typeof SignatureClusterAssignmentSchema>;

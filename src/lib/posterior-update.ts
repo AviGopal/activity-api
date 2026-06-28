@@ -26,6 +26,8 @@ import { seedPriorFromConcepts } from './prior-seed';
 import { lookupEmbeddingForSignature } from './embedding-lookup-cache';
 import { classifyTemplateTiers, type ResolverTier } from '../services/tier-classifier';
 import { enqueueVariantDelta, installPosteriorFlushOnShutdown } from './posterior-aggregator';
+import { embedSignatureForShapes } from '../jobs/signature-embed-backfill';
+import { applyClusterPosterior } from './cluster-posterior';
 
 // Install the SIGTERM/SIGINT flush hook once on module load so buffered α/β
 // deltas are written out on shutdown rather than lost.
@@ -85,6 +87,14 @@ export interface TraceForPosterior {
    * averages instead of k-fold-summing at shared ancestors. Absent ⇒ 1.
    */
   sibling_group_size?: number;
+  /**
+   * The impulse shapes the signature was derived from. When present alongside a
+   * newly-created context_thompson_scores row, applyOutcomeToPosteriors fires a
+   * fire-and-forget embed of the signature's SEMANTIC content (the sorted shape
+   * set, not the hash) so the clustering pass (D3) can place it. Best-effort;
+   * absence simply means the backfill job will pick the signature up later.
+   */
+  input_impulse_shapes?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +461,17 @@ async function writeAncestorDelta(
         error: err instanceof Error ? err.message : String(err),
       });
     }
+
+    // D4.2 — coarsening write: mirror the ancestor's leaf signature delta onto its
+    // cluster posterior. Self-contained + non-throwing; never affects chain credit.
+    void applyClusterPosterior(db, {
+      orgId,
+      templateId: ancestorId,
+      signature,
+      signatureVersion,
+      alphaDelta,
+      betaDelta,
+    });
   }
 }
 
@@ -762,6 +783,34 @@ export async function applyOutcomeToPosteriors(
         activity_id: activityId,
         error: v1Err instanceof Error ? v1Err.message : String(v1Err),
       });
+    }
+
+    // D4.1 — coarsening write: after the leaf signature posterior is updated above,
+    // mirror the SAME (alphaDelta, betaDelta) onto the signature's CLUSTER posterior
+    // (context_bucket = "cluster:" + cluster_id) so a well-sampled cluster bucket can
+    // back a cold leaf at selection time (D5). Self-contained + non-throwing.
+    void applyClusterPosterior(db, {
+      orgId,
+      templateId: activityId,
+      signature: trace.signature,
+      signatureVersion: trace.signature_version,
+      alphaDelta,
+      betaDelta,
+    });
+
+    // D2.3 — fire-and-forget: embed the signature's SEMANTIC content (the sorted
+    // shape set, NOT the hash) so the clustering pass (D3) can place it. Idempotent
+    // (skips if already embedded), advisory (concept-db down => no-op), non-blocking.
+    // Only fires when the originating shapes are available; otherwise the backfill
+    // job (D2.2) will pick the signature up later. Errors are fully swallowed inside
+    // embedSignatureForShapes — never let a clustering enhancement affect ingestion.
+    if (Array.isArray(trace.input_impulse_shapes) && trace.input_impulse_shapes.length > 0) {
+      void embedSignatureForShapes(
+        orgId,
+        trace.signature,
+        trace.signature_version,
+        trace.input_impulse_shapes,
+      );
     }
   }
 

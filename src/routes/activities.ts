@@ -157,8 +157,16 @@ import { broadcaster } from '../websocket/broadcaster';
 import { autoCreateVariantIfNeeded, checkAndRetireTemplate } from '../services/variant-creator';
 import { applyOutcomeToPosteriors } from '../lib/posterior-update';
 import { classifyTemplateTiers } from '../services/tier-classifier';
+import { lookupAssignment, readClusterPosterior } from '../lib/cluster-posterior';
 
 const app = new Hono();
+
+// D5.2 — partial-pooling minimum-sample threshold for the leaf signature posterior.
+// When the leaf signature has fewer than this many observed samples
+// (n_signature = alpha + beta - 2), the selector falls back to the well-sampled
+// CLUSTER posterior instead of the cold leaf / Beta(1,1) prior. Read once at module
+// init. Default 5 (aligns with RECOMMEND_SIGNATURE_SAMPLING_FLOOR semantics).
+const SIGNATURE_CLUSTER_N_MIN = parseInt(process.env.SIGNATURE_CLUSTER_N_MIN ?? '5', 10);
 
 // Cache configuration
 const TEMPLATE_CACHE_TTL = 3600; // 1 hour in seconds
@@ -6431,6 +6439,18 @@ app.post('/recommend', async (c) => {
     );
     let stateSpaceSig: string | null = null;
     const sigScoresMap = new Map<string, { alpha: number; beta: number; n_observations: number }>();
+    // D5 partial-pooling: cluster posteriors keyed by template_id, used ONLY for
+    // templates whose leaf signature posterior is cold (n_signature < N_MIN).
+    const SIGNATURE_VERSION = 1;
+    const clusterScoresMap = new Map<string, { alpha: number; beta: number; n_observations: number }>();
+    let clusterIdForSig: string | null = null;
+    let clusterContaminated = false;
+    // D5.3 — per-template partial-pooling decisions to emit as a cluster_shadow_decision.
+    const clusterShadowDecisions: Array<{
+      template_id: string;
+      n_signature: number;
+      used_scope: 'signature' | 'cluster' | 'fallback';
+    }> = [];
 
     // C6: derive the v1 state-space signature SERVER-SIDE from effectiveShapes
     // (impulse_shapes ∪ implied) so conditional posteriors are keyed even when the
@@ -6489,6 +6509,62 @@ app.post('/recommend', async (c) => {
           hits: sigScoresMap.size,
           floor: SIGNATURE_SAMPLING_FLOOR,
         });
+
+        // D5.1 — partial-pooling read. When a leaf signature posterior is COLD
+        // (n_signature = alpha+beta-2 < N_MIN), the selector falls back to the
+        // well-sampled CLUSTER posterior instead of an uninformed Beta(1,1).
+        //
+        // CRITICAL SAFETY: this is a SHADOW pre-fetch only — entirely best-effort,
+        // wrapped here AND inside the cluster-posterior helpers. Any error/miss
+        // leaves sigScoresMap (the leaf path) untouched, so the well-sampled
+        // (n_signature >= N_MIN) path is byte-for-byte unchanged. Contaminated
+        // clusters are NEVER used.
+        if (stateSpaceSig) {
+          try {
+            const assignment = await lookupAssignment(surrealDB, stateSpaceSig, SIGNATURE_VERSION);
+            clusterIdForSig = assignment?.cluster_id ?? null;
+            clusterContaminated = assignment?.contaminated === true;
+
+            // Only consult the cluster for templates whose leaf is cold (or absent).
+            const coldTemplateIds = activityIds.filter((tid: string) => {
+              const leaf = sigScoresMap.get(tid);
+              const nSig = leaf ? (leaf.alpha + leaf.beta - 2) : 0;
+              return !leaf || nSig < SIGNATURE_CLUSTER_N_MIN;
+            });
+
+            if (assignment && !assignment.contaminated && assignment.cluster_id && coldTemplateIds.length > 0) {
+              const clusterId = assignment.cluster_id;
+              await Promise.all(
+                coldTemplateIds.map(async (tid: string) => {
+                  const clusterRow = await readClusterPosterior(
+                    surrealDB, orgId, tid, SIGNATURE_VERSION, clusterId,
+                  );
+                  if (clusterRow) {
+                    clusterScoresMap.set(tid, {
+                      alpha: clusterRow.alpha,
+                      beta: clusterRow.beta,
+                      n_observations: clusterRow.n_observations,
+                    });
+                  }
+                }),
+              );
+            }
+
+            logger.debug('cluster partial-pooling pre-fetch', {
+              sig: stateSpaceSig,
+              cluster_id: clusterIdForSig,
+              contaminated: clusterContaminated,
+              cold_templates: coldTemplateIds.length,
+              cluster_hits: clusterScoresMap.size,
+              n_min: SIGNATURE_CLUSTER_N_MIN,
+            });
+          } catch (clusterErr: any) {
+            // Best-effort: leaf/Beta(1,1) selection proceeds exactly as today.
+            logger.warn('cluster partial-pooling pre-fetch failed (non-blocking)', {
+              error: clusterErr?.message ?? String(clusterErr),
+            });
+          }
+        }
       } catch (sigErr: any) {
         logger.warn('v1 conditional posterior lookup failed (non-blocking)', {
           error: sigErr.message,
@@ -6692,15 +6768,57 @@ app.post('/recommend', async (c) => {
         // enough observations AND there are ≥2 candidates — so the signature
         // DIFFERENTIATES between arms, never collapses a single-candidate set onto
         // one posterior. Falls back to the global/context-bucketed posterior otherwise.
-        if (
+        // (leafConditionalActive also gates the D5 cluster fallback below — the
+        // validTemplates≥2 guard applies to both paths.)
+        const leafConditionalActive = !!(
           sigRow &&
           sigRow.n_observations >= SIGNATURE_SAMPLING_FLOOR &&
           validTemplates.length >= 2
-        ) {
+        );
+        if (leafConditionalActive && sigRow) {
           alphaBlended = sigRow.alpha + totalBoost;
           betaBlended  = sigRow.beta  + impulseBetaPenalty;
           posteriorSource = 'conditional';
         }
+
+        // D5.1 — partial-pooling cluster fallback (PAYOFF). Engages ONLY for a
+        // COLD leaf signature (n_signature = alpha+beta-2 < N_MIN). The well-sampled
+        // branch above is left byte-for-byte unchanged; this block never runs when
+        // the leaf already drove the override.
+        //
+        // Decision (per task D5.1):
+        //   n_signature >= N_MIN AND leaf exists  -> used_scope='signature' (above)
+        //   else if non-contaminated cluster row  -> used_scope='cluster'
+        //   else                                  -> used_scope='fallback' (leaf/Beta(1,1))
+        let usedScope: 'signature' | 'cluster' | 'fallback';
+        const nSignature = sigRow ? (sigRow.alpha + sigRow.beta - 2) : 0;
+        // CRITICAL: never disturb the well-sampled path. If the existing leaf
+        // conditional override already fired (n_observations >= floor), OR the leaf
+        // has n_signature >= N_MIN, treat it as 'signature' and leave alpha/beta as-is.
+        // The cluster fallback engages ONLY for a genuinely cold leaf.
+        if (leafConditionalActive || (sigRow && nSignature >= SIGNATURE_CLUSTER_N_MIN)) {
+          // Leaf is well-sampled — keep whatever the conditional override decided.
+          usedScope = 'signature';
+        } else {
+          // Cold (or absent) leaf: try the well-sampled cluster posterior.
+          const clusterRow = (!clusterContaminated && clusterIdForSig)
+            ? clusterScoresMap.get(activityId)
+            : undefined;
+          if (clusterRow) {
+            alphaBlended = clusterRow.alpha + totalBoost;
+            betaBlended  = clusterRow.beta  + impulseBetaPenalty;
+            posteriorSource = 'cluster';
+            usedScope = 'cluster';
+          } else {
+            // No usable cluster posterior — leaf / Beta(1,1) as today.
+            usedScope = 'fallback';
+          }
+        }
+        clusterShadowDecisions.push({
+          template_id: activityId,
+          n_signature: nSignature,
+          used_scope: usedScope,
+        });
 
         // Sample from Beta(alpha, beta) distribution for Thompson Sampling.
         // This enables exploration (high variance for uncertain templates) and
@@ -6829,6 +6947,13 @@ app.post('/recommend', async (c) => {
               conditional_sig: stateSpaceSig,
               conditional_n_observations: sigRow.n_observations,
               conditional_active: sigRow.n_observations >= SIGNATURE_SAMPLING_FLOOR,
+            } : {}),
+            // D5 — partial-pooling (cluster shadow) metadata
+            ...(stateSpaceSig ? {
+              cluster_id: clusterIdForSig,
+              cluster_contaminated: clusterContaminated,
+              n_signature: nSignature,
+              used_scope: usedScope,
             } : {}),
             // Output shape analysis
             output_shape_analysis: expected_output_shapes.length > 0 ? {
@@ -7093,6 +7218,63 @@ app.post('/recommend', async (c) => {
         output_shapes: finalRecommendations[0].output_shapes,
       } : null,
     });
+
+    // D5.3 — emit a `cluster_shadow_decision` impulse summarising the partial-pooling
+    // decision for this selector call: { signature, cluster_id, n_signature, used_scope }.
+    // OBSERVABILITY ONLY — fire-and-forget on the existing impulse-write path
+    // (`INSERT INTO impulse`, same table the /v2/impulses endpoint uses), never
+    // blocks/affects selection. SAMPLED: per-call impulse emission is too heavy for
+    // the recommend hot path, so we emit at CLUSTER_SHADOW_SAMPLE_RATE (default 1.0;
+    // lower it under load). One impulse per call carries the signature-level decision
+    // plus the per-template breakdown in metadata.
+    const CLUSTER_SHADOW_SAMPLE_RATE = parseFloat(process.env.CLUSTER_SHADOW_SAMPLE_RATE ?? '1.0');
+    if (orgId && stateSpaceSig && clusterShadowDecisions.length > 0 && Math.random() < CLUSTER_SHADOW_SAMPLE_RATE) {
+      // Signature-level used_scope: 'signature' if any template used the leaf, else
+      // 'cluster' if any used the cluster, else 'fallback'.
+      const sigUsedScope: 'signature' | 'cluster' | 'fallback' =
+        clusterShadowDecisions.some((d) => d.used_scope === 'signature') ? 'signature'
+        : clusterShadowDecisions.some((d) => d.used_scope === 'cluster') ? 'cluster'
+        : 'fallback';
+      // n_signature is per-template; surface the min (the coldest leaf, which is what
+      // actually triggers the fallback) at the signature level.
+      const minNSignature = clusterShadowDecisions.reduce(
+        (m, d) => Math.min(m, d.n_signature), Number.POSITIVE_INFINITY,
+      );
+      const shadowBody = {
+        signature: stateSpaceSig,
+        cluster_id: clusterIdForSig,
+        cluster_contaminated: clusterContaminated,
+        n_signature: Number.isFinite(minNSignature) ? minNSignature : 0,
+        used_scope: sigUsedScope,
+        n_min: SIGNATURE_CLUSTER_N_MIN,
+        decisions: clusterShadowDecisions,
+      };
+      surrealDB.query(`
+        INSERT INTO impulse {
+          id: $id,
+          shape: 'cluster_shadow_decision',
+          pointer: { type: 'memo' },
+          summary: $summary,
+          metadata: $metadata,
+          token_estimate: 0,
+          org_id: $org_id,
+          account_id: IF $account_id IS NULL THEN NONE ELSE $account_id END,
+          account_id_version: 1,
+          created_at: time::now()
+        }
+      `, {
+        id: `cluster-shadow-${timestamp}-${Math.random().toString(36).slice(2, 8)}`,
+        summary: `cluster_shadow_decision sig=${stateSpaceSig.slice(0, 12)} scope=${sigUsedScope}`.slice(0, 100),
+        metadata: shadowBody,
+        org_id: orgId,
+        account_id: jwtAuth?.accountId ?? null,
+      }).catch((err: any) => {
+        // Advisory: a dropped observability impulse never affects selection.
+        logger.debug('cluster_shadow_decision emit failed (non-blocking)', {
+          error: err?.message ?? String(err),
+        });
+      });
+    }
 
     // Log Thompson Sampling selections for explainability (non-blocking)
     // Only log if we have an org context and recommendations

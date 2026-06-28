@@ -1,0 +1,21 @@
+-- Migration 134: context_thompson_scores.cluster_id — cluster tag on the
+-- existing Thompson-score rows.
+--
+-- Spec: openspec/changes/2026-06-04-learning-rate-8-hierarchical-signature-clustering/
+--       (task D1.3)
+--
+-- Adds an optional cluster_id field so a context_thompson_scores row can carry
+-- its cluster label inline (alongside the existing leaf keying of
+-- (org_id, template_id, signature_version, context_bucket)). Existing rows
+-- backfill to NONE — treated as leaf-only, no cluster shadowing — preserving
+-- current behaviour exactly.
+--
+-- Cluster-LEVEL posterior rows are NOT a new table: per task D1.4 they live in
+-- this same table under the composite-key convention
+--   context_bucket = "cluster:" + cluster_id
+-- mirroring how the scope='global' marker keeps the table flat. No schema change
+-- is needed for that convention; this migration only adds the inline tag.
+--
+-- Additive schema only — no selector or posterior wiring in this task group.
+
+DEFINE FIELD OVERWRITE cluster_id ON context_thompson_scores TYPE option<string>;

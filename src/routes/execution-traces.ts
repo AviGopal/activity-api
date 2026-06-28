@@ -26,6 +26,7 @@ import { resolveLearningTrack, type LearningTrack } from '../lib/learning-track'
 import { incrementExemplarBurstCounter } from '../services/exemplar-selector';
 import { applyOutcomeToPosteriors } from '../lib/posterior-update';
 import { updateSuccessorFeatures } from '../lib/successor-features';
+import { applyClusterPosterior } from '../lib/cluster-posterior';
 
 const app = new Hono();
 
@@ -2622,6 +2623,11 @@ app.post('/', async (c) => {
           ...(typeof (body.metadata as { siblingGroupSize?: unknown } | undefined)?.siblingGroupSize === 'number'
             ? { sibling_group_size: (body.metadata as { siblingGroupSize: number }).siblingGroupSize }
             : {}),
+          // D2.3: pass the originating shapes so applyOutcomeToPosteriors can
+          // fire-and-forget embed the signature's semantic content (shape set).
+          ...(v1Sig && Array.isArray(body.input_impulse_shapes) && body.input_impulse_shapes.length > 0
+            ? { input_impulse_shapes: body.input_impulse_shapes }
+            : {}),
         },
         surrealDB,
         trace.org_id as string,
@@ -2740,6 +2746,19 @@ app.post('/', async (c) => {
           context_bucket: rawContextBucket,
           success: trace.success,
         });
+
+        // D4.3 — coarsening write for the legacy inline v0 bucket. Mirrors the
+        // leaf delta onto the bucket's cluster posterior when a cluster assignment
+        // exists (v0 buckets are not currently clustered, so this typically skips
+        // as skipped_no_assignment — the correct degraded path). Non-throwing.
+        void applyClusterPosterior(surrealDB, {
+          orgId: traceOrgId,
+          templateId: trace.variant_id as string,
+          signature: rawContextBucket,
+          signatureVersion: 0,
+          alphaDelta: ctxAlphaDelta,
+          betaDelta: ctxBetaDelta,
+        });
       } catch (ctxErr: any) {
         logger.warn('[learning] context_thompson_scores update failed (non-blocking)', {
           execution_id: trace.execution_id,
@@ -2804,6 +2823,17 @@ app.post('/', async (c) => {
         } else {
           await surrealDB.query(rdSql, rdParams);
         }
+
+        // D4.3 — coarsening write for the re-derived legacy inline v0 bucket.
+        // Same degraded path as the primary bucket above. Non-throwing.
+        void applyClusterPosterior(surrealDB, {
+          orgId: traceOrgId,
+          templateId: trace.variant_id as string,
+          signature: rederived,
+          signatureVersion: 0,
+          alphaDelta: rdAlphaDelta,
+          betaDelta: rdBetaDelta,
+        });
       } catch (ctxRederiveErr: any) {
         logger.warn('[learning] context_thompson_scores re-derive update failed (non-blocking)', {
           execution_id: trace.execution_id,

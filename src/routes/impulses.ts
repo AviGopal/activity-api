@@ -3669,7 +3669,7 @@ router.post('/resolve', async (c) => {
           }
           const sql = `
             SELECT template_id, context_bucket, signature_version,
-                   alpha, beta, n_observations, last_updated_at, created_at
+                   alpha, beta, n_observations, cluster_id, last_updated_at, created_at
             FROM context_thompson_scores
             WHERE ${conditions.join(' AND ')}
             ORDER BY template_id ASC, signature_version ASC, n_observations DESC
@@ -3679,16 +3679,26 @@ router.post('/resolve', async (c) => {
             ? await queryWithAuth<any>(jwtAuthCtx.jwtToken, sql, params)
             : await surrealDB.query<any>(sql, params)) as any[];
 
-          const entries = (Array.isArray(rows) ? rows : []).map((row: any) => ({
-            template_id: row.template_id,
-            context_bucket: row.context_bucket,
-            signature_version: row.signature_version ?? 0,
-            alpha: row.alpha ?? 1,
-            beta: row.beta ?? 1,
-            n_observations: row.n_observations ?? 0,
-            last_updated_at: row.last_updated_at,
-            created_at: row.created_at,
-          }));
+          const entries = (Array.isArray(rows) ? rows : []).map((row: any) => {
+            // D5.4 — surface leaf-vs-cluster so workbench can render the two row kinds.
+            // Cluster-level rows use the D1.4 composite-key convention
+            // `context_bucket = "cluster:" + cluster_id`; everything else is a leaf.
+            const isClusterRow = typeof row.context_bucket === 'string'
+              && row.context_bucket.startsWith('cluster:');
+            return {
+              template_id: row.template_id,
+              context_bucket: row.context_bucket,
+              signature_version: row.signature_version ?? 0,
+              alpha: row.alpha ?? 1,
+              beta: row.beta ?? 1,
+              n_observations: row.n_observations ?? 0,
+              cluster_id: row.cluster_id
+                ?? (isClusterRow ? row.context_bucket.slice('cluster:'.length) : null),
+              used_scope: isClusterRow ? 'cluster' : 'signature',
+              last_updated_at: row.last_updated_at,
+              created_at: row.created_at,
+            };
+          });
 
           return c.json({
             success: true,
