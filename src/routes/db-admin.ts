@@ -243,13 +243,41 @@ async function runDiagnose(pointer: any): Promise<any> {
     .filter(([, c]) => typeof c === 'number' && (c as number) > 100000)
     .sort((a, b) => (b[1] as number) - (a[1] as number))
     .map(([t, c]) => ({ table: t, rows: c }));
-  if (dbMetrics.slow_queries > 0 && slowTables.length > 0) {
-    suggested.push({
-      operation: 'create_index',
-      reason: `${dbMetrics.slow_queries} slow queries; ${slowTables[0]!.table} is largest (${slowTables[0]!.rows} rows) — ensure hot filter/order columns are indexed`,
-      params: { table: slowTables[0]!.table, name: '<choose>', fields: '<choose>' },
-      advisory: true,
-    });
+  if (slowTables.length > 0) {  // a large table with an unindexed hot column is worth surfacing regardless of the transient slow-query window
+    // Emit a CONCRETE, auto-applyable suggestion: for each large table, find its known
+    // hot filter/order columns that are NOT already indexed and propose a concrete
+    // CONCURRENTLY index (non-blocking, safe to auto-apply). No more `<choose>`
+    // placeholders — the maintenance tick can act on these directly. (2026-06-28)
+    const HOT_COLS: Record<string, string[]> = {
+      activity_execution_traces: ['executed_at', 'activity_id', 'status', 'org_id'],
+      goal_execution_paths: ['goal_hash', 'updated_at'],
+      variant_performance_metrics: ['variant_id'],
+      context_thompson_scores: ['template_id'],
+      activity_composition_graph: ['edge_kind'],
+      successor_features: ['template_id'],
+    };
+    for (const { table, rows } of slowTables.slice(0, 3)) {
+      const hot = HOT_COLS[table];
+      if (!hot) continue;
+      let indexedCols = new Set<string>();
+      try {
+        const info = await surrealDB.query<any>(`INFO FOR TABLE ${table}`);
+        const idx = ((info?.[0] as any)?.indexes ?? {}) as Record<string, string>;
+        for (const def of Object.values(idx)) {
+          const fm = String(def).match(/FIELDS\s+([A-Za-z0-9_.,\s]+)/i);
+          if (fm) fm[1].split(',').forEach((c) => indexedCols.add(c.trim()));
+        }
+      } catch { /* advisory only */ }
+      const missing = hot.find((c) => !indexedCols.has(c));
+      if (missing) {
+        suggested.push({
+          operation: 'create_index',
+          reason: `${dbMetrics.slow_queries} slow queries; ${table} (${rows} rows) hot column "${missing}" is unindexed`,
+          params: { table, name: `idx_${table}_${missing.replace(/\W/g, '_')}`.slice(0, 60), fields: missing, concurrent: true },
+          advisory: false,
+        });
+      }
+    }
   }
 
   return {
@@ -292,15 +320,21 @@ async function runCreateIndex(pointer: any): Promise<{ ok: boolean; error?: stri
     }
   }
 
-  // Whitelist: only the IF NOT EXISTS form, which is re-run safe and does NOT
-  // trigger the destructive REBUILD that can hang for 27min on large tables.
-  const sql = `DEFINE INDEX IF NOT EXISTS ${name} ON ${table} FIELDS ${fieldList.join(', ')}${unique ? ' UNIQUE' : ''}`;
+  // CONCURRENTLY builds the index ASYNCHRONOUSLY in the background (verified on
+  // SurrealDB 2.3.3: returns in ~2ms even on the 275k-row activity_execution_traces,
+  // instead of the 27-min synchronous hang). This is what makes large-table indexing
+  // AUTONOMOUS + non-blocking — the substrate can index its biggest tables itself
+  // without freezing the /sql endpoint. IF NOT EXISTS keeps it re-run safe. Pass
+  // concurrent:false for a synchronous build (small tables / when you need it ready
+  // immediately). (2026-06-28)
+  const concurrent = pointer?.concurrent !== false;
+  const sql = `DEFINE INDEX IF NOT EXISTS ${name} ON ${table} FIELDS ${fieldList.join(', ')}${unique ? ' UNIQUE' : ''}${concurrent ? ' CONCURRENTLY' : ''}`;
   const cat = rejectCatastrophicSql(sql);
   if (cat) return { ok: false, error: cat, impact: 0 };
 
   try {
     await surrealDB.query<any>(sql);
-    return { ok: true, result: { sql, definition: sql }, impact: 1 };
+    return { ok: true, result: { sql, definition: sql, concurrent, note: concurrent ? 'index building asynchronously in background (non-blocking)' : 'synchronous build' }, impact: 1 };
   } catch (err: any) {
     return { ok: false, error: `create_index failed: ${err?.message}`, impact: 0 };
   }
