@@ -357,6 +357,7 @@ export function loadConfig(): Config {
         'sensitivity_evidence_write',
         'code_modification_proposal',
         'code_modification_proposal_write',
+        'db_admin',
       ],
     },
   };

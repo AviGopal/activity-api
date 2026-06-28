@@ -36,6 +36,7 @@ import executionTracesRouter from './execution-traces';
 import { runTemplateAuditReport, type TemplateAuditInput } from './template-audit';
 import { runExecutionTraceWithSignatures } from './execution-trace-with-signatures';
 import { runTraceAggregateReport } from './trace-aggregate-report';
+import { resolveDbAdmin } from './db-admin';
 import { queryActivitiesByFTS, getActivityScores } from '../db/paradigm';
 import {
   runDiscoverByShapes,
@@ -4287,6 +4288,18 @@ router.post('/resolve', async (c) => {
           logger.error('code_modification_proposal_write failed', { error: err?.message });
           return c.json({ success: false, error: err?.message || 'insert failed' } as ImpulseResolveResponse, 500);
         }
+      }
+
+      case 'db_admin': {
+        // Substrate self-management of its own SurrealDB. Requires
+        // authentication (the operation set spans full write authority); the
+        // resolver itself enforces the operation/pattern whitelists, dry_run
+        // defaults, max_rows bound, catastrophic-op rejection, and audit trail.
+        const authCheck = requireAuthenticated(c);
+        if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
+        const actor = jwtAuthCtx?.keyId || jwtAuthCtx?.userId || jwtAuthCtx?.orgId || null;
+        const result = await resolveDbAdmin(pointer, actor);
+        return c.json(result.body as ImpulseResolveResponse, result.status as any);
       }
 
       default: {
