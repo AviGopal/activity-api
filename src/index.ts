@@ -14,6 +14,7 @@ import { logger } from './utils/logger';
 import { jwtAuthMiddleware, JwtAuthContext } from './middleware/jwtAuth';
 import authRoutes from './routes/auth';
 import activitiesRoutes from './routes/activities';
+import { handleSelectActivityForGoal } from './selectActivityForGoal';
 import impulsesRoutes from './routes/impulses';
 import goalPathsRoutes from './routes/goal-paths';
 import boredomRoutes from './routes/boredom';
@@ -25,13 +26,13 @@ import vesselRegistryRoutes from './routes/vessel-registry';
 import connectionsRoutes from './routes/connections';
 import ribosomeRoutes from './routes/ribosome';
 import shapesRoutes from './routes/shapes';
-import eventsRouter from './routes/events';
+import clusterRoutes from './routes/cluster';
 import { broadcaster } from './websocket/broadcaster';
 import type { ServerWebSocket } from 'bun';
 import packageJson from '../package.json';
 import { discoveryClient } from './services/discovery-client';
 import { localEmbeddingService } from './services/embedding-service';
-import { surrealDB as surrealDBForBackfill, getDbStats } from './db/surreal';
+import { surrealDB as surrealDBForBackfill } from './db/surreal';
 
 // Define app-wide environment type with jwtAuth context variable
 type AppEnv = {
@@ -53,9 +54,6 @@ app.use('/*', cors({
     'https://internal.metabob.com',
     'https://app.metabob.com',
     'https://metabobproject.github.io',  // Dashboard on GitHub Pages
-    'app://obsidian.md',                 // Obsidian desktop plugin
-    'http://localhost',
-    'http://127.0.0.1',
   ],
   credentials: true,
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -100,11 +98,6 @@ app.use('/v2/*', async (c, next) => {
 
 // Health check endpoint (no auth required)
 // Deep health check: verifies Redis and SurrealDB connectivity
-// DB throughput / contention metrics (no auth — scrapeable like /health).
-// Surfaces the single-chokepoint query stats so contention (high in_flight /
-// p95 / slow_queries / error_rate) is observable instead of silent.
-app.get('/metrics/db', (c) => c.json(getDbStats()));
-
 app.get('/health', async (c) => {
   const healthStatus: any = {
     service: 'metabob-activity-api',
@@ -227,54 +220,9 @@ app.route('/v2/impulses', impulsesRoutes);
 // Shape registry routes (POST /v2/shapes, GET /v2/shapes, GET /v2/shapes/:name, etc.)
 app.route('/v2/shapes', shapesRoutes);
 
-// Substrate event bus publish (openspec 2026-05-27-neutral-emitter-lifecycle-bus).
-// POST /v2/events/publish — accepts <source>.<noun>.<verb> typed events from
-// any authenticated vessel; forwards to the WS broadcaster.
-app.route('/v2/events', eventsRouter);
-
-// F17 goal-template mismatch detector (inv-079).
-// In-process broadcaster subscriber — fires on lifecycle:execution:succeeded,
-// emits keyword.mapping.proposal when goal and template tags diverge.
-import { startGoalTemplateMismatchDetector } from './learners/goal-template-mismatch';
-startGoalTemplateMismatchDetector();
-
-// M1 continuous-training observer (concept_KKwxHmPfEMSY). Opt-in via
-// EMBEDDING_PRIOR_OBSERVER_ENABLED=true. Subscribes to task.completed events,
-// buffers eligible (variant, signature) cells, and fits θ_α/θ_β to
-// embedding_prior_weights when the count/time trigger trips.
-if (process.env.EMBEDDING_PRIOR_OBSERVER_ENABLED === 'true') {
-  void (async () => {
-    try {
-      const { startEmbeddingPriorTrainer } = await import('./services/embedding-prior-trainer');
-      const { broadcaster } = await import('./websocket/broadcaster');
-      const { lookupEmbeddingForSignature } = await import('./lib/embedding-lookup-cache');
-      const { surrealDB } = await import('./db/surreal');
-      // @ts-ignore — scripts/ lives outside tsconfig rootDir; runtime is fine.
-      const { writeWeights } = await import('../scripts/m1-train');
-      startEmbeddingPriorTrainer({
-        broadcaster,
-        loadContextScore: async (variantId, signature) => {
-          const rows = await surrealDB.query<{
-            total_executions: number;
-            alpha: number;
-            beta: number;
-          }>(
-            `SELECT total_executions, alpha, beta FROM context_thompson_scores
-             WHERE template_id = $vid AND context_bucket = $sig LIMIT 1`,
-            { vid: variantId, sig: signature },
-          );
-          return rows[0] ?? null;
-        },
-        lookupEmbedding: lookupEmbeddingForSignature,
-        writeWeights: ({ modelVersion, featureDim, thetaAlpha, thetaBeta, nTrainingSamples, orgId }) =>
-          writeWeights({ modelVersion, featureDim, thetaAlpha, thetaBeta, nTrainingSamples, orgId }),
-      });
-    } catch (err: any) {
-      // Never let observer wiring kill the server.
-      console.warn('[m1-observer] startup failed:', err?.message);
-    }
-  })();
-}
+// Hierarchical signature clustering status (D3.4) — GET /v2/cluster/status.
+// Auth: gated by the global /v2/* jwtAuthMiddleware above.
+app.route('/v2/cluster', clusterRoutes);
 
 // Boredom queue routes (GET /boredom-tasks, POST /v2/activities/boredom/enqueue, POST /v2/vessels/register)
 app.route('/', boredomRoutes);
@@ -418,6 +366,9 @@ const server = Bun.serve<WebSocketData>({
   fetch(req, server) {
     // Handle WebSocket upgrade for /ws endpoint
     const url = new URL(req.url);
+    if (req.method === 'POST' && url.pathname === '/v2/activities/select-activity-for-goal') {
+      return handleSelectActivityForGoal(req as import('bun').BunRequest);
+    }
     if (url.pathname === '/ws') {
       const success = server.upgrade(req, {
         data: { authenticated: false }
@@ -631,6 +582,36 @@ import('./jobs/fts-rebuild').then(({ rebuildFtsIndexes }) => {
 });
 
 // ============================================================================
+// Signature Clustering Tick (D3.2)
+// ============================================================================
+// Periodic pass that clusters state-space signatures (via concept-db delegation)
+// and UPSERTs signature_cluster_assignment + a signature_cluster_run log row.
+// Registered the same way as the FTS rebuild above: an initial delayed run plus a
+// fixed-interval setInterval. Advisory — the tick never throws fatally.
+const SIGNATURE_CLUSTER_INTERVAL_MS = parseInt(
+  process.env.SIGNATURE_CLUSTER_INTERVAL_MS ?? String(6 * 60 * 60 * 1000), 10, // 6h
+);
+
+import('./jobs/signature-cluster-tick').then(({ runSignatureClusterTick }) => {
+  // Initial run delayed 5 min so the embedding backfill has a chance to populate
+  // signature_embedding on a fresh start before the first clustering pass.
+  setTimeout(() => {
+    void runSignatureClusterTick()
+      .then(() => logger.info('[Cluster] Initial signature clustering tick complete'))
+      .catch(err => logger.warn('[Cluster] Initial signature clustering tick failed', { error: String(err) }));
+  }, 5 * 60 * 1000);
+
+  // Periodic every SIGNATURE_CLUSTER_INTERVAL_MS (default 6h).
+  setInterval(() => {
+    void runSignatureClusterTick()
+      .then(() => logger.info('[Cluster] Periodic signature clustering tick complete'))
+      .catch(err => logger.warn('[Cluster] Periodic signature clustering tick failed', { error: String(err) }));
+  }, SIGNATURE_CLUSTER_INTERVAL_MS);
+}).catch(err => {
+  logger.error('[Cluster] Failed to load signature-cluster-tick job', { error: String(err) });
+});
+
+// ============================================================================
 // Discovery Vessel Integration
 // ============================================================================
 
@@ -672,58 +653,30 @@ localEmbeddingService.init().then(async () => {
   }
 
   logger.info('[LocalEmbedding] Starting backfill for activities without embeddings');
+  let offset = 0;
   const batchSize = 50;
   let totalProcessed = 0;
-  let queryRetries = 0;
-  const MAX_QUERY_RETRIES = 6;
-
-  // The shared root SurrealDB connection can be transiently un-authed in the
-  // first moments after startup ("IAM error: Not enough permissions" -> the
-  // connection resets and reconnects on the next call). The backfill fires
-  // right after model load and used to hit that window, throw on the first
-  // SELECT, and `break` permanently -- leaving the entire corpus without
-  // embeddings until the next restart (which re-raced). Let the connection
-  // settle, then retry transient failures instead of aborting the whole pass.
-  await new Promise((r) => setTimeout(r, 3000));
 
   for (;;) {
     let rows: any[];
     try {
       rows = await surrealDBForBackfill.query<any>(
-        `SELECT meta::id(id) AS rid, name, description FROM activity WHERE name_embedding IS NONE LIMIT $limit`,
-        { limit: batchSize }
+        `SELECT id, name, description FROM activity WHERE name_embedding IS NONE LIMIT $limit START $offset`,
+        { limit: batchSize, offset }
       );
-      queryRetries = 0; // reset the retry budget after any successful page
     } catch (err) {
-      queryRetries++;
-      const msg = err instanceof Error ? err.message : String(err);
-      if (queryRetries > MAX_QUERY_RETRIES) {
-        logger.error('[LocalEmbedding] Backfill aborted after repeated query failures', {
-          error: msg,
-          attempts: queryRetries,
-        });
-        break;
-      }
-      logger.warn('[LocalEmbedding] Backfill query failed -- retrying after reconnect', {
-        error: msg,
-        attempt: queryRetries,
+      logger.warn('[LocalEmbedding] Backfill query failed', {
+        error: err instanceof Error ? err.message : String(err),
       });
-      // The connection auto-resets on the failed call; back off and retry the
-      // SAME offset (we never advanced past a failed page).
-      await new Promise((r) => setTimeout(r, 2000 * queryRetries));
-      continue;
+      break;
     }
 
     if (!rows || rows.length === 0) break;
 
-    const processedBefore = totalProcessed;
     for (const row of rows) {
       try {
-        // Use meta::id(id) from the SELECT directly. row.id can arrive as a
-        // RecordId object; JSON.stringify-ing it produced a mangled id that made
-        // `UPDATE type::thing(...)` silently match no record (no throw), so rows
-        // stayed in the IS NONE set and were reprocessed forever.
-        const plainId = String(row.rid);
+        const rawId = typeof row.id === 'object' ? JSON.stringify(row.id) : String(row.id);
+        const plainId = rawId.replace(/^activity:/, '').replace(/[⟨⟩`"]/g, '');
         const nameText = row.name || plainId;
         const nameVec = await localEmbeddingService.embed(nameText);
         const updates: Record<string, any> = { name_embedding: Array.from(nameVec) };
@@ -733,7 +686,7 @@ localEmbeddingService.init().then(async () => {
         }
         const setClause = Object.keys(updates).map(k => `${k} = $${k}`).join(', ');
         await surrealDBForBackfill.query(
-          `UPDATE type::thing("activity", $id) SET ${setClause}`,
+          `UPDATE type::record("activity", $id) SET ${setClause}`,
           { id: plainId, ...updates }
         );
         totalProcessed++;
@@ -748,18 +701,8 @@ localEmbeddingService.init().then(async () => {
       }
     }
 
-    // No START offset: each successful UPDATE removes a row from the
-    // `name_embedding IS NONE` set, so the next SELECT returns the next
-    // un-embedded batch. A START offset would skip rows as the set shrinks
-    // underneath the cursor (the original bug: backfill stalled far short of
-    // the corpus). Guard against an infinite loop when a page makes zero
-    // progress (e.g. rows whose embed repeatedly throws).
-    if (totalProcessed === processedBefore) {
-      logger.warn('[LocalEmbedding] Backfill made no progress on a non-empty page; aborting', {
-        page_size: rows.length,
-      });
-      break;
-    }
+    offset += batchSize;
+    if (rows.length < batchSize) break; // Last page
   }
 
   logger.info('[LocalEmbedding] Backfill complete', { totalProcessed });
@@ -901,18 +844,6 @@ if (exemplarSelectorEnabled) {
     logger.error('[Server] Failed to start exemplar selector job', { error: err.message });
   });
 }
-
-// Trace retention sweep — stratified bounded reservoir over activity_execution_traces.
-// Default-disabled and dry-run-by-default; bounds the Recorded trace store so the
-// execution-traces hot path (and thus the learning loop's posterior reads) stays fast.
-// Env: TRACE_RETENTION_ENABLED, TRACE_RETENTION_DRY_RUN, TRACE_RETENTION_INTERVAL_MS,
-//      TRACE_RETENTION_HOT_WINDOW_MS, TRACE_RETENTION_DEFAULT_{SUCCESS,FAILURE}_CAP,
-//      TRACE_RETENTION_DELETE_BATCH, TRACE_RETENTION_ACTIVITIES, TRACE_RETENTION_OVERRIDES.
-import('./services/trace-retention').then(({ startTraceRetentionSweep }) => {
-  startTraceRetentionSweep();
-}).catch(err => {
-  logger.error('[Server] Failed to start trace retention sweep', { error: err.message });
-});
 
 // Learning-track classifier — runs immediately on startup then every 6h (default).
 // Classifies activity templates as 'learning' | 'system' | 'unclassified' based on
