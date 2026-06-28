@@ -90,6 +90,33 @@ import {
 import { generateActivity } from '../services/activity-generator';
 import { applyReputationFactor } from '../services/thompson-sampling';
 import {
+  successorFeaturesEnabled,
+  fetchSuccessorFeatureCells,
+  successorFeatureCellKey,
+  rewardFromCompletionShapes,
+  successorValue,
+} from '../lib/successor-features';
+
+// Mechanism #7 consumer loop: blend the successor-features look-ahead ⟨ψ(s,a),R⟩
+// into the recommend ranking argmax. Fully reversible — SF_BLEND must be explicitly
+// enabled; when off (default) the ranking is byte-for-byte the prior Thompson order.
+function successorBlendEnabled(): boolean {
+  return process.env.SF_BLEND === '1' || process.env.SF_BLEND === 'true';
+}
+function successorBlendWeight(): number {
+  const raw = process.env.SF_BLEND_WEIGHT;
+  if (raw === undefined || raw === '') return 0.5;
+  const w = parseFloat(raw);
+  if (!Number.isFinite(w) || w < 0) return 0.5;
+  return w;
+}
+// Squash the unbounded discounted occupancy count ⟨ψ,R⟩ into [0,1) so it cannot
+// dominate a Beta sample (also in [0,1]). v/(1+v) is monotone, 0↦0, →1 as v→∞.
+function normalizeSuccessorValue(v: number): number {
+  if (!Number.isFinite(v) || v <= 0) return 0;
+  return v / (1 + v);
+}
+import {
   ExecutionRecordSchema,
   CreateTemplateRequestSchema,
   CompositionRecordRequestSchema,
@@ -6135,6 +6162,7 @@ app.post('/recommend', async (c) => {
       exploration_config: rawExplorationConfig,
       impulse_state_space,      // Phase 11: executor's loaded impulse pool (state-space-aware filtering)
       state_signature: callerStateSignature,  // C6 read-back: caller-supplied state-space signature (overrides server-side derivation for the cts lookup)
+      completion_shapes = [],   // Mechanism #7: goal direction R for the successor-features look-ahead ⟨ψ(s,a),R⟩. When present + SF_BLEND on, ψ steers the ranking argmax.
       // NOTE: pointer_state_space is intentionally NOT destructured — derived server-side
     } = body;
 
@@ -6836,6 +6864,80 @@ app.post('/recommend', async (c) => {
         return true;
       });
 
+    // ── Mechanism #7 CONSUMER LOOP: blend ⟨ψ(s,a),R⟩ into the selection argmax ──
+    // ψ (successor features) is the cell's discounted shape-occupancy; R is the
+    // goal's completion_shapes. ⟨ψ,R⟩ is the LOOK-AHEAD transfer value — how much
+    // of the goal direction this cell's trace-continuation is expected to occupy,
+    // INDEPENDENT of its Beta reward. The Thompson sample stays the BASE; ψ is an
+    // additive, weighted, normalized bonus. Fully reversible: when SF_BLEND is off
+    // (default) `_sf_blended` is never set and every sort below falls back to the
+    // exact prior Thompson key (`selection_metadata.score`). When on, the blended
+    // key is `thompson_sample + SF_BLEND_WEIGHT * v/(1+v)`.
+    let sfBlendApplied = false;
+    if (
+      successorFeaturesEnabled() &&
+      successorBlendEnabled() &&
+      typeof stateSpaceSig === 'string' &&
+      (stateSpaceSig as string).length > 0 &&
+      Array.isArray(completion_shapes) &&
+      (completion_shapes as string[]).length > 0 &&
+      recommendations.length > 0
+    ) {
+      try {
+        const sfScope = typeof (body as any).sf_scope === 'string' ? (body as any).sf_scope : 'org';
+        const reward = rewardFromCompletionShapes(completion_shapes as string[]);
+        const sfWeight = successorBlendWeight();
+        const templateIds = recommendations
+          .map((r: any) => r.template_id)
+          .filter((x: unknown): x is string => typeof x === 'string' && x.length > 0);
+        const cells = await fetchSuccessorFeatureCells(
+          surrealDB as any,
+          stateSpaceSig as string,
+          templateIds,
+          sfScope,
+        );
+        for (const rec of recommendations as any[]) {
+          const cell = cells.get(successorFeatureCellKey(stateSpaceSig as string, rec.template_id));
+          const rawV = cell ? successorValue(cell.vector, reward) : 0;
+          const normV = normalizeSuccessorValue(rawV);
+          const base = rec.selection_metadata?.score ?? 0;
+          rec._sf_blended = base + sfWeight * normV;
+          rec._sf_successor_value = rawV;
+          rec.selection_metadata = {
+            ...(rec.selection_metadata ?? {}),
+            successor_value: {
+              value: rawV,
+              normalized: normV,
+              blend_weight: sfWeight,
+              blended_score: rec._sf_blended,
+              signature: stateSpaceSig,
+              scope: cell?.scope ?? sfScope,
+              sample_count: cell?.sample_count ?? 0,
+              informed: !!cell,
+            },
+          };
+        }
+        sfBlendApplied = true;
+        logger.info('successor-features blend applied to recommend ranking', {
+          signature: stateSpaceSig,
+          completion_shapes,
+          blend_weight: sfWeight,
+          informed_cells: recommendations.filter((r: any) => (r.selection_metadata as any)?.successor_value?.informed).length,
+          candidates: recommendations.length,
+        });
+      } catch (err) {
+        logger.warn('successor-features blend failed (non-blocking, ranking falls back to Thompson)', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    // Ranking key used by the argmax sorts below. When the ψ blend is active it
+    // returns thompson_sample + weighted-ψ; otherwise the pure Thompson sample.
+    const rankKey = (c: any): number =>
+      sfBlendApplied && typeof c._sf_blended === 'number'
+        ? c._sf_blended
+        : (c.selection_metadata?.score ?? 0);
+
     // UCB pool partitioning: split into exploration/exploitation, assemble final list
     const reserved = exploration_ratio > 0 ? Math.max(1, Math.floor(limit * exploration_ratio)) : 0;
     // Proposed templates are exploration-only — they may have any
@@ -6849,12 +6951,28 @@ app.post('/recommend', async (c) => {
       c._proposed !== true && c._total_executions >= min_observations_threshold
     );
     explorationPool.sort((a: any, b: any) => {
+      // When the ψ blend is active, the look-ahead leads the ranking; UCB is the
+      // tiebreak. Off (default), this is the prior UCB-then-Thompson order exactly.
+      if (sfBlendApplied) {
+        const sfDiff = rankKey(b) - rankKey(a);
+        if (sfDiff !== 0) return sfDiff;
+        return b._ucb_score - a._ucb_score;
+      }
       const ucbDiff = b._ucb_score - a._ucb_score;
       if (ucbDiff !== 0) return ucbDiff;
       // Tiebreak by combined heuristic score so expected_output_shapes boosts surface to the top.
       return (b.selection_metadata?.score ?? 0) - (a.selection_metadata?.score ?? 0);
     });
-    exploitationPool.sort((a: any, b: any) => b._ucb_score - a._ucb_score);
+    exploitationPool.sort((a: any, b: any) => {
+      // ψ look-ahead enters the exploitation argmax (the actual Thompson pick) when
+      // SF_BLEND is on; UCB tiebreaks. Off, this is the prior pure-UCB order exactly.
+      if (sfBlendApplied) {
+        const sfDiff = rankKey(b) - rankKey(a);
+        if (sfDiff !== 0) return sfDiff;
+        return b._ucb_score - a._ucb_score;
+      }
+      return b._ucb_score - a._ucb_score;
+    });
     const headSlots = limit - reserved;
     const head = exploitationPool.slice(0, headSlots);
     const tail = explorationPool.slice(0, reserved);
@@ -6873,7 +6991,9 @@ app.post('/recommend', async (c) => {
         const bOsCov = b.selection_metadata?.boost_breakdown?.output_shape_coverage ?? 0;
         const aOsCov = a.selection_metadata?.boost_breakdown?.output_shape_coverage ?? 0;
         if (bOsCov !== aOsCov) return bOsCov - aOsCov;
-        return (b.selection_metadata?.score ?? 0) - (a.selection_metadata?.score ?? 0);
+        // Shape coverage is the hard primary; ψ look-ahead is the tiebreak when the
+        // blend is active, else the prior pure-Thompson tiebreak. Reversible.
+        return rankKey(b) - rankKey(a);
       });
     }
 
