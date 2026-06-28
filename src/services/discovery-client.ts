@@ -17,6 +17,9 @@ interface VesselRegistration {
   version: string;
   endpoint: string;
   shapes: string[];
+  /** Per-shape one-line descriptions (resolver-DESCRIPTION advertisement,
+   *  2026-06-28). Optional; discovery ignores keys not in `shapes`. */
+  shape_descriptions?: Record<string, string>;
   protocol?: string;
   orgId?: string;
   metadata?: Record<string, unknown>;
@@ -138,6 +141,11 @@ export class DiscoveryClient {
         version: packageJson.version,
         endpoint: this.getEndpoint(),
         shapes: safeShapes,
+        // Resolver-DESCRIPTION advertisement (2026-06-28): per-shape one-liners
+        // so a decomposition planner can match this vessel's data resolvers from
+        // their descriptions alone. Optional/backward-compat; discovery ignores
+        // descriptions for shapes not in `shapes`.
+        shape_descriptions: config.discovery.shapeDescriptions,
         protocol: 'http',
         // Wave 1 resolver contract — tells consumers (e.g. minibob's generic
         // resolver) how to dispatch impulse resolution requests against this

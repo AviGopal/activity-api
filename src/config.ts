@@ -73,6 +73,11 @@ export interface Config {
     retryAttempts: number;
     retryBackoffMs: number;
     shapes: string[];  // Default shapes this vessel can resolve
+    /** RESOLVER-DESCRIPTION ADVERTISEMENT (2026-06-28): per-shape one-liners
+     *  (shape id → "produces + when to use it") so a decomposition planner can
+     *  match this vessel's data resolvers from their descriptions alone. Only
+     *  keys present in `shapes` are honoured downstream. */
+    shapeDescriptions?: Record<string, string>;
   };
 }
 
@@ -359,6 +364,33 @@ export function loadConfig(): Config {
         'code_modification_proposal_write',
         'db_admin',
       ],
+      // RESOLVER-DESCRIPTION ADVERTISEMENT (2026-06-28). One concise line per
+      // DATA/REPORT resolver: what it produces + when to use it. Written ONCE
+      // here by the vessel that owns these resolvers (NOT in the planner).
+      // Discovery merges this across vessels and exposes it at
+      // GET /registry/shape-descriptions; author_composed_capability composes
+      // report/analysis chains from these descriptions with no hand-written hint.
+      // Only keys also present in `shapes` above are honoured (stray keys ignored).
+      shapeDescriptions: {
+        traceAggregateReport:
+          "Already-aggregated {key,value} rows computed in the database: failure/success/total counts or cost sums, grouped by activity template, status, or variant over a time window, sorted highest-first. THE direct answer to count/ranking/total/sum report goals — fast (~1s), no raw rows shipped. Config: group_by (activity_id|status|variant_id), metric (failure_count|success_count|count|cost_sum), window_hours, limit, order.",
+        activityTemplatesByMetrics:
+          "Activity templates filtered/ordered by performance metrics (Thompson posterior, success rate, execution count). Use for 'best/worst performing templates', 'top templates by success rate', or weak-family detection goals.",
+        variantMetricsSummary:
+          "Per-variant Thompson Sampling posteriors: alpha, beta, sample_count, success_count, failure_count for a given activity variant. Use to report a variant's learned win-rate or compare variants in a family.",
+        compositionSuccess:
+          "Composition-edge success statistics: for a producer→consumer shape edge, how often the composed execution succeeded. Use for 'which compositions/chains reliably work' or composition-health report goals.",
+        templateAuditReport:
+          "Per-template deficiency report: missing shapes, weak descriptions, all-LLM task graphs, hardcoded URLs, alias-cluster proposals. Use for 'audit template quality' or 'which templates are deficient' goals.",
+        executionTraceWithSignatures:
+          "Raw hydrated execution traces with per-task pointer/shape signatures and an impulses-by-id map. SLOW + load-fragile over the large trace table — use ONLY when the goal needs PER-TRACE detail an aggregate cannot give, never for counts/rankings (use traceAggregateReport for those). Config: limit (capped ~200), since, activity_template_id, success_only.",
+        executionTraceList:
+          "Paginated list of recent execution traces (id, activity_id, status, duration) for browse/inspect. Use for 'list recent executions' or 'show the last N runs' goals, not for aggregation.",
+        executionTraces:
+          "Query-able slice of execution-trace rows with filters. Use when a goal needs a filtered set of individual traces rather than an aggregate.",
+        impulseRelevance:
+          "Per-impulse relevance scores and failure counters learned from traces. Use for 'which impulses are most/least relevant' or impulse-quality report goals.",
+      },
     },
   };
 }
