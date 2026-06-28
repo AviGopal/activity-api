@@ -5683,6 +5683,10 @@ app.post('/discover-by-shapes', async (c) => {
       current_shapes: body.current_shapes ?? [],
       output_shapes: body.output_shapes ?? [],
       predecessor_activity_id: body.predecessor_activity_id,
+      // Successor-features readout (mechanism #7): goal direction (s, R).
+      signature: body.signature,
+      completion_shapes: body.completion_shapes,
+      sf_scope: body.sf_scope,
     };
 
     const validationError = validateDiscoverByShapesInput(input);

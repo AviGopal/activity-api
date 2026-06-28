@@ -3263,6 +3263,9 @@ router.post('/resolve', async (c) => {
           output_shapes?: string[];
           current_shapes?: string[];
           predecessor_activity_id?: string;
+          signature?: string;
+          completion_shapes?: string[];
+          sf_scope?: string;
         };
 
         const input = {
@@ -3272,6 +3275,11 @@ router.post('/resolve', async (c) => {
           current_shapes: extendedPointer.current_shapes ?? [],
           output_shapes: extendedPointer.output_shapes ?? [],
           predecessor_activity_id: extendedPointer.predecessor_activity_id,
+          // Successor-features readout (mechanism #7): pass the goal direction
+          // (signature s + completion_shapes R) through so candidates carry ⟨ψ,R⟩.
+          signature: extendedPointer.signature,
+          completion_shapes: extendedPointer.completion_shapes,
+          sf_scope: extendedPointer.sf_scope,
         };
 
         const validationError = validateDiscoverByShapesInput(input);

@@ -15,6 +15,13 @@
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
 import { transformToLegacyTemplate } from '../db/paradigm';
+import {
+  successorFeaturesEnabled,
+  fetchSuccessorFeatureCells,
+  successorFeatureCellKey,
+  rewardFromCompletionShapes,
+  successorValue,
+} from '../lib/successor-features';
 
 export type DiscoverByShapesMode = 'forward' | 'backward' | 'candidates_with_scores';
 
@@ -25,6 +32,18 @@ export interface DiscoverByShapesInput {
   current_shapes?: string[];
   output_shapes?: string[];
   predecessor_activity_id?: string;
+  /**
+   * Successor-features readout (mechanism #7). When `signature` (the state s)
+   * and `completion_shapes` (the goal direction R) are supplied in
+   * candidates_with_scores mode, each candidate is augmented with
+   * `successor_value` = ⟨ψ(s,a), R⟩ — the transfer value the cell's discounted
+   * shape-occupancy directs toward the goal, INDEPENDENT of its Beta reward.
+   * Gated behind SUCCESSOR_FEATURES (default ON).
+   */
+  signature?: string;
+  completion_shapes?: string[];
+  /** ψ partial-pool scope; defaults to 'org'. */
+  sf_scope?: string;
 }
 
 export interface DiscoverByShapesValidationError {
@@ -83,6 +102,9 @@ export async function runDiscoverByShapes(
     current_shapes = [],
     output_shapes = [],
     predecessor_activity_id,
+    signature,
+    completion_shapes = [],
+    sf_scope = 'org',
   } = input;
 
   // candidates_with_scores treats the query as forward mode (find producers)
@@ -186,6 +208,66 @@ export async function runDiscoverByShapes(
         return { ...legacyActivity, composition_score };
       })
     : legacyActivities;
+
+  // Successor-features readout (mechanism #7): Q_sf = ⟨ψ(s,a), R⟩ per candidate.
+  // R = completion_shapes (the goal direction). ψ is keyed (signature, template);
+  // the dot product is the TRANSFER value — non-zero even for cells the Beta
+  // never rewarded on this R, because ψ encodes transition structure, not reward.
+  // Additive: attaches `successor_value` alongside the unchanged Thompson scores.
+  if (
+    isCandidatesMode &&
+    successorFeaturesEnabled() &&
+    typeof signature === 'string' &&
+    signature.length > 0 &&
+    completion_shapes.length > 0
+  ) {
+    try {
+      const reward = rewardFromCompletionShapes(completion_shapes);
+      // The legacy transform emits the cell id under activity_id / variant_id
+      // (not `id`). Resolve robustly so the ψ-cell lookup keys match.
+      const candidateId = (a: any): string | undefined => {
+        const raw = a?.activity_id ?? a?.variant_id ?? a?.id;
+        if (raw == null) return undefined;
+        // raw may be a string OR a SurrealDB RecordId object — String() coerces
+        // both to the canonical `activity:⟨id⟩` form; normalizeActivityId (in
+        // successorFeatureCellKey) then strips the wrapper.
+        const s = typeof raw === 'string' ? raw : String(raw);
+        return s.length > 0 ? s : undefined;
+      };
+      const templateIds = finalActivities
+        .map((a: any) => candidateId(a))
+        .filter((x: unknown): x is string => typeof x === 'string');
+      const cells = await fetchSuccessorFeatureCells(surrealDB as any, signature, templateIds, sf_scope);
+      for (const a of finalActivities) {
+        const cid = candidateId(a);
+        const cell = cid ? cells.get(successorFeatureCellKey(signature, cid)) : undefined;
+        if (cell) {
+          a.successor_value = {
+            value: successorValue(cell.vector, reward),
+            signature,
+            scope: cell.scope,
+            sample_count: cell.sample_count,
+            discount: cell.discount,
+          };
+        } else {
+          // ψ uninformed for this cell — value 0, marked so the consumer can
+          // distinguish "no transition data" from "zero occupancy toward R".
+          a.successor_value = {
+            value: 0,
+            signature,
+            scope: sf_scope,
+            sample_count: 0,
+            discount: 0.9,
+          };
+        }
+      }
+    } catch (err) {
+      logger.warn('successor-features: readout failed (non-blocking)', {
+        signature,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 
   logger.info('Activities discovered by shapes', {
     count: finalActivities.length,

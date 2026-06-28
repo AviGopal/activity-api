@@ -25,6 +25,7 @@ import {
 import { resolveLearningTrack, type LearningTrack } from '../lib/learning-track';
 import { incrementExemplarBurstCounter } from '../services/exemplar-selector';
 import { applyOutcomeToPosteriors } from '../lib/posterior-update';
+import { updateSuccessorFeatures } from '../lib/successor-features';
 
 const app = new Hono();
 
@@ -2630,6 +2631,39 @@ app.post('/', async (c) => {
           error: err instanceof Error ? err.message : String(err),
         });
       });
+
+      // Successor features ψ(s,a) — learning-rate mechanism #7. Accumulate this
+      // trace's discounted shape-occupancy into the (signature, template) cell.
+      // ADDITIVE, env-flagged (SUCCESSOR_FEATURES, default ON), fire-and-forget —
+      // mirrors the chain-credit path. Keyed on the same v1 signature the
+      // conditional Thompson posterior uses, so ψ rides one-to-one alongside R.
+      if (v1Sig) {
+        // Use the RAW execution_trace.tasks (which carry per-task
+        // output_impulse_shapes / outputShapes) for the discounted occupancy
+        // walk — the normalized `trace.tasks` projection drops shape arrays.
+        // Falls back to top-level body.tasks then trace-level output shapes.
+        const sfTasks =
+          (Array.isArray((body as any).execution_trace?.tasks) && (body as any).execution_trace.tasks.length > 0
+            ? (body as any).execution_trace.tasks
+            : Array.isArray((body as any).tasks) && (body as any).tasks.length > 0
+              ? (body as any).tasks
+              : trace.tasks) as any;
+        updateSuccessorFeatures(
+          {
+            activity_id: trace.variant_id as string,
+            signature: v1Sig,
+            output_impulse_shapes: (trace as any).output_impulse_shapes,
+            tasks: sfTasks,
+          },
+          surrealDB,
+          trace.org_id as string,
+        ).catch((err) => {
+          logger.warn('successor-features: update failed (non-blocking)', {
+            execution_id: trace.execution_id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
     } catch (scoreUpdateError) {
       // Don't fail the request if score update fails - trace is already stored
       logger.error('[learning] Failed to update Thompson Sampling scores (non-blocking)', {
