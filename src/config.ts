@@ -264,6 +264,14 @@ export function loadConfig(): Config {
         // the minibob co-occurrence extractor (commit 1f8d703) so it can do
         // signature reasoning without a second round trip per impulse id.
         'executionTraceWithSignatures',
+        // traceAggregateReport: FAST server-side GROUP BY / COUNT / SUM over the
+        // indexed execution-trace table (failure-count-by-template, cost-by-
+        // activity, executions-by-status over a window). The aggregate path the
+        // decomposition planner should PREFER over executionTraceWithSignatures
+        // for operator report/ranking/sum goals — it computes the answer in the
+        // DB instead of shipping raw rows to the LLM (which timed out at 269K
+        // rows). Read-only, bounded, returns empty-but-valid (never a timeout).
+        'traceAggregateReport',
         // contextThompsonScores: paginated read over context_thompson_scores rows.
         // Supports filtering by templateId, signatureVersion, minObservations.
         // Powers harness discrimination stat (§6) and operator inspection.

@@ -35,6 +35,7 @@ import activitiesRouter, { accountIdScopedWhere } from './activities';
 import executionTracesRouter from './execution-traces';
 import { runTemplateAuditReport, type TemplateAuditInput } from './template-audit';
 import { runExecutionTraceWithSignatures } from './execution-trace-with-signatures';
+import { runTraceAggregateReport } from './trace-aggregate-report';
 import { queryActivitiesByFTS, getActivityScores } from '../db/paradigm';
 import {
   runDiscoverByShapes,
@@ -1865,8 +1866,8 @@ router.post('/resolve', async (c) => {
             SELECT variant_id, variant_name, description, category, task_steps
             FROM activity_template
             WHERE (
-              (type::is_record(variant_id) AND meta::id(variant_id) IN $variant_ids)
-              OR (type::is_string(variant_id) AND variant_id IN $variant_ids)
+              (type::is::record(variant_id) AND meta::id(variant_id) IN $variant_ids)
+              OR (type::is::string(variant_id) AND variant_id IN $variant_ids)
             )
             AND (org_id = $orgId OR scope = 'global' OR org_id IS NONE)
           `;
@@ -3206,6 +3207,58 @@ router.post('/resolve', async (c) => {
             {
               success: false,
               error: err?.message || 'executionTraceWithSignatures resolution failed',
+            } as ImpulseResolveResponse,
+            500,
+          );
+        }
+      }
+
+      // =============================================================================
+      // traceAggregateReport: FAST server-side aggregate (GROUP BY / COUNT / SUM)
+      // over the indexed execution-trace table. The aggregate path operator
+      // report/ranking/sum goals should use INSTEAD of fetching raw traces and
+      // asking the LLM to aggregate (which timed out over 269K rows). Read-only.
+      // See src/routes/trace-aggregate-report.ts.
+      // =============================================================================
+      case 'traceAggregateReport': {
+        const authCheck = requireAuthenticated(c);
+        if (authCheck) {
+          return c.json(
+            { success: false, error: authCheck.error } as ImpulseResolveResponse,
+            authCheck.status,
+          );
+        }
+        const jwtAuth = getJwtAuthFromContext(c)!;
+
+        try {
+          const db =
+            jwtAuth.authType === 'apikey' || !jwtAuth.jwtToken
+              ? await surrealDB.getInstance()
+              : await createAuthenticatedClient(jwtAuth.jwtToken);
+
+          const report = await runTraceAggregateReport(db, pointer as unknown, {
+            orgId: jwtAuth.orgId,
+            accountId: jwtAuth.accountId ?? null,
+            authType: jwtAuth.authType,
+          });
+
+          return c.json(
+            {
+              success: true,
+              content: JSON.stringify(report),
+              metadata: {
+                shape: 'traceAggregateReport',
+                summary: `${report.metric} by ${report.group_by} over ${report.window_hours}h: ${report.total_groups} group(s)${report.empty ? ' (no data)' : `, top: ${report.rows[0]?.key ?? ''}=${report.rows[0]?.value ?? ''}`}`,
+              },
+            } as ImpulseResolveResponse,
+            200,
+          );
+        } catch (err: any) {
+          logger.error('traceAggregateReport failed', { error: err?.message });
+          return c.json(
+            {
+              success: false,
+              error: err?.message || 'traceAggregateReport resolution failed',
             } as ImpulseResolveResponse,
             500,
           );
