@@ -347,6 +347,29 @@ async function defaultLoadVariantRows(minExecutions: number): Promise<VariantRow
 }
 
 async function defaultLookupEmbedding(signature: string): Promise<number[] | null> {
+  // The signature -> embedding link is produced by the working
+  // signature-embed-backfill job (src/jobs/signature-embed-backfill.ts), which
+  // resolves each signature back to its semantic shape-set text, embeds it via
+  // concept-db's MiniLM embedder, and stores the 384-dim vector in the local
+  // `signature_embedding` table (keyed by `signature`). The trainer reads
+  // straight from that table — the authoritative, already-populated source —
+  // rather than a separate concept-db `/concepts/search` lookup that no path
+  // ever populated (zero `impulse_signature` concepts exist).
+  try {
+    const rows = await surrealDB.query<{ embedding: number[] }>(
+      `SELECT embedding FROM signature_embedding
+       WHERE signature = $signature
+       LIMIT 1`,
+      { signature },
+    );
+    const emb = rows?.[0]?.embedding;
+    if (Array.isArray(emb) && emb.length > 0) return emb;
+  } catch {
+    /* fall through to concept-db lookup below */
+  }
+
+  // Legacy fallback: concept-db concept carrying the embedding (kept for
+  // forward-compat if a signature is only ever embedded as a concept).
   const url = process.env.CONCEPT_DB_URL ?? 'http://localhost:8260';
   try {
     const qs = new URLSearchParams({
