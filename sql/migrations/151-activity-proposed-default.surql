@@ -1,0 +1,23 @@
+-- Migration 151: make the `activity.proposed` field tolerate an omitted value.
+--
+-- Migration 139 defined `proposed` as `TYPE bool VALUE $value OR false`. The
+-- VALUE clause is NOT sufficient for `UPSERT activity:<id> CONTENT { ... }`
+-- (the POST /v2/activities/templates write path) in SurrealDB 3.x. Whenever the
+-- CONTENT object did not carry `proposed` (or carried NONE), the non-optional
+-- `TYPE bool` assertion ran and rejected NONE before the VALUE coercion settled:
+--
+--   Found NONE for field `proposed`, but expected a bool
+--
+-- This failed EVERY template write (ribosome / make-activity / reach→mint mint,
+-- and any operator write that omitted the field) fleet-wide — the ~2-day mint
+-- drought (last learned-* mint 2026-06-28). It fired on BOTH the create branch
+-- (new record) and, critically, the update branch of UPSERT (existing record,
+-- omitted field) — a plain `DEFAULT false` only covers create, so the field is
+-- redefined as `option<bool>` to accept the omitted/NONE case on both branches.
+-- `VALUE $value OR false` is retained so reads always coerce to a real bool and
+-- so an explicit value still wins. Graduated/real template writes resolve to
+-- proposed=false; substrate-authored speculative writes still pass proposed=true.
+--
+-- Lightweight single-field redefinition; safe to re-run (OVERWRITE is idempotent).
+
+DEFINE FIELD OVERWRITE proposed ON activity TYPE option<bool> DEFAULT false VALUE $value OR false PERMISSIONS FULL;
