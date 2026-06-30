@@ -3718,6 +3718,143 @@ router.post('/resolve', async (c) => {
         }
       }
 
+      case 'topologyCoverage': {
+        // Read-only summary of (pool-signature × template) exploration coverage.
+        // Mirrors GET /v2/activities/topology-coverage as an impulse so the shape
+        // is both discoverable and resolvable. Aggregates context_thompson_scores
+        // rows WHERE signature_version = 1, scoped to the caller's org via
+        // PERMISSIONS ($token.org_id). Returns a cold_start status when no v1 rows
+        // exist rather than erroring.
+        try {
+          const orgId = jwtAuthCtx.orgId;
+          const sql = `SELECT template_id, context_bucket, alpha, beta, n_observations,
+                              last_updated_at, created_at
+                         FROM context_thompson_scores
+                         WHERE signature_version = 1 AND org_id = $org_id
+                         ORDER BY n_observations DESC`;
+          const rows = (jwtAuthCtx.jwtToken
+            ? await queryWithAuth<any>(jwtAuthCtx.jwtToken, sql, { org_id: orgId })
+            : await surrealDB.query<any>(sql, { org_id: orgId })) as any[];
+
+          if (!Array.isArray(rows) || rows.length === 0) {
+            const coldStart = {
+              distinct_pool_signatures: 0,
+              total_v1_observations: 0,
+              avg_templates_per_signature: 0,
+              max_templates_per_signature: 0,
+              min_templates_per_signature: 0,
+              top_signatures: [],
+              dark_signature_count: 0,
+              oldest_observation: null,
+              newest_observation: null,
+              status: 'cold_start',
+              message:
+                'No precondition-conditioned observations yet. Ensure executors send ' +
+                'impulse_state_space with /recommend calls.',
+            };
+            return c.json({
+              success: true,
+              content: JSON.stringify(coldStart),
+              metadata: {
+                shape: 'topologyCoverage',
+                summary: 'topology coverage: cold start (no v1 observations)',
+                rowCount: 0,
+              },
+            } as ImpulseResolveResponse, 200);
+          }
+
+          const sigMap = new Map<string, {
+            templates: Set<string>;
+            totalObs: number;
+            alphaSum: number;
+            betaSum: number;
+            templateObsCounts: Map<string, number>;
+          }>();
+          let totalObs = 0;
+          let oldestTs: string | null = null;
+          let newestTs: string | null = null;
+
+          for (const row of rows) {
+            const sig = row.context_bucket;
+            let entry = sigMap.get(sig);
+            if (!entry) {
+              entry = { templates: new Set(), totalObs: 0, alphaSum: 0, betaSum: 0, templateObsCounts: new Map() };
+              sigMap.set(sig, entry);
+            }
+            entry.templates.add(row.template_id);
+            entry.totalObs += row.n_observations ?? 0;
+            entry.alphaSum += row.alpha ?? 1;
+            entry.betaSum += row.beta ?? 1;
+            entry.templateObsCounts.set(
+              row.template_id,
+              (entry.templateObsCounts.get(row.template_id) ?? 0) + (row.n_observations ?? 0),
+            );
+            totalObs += row.n_observations ?? 0;
+
+            const ts = row.last_updated_at ?? row.created_at ?? null;
+            if (ts) {
+              if (!oldestTs || ts < oldestTs) oldestTs = ts;
+              if (!newestTs || ts > newestTs) newestTs = ts;
+            }
+          }
+
+          const sigCounts = Array.from(sigMap.values()).map((e) => e.templates.size);
+          const avgTemplates = sigCounts.length > 0
+            ? sigCounts.reduce((a, b) => a + b, 0) / sigCounts.length
+            : 0;
+          const maxTemplates = sigCounts.length > 0 ? Math.max(...sigCounts) : 0;
+          const minTemplates = sigCounts.length > 0 ? Math.min(...sigCounts) : 0;
+          const darkSignatureCount = sigCounts.filter((n) => n <= 1).length;
+
+          const topSignatures = Array.from(sigMap.entries())
+            .sort((a, b) => b[1].totalObs - a[1].totalObs)
+            .slice(0, 10)
+            .map(([sig, entry]) => {
+              const meanAlpha = entry.alphaSum / Math.max(entry.templates.size, 1);
+              const meanBeta = entry.betaSum / Math.max(entry.templates.size, 1);
+              const successRate = meanAlpha / (meanAlpha + meanBeta);
+              const topTemplates = Array.from(entry.templateObsCounts.entries())
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 5)
+                .map(([tid]) => tid);
+              return {
+                pool_signature: sig,
+                observation_count: entry.totalObs,
+                success_rate: Math.round(successRate * 1000) / 1000,
+                top_templates: topTemplates,
+              };
+            });
+
+          const coverage = {
+            distinct_pool_signatures: sigMap.size,
+            total_v1_observations: totalObs,
+            avg_templates_per_signature: Math.round(avgTemplates * 100) / 100,
+            max_templates_per_signature: maxTemplates,
+            min_templates_per_signature: minTemplates,
+            top_signatures: topSignatures,
+            dark_signature_count: darkSignatureCount,
+            oldest_observation: oldestTs,
+            newest_observation: newestTs,
+          };
+
+          return c.json({
+            success: true,
+            content: JSON.stringify(coverage),
+            metadata: {
+              shape: 'topologyCoverage',
+              summary: `${sigMap.size} distinct pool signatures, ${totalObs} v1 observations, ${darkSignatureCount} dark`,
+              rowCount: sigMap.size,
+            },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          logger.error('topologyCoverage failed', { error: err.message });
+          return c.json({
+            success: false,
+            error: `topologyCoverage failed: ${err.message}`,
+          } as ImpulseResolveResponse, 500);
+        }
+      }
+
       // =============================================================================
       // Test-audit loop (OpenSpec 2026-05-18-test-audit-loop, Phase A)
       //
