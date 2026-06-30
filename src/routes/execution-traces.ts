@@ -1941,6 +1941,30 @@ app.post('/', async (c) => {
           } catch { /* non-blocking */ }
         }
       }
+
+      // Consumption seam 3b: on FAILED trace ingest, ALSO derive a failure-conditioned
+      // ('1f') signature and store it as `repair_signature` (migration 153) alongside the
+      // v1 signature. Same shape/provenance/missing assembly as v1, plus the failure_mode
+      // discriminator — so a later repair recommendation can read a posterior keyed on
+      // (state, failure_mode) instead of collapsing distinct failure modes onto one cell.
+      // ADDITIVE + behaviour-preserving: nothing consumes '1f' yet, and successful traces
+      // are unchanged (the failure_mode discriminator only exists on failures).
+      const failureModeTypeForSig = body.failure_mode?.type;
+      if (!success && typeof failureModeTypeForSig === 'string' && failureModeTypeForSig.length > 0) {
+        const repairShapes = deriveSignatureShapes(trace);
+        if (repairShapes.length > 0) {
+          try {
+            const { computeStateSpaceSignature } = await import('../utils/session-context');
+            (trace as any).repair_signature = computeStateSpaceSignature({
+              shapes: repairShapes,
+              provenance: Array.isArray(meta.provenance) ? (meta.provenance as any) : [],
+              missing: Array.isArray(meta.missing_shapes) ? (meta.missing_shapes as any) : [],
+              version: '1f',
+              failure_mode: failureModeTypeForSig,
+            });
+          } catch { /* non-blocking */ }
+        }
+      }
     }
 
     // Insert into database
@@ -1963,6 +1987,11 @@ app.post('/', async (c) => {
     if ((trace as any).signature) {
       optionalFields.push('signature: $signature');
       optionalFields.push('signature_version: $signature_version');
+    }
+    // Failure-conditioned ('1f') signature on failed traces (consumption seam 3b,
+    // migration 153). Only set when the failed-trace branch above derived it.
+    if ((trace as any).repair_signature) {
+      optionalFields.push('repair_signature: $repair_signature');
     }
     if (trace.metadata) optionalFields.push('metadata: $metadata');
     // Selection-to-execution correlation

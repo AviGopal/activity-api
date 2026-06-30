@@ -134,8 +134,21 @@ export interface StateSpaceSignatureInput {
   shapes: string[];
   provenance?: ProvenanceTuple[];
   missing?: string[];
-  /** Version token. "1" (default) = shape + provenance + missing. "1c" = shape-only coarse. */
-  version?: '1' | '1c';
+  /**
+   * Version token.
+   *   "1"  (default) = shape + provenance + missing.
+   *   "1c"           = shape-only coarse.
+   *   "1f"           = failure-conditioned: shape + provenance + missing + failure_mode.
+   *                    Mirrors the "1" raw assembly but appends a failure_mode
+   *                    segment so distinct failure modes do not collapse onto one
+   *                    repair posterior. Only meaningful on failed traces.
+   */
+  version?: '1' | '1c' | '1f';
+  /**
+   * Failure-mode discriminator. Only consumed when version === '1f'; ignored for
+   * "1" / "1c" so those signatures stay byte-identical regardless of this field.
+   */
+  failure_mode?: string;
 }
 
 export function computeStateSpaceSignature(input: StateSpaceSignatureInput): string {
@@ -157,6 +170,15 @@ export function computeStateSpaceSignature(input: StateSpaceSignatureInput): str
       return (a.producedBy ?? '').localeCompare(b.producedBy ?? '');
     });
     provenancePart = sorted.map(p => `${p.shape}:${p.producedBy ?? ''}`).join(',');
+  }
+
+  // v1f is failure-conditioned: same shape/provenance/missing assembly as v1, with
+  // a trailing failure_mode segment. Appending a 5th `|`-delimited segment keeps the
+  // v1 prefix structure but produces a distinct hash per failure mode. The v1 path
+  // (4 segments) never receives this segment, so v1/v1c outputs are unchanged.
+  if (version === '1f') {
+    const raw = ['1f', shapes.join(','), provenancePart, missing.join(','), input.failure_mode ?? ''].join('|');
+    return createHash('sha256').update(raw).digest().slice(0, 8).toString('hex');
   }
 
   const raw = [version, shapes.join(','), provenancePart, missing.join(',')].join('|');

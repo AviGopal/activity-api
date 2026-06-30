@@ -1,0 +1,17 @@
+-- 153-repair-signature.surql
+--
+-- Define the failure-conditioned ('1f') state-space `repair_signature` field on
+-- activity_execution_traces.
+--
+-- WHY (consumption seam 3b, 2026-06-30): the v1 `signature` (migration 145) ignores
+-- failure_mode, so a repair retry collapses distinct failure modes onto one posterior
+-- cell. On FAILED trace ingest, routes/execution-traces.ts now ALSO derives a
+-- failure-conditioned signature (computeStateSpaceSignature version '1f' = the v1
+-- shape/provenance/missing assembly plus the failure_mode discriminator) and stores it
+-- here, alongside the existing v1 `signature`. ADDITIVE + behaviour-preserving: nothing
+-- consumes '1f' yet — this seam only PRODUCES the signal so a later failure-conditioned
+-- repair recommendation can read a posterior keyed on (state, failure_mode).
+--
+-- option<string> so successful traces (which never derive a repair signature) and all
+-- legacy rows stay valid as NONE; no rebuild required.
+DEFINE FIELD OVERWRITE repair_signature ON activity_execution_traces TYPE option<string>;
