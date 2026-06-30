@@ -28,6 +28,7 @@ import { classifyTemplateTiers, type ResolverTier } from '../services/tier-class
 import { enqueueVariantDelta, installPosteriorFlushOnShutdown } from './posterior-aggregator';
 import { embedSignatureForShapes } from '../jobs/signature-embed-backfill';
 import { applyClusterPosterior } from './cluster-posterior';
+import { getTuningParam } from './tuning-params';
 
 // Install the SIGTERM/SIGINT flush hook once on module load so buffered α/β
 // deltas are written out on shutdown rather than lost.
@@ -119,20 +120,27 @@ const CREDIT_PROPAGATION_MAX_DEPTH = 4;
  * Sutton-Barto convention.
  */
 const TD_LAMBDA_DEFAULT = 0.7;
-const TD_LAMBDA: number = (() => {
-  const raw = process.env.TD_LAMBDA;
-  if (raw === undefined || raw === '') return TD_LAMBDA_DEFAULT;
-  const parsed = parseFloat(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0 || parsed >= 1) {
+
+/**
+ * Resolve the TD(λ) eligibility-trace decay, consuming the substrate_tuning_param
+ * row 'TD_LAMBDA' (seam 3a) with the historical env→default fallback chain. The
+ * out-of-range guard (λ must be in (0,1)) is preserved: a row/env value outside the
+ * open interval falls back to the default with a warn-log, exactly as before. With
+ * no tuning row authored, getTuningParam returns Number(process.env.TD_LAMBDA) (or
+ * the default), so behavior is identical to the prior module-level const.
+ */
+async function resolveTdLambda(): Promise<number> {
+  const value = await getTuningParam('TD_LAMBDA', process.env.TD_LAMBDA, TD_LAMBDA_DEFAULT);
+  if (!Number.isFinite(value) || value <= 0 || value >= 1) {
     logger.warn('td_lambda_invalid', {
       event: 'td_lambda_invalid',
-      raw,
+      raw: value,
       fallback: TD_LAMBDA_DEFAULT,
     });
     return TD_LAMBDA_DEFAULT;
   }
-  return parsed;
-})();
+  return value;
+}
 
 /**
  * Minimal execution descriptor for chain-credit propagation.
@@ -224,22 +232,58 @@ interface Deltas {
 // posterior anyway (M4), so this targets exactly the stochastic (LLM) cells κ⁻¹
 // measures. Gate: GRADED_YIELD_SUCCESS=0 restores the legacy binary update.
 const GRADED_YIELD_ENABLED = process.env.GRADED_YIELD_SUCCESS !== '0';
-const YIELD_FLOOR = 0.5;        // a success always credits at least this much α
-const YIELD_COST_REF = 0.02;    // $0.02 → cost component 0.5 (free → 1.0)
-const YIELD_PROD_REF = 4;       // ≥4 output impulses → productivity 1.0
+// In-code defaults (the historical hardcoded literals). These remain the final
+// fallback for the seam-3a getTuningParam reads: with no authored tuning row and
+// no env override, successYield resolves to exactly these values — unchanged
+// behavior.
+const YIELD_FLOOR_DEFAULT = 0.5;     // a success always credits at least this much α
+const YIELD_COST_REF_DEFAULT = 0.02; // $0.02 → cost component 0.5 (free → 1.0)
+const YIELD_PROD_REF_DEFAULT = 4;    // ≥4 output impulses → productivity 1.0
 
-export function successYield(trace: {
-  cost_usd?: number;
-  tasks?: Array<{ output_impulse_ids?: string[] }>;
-}): number {
+/**
+ * Resolved graded-yield reference constants for one trace evaluation. Passed into
+ * successYield so the (already-async) trace-ingest path can consume authored
+ * tuning rows without making the pure scoring math itself async.
+ */
+interface YieldRefs {
+  floor: number;
+  costRef: number;
+  prodRef: number;
+}
+
+/**
+ * Resolve the three graded-yield references (seam 3a), consuming the
+ * substrate_tuning_param rows with the env→default fallback chain. Absent table +
+ * absent env ⇒ the historical hardcoded literals, so behavior is preserved.
+ */
+async function resolveYieldRefs(): Promise<YieldRefs> {
+  const [floor, costRef, prodRef] = await Promise.all([
+    getTuningParam('YIELD_FLOOR', process.env.YIELD_FLOOR, YIELD_FLOOR_DEFAULT),
+    getTuningParam('YIELD_COST_REF', process.env.YIELD_COST_REF, YIELD_COST_REF_DEFAULT),
+    getTuningParam('YIELD_PROD_REF', process.env.YIELD_PROD_REF, YIELD_PROD_REF_DEFAULT),
+  ]);
+  return { floor, costRef, prodRef };
+}
+
+export function successYield(
+  trace: {
+    cost_usd?: number;
+    tasks?: Array<{ output_impulse_ids?: string[] }>;
+  },
+  refs: YieldRefs = {
+    floor: YIELD_FLOOR_DEFAULT,
+    costRef: YIELD_COST_REF_DEFAULT,
+    prodRef: YIELD_PROD_REF_DEFAULT,
+  },
+): number {
   const cost = typeof trace.cost_usd === 'number' && trace.cost_usd > 0 ? trace.cost_usd : 0;
-  const costScore = 1 / (1 + cost / YIELD_COST_REF);          // free → 1, expensive → →0
+  const costScore = 1 / (1 + cost / refs.costRef);            // free → 1, expensive → →0
   const tasks = trace.tasks ?? [];
   const outputs = tasks.reduce((sum, t) => sum + (t.output_impulse_ids?.length ?? 0), 0);
-  const productivity = Math.min(1, outputs / YIELD_PROD_REF);
+  const productivity = Math.min(1, outputs / refs.prodRef);
   const quality = 0.5 * costScore + 0.5 * productivity;
-  const y = YIELD_FLOOR + (1 - YIELD_FLOOR) * quality;
-  return Math.max(YIELD_FLOOR, Math.min(1, y));
+  const y = refs.floor + (1 - refs.floor) * quality;
+  return Math.max(refs.floor, Math.min(1, y));
 }
 
 function computeDeltas(
@@ -247,12 +291,13 @@ function computeDeltas(
   failureMode: FailureMode | null | undefined,
   warnings: string[],
   trace?: { cost_usd?: number; tasks?: Array<{ output_impulse_ids?: string[] }> },
+  yieldRefs?: YieldRefs,
 ): Deltas {
   if (success) {
     // Graded-yield reward — see successYield. Falls back to the binary update when
     // disabled or when no trace context is available (defensive).
     if (GRADED_YIELD_ENABLED && trace) {
-      const y = successYield(trace);
+      const y = successYield(trace, yieldRefs);
       return { alphaDelta: y, betaDelta: 1 - y };
     }
     return { alphaDelta: 1, betaDelta: 0 };
@@ -499,6 +544,10 @@ export async function propagateCreditAlongChain(
 
   if (!composition_chain || composition_chain.length === 0) return;
 
+  // Seam 3a: resolve TD(λ) from the authored tuning row (TTL-cached, env→default
+  // fallback, (0,1) guard preserved). Resolved once per propagation, not per ancestor.
+  const tdLambda = await resolveTdLambda();
+
   const isCascading = !success && failure_mode?.type === 'cascading';
 
   // composition_chain is root-first: [A, B, C, D].
@@ -550,7 +599,7 @@ export async function propagateCreditAlongChain(
     // normalized form stored in variant_performance_metrics.
     const ancestorId = normalizeActivityId(meta?.variant_id ?? ancestorExecId);
     const depth = i + 1; // 1-indexed depth from leaf
-    const decayFactor = Math.pow(TD_LAMBDA, depth);
+    const decayFactor = Math.pow(tdLambda, depth);
 
     // Use per-ancestor v1 signature when available.
     // When absent (transition period), skip the conditional write for this ancestor.
@@ -616,7 +665,10 @@ export async function applyOutcomeToPosteriors(
   // Strip activity:⟨⟩ wrapper so the WHERE clause matches variant_performance_metrics rows
   // written by the legacy path (which stores bare ids like "development-vessel:harness-run-matrix").
   const activityId = normalizeActivityId(rawActivityId);
-  const { alphaDelta, betaDelta } = computeDeltas(trace.success, trace.failure_mode, warnings, trace);
+  // Seam 3a: resolve the graded-yield references from authored tuning rows (TTL-cached,
+  // env→default fallback). Behavior-preserving when no row exists.
+  const yieldRefs = await resolveYieldRefs();
+  const { alphaDelta, betaDelta } = computeDeltas(trace.success, trace.failure_mode, warnings, trace, yieldRefs);
   const failureModeType = trace.failure_mode?.type ?? null;
 
   // M4 tier-restricted bandit: when every task on the trace is deterministic,
