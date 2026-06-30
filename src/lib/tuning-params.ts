@@ -61,12 +61,15 @@ export async function getTuningParam(
 
   let tableValue: number | null = null;
   try {
-    const rows = await surrealDB.query<{ value: number | null }>(
-      `SELECT value FROM substrate_tuning_param WHERE name = $name LIMIT 1`,
+    // NOTE: `value` is a reserved word in SurrealDB's SELECT grammar (it collides
+    // with the VALUE projection clause), so it must be backtick-quoted and aliased
+    // to a non-reserved name before it can be read as a plain column.
+    const rows = await surrealDB.query<{ param_value: number | null }>(
+      'SELECT `value` AS param_value FROM substrate_tuning_param WHERE name = $name LIMIT 1',
       { name },
     );
-    if (rows && rows.length > 0 && typeof rows[0].value === 'number' && Number.isFinite(rows[0].value)) {
-      tableValue = rows[0].value;
+    if (rows && rows.length > 0 && typeof rows[0].param_value === 'number' && Number.isFinite(rows[0].param_value)) {
+      tableValue = rows[0].param_value;
     }
   } catch (err) {
     // Table absent (pre-migration) or transient DB error: behave exactly as the
