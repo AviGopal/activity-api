@@ -6507,7 +6507,14 @@ app.post('/recommend', async (c) => {
           }
         }
 
-        logger.debug('v1 conditional posterior lookup', {
+        const repairSigForBoost = process.env.REPAIR_SIGNATURE_CONSUME === '1' ? validRepairSignature(callerRepairSignature) : null;
+      if (repairSigForBoost) {
+        try {
+          const repairRows = await surrealDB.query<any>(`SELECT template_id, alpha, beta, n_observations FROM context_thompson_scores WHERE org_id = $org_id AND signature_version = 2 AND context_bucket = $sig AND template_id IN $ids`, { org_id: orgId, sig: repairSigForBoost, ids: activityIds });
+          for (const [k, v] of repairBoostFromRows(repairRows || [])) repairScoresMap.set(k, v);
+        } catch { /* non-fatal */ }
+      }
+      logger.debug('v1 conditional posterior lookup', {
           sig: stateSpaceSig,
           hits: sigScoresMap.size,
           floor: SIGNATURE_SAMPLING_FLOOR,

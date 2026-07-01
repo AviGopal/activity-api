@@ -1956,7 +1956,7 @@ app.post('/', async (c) => {
     const _priorRepairSig = validRepairSignature(_priorRepairSigRaw);
     if (_priorRepairSig && body.template_id) {
       try {
-        const _successForRepair = body.status === 'success';
+        const _successForRepair = body.status === 'completed' || body.status === 'success' || body.success === true;
         const _repairDelta = priorRepairDelta(_successForRepair);
         await surrealDB.query(
           `LET $existing = (SELECT * FROM context_thompson_scores WHERE org_id = $org_id AND template_id = $activity_id AND signature_version = 2 AND context_bucket = $sig LIMIT 1); IF array::len($existing) > 0 THEN UPDATE context_thompson_scores SET alpha = alpha + $da, beta = beta + $db, n_observations = n_observations + 1, last_updated_at = time::now() WHERE org_id = $org_id AND template_id = $activity_id AND signature_version = 2 AND context_bucket = $sig ELSE CREATE context_thompson_scores CONTENT { org_id: $org_id, template_id: $activity_id, context_bucket: $sig, signature_version: 2, alpha: 1 + $da, beta: 1 + $db, n_observations: 1, last_updated_at: time::now(), created_at: time::now() } END`,
