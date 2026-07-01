@@ -592,7 +592,7 @@ app.get('/', async (c) => {
       fieldsParam === 'summary' || detailParam === 'false';
 
     // Validate and cap limit
-    const limit = Math.min(Math.max(limitParam, 1), 500);
+    const limit = Math.min(Math.max(limitParam, 1), 100);
     const offset = Math.max(offsetParam, 0);
 
     // Build SurrealDB query dynamically
