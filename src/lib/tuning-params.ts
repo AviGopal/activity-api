@@ -87,6 +87,45 @@ export async function getTuningParam(
   return tableValue ?? resolveFallback(envFallback, defaultValue);
 }
 
+/**
+ * writeTuningParam — author a runtime-consumable tuning parameter (seam 2a write-back).
+ *
+ * UPSERTs a single `substrate_tuning_param` row keyed by `name` (the table has a
+ * UNIQUE index on `name`, migration 152), sets its float `value`, stamps
+ * `updated_at`, and records `updated_by` + `evidence` for audit. After the write
+ * succeeds it drops this param's TTL cache entry so `getTuningParam(name, …)`
+ * observes the new value on its very next call (no 30s wait, no restart).
+ *
+ * The `name` UNIQUE index makes a bare CREATE fail on the second write, so we
+ * UPSERT by that natural key. Never throws to the caller of a write route beyond
+ * a rejected promise; callers translate a rejection into a 500.
+ */
+export async function writeTuningParam(
+  name: string,
+  value: number,
+  meta: { updated_by?: string; evidence?: string } = {},
+): Promise<void> {
+  if (typeof name !== 'string' || name.length === 0) {
+    throw new Error('writeTuningParam: name must be a non-empty string');
+  }
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new Error('writeTuningParam: value must be a finite number');
+  }
+  // UPSERT by the UNIQUE `name` key. `value` is backtick-quoted because it is a
+  // reserved word in SurrealDB's statement grammar.
+  await surrealDB.query(
+    'UPSERT substrate_tuning_param SET name = $name, `value` = $value, updated_at = time::now(), updated_by = $updated_by, evidence = $evidence WHERE name = $name',
+    {
+      name,
+      value,
+      updated_by: meta.updated_by ?? null,
+      evidence: meta.evidence ?? null,
+    },
+  );
+  // Drop just this param's cache entry so the next getTuningParam observes it.
+  cache.delete(name);
+}
+
 /** Test hook — drop the cache so a freshly-authored row is observed immediately. */
 export function __clearTuningParamCache(): void {
   cache.clear();
