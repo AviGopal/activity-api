@@ -9,6 +9,7 @@
  * Replaces Python RPC API with identical dataflows
  */
 
+import { validRepairSignature, repairBoostFromRows } from '../lib/repair-signature-consume';
 import { Hono } from 'hono';
 import beta from '@stdlib/random-base-beta';
 import { surrealDB, queryWithAuth } from '../db/surreal';
@@ -6170,6 +6171,7 @@ app.post('/recommend', async (c) => {
       exploration_config: rawExplorationConfig,
       impulse_state_space,      // Phase 11: executor's loaded impulse pool (state-space-aware filtering)
       state_signature: callerStateSignature,  // C6 read-back: caller-supplied state-space signature (overrides server-side derivation for the cts lookup)
+    repair_signature: callerRepairSignature, // D1 (REPAIR_SIGNATURE_CONSUME): failure-class signature of the attempt being retried
       completion_shapes = [],   // Mechanism #7: goal direction R for the successor-features look-ahead ⟨ψ(s,a),R⟩. When present + SF_BLEND on, ψ steers the ranking argmax.
       // NOTE: pointer_state_space is intentionally NOT destructured — derived server-side
     } = body;
@@ -6439,6 +6441,7 @@ app.post('/recommend', async (c) => {
     );
     let stateSpaceSig: string | null = null;
     const sigScoresMap = new Map<string, { alpha: number; beta: number; n_observations: number }>();
+    const repairScoresMap = new Map<string, number>();
     // D5 partial-pooling: cluster posteriors keyed by template_id, used ONLY for
     // templates whose leaf signature posterior is cold (n_signature < N_MIN).
     const SIGNATURE_VERSION = 1;
@@ -6758,11 +6761,13 @@ app.post('/recommend', async (c) => {
         const nContext = ctxRow ? (ctxRow.alpha + ctxRow.beta - 2) : 0;
         const blendWeight = nContext >= 5 ? 0.7 : nContext >= 2 ? 0.3 : 0.0;
         let alphaBlended = blendWeight * (ctxRow?.alpha ?? 1) + (1 - blendWeight) * alpha;
+        if (repairScoresMap.size > 0 && repairScoresMap.has(activityId)) alphaBlended += repairScoresMap.get(activityId)!;
         let betaBlended  = blendWeight * (ctxRow?.beta  ?? 1) + (1 - blendWeight) * adjustedBeta;
 
         // Phase 24 §4: v1 conditional posterior override
         // When state-space-signature row has enough observations, use it directly.
         let posteriorSource: string = blendWeight > 0 ? 'context_bucketed' : scoreMethod;
+        const repairBoost = repairScoresMap.get(activityId) ?? 0;
         const sigRow = sigScoresMap.get(activityId);
         // C6: apply the conditional (signature-keyed) posterior only when it has
         // enough observations AND there are ≥2 candidates — so the signature

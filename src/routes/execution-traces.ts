@@ -5,6 +5,7 @@
  * Used by dashboard to display execution history timeline
  */
 
+import { validRepairSignature, priorRepairDelta } from '../lib/repair-signature-consume';
 import { Hono } from 'hono';
 import { surrealDB, queryWithAuth } from '../db/surreal';
 import { logger } from '../utils/logger';
@@ -1949,7 +1950,23 @@ app.post('/', async (c) => {
       // (state, failure_mode) instead of collapsing distinct failure modes onto one cell.
       // ADDITIVE + behaviour-preserving: nothing consumes '1f' yet, and successful traces
       // are unchanged (the failure_mode discriminator only exists on failures).
-      const failureModeTypeForSig = body.failure_mode?.type;
+      // REPAIR_SIGNATURE_CONSUME: update version-2 Thompson row for prior_repair_signature if present
+    // (inserted before failure-mode sig block; prior_repair_signature comes from caller metadata)
+    const _priorRepairSigRaw = (meta as any)?.prior_repair_signature ?? (trace as any)?.metadata?.prior_repair_signature;
+    const _priorRepairSig = validRepairSignature(_priorRepairSigRaw);
+    if (_priorRepairSig && body.template_id) {
+      try {
+        const _successForRepair = body.status === 'success';
+        const _repairDelta = priorRepairDelta(_successForRepair);
+        await surrealDB.query(
+          `LET $existing = (SELECT * FROM context_thompson_scores WHERE org_id = $org_id AND template_id = $activity_id AND signature_version = 2 AND context_bucket = $sig LIMIT 1); IF array::len($existing) > 0 THEN UPDATE context_thompson_scores SET alpha = alpha + $da, beta = beta + $db, n_observations = n_observations + 1, last_updated_at = time::now() WHERE org_id = $org_id AND template_id = $activity_id AND signature_version = 2 AND context_bucket = $sig ELSE CREATE context_thompson_scores CONTENT { org_id: $org_id, template_id: $activity_id, context_bucket: $sig, signature_version: 2, alpha: 1 + $da, beta: 1 + $db, n_observations: 1, last_updated_at: time::now(), created_at: time::now() } END`,
+          { activity_id: body.template_id, org_id: trace.org_id, sig: _priorRepairSig, da: _repairDelta.dAlpha, db: _repairDelta.dBeta }
+        );
+      } catch (_e) {
+        // non-blocking
+      }
+    }
+    const failureModeTypeForSig = body.failure_mode?.type;
       if (!success && typeof failureModeTypeForSig === 'string' && failureModeTypeForSig.length > 0) {
         const repairShapes = deriveSignatureShapes(trace);
         if (repairShapes.length > 0) {
