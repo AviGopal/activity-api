@@ -58,6 +58,16 @@ export interface TraceRetentionConfig {
   activities: string[];
   /** Per-activity overrides, keyed by activity_id. */
   overrides: Record<string, Partial<StratumPolicy>>;
+  /**
+   * Auto-discover over-cap strata each cycle (GROUP BY activity_id, largest
+   * strata exceeding the default caps). A static env list cannot keep up with
+   * the fleet: on 2026-07-02 the store had re-bloated to 423k rows across
+   * 1,787 strata (130 observer-tick strata alone held 138k) while the
+   * configured list covered two activities.
+   */
+  autoDiscover: boolean;
+  /** Bound on auto-discovered strata swept per cycle (keeps cycles bounded). */
+  autoDiscoverMax: number;
 }
 
 export function loadTraceRetentionConfig(env = process.env): TraceRetentionConfig {
@@ -94,6 +104,8 @@ export function loadTraceRetentionConfig(env = process.env): TraceRetentionConfi
     deleteBatchSize: parseInt(env.TRACE_RETENTION_DELETE_BATCH ?? '1000', 10),
     activities,
     overrides,
+    autoDiscover: env.TRACE_RETENTION_AUTO !== 'false', // on by default; ENABLED already gates the job
+    autoDiscoverMax: parseInt(env.TRACE_RETENTION_AUTO_MAX ?? '60', 10),
   };
 }
 
@@ -134,7 +146,36 @@ export async function runTraceRetentionSweep(
   const statuses = ['success', 'failure'] as const;
   const results: StratumResult[] = [];
 
-  for (const activityId of cfg.activities) {
+  // Auto-discover the strata actually worth sweeping this cycle: one GROUP BY,
+  // keep the largest strata whose total exceeds the combined default caps,
+  // bounded by autoDiscoverMax so a cycle's work stays bounded. Per-stratum
+  // caps below still come from policyFor (overrides respected). Best-effort:
+  // on failure we fall back to the configured list alone.
+  let sweepActivities = cfg.activities;
+  if (cfg.autoDiscover) {
+    try {
+      const groups = await surrealDB.query<{ activity_id: unknown; n: unknown }>(
+        `SELECT activity_id, count() AS n FROM ${TABLE} GROUP BY activity_id`,
+      );
+      const overCap = (Array.isArray(groups) ? groups : [])
+        .filter((g) => typeof g?.activity_id === 'string' && Number(g?.n ?? 0) > cfg.defaultSuccessCap + cfg.defaultFailureCap)
+        .sort((a, b) => Number(b.n) - Number(a.n))
+        .slice(0, cfg.autoDiscoverMax)
+        .map((g) => g.activity_id as string);
+      sweepActivities = Array.from(new Set([...cfg.activities, ...overCap]));
+      if (overCap.length > 0) {
+        logger.info('[trace-retention] auto-discovered over-cap strata', {
+          discovered: overCap.length, sweeping: sweepActivities.length,
+        });
+      }
+    } catch (err) {
+      logger.warn('[trace-retention] stratum auto-discovery failed; sweeping configured list only', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  for (const activityId of sweepActivities) {
     const policy = policyFor(cfg, activityId);
     for (const status of statuses) {
       const cap = status === 'success' ? policy.successCap : policy.failureCap;

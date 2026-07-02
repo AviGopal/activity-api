@@ -588,6 +588,19 @@ import('./jobs/fts-rebuild').then(({ rebuildFtsIndexes }) => {
 });
 
 // ============================================================================
+// Trace-Retention Sweep
+// ============================================================================
+// Bounds activity_execution_traces via stratified reservoir sampling
+// (src/services/trace-retention.ts). The service was built + env-plumbed on
+// 2026-06-16 but this startup call was never wired — the store re-bloated to
+// 423k rows and SurrealDB pegged (2026-07-02). Env-gated: TRACE_RETENTION_ENABLED.
+import('./services/trace-retention').then(({ startTraceRetentionSweep }) => {
+  startTraceRetentionSweep();
+}).catch(err => {
+  logger.error('[trace-retention] Failed to load trace-retention job', { error: String(err) });
+});
+
+// ============================================================================
 // Signature Clustering Tick (D3.2)
 // ============================================================================
 // Periodic pass that clusters state-space signatures (via concept-db delegation)
