@@ -598,6 +598,28 @@ const SIGNATURE_CLUSTER_INTERVAL_MS = parseInt(
   process.env.SIGNATURE_CLUSTER_INTERVAL_MS ?? String(6 * 60 * 60 * 1000), 10, // 6h
 );
 
+import('./jobs/accelerator-flag-tick').then(({ runAcceleratorFlagTick }) => {
+  setTimeout(() => {
+    void runAcceleratorFlagTick().catch(err => logger.warn('[FlagPolicy] initial tick failed', { error: String(err) }));
+  }, 10 * 60 * 1000);
+  setInterval(() => {
+    void runAcceleratorFlagTick().catch(err => logger.warn('[FlagPolicy] periodic tick failed', { error: String(err) }));
+  }, parseInt(process.env.ACCELERATOR_FLAG_INTERVAL_MS ?? String(60 * 60 * 1000), 10));
+}).catch(err => {
+  logger.error('[FlagPolicy] Failed to load accelerator-flag-tick job', { error: String(err) });
+});
+
+import('./jobs/accelerator-flag-tick').then(({ runAcceleratorFlagTick }) => {
+  setTimeout(() => {
+    void runAcceleratorFlagTick().catch(err => logger.warn('[FlagPolicy] initial tick failed', { error: String(err) }));
+  }, 10 * 60 * 1000);
+  setInterval(() => {
+    void runAcceleratorFlagTick().catch(err => logger.warn('[FlagPolicy] periodic tick failed', { error: String(err) }));
+  }, parseInt(process.env.ACCELERATOR_FLAG_INTERVAL_MS ?? String(60 * 60 * 1000), 10));
+}).catch(err => {
+  logger.error('[FlagPolicy] Failed to load accelerator-flag-tick job', { error: String(err) });
+});
+
 import('./jobs/signature-cluster-tick').then(({ runSignatureClusterTick }) => {
   // Initial run delayed 5 min so the embedding backfill has a chance to populate
   // signature_embedding on a fresh start before the first clustering pass.
