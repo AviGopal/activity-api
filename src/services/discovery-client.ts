@@ -246,9 +246,18 @@ export class DiscoveryClient {
         registered: this.registered,
       });
 
-      // If heartbeat fails, vessel may be considered expired
-      // Attempt re-registration on next cycle
+      // If heartbeat fails, vessel may be considered expired.
+      // Re-register IMMEDIATELY (canonical DiscoveryRegistrationLoop
+      // semantics): a failed heartbeat usually means discovery-vessel
+      // restarted and lost its in-memory record — deferring to the next
+      // interval tick leaves this vessel unroutable for up to a full
+      // heartbeatIntervalMs.
       this.registered = false;
+      try {
+        await this.register();
+      } catch {
+        // next interval tick retries via startHeartbeatManager
+      }
       return false;
     }
   }
