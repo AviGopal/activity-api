@@ -101,8 +101,9 @@ import {
 // Mechanism #7 consumer loop: blend the successor-features look-ahead ⟨ψ(s,a),R⟩
 // into the recommend ranking argmax. Fully reversible — SF_BLEND must be explicitly
 // enabled; when off (default) the ranking is byte-for-byte the prior Thompson order.
-function successorBlendEnabled(): boolean {
-  return process.env.SF_BLEND === '1' || process.env.SF_BLEND === 'true';
+async function successorBlendEnabled(): Promise<boolean> {
+  if (process.env.SF_BLEND === '1' || process.env.SF_BLEND === 'true') return true;
+  return (await getTuningParam('SF_BLEND', process.env.SF_BLEND, 0)) >= 1;
 }
 function successorBlendWeight(): number {
   const raw = process.env.SF_BLEND_WEIGHT;
@@ -159,6 +160,7 @@ import { autoCreateVariantIfNeeded, checkAndRetireTemplate } from '../services/v
 import { applyOutcomeToPosteriors } from '../lib/posterior-update';
 import { classifyTemplateTiers } from '../services/tier-classifier';
 import { lookupAssignment, readClusterPosterior } from '../lib/cluster-posterior';
+import { getTuningParam } from '../lib/tuning-params';
 
 const app = new Hono();
 
@@ -6433,9 +6435,7 @@ app.post('/recommend', async (c) => {
     // Env-flag-gated, default OFF: when unset/falsey, the reputation factor is
     // always 1.0 (current behavior byte-for-byte preserved). See
     // applyReputationFactor() in services/thompson-sampling.ts.
-    const CROSS_SIG_REPUTATION_PENALTY =
-      process.env.CROSS_SIG_REPUTATION_PENALTY === '1' ||
-      process.env.CROSS_SIG_REPUTATION_PENALTY === 'true';
+    const CROSS_SIG_REPUTATION_PENALTY = (await getTuningParam("CROSS_SIG_REPUTATION_PENALTY", process.env.CROSS_SIG_REPUTATION_PENALTY, 0)) >= 1;
     const CROSS_SIG_MIN_GLOBAL_OBS = parseInt(
       process.env.CROSS_SIG_REPUTATION_MIN_GLOBAL_OBS ?? '5', 10
     );
@@ -6507,7 +6507,7 @@ app.post('/recommend', async (c) => {
           }
         }
 
-        const repairSigForBoost = process.env.REPAIR_SIGNATURE_CONSUME === '1' ? validRepairSignature(callerRepairSignature) : null;
+        const repairSigForBoost = (await getTuningParam("REPAIR_SIGNATURE_CONSUME", process.env.REPAIR_SIGNATURE_CONSUME, 0)) >= 1 ? validRepairSignature(callerRepairSignature) : null;
       if (repairSigForBoost) {
         try {
           const repairRows = await surrealDB.query<any>(`SELECT template_id, alpha, beta, n_observations FROM context_thompson_scores WHERE org_id = $org_id AND signature_version = 2 AND context_bucket = $sig AND template_id IN $ids`, { org_id: orgId, sig: repairSigForBoost, ids: activityIds });
@@ -7013,7 +7013,7 @@ app.post('/recommend', async (c) => {
     let sfBlendApplied = false;
     if (
       successorFeaturesEnabled() &&
-      successorBlendEnabled() &&
+      (await successorBlendEnabled()) &&
       typeof stateSpaceSig === 'string' &&
       (stateSpaceSig as string).length > 0 &&
       Array.isArray(completion_shapes) &&
