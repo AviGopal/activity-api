@@ -1074,7 +1074,47 @@ app.get('/:executionId', async (c) => {
       result: result,
     });
 
-    if (!result || result.length === 0) {
+    // UNION-GAP FIX (2026-07-02, reason plane): the single-trace GET only
+    // consulted activity_execution_traces (wrappers keyed by the execution_id
+    // FIELD). ias-executor paradigm-walk executions land in the `execution`
+    // table keyed by RECORD ID (execution:<id>) with the execution_id field
+    // NULL — so `WHERE execution_id = $id` never matched them and template-walk
+    // traces 404'd here, leaving goal_reasoning with no per-task detail. Mirror
+    // the LIST path's paradigm union: fall back to the `execution` table by
+    // record id before declaring not-found. (Satisfier-only reaches persist no
+    // execution row at all — their reasoning lives in the goal-host walkLog.)
+    let traceRow: ExecutionTrace | undefined = result?.[0];
+    if (!traceRow) {
+      try {
+        const paradigmRows = await surrealDB.query<any>(
+          `SELECT * FROM type::thing('execution', $eid) LIMIT 1`,
+          { eid: executionId },
+        );
+        const p = paradigmRows?.[0];
+        if (p) {
+          const rowId = typeof p.id === 'string'
+            ? (p.id.includes(':') ? p.id.split(':').pop()!.replace(/[⟨⟩]/g, '') : p.id)
+            : String(p.id ?? '');
+          traceRow = {
+            ...p,
+            execution_id: p.execution_id || rowId || executionId,
+            activity_id: p.activity_id,
+            status: p.status,
+            created_at: p.created_at || p.executed_at,
+            error_message: p.error?.message ?? p.error_message,
+            tasks: p.trace?.tasks ?? p.tasks ?? [],
+          } as ExecutionTrace;
+          logger.info('[paradigm-union] single-GET fell back to paradigm execution table', { executionId });
+        }
+      } catch (paradigmError) {
+        logger.warn('[paradigm-union] single-GET paradigm fallback failed', {
+          executionId,
+          error: paradigmError instanceof Error ? paradigmError.message : String(paradigmError),
+        });
+      }
+    }
+
+    if (!traceRow) {
       logger.warn('Execution trace not found in database', {
         executionId,
         params: { execution_id: executionId },
@@ -1085,7 +1125,7 @@ app.get('/:executionId', async (c) => {
       }, 404);
     }
 
-    const trace = result[0];
+    const trace = traceRow;
 
     // M4.2: Fetch Thompson Sampling selection data for explainability
     // Priority: 1) correlation_id (exact match), 2) activity_id (approximate/most recent)
