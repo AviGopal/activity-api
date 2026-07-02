@@ -370,6 +370,25 @@ async function main() {
     }
   }
 
+  // ── Secret-bearing DDL: ALWAYS re-apply, outside migration tracking ──────
+  // The apikey_token JWT ACCESS method embeds JWT_SECRET. Migration files
+  // (064/069/112) each ran ONCE and are then skipped forever by
+  // init_migrations — so when JWT_SECRET changes (e.g. a container recreate
+  // regenerated it, 2026-07-02), every JWT-authed query fails 'problem with
+  // authentication' until an operator re-defines the access method by hand.
+  // Re-applying here on every start keeps the DB verifier in lockstep with
+  // the secret the app signs with; DEFINE ... OVERWRITE is idempotent.
+  try {
+    await runSQL(
+      `DEFINE ACCESS OVERWRITE apikey_token ON DATABASE TYPE JWT ` +
+      `ALGORITHM HS512 KEY '${JWT_SECRET.replace(/'/g, "\\'")}' ` +
+      `DURATION FOR TOKEN 15m, FOR SESSION 1h;`
+    );
+    console.log('[Init] ✓ apikey_token ACCESS re-applied with current JWT_SECRET');
+  } catch (error) {
+    console.warn('[Init] ⚠ could not re-apply apikey_token ACCESS:', error);
+  }
+
   console.log('\n' + '='.repeat(80));
   console.log(
     `[Init] Migration complete: ${successCount}/${sqlFiles.length} succeeded` +
