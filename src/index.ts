@@ -28,6 +28,7 @@ import ribosomeRoutes from './routes/ribosome';
 import shapesRoutes from './routes/shapes';
 import clusterRoutes from './routes/cluster';
 import tuningParamsRoutes from './routes/tuning-params';
+import llmRouterRoutes from './routes/llm-router';
 import { broadcaster } from './websocket/broadcaster';
 import type { ServerWebSocket } from 'bun';
 import packageJson from '../package.json';
@@ -229,6 +230,7 @@ app.route('/v2/cluster', clusterRoutes);
 // learning-policy recommendation actuate on the learner. Auth: gated by the
 // global /v2/* jwtAuthMiddleware above.
 app.route('/v2/tuning-params', tuningParamsRoutes);
+app.route('/v2/llm-router', llmRouterRoutes);
 
 // Boredom queue routes (GET /boredom-tasks, POST /v2/activities/boredom/enqueue, POST /v2/vessels/register)
 app.route('/', boredomRoutes);
@@ -611,6 +613,9 @@ const SIGNATURE_CLUSTER_INTERVAL_MS = parseInt(
   process.env.SIGNATURE_CLUSTER_INTERVAL_MS ?? String(6 * 60 * 60 * 1000), 10, // 6h
 );
 
+import { runAcceleratorFlagTick } from './jobs/accelerator-flag-tick';
+import { runSuccessorFeaturesBackfill } from './jobs/successor-features-backfill';
+
 import('./jobs/accelerator-flag-tick').then(({ runAcceleratorFlagTick }) => {
   setTimeout(() => {
     void runAcceleratorFlagTick().catch(err => logger.warn('[FlagPolicy] initial tick failed', { error: String(err) }));
@@ -620,6 +625,12 @@ import('./jobs/accelerator-flag-tick').then(({ runAcceleratorFlagTick }) => {
   }, parseInt(process.env.ACCELERATOR_FLAG_INTERVAL_MS ?? String(60 * 60 * 1000), 10));
 }).catch(err => {
   logger.error('[FlagPolicy] Failed to load accelerator-flag-tick job', { error: String(err) });
+});
+
+import('./jobs/successor-features-backfill').then(({ runSuccessorFeaturesBackfill }) => {
+  runSuccessorFeaturesBackfill(surrealDBForBackfill).then((r) => logger.info('[SF-backfill] done', r)).catch((err) => logger.warn('[SF-backfill] failed', { error: String(err) }));
+}).catch(err => {
+  logger.error('[SF-backfill] Failed to load successor-features-backfill job', { error: String(err) });
 });
 
 import('./jobs/accelerator-flag-tick').then(({ runAcceleratorFlagTick }) => {
