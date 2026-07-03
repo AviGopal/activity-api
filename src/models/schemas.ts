@@ -230,6 +230,10 @@ export const CreateTemplateRequestSchema = z.object({
   // Input/output shapes for paradigm alignment
   // input_shapes: Optional - activities can work with any input
   input_shapes: z.array(z.string()).optional(),
+  // optional_input_shapes: bind-if-present inputs that do NOT gate shape-feasibility.
+  // The producer self-grounds without them; they are a relevance/applicability hint,
+  // not a required data-dependency. The shape-graph walk treats these as non-gating.
+  optional_input_shapes: z.array(z.string()).optional(),
   // output_shapes: Optional in request (will be inferred if not provided)
   // but required in stored template after shape inference
   output_shapes: z.array(z.string()).optional(),
