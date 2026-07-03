@@ -17,9 +17,20 @@ export async function runSuccessorFeaturesBackfill(
   );
   const covered = new Set<string>(coveredRows.flat().map((r) => r.template_id));
 
+  const tracedRows: { variant_id: string }[][] = await surrealDB.query(
+    'SELECT variant_id FROM activity_execution_traces WHERE signature != NONE GROUP BY variant_id',
+  );
+  const traced = new Set<string>(
+    tracedRows.flat().map((r) => String(r.variant_id ?? '').replace(/^activity:/, '').replace(/[⟨⟩]/g, '')),
+  );
+
   for (const cell of cells) {
     const id = cell.activity_id;
     if (covered.has(id)) {
+      skipped++;
+      continue;
+    }
+    if (!traced.has(id)) {
       skipped++;
       continue;
     }
