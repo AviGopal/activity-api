@@ -120,6 +120,7 @@ export interface ParadigmActivity {
   name: string;
   description?: string;
   input_shapes: string[];
+  optional_input_shapes?: string[];
   output_shapes: string[];
   /**
    * Execution type determines how this activity is executed and which patterns it matches.
@@ -226,6 +227,7 @@ export async function insertActivity(
       name: activity.name,
       description: activity.description,
       input_shapes: activity.input_shapes || [],
+      optional_input_shapes: activity.optional_input_shapes || [],
       output_shapes: activity.output_shapes || [],
       execution_type: activity.execution_type || 'template',
       category: activity.category,
@@ -836,8 +838,11 @@ export function transformToLegacyTemplate(activity: ParadigmActivity): any {
     scope: activity.scope,
     org_id: activity.org_id,
     project_id: activity.project_id,
-    input_schema: activity.input_shapes.length > 0
-      ? { required_shapes: activity.input_shapes }
+    input_schema: (activity.input_shapes.length > 0 || (activity.optional_input_shapes?.length ?? 0) > 0)
+      ? {
+          ...(activity.input_shapes.length > 0 ? { required_shapes: activity.input_shapes } : {}),
+          ...((activity.optional_input_shapes?.length ?? 0) > 0 ? { optional_shapes: activity.optional_input_shapes } : {}),
+        }
       : undefined,
     output_schema: activity.output_shapes.length > 0
       ? { produces_shapes: activity.output_shapes }
