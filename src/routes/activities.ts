@@ -1162,6 +1162,9 @@ app.post('/templates', async (c) => {
         .filter(Boolean);
       inputShapesProvided = activityRecord.input_shapes.length > 0;
     }
+    if (Array.isArray(validated.optional_input_shapes)) {
+      activityRecord.optional_input_shapes = validated.optional_input_shapes;
+    }
     if (validated.output_shapes?.length) {
       activityRecord.output_shapes = validated.output_shapes;
       outputShapesProvided = true;
