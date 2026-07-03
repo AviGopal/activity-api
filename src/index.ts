@@ -29,6 +29,7 @@ import shapesRoutes from './routes/shapes';
 import clusterRoutes from './routes/cluster';
 import eventsRoutes from './routes/events';
 import tuningParamsRoutes from './routes/tuning-params';
+import llmRouterRoutes from './routes/llm-router';
 import { broadcaster } from './websocket/broadcaster';
 import type { ServerWebSocket } from 'bun';
 import packageJson from '../package.json';
@@ -237,6 +238,7 @@ app.route('/v2/cluster', clusterRoutes);
 // learning-policy recommendation actuate on the learner. Auth: gated by the
 // global /v2/* jwtAuthMiddleware above.
 app.route('/v2/tuning-params', tuningParamsRoutes);
+app.route('/v2/llm-router', llmRouterRoutes);
 
 // Boredom queue routes (GET /boredom-tasks, POST /v2/activities/boredom/enqueue, POST /v2/vessels/register)
 app.route('/', boredomRoutes);
