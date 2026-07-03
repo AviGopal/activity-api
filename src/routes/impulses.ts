@@ -2717,7 +2717,7 @@ router.post('/resolve', async (c) => {
           return c.json({ success: false, error: 'templateId and updates (object) required for activityTemplate_update' } as ImpulseResolveResponse, 400);
         }
 
-        const allowedFields = new Set(['name', 'description', 'tags', 'tasks', 'input_shapes', 'output_shapes', 'deprecated']);
+        const allowedFields = new Set(['name', 'description', 'tags', 'tasks', 'input_shapes', 'optional_input_shapes', 'output_shapes', 'deprecated']);
         const rejected = Object.keys(updatePointer.updates).filter((k) => !allowedFields.has(k));
         if (rejected.length > 0) {
           return c.json({
