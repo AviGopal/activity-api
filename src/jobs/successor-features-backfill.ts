@@ -26,7 +26,7 @@ export async function runSuccessorFeaturesBackfill(
     try {
       const traceRows: { signature: any; output_impulse_shapes: any; org_id: string }[][] =
         await surrealDB.query(
-          'SELECT signature, output_impulse_shapes, org_id FROM activity_execution_traces WHERE (variant_id = $id OR variant_id = $prefixed) AND signature != NONE ORDER BY created_at DESC LIMIT 5',
+          'SELECT signature, output_impulse_shapes, org_id, created_at FROM activity_execution_traces WHERE (variant_id = $id OR variant_id = $prefixed) AND signature != NONE ORDER BY created_at DESC LIMIT 5',
           { id, prefixed: 'activity:' + id },
         );
       const traces: { signature: any; output_impulse_shapes: any; org_id: string }[] =
