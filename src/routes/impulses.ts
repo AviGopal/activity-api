@@ -1807,18 +1807,19 @@ router.post('/resolve', async (c) => {
       case 'activityTemplatesByMetrics': {
         // Get top-performing templates by metrics
         // Used by genesis template to learn task structure from successful templates
-        const sortBy = pointer.sortBy || 'success_rate';
-        const minExecutions = pointer.minExecutions || 5;
-        const limit = pointer.limit || 2;
+        const sortByRaw = String(pointer.sortBy || pointer.order_by || pointer.sort || pointer.metric || 'success_rate');
+        const sortBy = /fail/i.test(sortByRaw) ? 'failures' : sortByRaw;
+        const minExecutions = pointer.minExecutions || pointer.min_executions || (sortBy === 'failures' ? 1 : 5);
+        const limit = pointer.limit || pointer.count || pointer.top || 2;
 
         logger.info('Resolving activityTemplatesByMetrics', { sortBy, minExecutions, limit });
 
         // First get metrics for top-performing templates
-        const orderField = sortBy === 'success_rate' ? 'success_rate' : 'total_executions';
+        const orderField = sortBy === 'success_rate' ? 'success_rate' : sortBy === 'failures' ? 'failure_count' : 'total_executions';
         // Phase B2: dual-tenant scoping. Legacy/global rows (org_id IS NONE)
         // remain visible.
         const metricsQuery = `
-          SELECT variant_id, total_executions, success_rate, avg_duration_ms, avg_cost_usd
+          SELECT variant_id, total_executions, success_rate, avg_duration_ms, avg_cost_usd, math::ceil(total_executions * (1 - success_rate)) AS failure_count
           FROM variant_performance_metrics
           WHERE total_executions >= $min_executions
           AND (${accountIdScopedWhere()} OR org_id IS NONE)
@@ -1896,12 +1897,17 @@ router.post('/resolve', async (c) => {
               variant_id: key || normalizeRecordId(template.variant_id) || normalizeRecordId(m.variant_id),
               total_executions: m.total_executions,
               success_rate: m.success_rate,
+              failure_count: m.failure_count,
               avg_duration_ms: m.avg_duration_ms,
               avg_cost_usd: m.avg_cost_usd,
             };
           });
 
           content = formatTemplateListWithMetricsAsMarkdown(templates);
+          if (sortBy === 'failures') {
+            const rows = templates.map((t: any, i: number) => `${i + 1}. ${t.variant_id} — ${t.failure_count ?? 0} failures / ${t.total_executions} executions`).join('\n');
+            content = `# Templates by Failure Count (desc)\n\n${rows}\n\n${content}`;
+          }
         }
         break;
       }
