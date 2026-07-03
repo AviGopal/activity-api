@@ -1,0 +1,24 @@
+-- Migration 154: optional_input_shapes on the activity (paradigm) table.
+--
+-- The optional-input primitive (2026-07-03). Before this, a template's
+-- `input_shapes` did double duty: (a) a data-dependency the walk must produce
+-- before the producer is shape-feasible, AND (b) an applicability/relevance
+-- hint. That overload made producers like `development-vessel:repair-activity-
+-- from-failures` unreachable: it declared `input_shapes:[trace_failure_pattern_
+-- report]`, so the shape-graph walk 0-stepped trying to produce that (not cold-
+-- feasible) input — even though its resolver (`template_repair`) self-grounds
+-- from the target's failure traces given only `activity_id` and never consumes
+-- the pool impulse.
+--
+-- `optional_input_shapes` splits the two meanings: these inputs BIND if present
+-- (via {{shape}}) and remain a relevance hint, but do NOT gate shape-feasibility.
+-- goal-host's readCandidateShapes subtracts them from the gating input set; a
+-- producer whose only unmet input is optional is immediately shape-feasible.
+--
+-- The `activity` table is SCHEMAFULL (sql/schemas/020-paradigm-core-tables.surql),
+-- so an undeclared field is silently dropped on write — this DEFINE FIELD is the
+-- reason a POST /templates carrying optional_input_shapes actually persists.
+-- Applied live via /sql on 2026-07-03; this file makes it reproducible on a
+-- fresh substrate. DEFAULT [] so every existing activity row gets the field.
+
+DEFINE FIELD IF NOT EXISTS optional_input_shapes ON activity TYPE array<string> DEFAULT [];
