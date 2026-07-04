@@ -121,6 +121,13 @@ const CREDIT_PROPAGATION_MAX_DEPTH = 4;
  */
 const TD_LAMBDA_DEFAULT = 0.7;
 
+// Lifecycle-hook subscriber templates (validator-dispatch, slot-binding,
+// create-shape-provider-goal) measure hook mechanics, not goal-reach. Their
+// traces are excluded from the state-conditioned context_thompson_scores
+// posterior so hook volume cannot poison goal-reach selection; they still
+// update their own variant_performance_metrics posterior.
+const HOOK_SUBSCRIBER_PATTERN = /validator-dispatch|slot-binding|create-shape-provider-goal/;
+
 /**
  * Resolve the TD(λ) eligibility-trace decay, consuming the substrate_tuning_param
  * row 'TD_LAMBDA' (seam 3a) with the historical env→default fallback chain. The
@@ -754,6 +761,7 @@ export async function applyOutcomeToPosteriors(
   // variant_performance_metrics UPDATE above.
   if (
     !skipVariantUpdate &&
+    !HOOK_SUBSCRIBER_PATTERN.test(activityId) &&
     trace.signature &&
     typeof trace.signature_version === 'number' &&
     (alphaDelta !== 0 || betaDelta !== 0)
