@@ -102,7 +102,10 @@ export async function seedPriorFromConcepts(
       `${url}/concepts/search?query=${encodeURIComponent(query)}&limit=${K}`,
       {
         signal: ctrl.signal,
-        headers: { 'X-Org-Id': orgId },
+        headers: {
+          'X-Org-Id': orgId,
+          ...(process.env.METABOB_API_KEY ? { Authorization: `ApiKey ${process.env.METABOB_API_KEY}` } : {}),
+        },
       },
     );
     clearTimeout(t);

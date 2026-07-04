@@ -131,7 +131,10 @@ export async function lookupEmbeddingForSignature(
     });
     const res = await fetch(`${url}/concepts/search?${qs.toString()}`, {
       signal: ctrl.signal,
-      headers: { 'X-Org-Id': orgId },
+      headers: {
+        'X-Org-Id': orgId,
+        ...(process.env.METABOB_API_KEY ? { Authorization: `ApiKey ${process.env.METABOB_API_KEY}` } : {}),
+      },
     });
     if (!res.ok) {
       embeddingLookupCache.set(signature, null);
