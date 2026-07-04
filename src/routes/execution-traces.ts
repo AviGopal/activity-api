@@ -719,6 +719,7 @@ app.get('/', async (c) => {
       ? `
         id, execution_id, activity_id, variant_id, org_id, account_id,
         status, success, error, executed_at, duration_ms, cost_usd,
+        error_message, failed_task_id,
         parent_execution_id,
         vessel_id, vessel_version, tags,
         failure_mode.type AS failure_mode_type,
@@ -726,6 +727,7 @@ app.get('/', async (c) => {
       : `
         id, execution_id, activity_id, variant_id, org_id, account_id,
         status, success, error, executed_at, duration_ms, cost_usd,
+        error_message, failed_task_id,
         parent_execution_id, composition_chain,
         vessel_id, vessel_version,
         failure_mode, metadata, tags,
