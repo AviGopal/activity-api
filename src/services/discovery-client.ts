@@ -351,11 +351,15 @@ export class DiscoveryClient {
     }
 
     try {
-      const response = await this.retryRequest<any>(
+      // discovery-vessel /resolve expects a pointer envelope and wraps the
+      // payload in `content` — the bare { shape } body has returned HTTP 400
+      // ("Missing pointer or pointer.type") since the pointer contract landed.
+      const raw = await this.retryRequest<any>(
         'POST',
         '/resolve',
-        { shape }
+        { pointer: { type: 'vesselCapability', shape } }
       );
+      const response = raw?.content ?? raw;
 
       if (response.found && response.vessels && response.vessels.length > 0) {
         logger.debug('[Discovery] Found vessels for shape', {
