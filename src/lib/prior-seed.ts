@@ -91,7 +91,7 @@ export async function seedPriorFromConcepts(
 
   const K = parseInt(process.env.PRIOR_SEED_K ?? '5', 10);
   const kappa = parseFloat(process.env.PRIOR_SEED_KAPPA ?? '10');
-  const timeoutMs = parseInt(process.env.PRIOR_SEED_TIMEOUT_MS ?? '2500', 10);
+  const timeoutMs = parseInt(process.env.PRIOR_SEED_TIMEOUT_MS ?? '10000', 10);
 
   const query = signature ? `${templateId} ${signature}` : templateId;
 

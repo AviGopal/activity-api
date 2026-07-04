@@ -106,7 +106,7 @@ export const embeddingLookupCache = new EmbeddingLookupCache(
 export async function lookupEmbeddingForSignature(
   signature: string,
   orgId: string,
-  timeoutMs = parseInt(process.env.EMBEDDING_LOOKUP_TIMEOUT_MS ?? '2500', 10),
+  timeoutMs = parseInt(process.env.EMBEDDING_LOOKUP_TIMEOUT_MS ?? '10000', 10),
 ): Promise<number[] | null> {
   const cached = embeddingLookupCache.get(signature);
   if (cached !== undefined) return cached;
