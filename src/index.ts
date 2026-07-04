@@ -369,6 +369,7 @@ interface WebSocketData {
 // Start server with WebSocket support
 const server = Bun.serve<WebSocketData>({
   port,
+  idleTimeout: 60,
   fetch(req, server) {
     // Handle WebSocket upgrade for /ws endpoint
     const url = new URL(req.url);
