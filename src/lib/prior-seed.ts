@@ -29,6 +29,35 @@ export interface SeededPrior {
 
 const FALLBACK: SeededPrior = { alpha0: 1, beta0: 1, source: 'fallback' };
 
+// Concept-db endpoint resolution (discovery-first; env override wins).
+// Env-var endpoint gating is a defect class: vessel dependencies resolve via
+// the discovery registry. An explicit env override wins when set; else
+// resolve the vessel advertising shape "concept" via discovery (cached 60s);
+// only when BOTH are unavailable return null — and warn, never silently.
+let conceptDbUrlCache: { url: string | null; expiresAt: number } | null = null;
+const CONCEPT_DB_URL_TTL_MS = 60_000;
+
+export async function resolveConceptDbUrl(): Promise<string | null> {
+  const override = process.env['CONCEPT_DB_URL'];
+  if (override) return override;
+  const now = Date.now();
+  if (conceptDbUrlCache && conceptDbUrlCache.expiresAt > now) {
+    return conceptDbUrlCache.url;
+  }
+  const { discoveryClient } = await import('../services/discovery-client');
+  const { found, vessels } = await discoveryClient.discoverVesselsForShape('concept');
+  const endpoint =
+    found && vessels[0]?.endpoint ? vessels[0].endpoint.replace(/\/+$/, '') : null;
+  if (!endpoint) {
+    logger.warn('concept_db_unresolved', {
+      event: 'concept_db_unresolved',
+      reason: 'concept-db endpoint override unset and discovery returned no vessel for shape concept; prior seeding disabled until one resolves',
+    });
+  }
+  conceptDbUrlCache = { url: endpoint, expiresAt: now + CONCEPT_DB_URL_TTL_MS };
+  return endpoint;
+}
+
 interface ConceptHit {
   id?: string;
   relevance?: number;
@@ -57,7 +86,7 @@ export async function seedPriorFromConcepts(
     // else: fall through to concept-db path
   }
 
-  const url = process.env.CONCEPT_DB_URL;
+  const url = await resolveConceptDbUrl();
   if (!url) return FALLBACK;
 
   const K = parseInt(process.env.PRIOR_SEED_K ?? '5', 10);
