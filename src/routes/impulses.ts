@@ -2620,6 +2620,46 @@ router.post('/resolve', async (c) => {
       // goal_verification_labels via executeAsAuth with org_id scoping.
       // =============================================================================
 
+      case 'goal_verification_label': {
+        const authCheck = requireAuthenticated(c);
+        if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
+
+        const jwtAuth = getJwtAuthFromContext(c)!;
+        const gvlReadPointer = pointer as typeof pointer & {
+          limit?: number;
+          verdict?: string;
+          execution_id?: string;
+        };
+        const limit = Math.min(Math.max(gvlReadPointer.limit ?? 20, 1), 100);
+        const validVerdicts = ['achieved', 'not_achieved', 'partial'];
+        const hasVerdict = typeof gvlReadPointer.verdict === 'string' && validVerdicts.includes(gvlReadPointer.verdict);
+        const hasExecId = typeof gvlReadPointer.execution_id === 'string' && gvlReadPointer.execution_id.length > 0;
+
+        try {
+          let whereClause = '';
+          const bindings: Record<string, unknown> = { limit };
+          const conditions: string[] = [];
+          if (hasVerdict) { conditions.push('verdict = $verdict'); bindings.verdict = gvlReadPointer.verdict; }
+          if (hasExecId) { conditions.push('execution_id = $execution_id'); bindings.execution_id = gvlReadPointer.execution_id; }
+          if (conditions.length > 0) whereClause = 'WHERE ' + conditions.join(' AND ');
+
+          const sql = 'SELECT * FROM goal_verification_labels ' + whereClause + ' ORDER BY created_at DESC LIMIT $limit';
+          const rows = await executeAsAuth<any>(jwtAuth, sql, bindings);
+
+          return c.json({
+            success: true,
+            content: JSON.stringify(rows || []),
+            metadata: {
+              shape: 'goal_verification_label',
+              summary: 'returned ' + (rows || []).length + ' goal verification label(s)',
+            },
+          } as ImpulseResolveResponse, 200);
+        } catch (err: any) {
+          logger.error('goal_verification_label read failed', { error: err?.message });
+          return c.json({ success: false, error: err?.message || 'read failed' } as ImpulseResolveResponse, 500);
+        }
+      }
+
       case 'goal_verification_label_write': {
         const authCheck = requireAuthenticated(c);
         if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);

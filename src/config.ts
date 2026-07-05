@@ -221,7 +221,7 @@ export function loadConfig(): Config {
       // Entries must match case statements in src/routes/impulses.ts.
       // Do not advertise shapes that return 410 Gone or have no case.
       shapes: [
-        'activityExecutionTrace',
+        'activityExecutionTrace', 'goal_verification_label',
         'activityTemplate',
         'activityMetrics',
         'executionTraceList',
