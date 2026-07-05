@@ -89,18 +89,18 @@ class SurrealDBClient {
           database: config.surrealdb.database,
         });
 
-        this.db = new Surreal();
-        await this.db.connect(config.surrealdb.url);
+        const db = new Surreal();
+        await db.connect(config.surrealdb.url);
 
         // SurrealDB v3.0.0: Use namespace and database before signin
-        await this.db.use({
+        await db.use({
           namespace: config.surrealdb.namespace,
           database: config.surrealdb.database,
         });
 
         // Root user signin (after USE to establish context)
         if (config.surrealdb.authEnabled) {
-          await this.db.signin({
+          await db.signin({
             username: config.surrealdb.username,
             password: config.surrealdb.password,
           });
@@ -112,6 +112,7 @@ class SurrealDBClient {
         } else {
           logger.info('SurrealDB auth disabled, skipping signin');
         }
+        this.db = db;
 
         // Verify namespace access by attempting a simple query
         try {
