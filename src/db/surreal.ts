@@ -112,11 +112,12 @@ class SurrealDBClient {
         } else {
           logger.info('SurrealDB auth disabled, skipping signin');
         }
-        this.db = db;
-
-        // Verify namespace access by attempting a simple query
+        // Verify namespace access by attempting a simple query before
+        // exposing the connection — prevents TOCTOU where callers observe
+        // this.db while it is only partially initialised.
         try {
           await db.query('INFO FOR NS');
+          this.db = db;
           logger.info('Connected to SurrealDB successfully', {
             namespace: config.surrealdb.namespace,
             database: config.surrealdb.database,
