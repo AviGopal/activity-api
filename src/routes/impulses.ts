@@ -1144,7 +1144,7 @@ router.post('/resolve', async (c) => {
             duration_ms,
             cost_usd,
             executed_at
-          FROM execution
+          FROM activity_execution_traces
           ${whereClause}
           ORDER BY executed_at DESC
           LIMIT $limit
