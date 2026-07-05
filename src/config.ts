@@ -303,6 +303,7 @@ export function loadConfig(): Config {
         // route. Meta-activities reach this through the generic `impulse-resolve`
         // resolver in minibob — no source changes in the integrating vessel.
         'discoverByShapesQuery',
+        // goal_verification_label: read-side resolver added alongside the write side.
         'goal_verification_label',
         'goal_verification_label_write',
         // Semantic-context shapes (2026-05-01): permissive search over the
