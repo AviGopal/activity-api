@@ -878,9 +878,9 @@ export const ExecutedTaskSchema = z.object({
     filesModified: z.array(z.string()),
     filesCreated: z.array(z.string()),
     filesDeleted: z.array(z.string()),
-      // Material locators READ by this task (e.g. `file:<path>`), the consulted half of the attributed experience log for locality learning; additive + optional so legacy traces stay valid.
-      materialsConsulted: z.array(z.string()).optional(),
-    exitCode: z.number().optional(),
+        // Material locators READ by this task (e.g. file:<path>) — the consulted half of the attributed experience log for locality learning; optional so legacy traces stay valid.
+        materialsConsulted: z.array(z.string()).optional(),
+        exitCode: z.number().optional(),
     stderr: z.string().optional(),
   }).optional(),
   stateTransition: z.object({
