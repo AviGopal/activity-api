@@ -27,6 +27,7 @@ import connectionsRoutes from './routes/connections';
 import ribosomeRoutes from './routes/ribosome';
 import shapesRoutes from './routes/shapes';
 import clusterRoutes from './routes/cluster';
+import eventsRoutes from './routes/events';
 import tuningParamsRoutes from './routes/tuning-params';
 import { broadcaster } from './websocket/broadcaster';
 import type { ServerWebSocket } from 'bun';
@@ -220,6 +221,13 @@ app.route('/v2/impulses', impulsesRoutes);
 
 // Shape registry routes (POST /v2/shapes, GET /v2/shapes, GET /v2/shapes/:name, etc.)
 app.route('/v2/shapes', shapesRoutes);
+
+// Substrate event bus publish endpoint (POST /v2/events/publish). The router
+// existed in src/routes/events.ts since 2026-05-27 but was never mounted, so
+// every BusForwardingEventSink publish from goal-host and vessel-daemon 404'd
+// and all lifecycle bus events were dropped. Mounted 2026-07-05
+// (gap trace-persistence-loss-2026-07-05 investigation).
+app.route('/v2/events', eventsRoutes);
 
 // Hierarchical signature clustering status (D3.4) — GET /v2/cluster/status.
 // Auth: gated by the global /v2/* jwtAuthMiddleware above.
