@@ -847,6 +847,7 @@ export const ValidationResultsSchema = z.object({
 });
 
 export const ExecutedTaskSchema = z.object({
+  materialsConsulted: z.array(z.string()).optional(),
   id: z.string(),
   description: z.string(),
   actualPrompt: z.string(),
