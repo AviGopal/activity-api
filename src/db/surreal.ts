@@ -116,7 +116,7 @@ class SurrealDBClient {
 
         // Verify namespace access by attempting a simple query
         try {
-          await this.db.query('INFO FOR NS');
+          await db.query('INFO FOR NS');
           logger.info('Connected to SurrealDB successfully', {
             namespace: config.surrealdb.namespace,
             database: config.surrealdb.database,
@@ -124,12 +124,16 @@ class SurrealDBClient {
           });
         } catch (verifyError) {
           const err = verifyError as Error;
-          this.db = null;
           throw new Error(
             `Cannot access namespace '${config.surrealdb.namespace}': ${err.message}. ` +
             `Ensure the namespace exists and credentials have appropriate permissions.`
           );
         }
+
+        // Publish only after fully initialized: concurrent callers must
+        // never observe a half-built instance — the auth-loss reset in
+        // query() can null this.db while this closure is in flight.
+        this.db = db;
       } catch (error) {
         logger.error('Failed to connect to SurrealDB', { error });
         this.db = null;
