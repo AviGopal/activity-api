@@ -3147,6 +3147,18 @@ app.post('/', async (c) => {
     });
 
   } catch (error) {
+    // Idempotent duplicate delivery (2026-07-07): trace forwarding is
+    // at-least-once (TranslatingTraceSink spools + replays on lost responses),
+    // so a re-POST hitting the unique index idx_activity_executions_execution_id
+    // means the trace is already durably stored — success, not a 500. Returning
+    // 500 here put the sink into a permanent retry loop (43 already-delivered
+    // traces replayed 4,200+ times/day against the hub store).
+    const dupMsg = error instanceof Error ? error.message : String(error);
+    if (dupMsg.includes('already contains') && dupMsg.includes('execution_id')) {
+      logger.info('Duplicate trace delivery, already stored', { message: dupMsg.slice(0, 200) });
+      return c.json({ success: true, stored: false, duplicate: true }, 200);
+    }
+
     logger.error('Failed to store execution trace', {
       error: error instanceof Error ? error.message : String(error),
       stack: error instanceof Error ? error.stack : undefined,
