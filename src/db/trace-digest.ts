@@ -17,7 +17,7 @@ export interface TraceDigestRow {
 export async function upsertTraceDigest(row: TraceDigestRow): Promise<void> {
   try {
     const sql = `
-      UPSERT activity_execution_trace_digest CONTENT {
+      INSERT INTO activity_execution_trace_digest {
         execution_id: $execution_id,
         activity_template_id: $activity_template_id,
         status: $status,
@@ -28,7 +28,16 @@ export async function upsertTraceDigest(row: TraceDigestRow): Promise<void> {
         failure_mode_type: $failure_mode_type,
         org_id: $org_id,
         project_id: $project_id
-      } WHERE execution_id = $execution_id
+      } ON DUPLICATE KEY UPDATE
+        activity_template_id = $activity_template_id,
+        status = $status,
+        success = $success,
+        executed_at = $executed_at,
+        duration_ms = $duration_ms,
+        output_shapes = $output_shapes,
+        failure_mode_type = $failure_mode_type,
+        org_id = $org_id,
+        project_id = $project_id
     `;
     await surrealDB.query(sql, {
       execution_id: row.execution_id,
@@ -43,10 +52,7 @@ export async function upsertTraceDigest(row: TraceDigestRow): Promise<void> {
       project_id: row.project_id,
     });
   } catch (err) {
-    logger.warn('[trace-digest] upsertTraceDigest failed', {
-      execution_id: row.execution_id,
-      error: err instanceof Error ? err.message : String(err),
-    });
+    logger.warn('[trace-digest] upsertTraceDigest failed', { error: (err as Error).message });
   }
 }
 
