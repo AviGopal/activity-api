@@ -1451,7 +1451,7 @@ export async function updateShapeActivityScores(
           shape: $shape,
           activity_id: $activity_id,
           org_id: $org_id,
-          account_id: $account_id,
+          account_id: $account_id ?? NONE,
           account_id_version: $account_id_version,
           success_count: (
             SELECT VALUE success_count FROM ONLY impulse_shape_activity_score:[$org_id, $shape, $activity_id]
