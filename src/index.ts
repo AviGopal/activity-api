@@ -101,7 +101,9 @@ app.use('/v2/*', async (c, next) => {
 
 // Health check endpoint (no auth required)
 // Deep health check: verifies Redis and SurrealDB connectivity
+let healthCache: { at: number; body: any; code: number } | null = null;
 app.get('/health', async (c) => {
+  if (healthCache && Date.now() - healthCache.at < 10_000) { return c.json({ ...healthCache.body, cached: true }, healthCache.code as 200 | 503); }
   const healthStatus: any = {
     service: 'metabob-activity-api',
     version: packageJson.version,
@@ -192,7 +194,8 @@ app.get('/health', async (c) => {
 
   // Return 503 Service Unavailable if any critical dependency is unhealthy
   // Discovery is non-critical, so it won't affect health status
-  return c.json(healthStatus, allHealthy ? 200 : 503);
+  healthCache = { at: Date.now(), body: healthStatus, code: allHealthy ? 200 : 503 };
+  return c.json({ ...healthStatus, cached: false }, allHealthy ? 200 : 503);
 });
 
 // Phase 12: full pool stats. Unauthenticated (parallel to /health) so
