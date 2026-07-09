@@ -119,13 +119,20 @@ function policyFor(cfg: TraceRetentionConfig, activityId: string): StratumPolicy
 
 /** Reliable per-stratum count: GROUP ALL aggregate (not GROUP BY <field>). */
 async function countCold(activityId: string, status: string, coldCutoffIso: string): Promise<number> {
-  const rows = await surrealDB.query<{ count: number }>(
-    `SELECT count() FROM ${TABLE}
-       WHERE activity_id = $aid AND status = $st AND created_at < type::datetime($cut)
-       GROUP ALL`,
-    { aid: activityId, st: status, cut: coldCutoffIso },
-  );
-  return Array.isArray(rows) && rows.length > 0 ? Number(rows[0]?.count ?? 0) : 0;
+  try {
+    const rows = await surrealDB.query<{ count: number }>(
+      `SELECT count() FROM ${TABLE}
+         WHERE activity_id = $aid AND status = $st AND created_at < type::datetime($cut)
+         GROUP ALL`,
+      { aid: activityId, st: status, cut: coldCutoffIso },
+    );
+    return Array.isArray(rows) && rows.length > 0 ? Number(rows[0]?.count ?? 0) : 0;
+  } catch (err) {
+    logger.warn('[trace-retention] countCold failed; treating stratum as empty this cycle', {
+      activityId, status, error: err instanceof Error ? err.message : String(err),
+    });
+    return 0;
+  }
 }
 
 export interface StratumResult {
