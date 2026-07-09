@@ -79,6 +79,17 @@ export interface Config {
      *  keys present in `shapes` are honoured downstream. */
     shapeDescriptions?: Record<string, string>;
   };
+
+  // Trace-store retention/evolution config (self-managed DB reconciliation,
+  // openspec/changes/2026-07-08-substrate-self-managed-db-reconciliation).
+  // Governs when the trace-store health observer (development-vessel) flags
+  // activity_execution_traces for reconciliation, and the bounds the
+  // `db_admin reconcile_trace_store` swap operates within.
+  traceStore: {
+    cap: number;                // TRACE_STORE_CAP, default 50_000
+    hotWindowDays: number;      // TRACE_STORE_HOT_WINDOW_DAYS, default 14
+    reservoirPerActivity: number; // TRACE_STORE_RESERVOIR_PER_ACTIVITY, default 25
+  };
 }
 
 function parseEnvInt(key: string, defaultValue: number): number {
@@ -390,6 +401,12 @@ export function loadConfig(): Config {
         impulseRelevance:
           "Per-impulse relevance scores and failure counters learned from traces. Use for 'which impulses are most/least relevant' or impulse-quality report goals.",
       },
+    },
+
+    traceStore: {
+      cap: parseEnvInt('TRACE_STORE_CAP', 50_000),
+      hotWindowDays: parseEnvInt('TRACE_STORE_HOT_WINDOW_DAYS', 14),
+      reservoirPerActivity: parseEnvInt('TRACE_STORE_RESERVOIR_PER_ACTIVITY', 25),
     },
   };
 }

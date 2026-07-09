@@ -206,6 +206,49 @@ app.get('/v2/health/db-pool', async (c) => {
   }
 });
 
+// DB throughput/contention chokepoint instrumentation (see src/db/surreal.ts
+// DbStats). Read by development-vessel's db_contention_observer resolver.
+// Unauthenticated (parallel to /health and /v2/health/db-pool) so in-container
+// observers can scrape without minting credentials.
+//
+// Also surfaces `traceStore` (row_count / cap / last_reconciled_at) from the
+// single-row trace_store_counters:activity_execution_traces counter
+// (migration 156, openspec/changes/2026-07-08-substrate-self-managed-db-reconciliation)
+// — an O(1) read, NEVER a COUNT() over activity_execution_traces.
+app.get('/metrics/db', async (c) => {
+  try {
+    const { getDbStats, surrealDB } = await import('./db/surreal');
+    const { TRACE_STORE_COUNTER_ID } = await import('./lib/trace-store-counters');
+    const stats = getDbStats();
+
+    let traceStore: { row_count: number; cap: number; last_reconciled_at: string | null } = {
+      row_count: 0,
+      cap: config.traceStore.cap,
+      last_reconciled_at: null,
+    };
+    try {
+      const rows = await surrealDB.query<any>(`SELECT * FROM ${TRACE_STORE_COUNTER_ID}`);
+      const row = (Array.isArray(rows) ? rows : [])[0];
+      if (row) {
+        traceStore = {
+          row_count: typeof row.row_count === 'number' ? row.row_count : 0,
+          cap: typeof row.cap === 'number' ? row.cap : config.traceStore.cap,
+          last_reconciled_at: row.last_reconciled_at ?? null,
+        };
+      }
+    } catch (e) {
+      // Counters row is advisory metadata; never fail /metrics/db on it.
+      logger.warn('trace_store_counters read failed for /metrics/db', {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+
+    return c.json({ ...stats, traceStore });
+  } catch (e) {
+    return c.json({ error: 'db metrics unavailable', message: e instanceof Error ? e.message : String(e) }, 500);
+  }
+});
+
 // Authentication routes - DEPRECATED (vessel alignment 2026-04-02)
 // MiniBob auth moved to identity-vessel: POST https://identity.metabob.local/v1/auth/minibob/signin
 // This empty router is kept for documentation and to return 404 for legacy auth calls

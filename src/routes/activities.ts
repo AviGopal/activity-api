@@ -158,6 +158,7 @@ import {
 import { broadcaster } from '../websocket/broadcaster';
 import { autoCreateVariantIfNeeded, checkAndRetireTemplate } from '../services/variant-creator';
 import { applyOutcomeToPosteriors } from '../lib/posterior-update';
+import { incrementTraceStoreCounter } from '../lib/trace-store-counters';
 import { classifyTemplateTiers } from '../services/tier-classifier';
 import { lookupAssignment, readClusterPosterior } from '../lib/cluster-posterior';
 import { getTuningParam } from '../lib/tuning-params';
@@ -2501,6 +2502,10 @@ app.post('/executions', async (c) => {
     await surrealDB.query(insertExecutionQuery, executionRecord);
 
     logger.debug('Execution recorded in activity_execution_traces', { executionId });
+
+    // trace_store_counters bookkeeping (migration 156) — fire-and-forget,
+    // never blocks the trace insert's critical path.
+    void incrementTraceStoreCounter();
 
     // DUAL-WRITE: Also insert into new paradigm execution table (schema-paradigm-alignment)
     // v_activity_score view computes Thompson Sampling from execution table automatically

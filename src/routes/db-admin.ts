@@ -30,6 +30,7 @@
 
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
+import { resolveReconcileTraceStore } from './db-admin-reconcile';
 
 // ---------------------------------------------------------------------------
 // Whitelists
@@ -41,6 +42,7 @@ export const DB_ADMIN_OPERATIONS = [
   'apply_migration',
   'repair',
   'prune',
+  'reconcile_trace_store',
 ] as const;
 export type DbAdminOperation = (typeof DB_ADMIN_OPERATIONS)[number];
 
@@ -489,6 +491,10 @@ export async function resolveDbAdmin(pointer: any, actor: string | null): Promis
           metadata: { shape: 'db_admin_apply_migration', summary: `apply_migration ${pointer?.mode}: ${r.impact} affected` },
         },
       };
+    }
+
+    if (operation === 'reconcile_trace_store') {
+      return await resolveReconcileTraceStore(pointer, actor, { surrealDB, writeAudit });
     }
 
     // repair / prune — delegate to the repair module (commit #2). If absent,

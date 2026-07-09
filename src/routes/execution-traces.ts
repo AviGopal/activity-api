@@ -25,6 +25,7 @@ import {
 } from '../services/thompson-sampling';
 import { resolveLearningTrack, type LearningTrack } from '../lib/learning-track';
 import { incrementExemplarBurstCounter } from '../services/exemplar-selector';
+import { incrementTraceStoreCounter } from '../lib/trace-store-counters';
 import { applyOutcomeToPosteriors } from '../lib/posterior-update';
 import { updateSuccessorFeatures } from '../lib/successor-features';
 import { applyClusterPosterior } from '../lib/cluster-posterior';
@@ -2172,6 +2173,9 @@ app.post('/', async (c) => {
     });
     // Burst counter for adaptive exemplar selection
     void incrementExemplarBurstCounter(trace.activity_id as string).catch(() => {});
+    // trace_store_counters bookkeeping (migration 156) — O(1) row-count so the
+    // reconciliation observer never has to COUNT() the AET table itself.
+    void incrementTraceStoreCounter();
 
     // Backfill composition_chain on any already-inserted children of this
     // trace. Handles minibob's L1/L2 meta-trace write-order race where
