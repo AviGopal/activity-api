@@ -1,0 +1,1 @@
+DEFINE FIELD OVERWRITE last_inference_confidence ON TABLE goal_execution_paths TYPE option<number> PERMISSIONS FULL;

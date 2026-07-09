@@ -391,6 +391,7 @@ app.post('/', async (c) => {
           failed_executions = (failed_executions ?? 0) + $failure_delta,
           thompson_alpha = (thompson_alpha ?? 1) + $success_delta,
           thompson_beta = (thompson_beta ?? 1) + $failure_delta,
+          last_inference_confidence = $inference_confidence ?? last_inference_confidence,
           success_rate = ((successful_executions ?? 0) + $success_delta) / ((total_executions ?? 0) + 1),
           avg_duration_ms = (((avg_duration_ms ?? 0) * (total_executions ?? 0)) + $duration_ms) / ((total_executions ?? 0) + 1),
           avg_cost_usd = (((avg_cost_usd ?? 0) * (total_executions ?? 0)) + $cost_usd) / ((total_executions ?? 0) + 1),
@@ -414,6 +415,7 @@ app.post('/', async (c) => {
         duration_ms: validated.duration_ms,
         cost_usd: validated.cost_usd,
         token_usage: tokenUsage,
+        inference_confidence: validated.inference_confidence ?? null,
         endpoint_output_shapes: endpointOutputShapes,
       });
       
@@ -456,6 +458,7 @@ app.post('/', async (c) => {
           avg_duration_ms: $avg_duration_ms,
           avg_cost_usd: $avg_cost_usd,
           avg_token_usage: $avg_token_usage,
+          last_inference_confidence: $inference_confidence,
           typical_files_modified: $typical_files_modified,
           typical_tools_used: $typical_tools_used,
           last_executed_at: time::now(),
@@ -480,6 +483,7 @@ app.post('/', async (c) => {
         avg_duration_ms: validated.duration_ms,
         avg_cost_usd: validated.cost_usd,
         avg_token_usage: validated.token_usage || 0,
+        inference_confidence: validated.inference_confidence ?? null,
         typical_files_modified: validated.files_modified ?? undefined,
         typical_tools_used: validated.tools_used ?? undefined,
       });

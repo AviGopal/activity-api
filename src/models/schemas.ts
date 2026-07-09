@@ -722,6 +722,7 @@ export const PathRecordRequestSchema = z.object({
   duration_ms: z.number().int(),
   cost_usd: z.number(),
   token_usage: z.number().int().optional(),
+  inference_confidence: z.number().min(0).max(1).nullable().optional(),
   files_modified: z.array(z.string()).optional(),
   tools_used: z.array(z.string()).optional(),
   // Phase G2 (CC1 scope-narrowing, 2026-04-28): when this path is a child
