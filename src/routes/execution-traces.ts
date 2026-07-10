@@ -2053,6 +2053,10 @@ app.post('/', async (c) => {
     if ((trace as any).repair_signature) {
       optionalFields.push('repair_signature: $repair_signature');
     }
+    if (body.failure_mode) {
+      (trace as any).failure_mode = body.failure_mode;
+      optionalFields.push('failure_mode: $failure_mode');
+    }
     if (trace.metadata) optionalFields.push('metadata: $metadata');
     // Selection-to-execution correlation
     if ((trace as any).correlation_id) optionalFields.push('correlation_id: $correlation_id');
