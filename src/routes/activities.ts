@@ -1747,7 +1747,7 @@ app.get('/templates', async (c) => {
     let templates: ActivityTemplate[] = [];
     let cacheHit = false;
 
-    if (templateIdsSet.length > 0) {
+    if (templateIdsSet.length > 0 && templateIdsSet.length >= limit) {
       // CACHE HIT - Load templates from Redis
       logger.debug('Template list cache hit', { count: templateIdsSet.length });
       cacheHit = true;
