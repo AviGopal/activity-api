@@ -1114,12 +1114,10 @@ export async function queryActivitiesByFTS(
       .slice(0, 10);
     if (tokens.length === 0) tokens.push(ftsLiteral);
 
-    const tokenWhereParts = tokens.flatMap((tok, i) => [
-    "name @" + (2 * i) + "@ '" + tok + "'",
-    "tags @" + (2 * i + 1) + "@ '" + tok + "'"
-  ]);
-    let matchRef = 0;
-    const scoreTerms2 = tokens.flatMap((tok, i) => [`name @${matchRef++}@ '${tok}'`, `tags @${matchRef++}@ '${tok}'`]);
+    const tokenWhereParts = tokens.flatMap(tok => {
+      const lt = tok.toLowerCase().replace(/'/g, '');
+      return ["string::lowercase(name) CONTAINS '" + lt + "'", "tags CONTAINS '" + lt + "'"];
+    });
     whereClauses.push(`(${tokenWhereParts.join(' OR ')})`);
 
     // Multi-tenant filtering: include global scope OR org-specific activities.
@@ -1150,12 +1148,14 @@ export async function queryActivitiesByFTS(
     // name (2.0) > tags (1.5) > description substring (1.0).
     // SurrealDB 3.0.0 search::score(N) always returns 0.0 (known bug, fixed in
     // 3.0.5). Workaround: IF/THEN presence check assigns static field weights.
-    let scoreMatchRef = 0;
-    const scoreTerms = tokens.flatMap((tok, i) => [
-      `(IF name @${scoreMatchRef++}@ '${tok}' THEN 2.0 ELSE 0.0 END)`,
-      `(IF tags @${matchRef++}@ '${tok}' THEN 1.5 ELSE 0.0 END)`,
-      `(IF string::lowercase(description ?? '') CONTAINS '${tok.toLowerCase()}' THEN 1.0 ELSE 0.0 END)`,
-    ]);
+    const scoreTerms = tokens.flatMap(tok => {
+      const lt = tok.toLowerCase().replace(/'/g, '');
+      return [
+        "(IF string::lowercase(name) CONTAINS '" + lt + "' THEN 2.0 ELSE 0.0 END)",
+        "(IF tags CONTAINS '" + lt + "' THEN 1.5 ELSE 0.0 END)",
+        `(IF description CONTAINS '${lt}' THEN 0.5 ELSE 0.0 END)`,
+      ];
+    });
     const scoreExpr = scoreTerms.join(' + ');
 
     const query = `
