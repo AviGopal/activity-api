@@ -105,7 +105,7 @@ let healthCache: { at: number; body: any; code: number } | null = null;
 app.get('/health', async (c) => {
   if (healthCache && Date.now() - healthCache.at < 10_000) { return c.json({ ...healthCache.body, cached: true }, healthCache.code as 200 | 503); }
   const healthStatus: any = {
-    service: 'metabob-activity-api',
+    service: 'activity-api',
     version: packageJson.version,
     timestamp: new Date().toISOString(),
     checks: {
