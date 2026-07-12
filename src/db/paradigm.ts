@@ -1110,6 +1110,7 @@ export async function queryActivitiesByFTS(
       .split(/\s+/)
       .filter(t => t.length >= 3 && !FTS_STOP_WORDS.has(t.toLowerCase()))
       .sort((a, b) => b.length - a.length)
+      .filter((t, i, arr) => arr.findIndex(x => x.toLowerCase() === t.toLowerCase()) === i)
       .slice(0, 10);
     if (tokens.length === 0) tokens.push(ftsLiteral);
 
