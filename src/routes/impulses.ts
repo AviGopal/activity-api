@@ -43,6 +43,7 @@ import {
   validateDiscoverByShapesInput,
   type DiscoverByShapesMode,
 } from '../services/discover-by-shapes';
+
 import { z } from 'zod';
 
 const router = new Hono();
@@ -4782,11 +4783,18 @@ router.post('/resolve', async (c) => {
       }
 
       case 'compositionGraph': {
-        const { limit, since } = pointer as { type: string; limit?: number; since?: string };
-        const orgId: string = (c.get as (key: string) => string | undefined)('orgId') ?? (c.get as (key: string) => string | undefined)('org_id') ?? '';
-        const compositionGraphModule = await import('../services/composition-graph');
-        const getCompositionGraph = (compositionGraphModule as any).getCompositionGraph;
-        const graph = await getCompositionGraph({ orgId, limit, since });
+        const limit = (pointer as any).limit ?? 100;
+        const activityId = (pointer as any).activity_id as string | undefined;
+        let graphQuery = 'SELECT * FROM activity_composition_graph';
+        const graphParams: Record<string, unknown> = { limit };
+        if (activityId) {
+          graphQuery += ' WHERE activity_id = $activity_id';
+          graphParams['activity_id'] = activityId;
+        }
+        graphQuery += ' LIMIT $limit';
+        const graphResult = await surrealDB.query<Record<string, unknown>[]>(graphQuery, graphParams);
+        const edges = Array.isArray(graphResult[0]) ? graphResult[0] : (graphResult as unknown as Record<string, unknown>[]);
+        const graph = { edges, count: edges.length };
         return c.json({ shape: 'compositionGraph', ...graph });
       }
     default: {
