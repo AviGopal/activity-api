@@ -98,6 +98,38 @@ const REPAIR_PATTERNS: Record<string, RepairPattern> = {
     }),
   },
 
+  // A storage-level corrupt row (SurrealDB InternalError on ANY projection,
+  // even id-only) cannot be read, deprecated, or repaired through any impulse
+  // plane — the only recovery is a bounded range DELETE that never needs to
+  // serialize the row back to the client. The caller brackets the row with its
+  // readable neighbors' created_at values; the guard refuses windows wider
+  // than 24h and (via the standard dry-run count) surfaces the blast radius
+  // before apply.
+  delete_unreadable_row: {
+    describe: (p) => `DELETE ${p?.table} rows created in (${p?.created_after}, ${p?.created_before}) exclusive`,
+    validate: (p) => {
+      if (p?.table !== 'activity' && p?.table !== 'activity_template') {
+        return `delete_unreadable_row: table "${p?.table}" not supported (allowed: activity, activity_template)`;
+      }
+      if (typeof p?.created_after !== 'string' || typeof p?.created_before !== 'string') {
+        return 'delete_unreadable_row: created_after and created_before (ISO datetimes bracketing the corrupt row) are required';
+      }
+      const a = Date.parse(p.created_after);
+      const b = Date.parse(p.created_before);
+      if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a) return 'delete_unreadable_row: invalid created_after/created_before window';
+      if (b - a > 24 * 3600 * 1000) return 'delete_unreadable_row: window wider than 24h refused (bracket the row tighter)';
+      return null;
+    },
+    countSql: (p) => ({
+      sql: 'SELECT count() AS c FROM type::table($tb) WHERE created_at > <datetime>$after AND created_at < <datetime>$before GROUP ALL',
+      params: { tb: p.table, after: p.created_after, before: p.created_before },
+    }),
+    mutateSql: (p) => ({
+      sql: 'DELETE FROM type::table($tb) WHERE created_at > <datetime>$after AND created_at < <datetime>$before',
+      params: { tb: p.table, after: p.created_after, before: p.created_before },
+    }),
+  },
+
   // Doubled-prefix ids (`activity:⟨activity:⟨…⟩⟩`) are unreachable via
   // type::record() and pollute the registry. Delete them.
   delete_doubled_prefix_ids: {
