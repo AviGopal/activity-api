@@ -394,11 +394,14 @@ export async function writeImpulseRelevancePenalty(
   const uniqueIds = [...new Set(taskImpulseIds)];
   if (uniqueIds.length === 0) return 0;
 
-  // Fire-and-forget to the relevance-sink vessel — do not block the hot path
-  fetch(`${RELEVANCE_SINK_ENDPOINT}/penalty`, {
+  // Fire-and-forget shaped write — the penalty crosses as an impulse resolve
+  // (impulseRelevancePenalty_write) on the vessel's standard resolve surface,
+  // not a bespoke /penalty REST verb. Endpoint is bootstrap config; the SHAPE
+  // is what discovery routes and the learning loop can grade.
+  fetch(`${RELEVANCE_SINK_ENDPOINT}/v2/impulses/resolve`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ impulse_ids: uniqueIds, org_id: orgId }),
+    body: JSON.stringify({ impulse: { pointer: { type: "impulseRelevancePenalty_write", impulse_ids: uniqueIds, org_id: orgId } } }),
   }).catch(() => {
     // swallow errors; penalty writes are best-effort
   });
