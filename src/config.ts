@@ -373,6 +373,7 @@ export function loadConfig(): Config {
         'code_modification_proposal',
         'code_modification_proposal_write',
         'db_admin',
+        'compositionGraph',
       ],
       // RESOLVER-DESCRIPTION ADVERTISEMENT (2026-06-28). One concise line per
       // DATA/REPORT resolver: what it produces + when to use it. Written ONCE

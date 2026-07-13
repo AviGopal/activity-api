@@ -4781,7 +4781,15 @@ router.post('/resolve', async (c) => {
         return c.json(result.body as ImpulseResolveResponse, result.status as any);
       }
 
-      default: {
+      case 'compositionGraph': {
+        const { limit, since } = pointer as { type: string; limit?: number; since?: string };
+        const orgId: string = (c.get as (key: string) => string | undefined)('orgId') ?? (c.get as (key: string) => string | undefined)('org_id') ?? '';
+        const compositionGraphModule = await import('../services/composition-graph');
+        const getCompositionGraph = (compositionGraphModule as any).getCompositionGraph;
+        const graph = await getCompositionGraph({ orgId, limit, since });
+        return c.json({ shape: 'compositionGraph', ...graph });
+      }
+    default: {
         // Unknown shape - delegate to vessel discovery
         // This follows the "Resolvers live WHERE THE DATA IS" principle
         logger.info('Unknown impulse shape - routing to vessel discovery', {
