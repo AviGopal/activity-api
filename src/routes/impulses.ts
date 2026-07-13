@@ -14,6 +14,7 @@
 import { Hono } from 'hono';
 import { surrealDB, queryWithAuth, createAuthenticatedClient } from '../db/surreal';
 import { logger } from '../utils/logger';
+import { broadcaster } from '../websocket/broadcaster';
 import {
   ImpulseCreateRequestSchema,
   ImpulseResolveRequestSchema,
@@ -4796,6 +4797,17 @@ router.post('/resolve', async (c) => {
         const edges = Array.isArray(graphResult[0]) ? graphResult[0] : (graphResult as unknown as Record<string, unknown>[]);
         const graph = { edges, count: edges.length };
         return c.json({ shape: 'compositionGraph', ...graph });
+      }
+      case 'eventStream': {
+        // Poll floor of the shaped-stream design: batch-read the broadcaster's
+        // event buffer by sequence cursor. A future /substrate/stream/1.0.0
+        // session is the learned fast path over the same frames.
+        const sinceSeq = Number((pointer as any).since_seq ?? 0);
+        const typesRaw = (pointer as any).types;
+        const types = Array.isArray(typesRaw) ? typesRaw.map(String) : undefined;
+        const limit = Number((pointer as any).limit ?? 200);
+        const es = broadcaster.readSince(sinceSeq, types, limit);
+        return c.json({ success: true, shape: 'eventStream', body: es });
       }
     default: {
         // Unknown shape - delegate to vessel discovery

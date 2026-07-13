@@ -247,6 +247,9 @@ export function loadConfig(): Config {
         // Summary aggregates across variants; thompson_posterior is per-
         // variant precise). See docs/impulse-types/thompson_posterior.md.
         'thompson_posterior',
+        // Shaped-stream stage 1 (2026-07): poll-floor read over the WS
+        // broadcaster's sequence-numbered event buffer.
+        'eventStream',
         // Phase 10 P4.5 (2026-04-30): cached resolutions for previously
         // missing impulse shapes. Slot-binding consults this shape
         // before triggering create-shape-provider-goal escalation —

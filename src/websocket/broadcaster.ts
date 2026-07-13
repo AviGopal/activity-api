@@ -195,6 +195,20 @@ class WebSocketBroadcaster {
   }
 
   /**
+   * Poll-equivalent of the catchup protocol (shaped-stream design, stage 1):
+   * return buffered events with sequence > sinceSeq instead of sending them
+   * over a WebSocket. Serves the eventStream impulse shape — every stream
+   * must have a poll floor.
+   */
+  readSince(sinceSeq: number, types?: string[], limit = 200): { events: Array<{ seq: number; type: string; timestamp: string; data: unknown }>; latest_seq: number } {
+    const events = this.eventHistory
+      .filter((m) => (m.sequence ?? 0) > sinceSeq && (!types || types.length === 0 || types.includes(m.type)))
+      .slice(0, limit)
+      .map((m) => ({ seq: m.sequence ?? 0, type: m.type, timestamp: m.timestamp ?? '', data: m.data as unknown }));
+    return { events, latest_seq: this.eventSequence };
+  }
+
+  /**
    * Send catchup events to a client that reconnected
    * Returns events with sequence number > lastSeenSequence
    */
