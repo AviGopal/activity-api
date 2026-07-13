@@ -59,6 +59,11 @@ type RepairPattern = {
   validate: (p: any, ctx: Ctx) => string | null; // returns error or null
   countSql: (p: any) => { sql: string; params: Record<string, unknown> };
   mutateSql: (p: any) => { sql: string; params: Record<string, unknown> };
+  // ONLY for patterns whose target rows are unreadable by definition (storage-level
+  // corruption): the snapshot-before-destructive rail would always fail on them, so
+  // the pattern declares the exemption explicitly and the audit records it. The
+  // whole-DB logical export is the recovery path for this class.
+  backupExempt?: boolean;
 };
 
 const REPAIR_PATTERNS: Record<string, RepairPattern> = {
@@ -125,9 +130,10 @@ const REPAIR_PATTERNS: Record<string, RepairPattern> = {
       params: { tb: p.table, after: p.created_after, before: p.created_before },
     }),
     mutateSql: (p) => ({
-      sql: 'DELETE FROM type::table($tb) WHERE created_at > <datetime>$after AND created_at < <datetime>$before',
+      sql: 'DELETE type::table($tb) WHERE created_at > <datetime>$after AND created_at < <datetime>$before',
       params: { tb: p.table, after: p.created_after, before: p.created_before },
     }),
+    backupExempt: true,
   },
 
   // Doubled-prefix ids (`activity:⟨activity:⟨…⟩⟩`) are unreachable via
@@ -294,7 +300,8 @@ export async function resolveRepairOrPrune(
   // we can't restore. Soft-deprecate prune is reversible by design (un-deprecate) so it
   // is exempt. (2026-06-28)
   let backupPath: string | null = null;
-  if (mode === 'hard_delete' || (operation === 'repair' && /\b(DELETE|UPDATE)\b/i.test(mutate.sql))) {
+  const backupExempt = operation === 'repair' && (pattern as RepairPattern).backupExempt === true;
+  if (!backupExempt && (mode === 'hard_delete' || (operation === 'repair' && /\b(DELETE|UPDATE)\b/i.test(mutate.sql)))) {
     // Derive a SELECT for the same target rows from the DELETE/UPDATE predicate.
     const m = mutate.sql.match(/^\s*DELETE\s+(\S+)\s+WHERE\s+(.+)$/is)
       ?? mutate.sql.match(/^\s*UPDATE\s+(\S+)\s+SET\s+.+?\s+WHERE\s+(.+)$/is);
@@ -334,7 +341,7 @@ export async function resolveRepairOrPrune(
     applied: true,
     actor,
     impact_count: affected,
-    detail: { mode, before: affected, after: afterCount, description: base.description, backup_path: backupPath },
+    detail: { mode, before: affected, after: afterCount, description: base.description, backup_path: backupPath, ...(backupExempt ? { backup: 'exempt_unreadable_rows' } : {}) },
   });
 
   return ok(
