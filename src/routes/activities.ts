@@ -692,6 +692,67 @@ async function enrichTemplatesWithMetrics(
     return ensureOutputShapes(templates);
   }
 }
+// Explicit projection of the fields GET /v2/activities/templates actually
+// returns (the ActivityTemplate interface above). SELECT * additionally drags
+// legacy/experimental columns through the SDK deserializer, where a single
+// row with an unserializable value 500s the entire listing
+// (gap: templates-listing-poison-row-500).
+const TEMPLATE_LIST_FIELDS =
+  'id, name, description, tags, tag_prefixes, category, tasks, scope, org_id, project_id, input_shapes, output_shapes, execution_type, variant_of, created_at, updated_at';
+
+/**
+ * Run a template listing query with per-row poison tolerance.
+ *
+ * Fast path: one batch query with the explicit projection. If the batch
+ * still fails to deserialize (poison value inside a projected field), re-walk
+ * the same window row-by-row (LIMIT 1 at each absolute offset), skip only the
+ * rows that fail, and log each skipped row with its id so the poison row is
+ * identifiable instead of 500ing the whole listing.
+ */
+async function fetchTemplatesRowTolerant(
+  makeQuery: (fields: string) => string,
+  params: Record<string, any>,
+  run: (sql: string, params: Record<string, any>) => Promise<any[]>
+): Promise<ActivityTemplate[]> {
+  const query = makeQuery(TEMPLATE_LIST_FIELDS);
+  try {
+    return (await run(query, params)) as ActivityTemplate[];
+  } catch (batchErr: any) {
+    logger.warn('Template batch listing failed; retrying row-by-row (poison-row tolerance)', {
+      error: batchErr?.message,
+      errorName: batchErr?.constructor?.name,
+    });
+    const limit = Number(params.limit) || 0;
+    const baseOffset = Number(params.offset) || 0;
+    const rows: ActivityTemplate[] = [];
+    for (let i = 0; i < limit; i++) {
+      const rowParams = { ...params, limit: 1, offset: baseOffset + i };
+      try {
+        const row = await run(query, rowParams);
+        if (row.length === 0) break; // walked past the end of the visible set
+        rows.push(row[0] as ActivityTemplate);
+      } catch (rowErr: any) {
+        // Row fails even with the explicit projection — skip it, but fetch
+        // its id alone (ids always deserialize) so the poison row is named.
+        let poisonId: string | undefined;
+        try {
+          const idRow = await run(makeQuery('meta::id(id) AS id'), rowParams);
+          poisonId = idRow[0] ? String((idRow[0] as any).id) : undefined;
+        } catch {
+          /* id fetch failed too; the absolute offset is the only handle */
+        }
+        logger.error('Skipping undeserializable activity row in template listing', {
+          offset: baseOffset + i,
+          id: poisonId,
+          error: rowErr?.message,
+          errorName: rowErr?.constructor?.name,
+        });
+      }
+    }
+    return rows;
+  }
+}
+
 /**
  * Fetch all templates from SurrealDB with multi-tenant filtering
  *
@@ -712,7 +773,7 @@ async function listAllTemplatesFromDB(
   offset: number = 0, // Pagination offset (operator audit / shadow-template enumeration)
   accountId?: string | null // Prefer account_id, fall back to org_id
 ): Promise<ActivityTemplate[]> {
-  let query: string;
+  let makeQuery: (fields: string) => string;
   let params: Record<string, any>;
 
   // T8: Default to 'template' for backward compatibility
@@ -736,8 +797,8 @@ async function listAllTemplatesFromDB(
       }
     }
 
-    query = `
-      SELECT * FROM activity
+    makeQuery = (fields) => `
+      SELECT ${fields} FROM activity
       WHERE execution_type = $execution_type
       AND (retired = false OR retired IS NONE)
       ${whereClause ? 'AND ' + whereClause.replace('WHERE ', '') : ''}
@@ -746,7 +807,9 @@ async function listAllTemplatesFromDB(
     `;
 
     logger.debug('Fetching activities with JWT auth (RBAC enforced)', { limit, offset, scopeFilter, executionType: effectiveExecutionType });
-    const result = await queryWithAuth<ActivityTemplate>(jwtToken, query, params);
+    const result = await fetchTemplatesRowTolerant(makeQuery, params, (sql, p) =>
+      queryWithAuth<ActivityTemplate>(jwtToken, sql, p)
+    );
 
     logger.info('SurrealDB templates fetched (RBAC)', {
       count: result.length,
@@ -778,8 +841,8 @@ async function listAllTemplatesFromDB(
     const orgScope = `(scope = 'org' AND ${accountIdScopedWhere()})`;
     if (projectId) {
       // User has both org_id and project_id: return global + org + project activities
-      query = `
-        SELECT * FROM activity
+      makeQuery = (fields) => `
+        SELECT ${fields} FROM activity
         WHERE execution_type = $execution_type
         AND (retired = false OR retired IS NONE)
         AND (
@@ -793,8 +856,8 @@ async function listAllTemplatesFromDB(
       params = { limit, offset, org_id: orgId, account_id: accountId ?? null, project_id: projectId, execution_type: effectiveExecutionType };
     } else {
       // User has org_id but no project_id: return global + org activities
-      query = `
-        SELECT * FROM activity
+      makeQuery = (fields) => `
+        SELECT ${fields} FROM activity
         WHERE execution_type = $execution_type
         AND (retired = false OR retired IS NONE)
         AND (
@@ -809,8 +872,8 @@ async function listAllTemplatesFromDB(
     }
   } else {
     // No org_id: return only global activities
-    query = `
-      SELECT * FROM activity
+    makeQuery = (fields) => `
+      SELECT ${fields} FROM activity
       WHERE execution_type = $execution_type
       AND (retired = false OR retired IS NONE)
       AND (
@@ -823,8 +886,10 @@ async function listAllTemplatesFromDB(
     params = { limit, offset, execution_type: effectiveExecutionType };
   }
 
-  logger.debug('Fetching templates from SurrealDB', { query, params });
-  const result = await surrealDB.query<ActivityTemplate>(query, params);
+  logger.debug('Fetching templates from SurrealDB', { params });
+  const result = await fetchTemplatesRowTolerant(makeQuery, params, (sql, p) =>
+    surrealDB.query<ActivityTemplate>(sql, p)
+  );
 
   logger.info('SurrealDB templates fetched', {
     count: result.length,

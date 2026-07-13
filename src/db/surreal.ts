@@ -214,17 +214,43 @@ class SurrealDBClient {
         return await this.query<T>(sql, params, _isRetry, _conflictRetries + 1);
       }
 
+      // SDK errors (notably response-deserialization failures) can carry an
+      // empty .message — preserve the constructor name, cause, and a
+      // stringified payload snippet so an empty .message never leaves
+      // "Query failed in ns.db: " as the only diagnostic.
+      const errName =
+        err?.constructor?.name && err.constructor.name !== 'Error'
+          ? err.constructor.name
+          : err?.name && err.name !== 'Error'
+            ? err.name
+            : '';
+      let detail = err?.message ?? '';
+      if (!detail) {
+        try {
+          detail = JSON.stringify(error)?.slice(0, 300) ?? '';
+        } catch {
+          /* non-serializable payload; fall through to String() */
+        }
+        if (!detail || detail === '{}') detail = String(error).slice(0, 300);
+      }
+      const cause = (error as { cause?: unknown })?.cause;
+      const causeStr = cause ? ` (cause: ${String(cause).slice(0, 200)})` : '';
+
       logger.error('SurrealDB query failed', {
         sql,
         params,
         namespace: config.surrealdb.namespace,
         database: config.surrealdb.database,
-        error: err.message
+        error: err.message,
+        errorName: errName || undefined,
+        errorDetail: detail !== err.message ? detail : undefined,
+        cause: causeStr || undefined,
       });
 
       // Enrich error with namespace context
       throw new Error(
-        `Query failed in ${config.surrealdb.namespace}.${config.surrealdb.database}: ${err.message}`
+        `Query failed in ${config.surrealdb.namespace}.${config.surrealdb.database}: ${errName ? `${errName}: ` : ''}${detail}${causeStr}`,
+        { cause: error }
       );
     }
   }
