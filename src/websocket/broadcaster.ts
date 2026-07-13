@@ -77,7 +77,9 @@ class WebSocketBroadcaster {
       message.type === 'task.started' ||
       message.type === 'task.completed' ||
       message.type === 'tool.call' ||
-      message.type === 'impulse.resolved'
+      message.type === 'impulse.resolved' ||
+      message.type === 'execution_started' ||
+      message.type === 'execution_completed'
     ) {
       message.sequence = ++this.eventSequence;
 
