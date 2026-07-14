@@ -2508,6 +2508,18 @@ router.post('/resolve', async (c) => {
         if (!writePointer.templateData) {
           return c.json({ success: false, error: 'templateData required for activityTemplate_write' } as ImpulseResolveResponse, 400);
         }
+        // LLM-synthesized proposals (ribosome-extract on fallback models)
+        // recurrently omit `description` despite the prompt stating the
+        // contract; a missing human blurb is not worth losing a learned
+        // template over. Default it deterministically from name/id.
+        if (
+          typeof writePointer.templateData === 'object' &&
+          writePointer.templateData !== null &&
+          typeof (writePointer.templateData as Record<string, unknown>).description !== 'string'
+        ) {
+          const td = writePointer.templateData as Record<string, unknown>;
+          td.description = `${typeof td.name === 'string' ? td.name : String(td.id ?? 'learned template')} (description defaulted at write; synthesized proposal omitted it)`;
+        }
         const delegated = await delegateWriteToRouter(c, activitiesRouter, '/templates', writePointer.templateData);
         return c.json(buildWriteResolverResponse('activityTemplate_write', delegated, 'template proposed') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
       }
