@@ -707,6 +707,7 @@ import('./jobs/signature-cluster-tick').then(({ runSignatureClusterTick }) => {
   }, SIGNATURE_CLUSTER_INTERVAL_MS);
 }).catch(err => {
   logger.error('[Cluster] Failed to load signature-cluster-tick job', { error: String(err) });
+});
 
 import('./jobs/trace-replication-tick').then(({ runTraceReplicationTick }) => {
   // Intra-identity-group pull replication: converge `execution` across peers.
@@ -725,7 +726,6 @@ import('./jobs/trace-replication-tick').then(({ runTraceReplicationTick }) => {
   }, intervalMs);
 }).catch(err => {
   logger.error('[Replication] Failed to load trace-replication-tick job', { error: String(err) });
-});
 });
 
 // ============================================================================

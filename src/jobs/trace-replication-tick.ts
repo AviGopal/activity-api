@@ -213,19 +213,21 @@ export async function runTraceReplicationTick(): Promise<void> {
         Array.isArray(v.libp2p_multiaddr) &&
         v.libp2p_multiaddr.length > 0,
     );
+    logger.info('[Replication] tick: discovered peers', {
+      total: vessels.length,
+      libp2pPeers: peers.length,
+      self: selfId,
+    });
     if (peers.length === 0) {
-      logger.debug('[Replication] no libp2p peers to pull from');
       return;
     }
     for (const peer of peers) {
       const { pulled, stored } = await pullFromPeer(peer);
-      if (pulled > 0) {
-        logger.info('[Replication] pulled from peer', {
-          peer: peer.vesselId,
-          pulled,
-          stored,
-        });
-      }
+      logger.info('[Replication] peer pull result', {
+        peer: peer.vesselId,
+        pulled,
+        stored,
+      });
     }
   } catch (err) {
     logger.warn('[Replication] tick failed (non-blocking)', {
