@@ -71,7 +71,7 @@ async function buildSignatureShapeMap(traceLimit: number): Promise<Map<string, s
     executed_at?: string;
   }>(
     `
-    SELECT input_impulse_shapes, executed_at FROM activity_execution_traces
+    SELECT input_impulse_shapes, executed_at FROM v_paradigm_execution_traces
     WHERE input_impulse_shapes IS NOT NONE
       AND array::len(input_impulse_shapes) > 0
     ORDER BY executed_at DESC

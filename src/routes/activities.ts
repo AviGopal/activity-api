@@ -3181,7 +3181,7 @@ app.get('/metrics/trend', async (c) => {
         count(IF success = true THEN 1 ELSE NONE END) AS success_count,
         count(IF success = false THEN 1 ELSE NONE END) AS failure_count,
         math::sum(cost_usd) AS total_cost
-      FROM activity_execution_traces
+      FROM v_paradigm_execution_traces
       WHERE created_at > time::now() - duration::from::days($days)
       GROUP BY time::format(created_at, '%Y-%m-%d')
       ORDER BY date ASC
@@ -3249,7 +3249,7 @@ app.get('/metrics/summary', async (c) => {
         math::mean(IF success = true THEN 1.0 ELSE 0.0 END) AS success_rate,
         math::mean(duration_ms) AS avg_duration,
         math::sum(cost_usd) AS total_cost
-      FROM activity_execution_traces
+      FROM v_paradigm_execution_traces
       GROUP ALL
     `);
 
@@ -3320,7 +3320,7 @@ app.get('/metrics', async (c) => {
         math::mean(IF success = true THEN 1.0 ELSE 0.0 END) AS success_rate,
         math::mean(duration_ms) AS avg_duration_ms,
         math::mean(cost_usd) AS avg_cost_usd
-      FROM activity_execution_traces
+      FROM v_paradigm_execution_traces
       WHERE activity_id = $activity_id
       GROUP ALL
     `, { activity_id: activityId });
@@ -3885,7 +3885,7 @@ app.post('/templates/auto-promote', async (c) => {
         `SELECT activity_id,
                 count() AS total,
                 count(status = 'success' OR status = 'completed' OR success = true) AS succ
-           FROM activity_execution_traces
+           FROM v_paradigm_execution_traces
           GROUP BY activity_id`,
       )) || [];
       for (const r of (Array.isArray(traceRows) ? traceRows : [])) {
@@ -4807,7 +4807,7 @@ app.get('/templates/:templateId/metrics', async (c) => {
         math::mean(cost_usd) AS avg_cost_usd,
         math::sum(cost_usd) AS total_cost_usd,
         time::max(executed_at) AS last_executed_at
-      FROM activity_execution_traces
+      FROM v_paradigm_execution_traces
       WHERE activity_id = $template_id
       GROUP ALL
     `, { template_id: templateId });
@@ -4829,7 +4829,7 @@ app.get('/templates/:templateId/metrics', async (c) => {
         time::format(executed_at, '%Y-%m-%d') AS date,
         count() AS count,
         count(IF success = true THEN 1 ELSE NONE END) AS success_count
-      FROM activity_execution_traces
+      FROM v_paradigm_execution_traces
       WHERE activity_id = $template_id
       GROUP BY time::format(executed_at, '%Y-%m-%d')
       ORDER BY date DESC
@@ -4907,7 +4907,7 @@ app.get('/metrics/aggregate', async (c) => {
         count(IF success = false THEN 1 ELSE NONE END) AS failed_executions,
         math::mean(IF success = true THEN 1.0 ELSE 0.0 END) AS overall_success_rate,
         math::sum(cost_usd) AS total_cost_usd
-      FROM activity_execution_traces
+      FROM v_paradigm_execution_traces
       GROUP ALL
     `);
 
@@ -4932,7 +4932,7 @@ app.get('/metrics/aggregate', async (c) => {
     // first (one row per distinct id), then count the rows.
     const executedTemplatesResult = await surrealDB.query(`
       SELECT count() AS executed_count FROM (
-        SELECT activity_id FROM activity_execution_traces GROUP BY activity_id
+        SELECT activity_id FROM v_paradigm_execution_traces GROUP BY activity_id
       ) GROUP ALL
     `);
     const templatesExecuted = ((executedTemplatesResult[0] as any)?.executed_count) || 0;
@@ -4944,7 +4944,7 @@ app.get('/metrics/aggregate', async (c) => {
         activity_id AS template_id,
         count() AS execution_count,
         math::mean(IF success = true THEN 1.0 ELSE 0.0 END) AS success_rate
-      FROM activity_execution_traces
+      FROM v_paradigm_execution_traces
       GROUP BY activity_id
       ORDER BY execution_count DESC
       LIMIT 10
@@ -4958,7 +4958,7 @@ app.get('/metrics/aggregate', async (c) => {
           activity_id AS template_id,
           math::mean(IF success = true THEN 1.0 ELSE 0.0 END) AS success_rate,
           count() AS execution_count
-        FROM activity_execution_traces
+        FROM v_paradigm_execution_traces
         GROUP BY activity_id
       ) WHERE execution_count >= 3
       ORDER BY success_rate DESC, execution_count DESC

@@ -34,7 +34,7 @@ export async function computeVesselProductionSuccessRate(
     SELECT
       success,
       failure_mode.type AS failure_type
-    FROM activity_execution_traces
+    FROM v_paradigm_execution_traces
     WHERE (
         vessel_id = $vessel_id
         OR composition_chain CONTAINS $vessel_id

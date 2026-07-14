@@ -541,7 +541,7 @@ app.post('/extract', async (c) => {
     });
 
     const query = `
-      SELECT * FROM activity_execution_traces
+      SELECT * FROM v_paradigm_execution_traces
       WHERE execution_id IN [${placeholders}]
       ORDER BY executed_at ASC
     `;
@@ -709,7 +709,7 @@ app.get('/candidates', async (c) => {
         count() as execution_count,
         math::sum(IF success THEN 1 ELSE 0 END) as success_count,
         array::group(execution_id) as execution_ids
-      FROM activity_execution_traces
+      FROM v_paradigm_execution_traces
       GROUP BY activity_id
       ORDER BY success_count DESC
     `;

@@ -965,7 +965,7 @@ router.post('/resolve', async (c) => {
             ? pointer.executionId.slice('execution:'.length)
             : pointer.executionId;
           const legacyQuery = `
-            SELECT * FROM activity_execution_traces
+            SELECT * FROM v_paradigm_execution_traces
             WHERE (execution_id = $execution_id OR execution_id = $bare_execution_id)
             AND ${accountIdScopedWhere()}
             LIMIT 1
@@ -1147,7 +1147,7 @@ router.post('/resolve', async (c) => {
             duration_ms,
             cost_usd,
             executed_at
-          FROM activity_execution_traces
+          FROM v_paradigm_execution_traces
           ${whereClause}
           ORDER BY executed_at DESC
           LIMIT $limit
@@ -1951,7 +1951,7 @@ router.post('/resolve', async (c) => {
         const tracesQuery = `
           SELECT execution_id, variant_id, status, duration_ms, cost_usd,
                  error_message, failed_task_id, execution_trace, created_at
-          FROM activity_execution_traces
+          FROM v_paradigm_execution_traces
           ${whereClause}
           ORDER BY created_at DESC
           LIMIT $limit
@@ -3913,7 +3913,7 @@ router.post('/resolve', async (c) => {
               execution_id, activity_id, success, duration_ms, cost_usd,
               metadata, executed_at,
               tasks
-            FROM activity_execution_traces
+            FROM v_paradigm_execution_traces
             WHERE ${whereClauses.join(' AND ')}
             ORDER BY executed_at DESC
             LIMIT $limit

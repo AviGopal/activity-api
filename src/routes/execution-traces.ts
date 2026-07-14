@@ -736,7 +736,7 @@ app.get('/', async (c) => {
         (metadata.task_count ?? 0) AS task_count`;
     const query = `
       SELECT${selectFields}
-      FROM activity_execution_traces
+      FROM v_paradigm_execution_traces
       ${whereClause}
       ORDER BY executed_at DESC
       LIMIT $limit
@@ -1062,7 +1062,7 @@ app.get('/:executionId', async (c) => {
 
     // Fetch execution trace
     const traceQuery = `
-      SELECT * FROM activity_execution_traces
+      SELECT * FROM v_paradigm_execution_traces
       WHERE execution_id = $execution_id
       LIMIT 1
     `;

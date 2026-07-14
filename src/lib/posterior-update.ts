@@ -584,7 +584,7 @@ export async function propagateCreditAlongChain(
     // EXPLAIN-verified 2026-06-21). The $ids come from THIS execution's own
     // composition_chain, so they are already org-scoped by provenance.
     const rows = await db.query<{ execution_id: string; variant_id: string }>(
-      `SELECT execution_id, variant_id FROM activity_execution_traces
+      `SELECT execution_id, variant_id FROM v_paradigm_execution_traces
        WHERE execution_id IN $ids`,
       { ids: limited },
     );

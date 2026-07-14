@@ -146,7 +146,7 @@ export async function runTraceAggregateReport(
   // count is bounded (≤ a few hundred distinct templates) so this is cheap. (2026-06-27)
   const sql = `
     SELECT ${groupBy}, ${valueExpr}
-    FROM activity_execution_traces
+    FROM v_paradigm_execution_traces
     WHERE ${where.join(' AND ')}
     GROUP BY ${groupBy}
   `;

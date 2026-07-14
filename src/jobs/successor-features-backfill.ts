@@ -18,7 +18,7 @@ export async function runSuccessorFeaturesBackfill(
   const covered = new Set<string>(coveredRows.flat().map((r) => r.template_id));
 
   const tracedRows: { variant_id: string }[][] = await surrealDB.query(
-    'SELECT variant_id FROM activity_execution_traces WHERE signature != NONE GROUP BY variant_id',
+    'SELECT variant_id FROM v_paradigm_execution_traces WHERE signature != NONE GROUP BY variant_id',
   );
   const traced = new Set<string>(
     tracedRows.flat().map((r) => String(r.variant_id ?? '').replace(/^activity:/, '').replace(/[⟨⟩]/g, '')),
@@ -37,7 +37,7 @@ export async function runSuccessorFeaturesBackfill(
     try {
       const traceRows: { signature: any; output_impulse_shapes: any; org_id: string }[][] =
         await surrealDB.query(
-          'SELECT signature, output_impulse_shapes, org_id, created_at FROM activity_execution_traces WHERE (variant_id = $id OR variant_id = $prefixed) AND signature != NONE ORDER BY created_at DESC LIMIT 5',
+          'SELECT signature, output_impulse_shapes, org_id, created_at FROM v_paradigm_execution_traces WHERE (variant_id = $id OR variant_id = $prefixed) AND signature != NONE ORDER BY created_at DESC LIMIT 5',
           { id, prefixed: 'activity:' + id },
         );
       const traces: { signature: any; output_impulse_shapes: any; org_id: string }[] =
