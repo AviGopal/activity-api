@@ -33,11 +33,11 @@ const SELF_ORIGIN =
   process.env.FED_SUBSTRATE_ID || process.env.SUBSTRATE_ID || '';
 const PULL_LIMIT = Math.max(
   1,
-  Math.min(2000, Number(process.env.REPLICATION_PULL_LIMIT || 500)),
+  Math.min(2000, Number(process.env.REPLICATION_PULL_LIMIT || 200)),
 );
 const MAX_BATCHES_PER_PEER = Math.max(
   1,
-  Number(process.env.REPLICATION_MAX_BATCHES || 20),
+  Number(process.env.REPLICATION_MAX_BATCHES || 5),
 );
 const LOOKBACK_MS = 24 * 60 * 60 * 1000;
 
@@ -214,6 +214,10 @@ async function pullFromPeer(peer: PeerVessel): Promise<{ pulled: number; stored:
     // tick) or if we could not advance at all (avoid a hot loop on a stuck row).
     if (brokeOnFailure || !advanced) break;
     if (rows.length < PULL_LIMIT) break; // drained this peer for now
+
+    // Yield briefly between batches so the historical drain does not starve
+    // live trace ingest on the shared SurrealDB.
+    await new Promise((r) => setTimeout(r, 250));
   }
 
   return { pulled: pulledTotal, stored: storedTotal };
