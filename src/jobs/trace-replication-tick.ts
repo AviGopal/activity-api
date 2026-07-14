@@ -185,25 +185,34 @@ async function pullFromPeer(peer: PeerVessel): Promise<{ pulled: number; stored:
 
     if (!Array.isArray(rows) || rows.length === 0) break;
 
-    let maxTs = since;
+    // Rows come back ORDER BY executed_at ASC. Advance the watermark ONLY over
+    // the contiguous prefix of successfully-stored rows: if a row fails to store
+    // (transient DB error, contention), stop advancing so it is re-pulled next
+    // tick rather than silently skipped. Advancing on *pulled* (not *stored*)
+    // rows would permanently drop any row whose UPSERT failed.
+    let contiguousTs = since;
+    let brokeOnFailure = false;
     for (const row of rows) {
       const ok = await upsertRow(row);
-      if (ok) storedTotal++;
+      if (!ok) {
+        brokeOnFailure = true;
+        break;
+      }
+      storedTotal++;
       const ts = row.executed_at;
-      if (typeof ts === 'string' && ts > maxTs) maxTs = ts;
+      if (typeof ts === 'string' && ts > contiguousTs) contiguousTs = ts;
     }
     pulledTotal += rows.length;
 
-    // Advance the watermark strictly so we make progress even within a tick.
-    if (maxTs > since) {
-      since = maxTs;
+    const advanced = contiguousTs > since;
+    if (advanced) {
+      since = contiguousTs;
       await setWatermark(peer.vesselId, since);
-    } else {
-      // No forward progress (all rows share the boundary ts) — stop to avoid a
-      // hot loop; next tick resumes from here.
-      break;
     }
 
+    // Stop this peer's loop if a row failed (re-pull from the watermark next
+    // tick) or if we could not advance at all (avoid a hot loop on a stuck row).
+    if (brokeOnFailure || !advanced) break;
     if (rows.length < PULL_LIMIT) break; // drained this peer for now
   }
 
