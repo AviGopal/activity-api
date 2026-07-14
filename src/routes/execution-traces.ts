@@ -2435,6 +2435,26 @@ app.post('/', async (c) => {
         project_id: typeof trace.project_id === 'string' ? trace.project_id : undefined,
         vessel_id: body.vessel_id || body.pod_name,
         vessel_version: body.vessel_version,
+        // Lossless mirror of AET learning fields so `execution` carries what
+        // readers need (migration 157), + cross-instance replication provenance.
+        variant_id: trace.variant_id,
+        status: trace.status,
+        signature: (trace as any).signature,
+        signature_version: (trace as any).signature_version,
+        repair_signature: (trace as any).repair_signature,
+        failure_mode: (trace as any).failure_mode ?? body.failure_mode,
+        correlation_id: (trace as any).correlation_id,
+        component_changes: trace.component_changes,
+        improvisation: trace.improvisation,
+        input_impulse_shapes: trace.input_impulse_shapes,
+        output_impulse_shapes: trace.output_impulse_shapes,
+        metadata: trace.metadata,
+        tags: (trace as any).tags,
+        account_id: (trace as any).account_id,
+        account_id_version: (trace as any).account_id_version,
+        origin_substrate_id: process.env.FED_SUBSTRATE_ID || process.env.SUBSTRATE_ID || undefined,
+        origin_instance: process.env.ACTIVITY_API_INSTANCE_ID || process.env.VESSEL_ID || undefined,
+        version: 0,
       };
 
       // Dual-write STAYS enabled, but detached from the response hot path so the

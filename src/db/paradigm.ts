@@ -180,6 +180,27 @@ export interface ParadigmExecution {
   vessel_version?: string;
   resolved_by_vessel_id?: string;
   resolver_tier?: string;
+  // Learning fields mirrored from activity_execution_traces so the `execution`
+  // dual-write is lossless (migration 157) — prerequisite for repointing readers.
+  variant_id?: string;
+  status?: string;
+  signature?: string;
+  signature_version?: number;
+  repair_signature?: string;
+  failure_mode?: Record<string, any>;
+  correlation_id?: string;
+  component_changes?: string[];
+  improvisation?: boolean;
+  input_impulse_shapes?: string[];
+  output_impulse_shapes?: string[];
+  metadata?: Record<string, any>;
+  tags?: string[];
+  account_id?: string;
+  account_id_version?: number;
+  // Cross-instance replication provenance (intra-identity-group trace sync).
+  origin_substrate_id?: string;
+  origin_instance?: string;
+  version?: number;
   executed_at: string;
   created_at: string;
 }
@@ -332,6 +353,13 @@ export async function insertExecution(
     // Resolver tracking fields (Migration 067)
     if (execution.resolved_by_vessel_id) record.resolved_by_vessel_id = execution.resolved_by_vessel_id;
     if (execution.resolver_tier) record.resolver_tier = execution.resolver_tier;
+    // Lossless passthrough of AET learning fields + replication provenance
+    // (migration 157) so `execution` can become authoritative without dropping
+    // reader-critical columns.
+    for (const k of ['variant_id','status','signature','signature_version','repair_signature','failure_mode','correlation_id','component_changes','improvisation','input_impulse_shapes','output_impulse_shapes','metadata','tags','account_id','account_id_version','origin_substrate_id','origin_instance','version'] as const) {
+      const v = (execution as any)[k];
+      if (v !== undefined && v !== null) record[k] = v;
+    }
 
     // Learning-track routing: 'system' traces go to execution_system_traces
     // and are excluded from Thompson posterior updates.  Any error falls through.
