@@ -412,18 +412,16 @@ export async function insertExecution(
       .map(k => `${k}: $${k}`)
       .join(',\n        ');
 
-    // For org_id: use $token.org_id — DEFINE ACCESS TYPE JWT populates $token,
-    // not $auth. $auth is only populated for DEFINE ACCESS TYPE RECORD users.
-    const orgIdClause = jwtToken
-      ? `,\n        org_id: <string>$token.org_id`
-      : (execution.org_id ? `,\n        org_id: $org_id` : '');
-    if (!jwtToken && execution.org_id) record.org_id = execution.org_id;
-
-    // For project_id: optional; only include when not relying on token context
-    const projectIdClause = jwtToken
-      ? ''
-      : (execution.project_id ? `,\n        project_id: $project_id` : '');
-    if (!jwtToken && execution.project_id) record.project_id = execution.project_id;
+    // ROOT path (matches AET, trace_digest, trace_content, system_trace): the
+    // execution FOR create guard evaluates $auth.org_id, which a JWT session
+    // does NOT populate ($token only) — so queryWithAuth silently DROPPED the
+    // row (PERMISSIONS false, no error, empty result), freezing the execution
+    // table (~5.5h stale, count static). Write via root with org_id carried
+    // from the trace; root bypasses table PERMISSIONS so the row persists.
+    const orgIdClause = execution.org_id ? `,\n        org_id: $org_id` : '';
+    if (execution.org_id) record.org_id = execution.org_id;
+    const projectIdClause = execution.project_id ? `,\n        project_id: $project_id` : '';
+    if (execution.project_id) record.project_id = execution.project_id;
 
     const query = `
       INSERT INTO execution {
@@ -439,9 +437,23 @@ export async function insertExecution(
       query: query.substring(0, 200),
     });
 
-    const result = jwtToken
-      ? await queryWithAuth<ParadigmExecution>(jwtToken, query, record)
-      : await surrealDB.query<ParadigmExecution>(query, record);
+    // Always root (see orgIdClause note): the JWT path silently drops the row.
+    const result = await surrealDB.query<ParadigmExecution>(query, record);
+
+    // Verify-after-insert (loud): a silent PERMISSIONS/type drop returns an
+    // empty result with no throw — treat that as a real failure so the
+    // execution table can never silently freeze again.
+    const inserted = Array.isArray(result)
+      ? (Array.isArray((result as any)[0]) ? (result as any)[0][0] : (result as any)[0])
+      : null;
+    if (!inserted) {
+      logger.error('[paradigm] Execution insert produced NO row (silent drop) — execution table not persisting', {
+        id: execution.id,
+        activity_id: execution.activity_id,
+        org_id: record.org_id,
+      });
+      return null;
+    }
 
     logger.info('[paradigm] Execution inserted into new schema', {
       id: execution.id,
