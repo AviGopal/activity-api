@@ -2127,7 +2127,7 @@ app.post('/', async (c) => {
     // reach this point; the root path is safe and matches how the existing
     // 19K rows were inserted (migration 121 repairs the schema PERMISSIONS
     // to also accept $token.org_id so future authenticated SELECTs work).
-    const result = await surrealDB.query(query, trace);
+    let result = await surrealDB.query(query, trace);
 
     // Verify INSERT succeeded.
     //
@@ -2140,15 +2140,13 @@ app.post('/', async (c) => {
     // real failure. Treat null/undefined as failure (driver-level
     // breakage); empty array is success.
     if (result === null || result === undefined) {
-      logger.error('INSERT returned null/undefined', {
+      // WRITE-FLIP: activity_execution_traces is now the non-authoritative
+      // DUAL_WRITE shadow — a null/failed AET write is logged, never fatal. The
+      // authoritative `execution` write below decides request success.
+      logger.warn('[aet-shadow] AET INSERT returned null/undefined (non-fatal)', {
         execution_id: trace.execution_id,
-        query_result: result,
       });
-      return c.json({
-        success: false,
-        error: 'Failed to insert execution trace - driver returned null',
-        execution_id: trace.execution_id,
-      }, 500);
+      result = [];
     }
     if (result.length === 0) {
       logger.debug('INSERT succeeded but RETURN was filtered (likely PERMISSIONS)', {
@@ -2459,28 +2457,29 @@ app.post('/', async (c) => {
 
       // Dual-write STAYS enabled, but detached from the response hot path so the
       // trace-ingest response no longer blocks on a second full-trace insert.
-      void insertExecution(paradigmExecution, jwtAuth?.jwtToken)
-        .then((paradigmResult) => {
-          if (paradigmResult) {
-            logger.info('[paradigm] Execution trace also written to execution table', {
-              id: trace.execution_id,
-              activity_id: trace.variant_id,
-              path: 'dual-write',
-            });
-          }
-        })
-        .catch((paradigmError) => {
-          logger.warn('[paradigm] Dual-write to execution table failed (non-blocking)', {
-            execution_id: trace.execution_id,
-            error: paradigmError instanceof Error ? paradigmError.message : String(paradigmError),
-          });
+      // WRITE-FLIP: `execution` is the AUTHORITATIVE write — awaited + blocking.
+      // insertExecution rethrows real DB errors; they propagate to the outer
+      // catch below (-> handler outer catch: duplicate => idempotent 200, else
+      // 500). A null result is a successful system-track/empty-RETURN write
+      // (null == success).
+      const paradigmResult = await insertExecution(paradigmExecution, jwtAuth?.jwtToken);
+      if (paradigmResult) {
+        logger.info('[paradigm] Execution trace written to AUTHORITATIVE execution table', {
+          id: trace.execution_id,
+          activity_id: trace.variant_id,
+          path: 'authoritative',
         });
+      }
       } catch (paradigmError) {
-        // Don't fail the request if paradigm write fails - legacy write succeeded
-        logger.warn('[paradigm] Dual-write to execution table failed (non-blocking)', {
+        // WRITE-FLIP: `execution` is authoritative — its failure fails the
+        // request (rollback: revert this commit; DUAL_WRITE keeps AET warm).
+        // Duplicate redelivery surfaces as "already exists" and is mapped to an
+        // idempotent 200 by the handler's outer catch.
+        logger.error('[paradigm] Authoritative execution write failed', {
           execution_id: trace.execution_id,
           error: paradigmError instanceof Error ? paradigmError.message : String(paradigmError),
         });
+        throw paradigmError;
       }
     } // end isDualWriteEnabled()
 
@@ -3182,7 +3181,12 @@ app.post('/', async (c) => {
     // 500 here put the sink into a permanent retry loop (43 already-delivered
     // traces replayed 4,200+ times/day against the hub store).
     const dupMsg = error instanceof Error ? error.message : String(error);
-    if (dupMsg.includes('already contains') && dupMsg.includes('execution_id')) {
+    if (
+      (dupMsg.includes('already contains') && dupMsg.includes('execution_id')) ||
+      // WRITE-FLIP: the authoritative `execution` INSERT throws a record-level
+      // "already exists" on redelivery — also idempotent, not a 500.
+      (dupMsg.includes('already exists') && dupMsg.includes('execution:'))
+    ) {
       logger.info('Duplicate trace delivery, already stored', { message: dupMsg.slice(0, 200) });
       return c.json({ success: true, stored: false, duplicate: true }, 200);
     }
@@ -3696,6 +3700,17 @@ app.post('/deliberation', async (c) => {
        WHERE execution_id = $execution_id`,
       { steps: tagged, execution_id: String(execId) },
     );
+    // WRITE-FLIP: mirror onto the authoritative `execution` row (point update by
+    // record id; non-fatal — a shadow-patch miss never fails the request).
+    try {
+      await surrealDB.query(
+        `UPDATE type::thing('execution', $execution_id)
+           SET impulse_resolutions = array::concat(impulse_resolutions ?? [], $steps)`,
+        { steps: tagged, execution_id: String(execId) },
+      );
+    } catch (e) {
+      logger.warn('[deliberation-patch] execution mirror update failed (non-fatal)', { error: e instanceof Error ? e.message : String(e) });
+    }
     const updated = Array.isArray(res) && Array.isArray(res[0]) ? (res[0] as unknown[]).length : (Array.isArray(res) ? res.length : 0);
     return c.json({ success: true, execution_id: String(execId), appended: tagged.length, updated }, 200);
   } catch (err) {
@@ -3726,6 +3741,16 @@ app.post('/reach', async (c) => {
       `UPDATE activity_execution_traces SET reached = $reached, completion_shapes = $completion_shapes WHERE execution_id = $execution_id`,
       { reached: body.reached, completion_shapes, execution_id: String(execId) },
     );
+    // WRITE-FLIP: mirror the reach verdict onto the authoritative `execution`
+    // row (the load-bearing learning signal; point update, non-fatal).
+    try {
+      await surrealDB.query(
+        `UPDATE type::thing('execution', $execution_id) SET reached = $reached, completion_shapes = $completion_shapes`,
+        { reached: body.reached, completion_shapes, execution_id: String(execId) },
+      );
+    } catch (e) {
+      logger.warn('[reach-patch] execution mirror update failed (non-fatal)', { error: e instanceof Error ? e.message : String(e) });
+    }
     const updated = Array.isArray(res) && Array.isArray(res[0]) ? (res[0] as unknown[]).length : (Array.isArray(res) ? res.length : 0);
     return c.json({ success: true, execution_id: String(execId), reached: body.reached, updated }, 200);
   } catch (err) {

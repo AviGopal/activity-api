@@ -473,12 +473,16 @@ export async function insertExecution(
     return result?.[0] || null;
 
   } catch (error) {
+    // WRITE-FLIP: `execution` is authoritative — a real DB failure must be
+    // observable to the caller (it can no longer be swallowed as null). Rethrow.
+    // NOTE: a successful insert whose RETURN is empty still returns null above
+    // (null == success, throw == failure — the awaited caller relies on this).
     logger.error('[paradigm] Failed to insert execution into new schema', {
       id: execution.id,
       error: error instanceof Error ? error.message : String(error),
       latency_ms: Date.now() - startTime,
     });
-    return null;
+    throw error;
   }
 }
 
