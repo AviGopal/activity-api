@@ -2508,6 +2508,38 @@ router.post('/resolve', async (c) => {
         if (!writePointer.templateData) {
           return c.json({ success: false, error: 'templateData required for activityTemplate_write' } as ImpulseResolveResponse, 400);
         }
+        // Fence-tolerant string parse: when the extract chain's slot merge
+        // could not parse the completion, templateData arrives as a raw
+        // string; the org_id enrichment below would silently REPLACE a
+        // non-object body with {org_id}, producing an opaque description-
+        // required 400. Parse it here (strip markdown fences, slice the
+        // first balanced object) or reject legibly.
+        if (typeof writePointer.templateData === 'string') {
+          let raw = writePointer.templateData.trim();
+          const fence = /^```(?:json)?\s*\n?([\s\S]*?)\n?```/m.exec(raw);
+          if (fence?.[1]) raw = fence[1].trim();
+          let parsed: unknown = null;
+          try { parsed = JSON.parse(raw); } catch {
+            const start = raw.indexOf('{');
+            if (start !== -1) {
+              let depth = 0, inStr = false, esc = false;
+              for (let i = start; i < raw.length; i++) {
+                const ch = raw[i];
+                if (esc) { esc = false; continue; }
+                if (ch === '\\') { esc = true; continue; }
+                if (ch === '"') { inStr = !inStr; continue; }
+                if (inStr) continue;
+                if (ch === '{') depth++;
+                else if (ch === '}') { depth--; if (depth === 0) { try { parsed = JSON.parse(raw.slice(start, i + 1)); } catch { /* fallthrough */ } break; } }
+              }
+            }
+          }
+          if (parsed && typeof parsed === 'object') {
+            writePointer.templateData = parsed;
+          } else {
+            return c.json({ success: false, error: 'templateData is an unparseable string; expected a JSON object (fence-tolerant parse failed)' } as ImpulseResolveResponse, 400);
+          }
+        }
         // LLM-synthesized proposals (ribosome-extract on fallback models)
         // recurrently omit `description` despite the prompt stating the
         // contract; a missing human blurb is not worth losing a learned
