@@ -647,14 +647,14 @@ app.post('/extract-from-session', async (c) => {
 
     // Fetch traces for session
     let query = `
-      SELECT * FROM activity_execution_traces
+      SELECT * FROM v_paradigm_execution_traces
       WHERE variant_id CONTAINS $session_id
       ORDER BY executed_at ASC
     `;
 
     if (success_only) {
       query = `
-        SELECT * FROM activity_execution_traces
+        SELECT * FROM v_paradigm_execution_traces
         WHERE variant_id CONTAINS $session_id AND success = true
         ORDER BY executed_at ASC
       `;

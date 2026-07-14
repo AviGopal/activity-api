@@ -34,7 +34,10 @@
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
 
-const TABLE = 'activity_execution_traces';
+// WRITE-FLIP/decommission: retention now bounds the canonical `execution`
+// table (root path). AET is the DUAL_WRITE shadow; when DUAL_WRITE is off it
+// stops growing and ages out on its own.
+const TABLE = 'execution';
 
 export interface StratumPolicy {
   /** Max cold-tail (older than hot window) traces to keep for status=success. */

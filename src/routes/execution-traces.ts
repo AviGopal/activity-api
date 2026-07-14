@@ -1405,7 +1405,7 @@ export async function denormalizeCompositionChain(
       composition_chain?: string[] | null;
     }>(
       `
-        SELECT execution_id, composition_chain FROM activity_execution_traces
+        SELECT execution_id, composition_chain FROM v_paradigm_execution_traces
         WHERE execution_id = $parent_execution_id
         LIMIT 1
       `,
@@ -1492,7 +1492,7 @@ export async function backfillChildCompositionChains(
     // no children at all. Skipping the UPDATE on the empty probe removes that
     // full scan from the steady-state hot path.
     const probeSql = `
-        SELECT VALUE id FROM activity_execution_traces
+        SELECT VALUE id FROM execution
         WHERE parent_execution_id = $parent_execution_id
         LIMIT 1
       `;
@@ -1526,6 +1526,14 @@ export async function backfillChildCompositionChains(
         WHERE parent_execution_id = $parent_execution_id
           AND (composition_chain IS NONE OR composition_chain = [])
       `;
+    // WRITE-FLIP: mirror the chain backfill onto the authoritative `execution`
+    // table (indexed on parent_execution_id; root path, non-fatal).
+    const updateExecSql = `
+        UPDATE execution
+        SET composition_chain = $new_chain
+        WHERE parent_execution_id = $parent_execution_id
+          AND (composition_chain IS NONE OR composition_chain = [])
+      `;
     const updateParams = {
       parent_execution_id: insertedExecutionId,
       new_chain: newChain,
@@ -1535,6 +1543,8 @@ export async function backfillChildCompositionChains(
     } else {
       await surrealDB.query(updateSql, updateParams);
     }
+    // WRITE-FLIP: mirror onto the authoritative `execution` table (root path).
+    await surrealDB.query(updateExecSql, updateParams);
   } catch (err) {
     logger.warn('[composition-chain] Failed to backfill child composition_chains — leaving empty', {
       inserted_execution_id: insertedExecutionId,
@@ -1578,7 +1588,7 @@ export async function walkCompositionChain(
         composition_chain?: string[] | null;
       }>(
         `
-          SELECT execution_id, parent_execution_id, composition_chain FROM activity_execution_traces
+          SELECT execution_id, parent_execution_id, composition_chain FROM v_paradigm_execution_traces
           WHERE execution_id = $execution_id
           LIMIT 1
         `,
@@ -2127,7 +2137,14 @@ app.post('/', async (c) => {
     // reach this point; the root path is safe and matches how the existing
     // 19K rows were inserted (migration 121 repairs the schema PERMISSIONS
     // to also accept $token.org_id so future authenticated SELECTs work).
-    let result = await surrealDB.query(query, trace);
+    // WRITE-FLIP/decommission: activity_execution_traces is the DUAL_WRITE
+    // shadow. Execute the INSERT only when the shadow is enabled; when
+    // DUAL_WRITE is off, AET stops being written entirely (execution is
+    // authoritative below).
+    let result: any[] = [];
+    if (isDualWriteEnabled()) {
+      result = ((await surrealDB.query(query, trace)) as any[]) ?? [];
+    }
 
     // Verify INSERT succeeded.
     //
@@ -2393,7 +2410,10 @@ app.post('/', async (c) => {
     // DUAL-WRITE: Also insert into new paradigm execution table (schema-paradigm-alignment)
     // v_activity_score view computes Thompson Sampling from execution table automatically
     // P4.1: Feature flag controlled
-    if (isDualWriteEnabled()) {
+    // WRITE-FLIP: `execution` is ALWAYS written (authoritative) — no DUAL_WRITE
+    // gate. Its failure fails the request (rollback: revert; AET stays warm
+    // while DUAL_WRITE is on).
+    {
       try {
         // Use new fields from MiniBob (P3.1) or fallback to legacy extraction
       const inputImpulses = body.input_impulses || trace.impulses_used || [];
@@ -2481,7 +2501,7 @@ app.post('/', async (c) => {
         });
         throw paradigmError;
       }
-    } // end isDualWriteEnabled()
+    } // end execution authoritative write
 
     // ========================================================================
     // FIX 2: Update Thompson Sampling scores in activity table
@@ -3310,7 +3330,7 @@ app.get('/selection-outcomes', async (c) => {
           tokens_output,
           error_type,
           executed_at
-        FROM activity_execution_traces
+        FROM execution
         WHERE correlation_id IN $correlation_ids
       `;
 

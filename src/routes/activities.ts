@@ -2564,18 +2564,19 @@ app.post('/executions', async (c) => {
       }
     `;
 
-    await surrealDB.query(insertExecutionQuery, executionRecord);
-
-    logger.debug('Execution recorded in activity_execution_traces', { executionId });
+    // WRITE-FLIP/decommission: AET is the DUAL_WRITE shadow — only write it
+    // while the shadow is enabled.
+    if (isDualWriteEnabled()) {
+      await surrealDB.query(insertExecutionQuery, executionRecord);
+      logger.debug('Execution recorded in activity_execution_traces (shadow)', { executionId });
+    }
 
     // trace_store_counters bookkeeping (migration 156) — fire-and-forget,
     // never blocks the trace insert's critical path.
     void incrementTraceStoreCounter();
 
-    // DUAL-WRITE: Also insert into new paradigm execution table (schema-paradigm-alignment)
-    // v_activity_score view computes Thompson Sampling from execution table automatically
-    // P4.1: Feature flag controlled
-    if (isDualWriteEnabled()) {
+    // WRITE-FLIP: `execution` is ALWAYS written (authoritative store).
+    {
       try {
         const paradigmExecution: Partial<ParadigmExecution> = {
         id: executionId,
@@ -3330,7 +3331,7 @@ app.get('/metrics', async (c) => {
     // Query model usage distribution
     const modelDistResult = await surrealDB.query(`
       SELECT model, count() AS count
-      FROM activity_execution_traces
+      FROM v_paradigm_execution_traces
       WHERE activity_id = $activity_id
       GROUP BY model
     `, { activity_id: activityId });

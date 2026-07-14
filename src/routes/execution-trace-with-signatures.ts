@@ -485,7 +485,7 @@ async function queryExecutions(
       composition_chain,
       tasks,
       org_id
-    FROM activity_execution_traces
+    FROM v_paradigm_execution_traces
     WHERE ${where.join(' AND ')}
     ${input.execution_id ? '' : 'ORDER BY executed_at DESC'}
     LIMIT $lim
