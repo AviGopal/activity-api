@@ -36,6 +36,7 @@ import activitiesRouter, { accountIdScopedWhere } from './activities';
 import executionTracesRouter from './execution-traces';
 import { runTemplateAuditReport, type TemplateAuditInput } from './template-audit';
 import { runExecutionTraceWithSignatures } from './execution-trace-with-signatures';
+import { runReplicationPull } from './replication-pull';
 import { runTraceAggregateReport } from './trace-aggregate-report';
 import { resolveDbAdmin } from './db-admin';
 import { queryActivitiesByFTS, getActivityScores } from '../db/paradigm';
@@ -3586,6 +3587,46 @@ router.post('/resolve', async (c) => {
             {
               success: false,
               error: err?.message || 'executionTraceWithSignatures resolution failed',
+            } as ImpulseResolveResponse,
+            500,
+          );
+        }
+      }
+
+      // =============================================================================
+      // executionReplicationPull: full lossless `execution` rows since a
+      // watermark, for intra-identity-group pull replication. Mirrors the
+      // executionTraceWithSignatures auth pattern (works over the transport).
+      // Read-only. See src/routes/replication-pull.ts.
+      // =============================================================================
+
+      case 'executionReplicationPull': {
+        const authCheck = requireAuthenticated(c);
+        if (authCheck) {
+          return c.json(
+            { success: false, error: authCheck.error } as ImpulseResolveResponse,
+            authCheck.status,
+          );
+        }
+        try {
+          const result = await runReplicationPull(pointer as unknown);
+          return c.json(
+            {
+              success: true,
+              content: JSON.stringify(result),
+              metadata: {
+                shape: 'executionReplicationPull',
+                summary: `Replication pull: ${result.count} execution row(s) since ${result.since}`,
+              },
+            } as ImpulseResolveResponse,
+            200,
+          );
+        } catch (err: any) {
+          logger.error('executionReplicationPull failed', { error: err?.message });
+          return c.json(
+            {
+              success: false,
+              error: err?.message || 'executionReplicationPull resolution failed',
             } as ImpulseResolveResponse,
             500,
           );

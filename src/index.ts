@@ -707,6 +707,25 @@ import('./jobs/signature-cluster-tick').then(({ runSignatureClusterTick }) => {
   }, SIGNATURE_CLUSTER_INTERVAL_MS);
 }).catch(err => {
   logger.error('[Cluster] Failed to load signature-cluster-tick job', { error: String(err) });
+
+import('./jobs/trace-replication-tick').then(({ runTraceReplicationTick }) => {
+  // Intra-identity-group pull replication: converge `execution` across peers.
+  const intervalMs = parseInt(process.env.REPLICATION_INTERVAL_MS ?? String(2 * 60 * 1000), 10);
+  // Initial run delayed 90s so discovery registration + the federation transport
+  // are up before the first pull.
+  setTimeout(() => {
+    void runTraceReplicationTick()
+      .then(() => logger.info('[Replication] Initial trace replication tick complete'))
+      .catch(err => logger.warn('[Replication] Initial trace replication tick failed', { error: String(err) }));
+  }, 90 * 1000);
+  setInterval(() => {
+    void runTraceReplicationTick()
+      .then(() => logger.debug('[Replication] Periodic trace replication tick complete'))
+      .catch(err => logger.warn('[Replication] Periodic trace replication tick failed', { error: String(err) }));
+  }, intervalMs);
+}).catch(err => {
+  logger.error('[Replication] Failed to load trace-replication-tick job', { error: String(err) });
+});
 });
 
 // ============================================================================

@@ -283,6 +283,7 @@ export function loadConfig(): Config {
         // the minibob co-occurrence extractor (commit 1f8d703) so it can do
         // signature reasoning without a second round trip per impulse id.
         'executionTraceWithSignatures',
+        'executionReplicationPull',
         // traceAggregateReport: FAST server-side GROUP BY / COUNT / SUM over the
         // indexed execution-trace table (failure-count-by-template, cost-by-
         // activity, executions-by-status over a window). The aggregate path the
@@ -396,6 +397,8 @@ export function loadConfig(): Config {
           "Composition-edge success statistics: for a producer→consumer shape edge, how often the composed execution succeeded. Use for 'which compositions/chains reliably work' or composition-health report goals.",
         templateAuditReport:
           "Per-template deficiency report: missing shapes, weak descriptions, all-LLM task graphs, hardcoded URLs, alias-cluster proposals. Use for 'audit template quality' or 'which templates are deficient' goals.",
+        executionReplicationPull:
+          'Full lossless execution rows since a watermark, for intra-identity-group pull replication (receiver UPSERTs by record id).',
         executionTraceWithSignatures:
           "Raw hydrated execution traces with per-task pointer/shape signatures and an impulses-by-id map. SLOW + load-fragile over the large trace table — use ONLY when the goal needs PER-TRACE detail an aggregate cannot give, never for counts/rankings (use traceAggregateReport for those). Config: limit (capped ~200), since, activity_template_id, success_only.",
         executionTraceList:
