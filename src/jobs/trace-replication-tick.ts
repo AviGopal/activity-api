@@ -96,10 +96,21 @@ function bareExecutionId(rawId: unknown): string | null {
 }
 
 /** UPSERT one pulled execution row verbatim (idempotent by record id). */
+// `execution` defines created_at/executed_at as datetime; over the transport
+// they arrive as ISO strings, which fail the SCHEMAFULL type check on CONTENT.
+// Coerce them to Date so the SurrealDB SDK encodes them as datetime.
+const DATETIME_FIELDS = ['created_at', 'executed_at'] as const;
+
 async function upsertRow(row: Record<string, unknown>): Promise<boolean> {
   const bid = bareExecutionId(row.id);
   if (!bid) return false;
   const { id: _drop, ...content } = row;
+  for (const f of DATETIME_FIELDS) {
+    if (typeof content[f] === 'string') {
+      const d = new Date(content[f] as string);
+      if (!Number.isNaN(d.getTime())) content[f] = d;
+    }
+  }
   try {
     await surrealDB.query(
       `UPSERT type::thing('execution', $bid) CONTENT $content`,
