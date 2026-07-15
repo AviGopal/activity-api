@@ -135,55 +135,6 @@ const CACHE_KEY_PREFIX = 'activity:template:';
 const CACHE_LIST_KEY = 'activity:templates:list';
 
 // =============================================================================
-// Composition-edge classification (C7 — SUBSTRATE_AS_DYNAMICS §3-4)
-// =============================================================================
-// A composition edge is durably tagged at WRITE time so the selection gate and
-// the spectral-gap reader can rely on a persisted column instead of re-deriving
-// "genuine vs scaffold" heuristically on every read. Classification by endpoint
-// name, with hub taking priority over scaffold (a lifecycle-hub spoke is never a
-// real capability edge even if the other endpoint looks like a wrapper):
-//   - 'hub'      : either endpoint is a lifecycle hub (validator-dispatch /
-//                  slot-binding) — nests under every execution, carries no
-//                  capability-to-capability credit.
-//   - 'scaffold' : either endpoint is wrapper/dispatch-nesting machinery
-//                  (compose-* wrappers, genuine-edge-probe λ₁-gaming trio) —
-//                  records wrapper→child, not producer→consumer.
-//   - 'genuine'  : neither — a real producer-shape → consumer-shape capability
-//                  edge. This is the honest λ₁ (credit-mixing) signal.
-// Mirrors the read-time heuristics in scripts/substrate/spectral-gap.ts
-// (touchesHook) and the recommend scaffold-exclusion gate below, so a row tagged
-// here and a legacy row classified heuristically agree.
-const COMPOSITION_HUB_MARKERS = ['validator-dispatch', 'slot-binding'];
-const COMPOSITION_SCAFFOLD_MARKERS = ['compose-', 'genuine-edge-probe'];
-export type CompositionEdgeKind = 'genuine' | 'scaffold' | 'hub';
-export function classifyCompositionEdge(
-  parentActivityId: string | null | undefined,
-  childActivityId: string | null | undefined,
-  // Recurrence/shape evidence supplied by WRITE-path callers. When present, a
-  // non-marker edge is 'genuine' ONLY with empirical proof — it has recurred with
-  // success (the data demonstrably flowed enough to succeed repeatedly) OR a shape
-  // the parent produces is one the child consumes. A brand-new/unproven non-marker
-  // edge is 'scaffold' until it earns 'genuine'. This is the honest λ₁ signal: the
-  // bare node-name verdict (no opts) marked EVERY non-wrapper pair genuine, which
-  // inflated the genuine count ~3× with single-shot/observer noise. Read-time
-  // callers pass no opts and keep the legacy node-name verdict (backward-compatible).
-  opts?: { executionCount?: number; successCount?: number; shapeFlow?: boolean },
-): CompositionEdgeKind {
-  const p = String(parentActivityId || '');
-  const ch = String(childActivityId || '');
-  const touchesHub = COMPOSITION_HUB_MARKERS.some((h) => p.includes(h) || ch.includes(h));
-  if (touchesHub) return 'hub';
-  const touchesScaffold = COMPOSITION_SCAFFOLD_MARKERS.some((s) => p.includes(s) || ch.includes(s));
-  if (touchesScaffold) return 'scaffold';
-  if (opts) {
-    const ec = opts.executionCount ?? 0, sc = opts.successCount ?? 0;
-    const recurring = ec >= 5 && sc >= 3;
-    return (recurring || opts.shapeFlow === true) ? 'genuine' : 'scaffold';
-  }
-  return 'genuine';
-}
-
-// =============================================================================
 // Phase B1: account_id dual-write helpers
 // =============================================================================
 // See OpenSpec change activity-api-account-id-migration-2026-04-28.
@@ -11853,3 +11804,7 @@ app.post('/internal/fts-rebuild', async (c) => {
 // --- parity-gated seam extraction: moved decls now live in ./activities.scoring ---
 import { betaSample, normalizeSuccessorValue, successorBlendEnabled, successorBlendWeight, updateShapeScoresFromExecution, variantMetricsRecordId } from "./activities.scoring";
 export { variantMetricsRecordId } from "./activities.scoring";
+
+// --- parity-gated seam extraction: moved decls now live in ./activities.composition ---
+import { classifyCompositionEdge } from "./activities.composition";
+export { CompositionEdgeKind, classifyCompositionEdge } from "./activities.composition";
