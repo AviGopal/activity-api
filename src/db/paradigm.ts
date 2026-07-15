@@ -21,12 +21,16 @@ import { resolveLearningTrack } from '../lib/learning-track';
 /**
  * Check if dual-write to new paradigm tables is enabled.
  * Controlled via DUAL_WRITE_ENABLED environment variable.
- * Default: true (enabled) during migration period.
+ * Migration COMPLETE (2026-07): `execution` is the sole authoritative trace
+ * store; activity_execution_traces is decommissioned. Default OFF — the AET
+ * shadow INSERT only runs if DUAL_WRITE_ENABLED is explicitly set to true/1
+ * (a rollback window). This makes the decommission survive a container image
+ * rebuild (env-less start no longer re-enables the AET write).
  */
 export function isDualWriteEnabled(): boolean {
   const envValue = process.env.DUAL_WRITE_ENABLED;
-  // Default to true unless explicitly disabled
-  return envValue !== 'false' && envValue !== '0';
+  // Default to false (AET decommissioned) unless explicitly re-enabled.
+  return envValue === 'true' || envValue === '1';
 }
 
 /**
