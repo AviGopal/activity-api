@@ -57,28 +57,6 @@ import {
   runDiscoverByShapes,
   validateDiscoverByShapesInput,
 } from '../services/discover-by-shapes';
-
-/**
- * Thompson Sampling Beta distribution sampler.
- *
- * Uses @stdlib/random-base-beta to sample from Beta(alpha, beta) distribution.
- * When THOMPSON_SAMPLING_SEED env var is set, uses seeded RNG for reproducible tests.
- *
- * @param alpha - Success count + 1 (prior)
- * @param betaParam - Failure count + 1 (prior)
- * @returns Sample from Beta(alpha, beta) distribution, value between 0 and 1
- */
-const betaSample: (alpha: number, betaParam: number) => number = (() => {
-  const seed = process.env.THOMPSON_SAMPLING_SEED;
-  if (seed) {
-    const seedNum = parseInt(seed, 10);
-    if (!isNaN(seedNum)) {
-      logger.info('Thompson Sampling initialized with seed', { seed: seedNum });
-      return beta.factory({ seed: seedNum });
-    }
-  }
-  return beta;
-})();
 import type { SessionData } from '../models/schemas';
 import { getJwtAuthFromContext, hasJwtAuth, getExecutionScopeFromContext, type JwtAuthContext } from '../middleware/jwtAuth';
 import {
@@ -97,27 +75,6 @@ import {
   rewardFromCompletionShapes,
   successorValue,
 } from '../lib/successor-features';
-
-// Mechanism #7 consumer loop: blend the successor-features look-ahead ⟨ψ(s,a),R⟩
-// into the recommend ranking argmax. Fully reversible — SF_BLEND must be explicitly
-// enabled; when off (default) the ranking is byte-for-byte the prior Thompson order.
-async function successorBlendEnabled(): Promise<boolean> {
-  if (process.env.SF_BLEND === '1' || process.env.SF_BLEND === 'true') return true;
-  return (await getTuningParam('SF_BLEND', process.env.SF_BLEND, 0)) >= 1;
-}
-function successorBlendWeight(): number {
-  const raw = process.env.SF_BLEND_WEIGHT;
-  if (raw === undefined || raw === '') return 0.5;
-  const w = parseFloat(raw);
-  if (!Number.isFinite(w) || w < 0) return 0.5;
-  return w;
-}
-// Squash the unbounded discounted occupancy count ⟨ψ,R⟩ into [0,1) so it cannot
-// dominate a Beta sample (also in [0,1]). v/(1+v) is monotone, 0↦0, →1 as v→∞.
-function normalizeSuccessorValue(v: number): number {
-  if (!Number.isFinite(v) || v <= 0) return 0;
-  return v / (1 + v);
-}
 import {
   ExecutionRecordSchema,
   CreateTemplateRequestSchema,
@@ -270,34 +227,6 @@ export function accountIdScopedWhere(): string {
 export function accountIdRecordRef(accountId: string | undefined | null): string | null {
   if (!accountId) return null;
   return accountId.startsWith('accounts:') ? accountId : `accounts:${accountId}`;
-}
-
-/**
- * Phase E: deterministic record-id slug for variant_performance_metrics.
- *
- * Returns `<variant-slug>` when account_id is null (preserves the legacy
- * single-row-per-variant key from before Phase E), and `<variant-slug>__<acct-slug>`
- * when account_id is present so different accounts in the same org keep
- * separate α/β posteriors. The double-underscore separator avoids collisions
- * with conventional slug characters.
- *
- * Pre-Phase-E rows continue to live at the legacy key — they have account_id
- * IS NONE in the schema, and reads via accountIdScopedWhere() still match them
- * via the org_id branch when the caller has no accountId.
- *
- * Behavior change: the first execution from an account-bearing JWT against
- * a variant that previously had only legacy rows will create a NEW
- * `<variant>__<acct>` row rather than incrementing the legacy `<variant>`
- * row. Posteriors fork from that point forward; legacy rows are preserved.
- */
-export function variantMetricsRecordId(
-  variantId: string,
-  accountId: string | undefined | null
-): string {
-  const variantSlug = variantId.replace(/[^a-zA-Z0-9_-]/g, '_');
-  if (!accountId) return variantSlug;
-  const acctSlug = accountId.replace(/^accounts:/, '').replace(/[^a-zA-Z0-9_-]/g, '_');
-  return `${variantSlug}__${acctSlug}`;
 }
 
 /**
@@ -11570,99 +11499,6 @@ app.post('/shape-scores', async (c) => {
 });
 
 /**
- * updateShapeScoresFromExecution - Helper function to update shape scores
- *
- * Called from the execution recording flow to update shape-based Thompson
- * Sampling scores based on execution outcomes.
- *
- * @param activityId - Activity that was executed
- * @param shapes - Input impulse shapes observed during execution
- * @param success - Whether the execution succeeded
- * @param orgId - Organization ID
- */
-async function updateShapeScoresFromExecution(
-  activityId: string,
-  shapes: string[],
-  success: boolean,
-  orgId: string,
-  jwtToken?: string | null,
-  accountId: string | null = null
-): Promise<void> {
-  if (!shapes || shapes.length === 0) {
-    return; // No shapes to update
-  }
-
-  try {
-    const successIncrement = success ? 1 : 0;
-    const failureIncrement = success ? 0 : 1;
-
-    for (const shape of shapes) {
-      try {
-        // Phase B-followup: dual-write account_id + version on the MERGE.
-        const upsertQuery = `
-          UPSERT impulse_shape_activity_score:[$org_id, $shape, $activity_id]
-          MERGE {
-            shape: $shape,
-            activity_id: $activity_id,
-            org_id: $org_id,
-            account_id: $account_id,
-            account_id_version: $account_id_version,
-            success_count: (
-              SELECT VALUE success_count FROM ONLY impulse_shape_activity_score:[$org_id, $shape, $activity_id]
-            ) ?? 0 + $success_increment,
-            failure_count: (
-              SELECT VALUE failure_count FROM ONLY impulse_shape_activity_score:[$org_id, $shape, $activity_id]
-            ) ?? 0 + $failure_increment,
-            alpha: (
-              SELECT VALUE success_count FROM ONLY impulse_shape_activity_score:[$org_id, $shape, $activity_id]
-            ) ?? 0 + $success_increment + 1,
-            beta: (
-              SELECT VALUE failure_count FROM ONLY impulse_shape_activity_score:[$org_id, $shape, $activity_id]
-            ) ?? 0 + $failure_increment + 1,
-            updated_at: time::now()
-          };
-        `;
-
-        const params = {
-          shape,
-          activity_id: activityId,
-          org_id: orgId,
-          account_id: accountId,
-          account_id_version: 1,
-          success_increment: successIncrement,
-          failure_increment: failureIncrement,
-        };
-
-        // Use authenticated connection if JWT token provided, otherwise use root connection
-        if (jwtToken) {
-          await queryWithAuth(jwtToken, upsertQuery, params);
-        } else {
-          await surrealDB.query(upsertQuery, params);
-        }
-      } catch (shapeError: any) {
-        logger.warn('Failed to update shape score in execution flow', {
-          shape,
-          activity_id: activityId,
-          error: shapeError.message,
-        });
-      }
-    }
-
-    logger.debug('Shape scores updated from execution', {
-      activity_id: activityId,
-      shapes_count: shapes.length,
-      success,
-    });
-  } catch (error: any) {
-    // Non-blocking: don't fail the execution recording if shape score update fails
-    logger.warn('Shape score update from execution failed (non-blocking)', {
-      activity_id: activityId,
-      error: error.message,
-    });
-  }
-}
-
-/**
  * GET /shapes/autocomplete
  *
  * Returns shape suggestions for UI autocomplete, sorted by frequency.
@@ -12013,3 +11849,7 @@ app.post('/internal/fts-rebuild', async (c) => {
 
   return c.json({ ok: true, message: 'rebuild started', estimated_ms: 360_000 }, 202);
 });
+
+// --- parity-gated seam extraction: moved decls now live in ./activities.scoring ---
+import { betaSample, normalizeSuccessorValue, successorBlendEnabled, successorBlendWeight, updateShapeScoresFromExecution, variantMetricsRecordId } from "./activities.scoring";
+export { variantMetricsRecordId } from "./activities.scoring";
