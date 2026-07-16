@@ -151,9 +151,7 @@ export async function runDiscoverByShapes(
   }
 
   const query = `
-    SELECT *,
-      (SELECT alpha, beta, total_executions, successes
-       FROM v_activity_score WHERE (activity_id = $parent.id OR <string>activity_id = <string>$parent.id) LIMIT 1)[0] AS metrics_row${compositionSubquery}
+    SELECT *${compositionSubquery}
     FROM activity
     WHERE ${whereClause}
     ORDER BY ev DESC, created_at DESC
@@ -162,29 +160,55 @@ export async function runDiscoverByShapes(
 
   const activities = await surrealDB.query(query, params);
 
+    const rows = (activities[0]?.result ?? []) as Array<Record<string, any>>;
+    const idPairs: Array<[string, string]> = rows.map((r) => {
+      const orig = String(r.id ?? '');
+      const plain = orig.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
+      return [plain, orig];
+    });
+    const activityIds = Array.from(new Set(idPairs.map(([p]) => p).concat(idPairs.map(([, o]) => o))));
+    const scoreMap = new Map<string, Record<string, any>>();
+    try {
+      const scoreRes = await surrealDB.query('SELECT * FROM v_activity_score WHERE activity_id IN $activity_ids', { activity_ids: activityIds });
+      const scoreRows = (scoreRes[0]?.result ?? []) as Array<Record<string, any>>;
+      for (const sr of scoreRows) {
+        const aid = String(sr.activity_id ?? '');
+        scoreMap.set(aid, sr);
+        const vid = String(sr.variant_id ?? '');
+        if (vid) scoreMap.set(vid, sr);
+      }
+    } catch (e) {
+      const fbRes = await surrealDB.query('SELECT activity_id, variant_id, total_executions, successful_executions, thompson_alpha, thompson_beta, success_rate FROM variant_performance_metrics WHERE activity_id IN $activity_ids', { activity_ids: activityIds });
+      const fbRows = (fbRes[0]?.result ?? []) as Array<Record<string, any>>;
+      for (const fr of fbRows) {
+        const aid = String(fr.activity_id ?? '');
+        scoreMap.set(aid, fr);
+        const vid = String(fr.variant_id ?? '');
+        if (vid) scoreMap.set(vid, fr);
+      }
+    }
+
   // Project metrics_row + comp_row into the legacy response shape.
   const activitiesWithScores = (activities || []).map((row: any) => {
-    const score = row.metrics_row ?? null;
+    const plainId = String(row.id ?? '').replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
+    const score = row.metrics_row ?? scoreMap.get(plainId) ?? scoreMap.get(String(row.id ?? '')) ?? null;
     const { metrics_row, comp_row, ...activity } = row;
+    const total_executions = (score?.total_executions ?? 0) as number;
+    const successful_executions = (score?.successful_executions ?? score?.successes ?? 0) as number;
+    const success_rate = (score?.success_rate ?? (total_executions > 0 ? (successful_executions / total_executions) : 0)) as number;
+    const thompson_alpha = (score?.thompson_alpha ?? score?.alpha ?? 1) as number;
+    const thompson_beta = (score?.thompson_beta ?? score?.beta ?? 1) as number;
+    const confidence = thompson_alpha / (thompson_alpha + thompson_beta);
     return {
       ...activity,
-      metrics: score
-        ? {
-            total_executions: score.total_executions || 0,
-            successful_executions: score.successes || 0,
-            success_rate: score.total_executions ? (score.successes || 0) / score.total_executions : 0,
-            thompson_alpha: score.alpha || 1,
-            thompson_beta: score.beta || 1,
-            confidence: (score.alpha || 1) / ((score.alpha || 1) + (score.beta || 1)),
-          }
-        : {
-            total_executions: 0,
-            successful_executions: 0,
-            success_rate: 0,
-            thompson_alpha: 1,
-            thompson_beta: 1,
-            confidence: 0.5,
-          },
+      metrics: {
+        total_executions,
+        successful_executions,
+        success_rate,
+        thompson_alpha,
+        thompson_beta,
+        confidence,
+      },
       _comp_row: comp_row ?? null,
     };
   });
