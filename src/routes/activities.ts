@@ -11111,7 +11111,8 @@ export { variantMetricsRecordId } from "./activities.scoring";
 
 // --- parity-gated seam extraction: moved decls now live in ./activities.composition ---
 import { classifyCompositionEdge } from "./activities.composition";
-export { CompositionEdgeKind, classifyCompositionEdge } from "./activities.composition";
+export type { CompositionEdgeKind } from "./activities.composition";
+export { classifyCompositionEdge } from "./activities.composition";
 
 // --- parity-gated seam extraction: moved decls now live in ./activities.templates-db ---
 import { ActivityTemplate, accountIdScopedWhere, countAllTemplatesFromDB, enrichTemplatesWithMetrics, ensureOutputShapes, listAllTemplatesFromDB, listPublicTemplatesFromDB } from "./activities.templates-db";

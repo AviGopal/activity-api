@@ -168,24 +168,32 @@ export async function runDiscoverByShapes(
     });
     const activityIds = Array.from(new Set(idPairs.map(([p]) => p).concat(idPairs.map(([, o]) => o))));
     const scoreMap = new Map<string, Record<string, any>>();
+    // The computed view only covers executions written since the paradigm
+    // dual-write began; the legacy variant_performance_metrics table carries
+    // the full history. Query the view first, then FILL the ids it missed
+    // from the legacy table (empty view result is normal, not an error).
+    const addScoreRows = (list: Array<Record<string, any>>): void => {
+      for (const sr of list) {
+        const aid = String(sr.activity_id ?? '');
+        if (aid && !scoreMap.has(aid)) scoreMap.set(aid, sr);
+        const vid = String(sr.variant_id ?? '');
+        if (vid && !scoreMap.has(vid)) scoreMap.set(vid, sr);
+      }
+    };
     try {
       const scoreRes = await surrealDB.query('SELECT * FROM v_activity_score WHERE activity_id IN $activity_ids', { activity_ids: activityIds });
-      const scoreRows = (Array.isArray(scoreRes) ? scoreRes : ((scoreRes as any)?.[0]?.result ?? [])) as Array<Record<string, any>>;
-      for (const sr of scoreRows) {
-        const aid = String(sr.activity_id ?? '');
-        scoreMap.set(aid, sr);
-        const vid = String(sr.variant_id ?? '');
-        if (vid) scoreMap.set(vid, sr);
+      addScoreRows((Array.isArray(scoreRes) ? scoreRes : ((scoreRes as any)?.[0]?.result ?? [])) as Array<Record<string, any>>);
+    } catch (e) {
+      // view unavailable — legacy fallback below covers everything
+    }
+    try {
+      const missing = activityIds.filter((id) => !scoreMap.has(id));
+      if (missing.length > 0) {
+        const fbRes = await surrealDB.query('SELECT activity_id, variant_id, total_executions, successful_executions, thompson_alpha, thompson_beta, success_rate FROM variant_performance_metrics WHERE activity_id IN $activity_ids OR variant_id IN $activity_ids', { activity_ids: missing });
+        addScoreRows((Array.isArray(fbRes) ? fbRes : ((fbRes as any)?.[0]?.result ?? [])) as Array<Record<string, any>>);
       }
     } catch (e) {
-      const fbRes = await surrealDB.query('SELECT activity_id, variant_id, total_executions, successful_executions, thompson_alpha, thompson_beta, success_rate FROM variant_performance_metrics WHERE activity_id IN $activity_ids', { activity_ids: activityIds });
-      const fbRows = (Array.isArray(fbRes) ? fbRes : ((fbRes as any)?.[0]?.result ?? [])) as Array<Record<string, any>>;
-      for (const fr of fbRows) {
-        const aid = String(fr.activity_id ?? '');
-        scoreMap.set(aid, fr);
-        const vid = String(fr.variant_id ?? '');
-        if (vid) scoreMap.set(vid, fr);
-      }
+      // legacy table unavailable — rows keep the cold-start default below
     }
 
   // Project metrics_row + comp_row into the legacy response shape.
