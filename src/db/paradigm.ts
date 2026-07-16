@@ -895,6 +895,7 @@ export function transformToLegacyTemplate(activity: ParadigmActivity): any {
     output_schema: activity.output_shapes.length > 0
       ? { produces_shapes: activity.output_shapes }
       : undefined,
+    ...((activity as { metrics?: unknown }).metrics ? { metrics: (activity as { metrics?: unknown }).metrics } : {}),
     created_at: activity.created_at,
     updated_at: activity.updated_at,
   };
