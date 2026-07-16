@@ -160,7 +160,7 @@ export async function runDiscoverByShapes(
 
   const activities = await surrealDB.query(query, params);
 
-    const rows = (activities[0]?.result ?? []) as Array<Record<string, any>>;
+    const rows = (Array.isArray(activities) ? activities : ((activities as any)?.[0]?.result ?? [])) as Array<Record<string, any>>;
     const idPairs: Array<[string, string]> = rows.map((r) => {
       const orig = String(r.id ?? '');
       const plain = orig.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
@@ -170,7 +170,7 @@ export async function runDiscoverByShapes(
     const scoreMap = new Map<string, Record<string, any>>();
     try {
       const scoreRes = await surrealDB.query('SELECT * FROM v_activity_score WHERE activity_id IN $activity_ids', { activity_ids: activityIds });
-      const scoreRows = (scoreRes[0]?.result ?? []) as Array<Record<string, any>>;
+      const scoreRows = (Array.isArray(scoreRes) ? scoreRes : ((scoreRes as any)?.[0]?.result ?? [])) as Array<Record<string, any>>;
       for (const sr of scoreRows) {
         const aid = String(sr.activity_id ?? '');
         scoreMap.set(aid, sr);
@@ -179,7 +179,7 @@ export async function runDiscoverByShapes(
       }
     } catch (e) {
       const fbRes = await surrealDB.query('SELECT activity_id, variant_id, total_executions, successful_executions, thompson_alpha, thompson_beta, success_rate FROM variant_performance_metrics WHERE activity_id IN $activity_ids', { activity_ids: activityIds });
-      const fbRows = (fbRes[0]?.result ?? []) as Array<Record<string, any>>;
+      const fbRows = (Array.isArray(fbRes) ? fbRes : ((fbRes as any)?.[0]?.result ?? [])) as Array<Record<string, any>>;
       for (const fr of fbRows) {
         const aid = String(fr.activity_id ?? '');
         scoreMap.set(aid, fr);
