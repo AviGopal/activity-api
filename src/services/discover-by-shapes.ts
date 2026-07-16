@@ -152,8 +152,8 @@ export async function runDiscoverByShapes(
 
   const query = `
     SELECT *,
-      (SELECT alpha, beta, total_executions, successful_executions, success_rate
-       FROM activity_metrics WHERE activity = $parent.id LIMIT 1)[0] AS metrics_row${compositionSubquery}
+      (SELECT alpha, beta, total_executions, successes
+       FROM v_activity_score WHERE activity_id = record::id($parent.id) LIMIT 1)[0] AS metrics_row${compositionSubquery}
     FROM activity
     WHERE ${whereClause}
     ORDER BY ev DESC, created_at DESC
@@ -171,8 +171,8 @@ export async function runDiscoverByShapes(
       metrics: score
         ? {
             total_executions: score.total_executions || 0,
-            successful_executions: score.successful_executions || 0,
-            success_rate: score.success_rate || 0,
+            successful_executions: score.successes || 0,
+            success_rate: score.total_executions ? (score.successes || 0) / score.total_executions : 0,
             thompson_alpha: score.alpha || 1,
             thompson_beta: score.beta || 1,
             confidence: (score.alpha || 1) / ((score.alpha || 1) + (score.beta || 1)),
