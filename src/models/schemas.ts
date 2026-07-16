@@ -1146,7 +1146,7 @@ export const ImpulseResolveRequestSchema = z.object({
     changedFiles: z.array(z.string()).optional(), // For impactAnalysis pointer
     query: z.string().optional(), // For codebaseSearch and activityTemplateRecommendation pointer
     maxDepth: z.number().int().positive().optional(), // For impactAnalysis and variantGenealogy
-    format: z.enum(['full', 'summary']).optional(), // For analysisResult
+    format: z.enum(['full', 'summary', 'json', 'markdown']).optional(), // For analysisResult; json/markdown for activityExecutionTrace
     severity: z.array(z.string()).optional(), // For codebaseSearch filters
     category: z.union([z.array(z.string()), z.string()]).optional(), // For codebaseSearch/template filters (accepts string or array)
     status: z.enum(['open', 'in_progress', 'resolved', 'ignored']).optional(), // For problemCluster filter
