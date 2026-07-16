@@ -998,7 +998,7 @@ router.post('/resolve', async (c) => {
         });
 
         // Format execution trace as markdown
-        content = formatExecutionTraceAsMarkdown(trace, queryPath === 'new');
+        content = (pointer as any).format === 'json' ? JSON.stringify(trace) : formatExecutionTraceAsMarkdown(trace, queryPath === 'new');
         break;
       }
 
@@ -4895,52 +4895,20 @@ router.post('/resolve', async (c) => {
         return c.json({ success: true, shape: 'eventStream', body: es });
       }
     default: {
-        try {
-          const discoveryRes = await fetch(`${config.discovery.endpoint}/resolve`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `ApiKey ${process.env.METABOB_API_KEY || process.env.ACTIVITY_API_KEY}`,
-            },
-            body: JSON.stringify({
-              pointer: {
-                type: 'vesselCapability',
-                shape: pointer.type,
-                excludeVessels: [config.discovery.vesselId],
-              },
-            }),
-          });
-          const discoveryJson: any = await discoveryRes.json();
-          const firstVessel = discoveryJson?.content?.vessels?.[0];
-          if (!firstVessel) {
-            logger.warn('Unknown impulse shape - routing to vessel discovery', { type: pointer.type });
-            return c.json({ success: false, error: 'use_vessel_discovery' }, 404);
-          }
-          const endpoint: string = firstVessel.endpoint;
-          const resolveEndpoint: string | undefined = firstVessel.resolve_endpoint;
-          const forwardRes = await fetch(`${endpoint}${resolveEndpoint ?? '/v2/impulses/resolve'}`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `ApiKey ${process.env.METABOB_API_KEY || process.env.ACTIVITY_API_KEY}`,
-            },
-            body: JSON.stringify({ impulse: { pointer } }),
-          });
-          const forwardJson: any = await forwardRes.json();
-          if (forwardJson?.success === false) {
-            return c.json({ success: false, error: 'use_vessel_discovery' }, 404);
-          }
-          if (forwardJson?.content) {
-            return c.json({ success: true, content: forwardJson.content });
-          }
-          if (forwardJson?.shape && forwardJson?.body) {
-            return c.json({ success: true, shape: forwardJson.shape, body: forwardJson.body });
-          }
-          return c.json({ success: false, error: 'use_vessel_discovery' }, 404);
-        } catch (err) {
-          logger.warn('Unknown impulse shape - routing to vessel discovery', { type: pointer.type, error: (err as Error).message });
-          return c.json({ success: false, error: 'use_vessel_discovery' }, 404);
-        }
+        // Unknown shape - delegate to vessel discovery
+        // This follows the "Resolvers live WHERE THE DATA IS" principle
+        logger.info('Unknown impulse shape - routing to vessel discovery', {
+          shape: pointer.type,
+        });
+
+        return c.json({
+          success: false,
+          error: 'use_vessel_discovery',
+          message: `Unknown impulse shape "${pointer.type}" - use vessel discovery to find capable resolver`,
+          shape: pointer.type,
+          suggested_approach: 'Query GET /v2/vessels/discover?shape=' + pointer.type + ' to find vessels capable of resolving this impulse',
+          hint: 'Vessels register their capabilities via POST /v2/vessels/register. The backend only resolves shapes it directly stores (execution traces, templates, metrics).'
+        } as ImpulseResolveResponse, 404);
       }
     }
 
