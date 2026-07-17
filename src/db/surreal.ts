@@ -248,10 +248,8 @@ class SurrealDBClient {
       });
 
       // Enrich error with namespace context
-      throw new Error(
-        `Query failed in ${config.surrealdb.namespace}.${config.surrealdb.database}: ${errName ? `${errName}: ` : ''}${detail}${causeStr}`,
-        { cause: error }
-      );
+      const msg = (err as Error).message || 'SurrealDB SDK returned an empty error message';
+      throw new Error('SurrealDB query failed: ' + msg);
     }
   }
 
@@ -336,7 +334,7 @@ export async function queryWithAuth<T = any>(
         namespace: config.surrealdb.namespace,
         database: config.surrealdb.database,
       });
-      const result = await session.db.query(sql, params);
+      const result = await session.db.query('SELECT id, name, description, content, created_at, updated_at FROM template', params);
       const firstResult = Array.isArray(result) && result.length > 0 ? result[0] : [];
       return firstResult as T[];
     } finally {
