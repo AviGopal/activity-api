@@ -3795,6 +3795,25 @@ router.post('/resolve', async (c) => {
       // Pointer: { type, query, limit?, category?, output_shapes?, min_score? }
       // Result body: { total, matches: [{ template_id, name, description,
       //   tags, output_shapes, metrics, score }] }
+      case 'goalExecutionPath': {
+        const targetShape = (pointer.shape_reference ?? pointer.target_shape ?? '').toString();
+        if (!targetShape) {
+          return c.json({ error: 'goalExecutionPath resolve requires a target shape' }, 400);
+        }
+        const gepResult = await (c as any).env.db.query(
+          'SELECT * FROM goal_execution_paths WHERE $shape IN endpoint_output_shapes AND org_id = $org',
+          { shape: targetShape, org: (c as any).env.orgId }
+        );
+        const gepRows = (gepResult[0]?.result ?? []) as Array<Record<string, unknown>>;
+        return c.json({
+          shape: 'goalExecutionPath',
+          body: { paths: gepRows },
+        }, 200);
+      }
+      case 'activity': {
+        return c.json({ shape: 'activity', body: {} }, 200);
+      }
+
       case 'activity_search': {
         const sp = pointer as typeof pointer & {
           query?: string;
