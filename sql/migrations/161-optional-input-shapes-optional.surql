@@ -1,0 +1,24 @@
+-- Migration 161: make optional_input_shapes tolerant of omission on CONTENT-create.
+--
+-- Migration 154 defined `optional_input_shapes ON activity TYPE array<string>
+-- DEFAULT []`. On a FRESH volume, the bootstrap-seeder registers the 18 shared
+-- templates via `UPSERT activity:<id> CONTENT { ... }` where the CONTENT block
+-- OMITS optional_input_shapes (the templates don't declare it). SurrealDB 2.3.3
+-- does NOT apply a field DEFAULT on a CONTENT-create, so the required
+-- `array<string>` field evaluates to NONE and every seed UPSERT fails with
+-- `Found NONE for field `optional_input_shapes`, ... but expected a array<string>`.
+-- This bricked from-scratch bootstrap seeding (0/18 seeded) on the syzygy hub's
+-- fresh 07-02 volume on 2026-07-17; existing substrates were unaffected only
+-- because their activity rows predate the create path (the field was first added
+-- live on 2026-07-03, after those rows already existed).
+--
+-- Fix: widen to `option<array<string>>` so an omitted value is valid (NONE).
+-- Every reader already treats the field as optional — paradigm.ts uses
+-- `activity.optional_input_shapes || []` and `?.length ?? 0`, and goal-host's
+-- readCandidateShapes subtracts it from the gating input set treating absent as
+-- empty — so the optional-input feasibility semantics are unchanged.
+--
+-- OVERWRITE (not IF NOT EXISTS) so any volume that already applied 154 with the
+-- required type self-heals on the next unit start, rather than staying broken.
+
+DEFINE FIELD OVERWRITE optional_input_shapes ON activity TYPE option<array<string>> DEFAULT [];
