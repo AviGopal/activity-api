@@ -15,6 +15,7 @@
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
 import { transformToLegacyTemplate } from '../db/paradigm';
+import { betaSample } from '../routes/activities.scoring';
 import {
   successorFeaturesEnabled,
   fetchSuccessorFeatureCells,
@@ -223,7 +224,17 @@ export async function runDiscoverByShapes(
 
   const legacyActivities = activitiesWithScores.map((a: any) => {
     const { _comp_row, ...rest } = a;
-    return transformToLegacyTemplate(rest);
+    const legacy = transformToLegacyTemplate(rest);
+    // FM-2: attach a top-level Thompson draw from this candidate's posterior so
+    // goal-host readCandidateShapes populates WalkCandidate.sampledScore in
+    // forward/backward mode (previously only candidates_with_scores carried a
+    // score) — letting producer-pick.scaffoldRank grant the -1 learned-pathway
+    // reuse bonus (sampledScore>0.5), and feeding the FM-1 pick-order sort below.
+    const sampled_score = betaSample(
+      (a.metrics?.thompson_alpha ?? 1) as number,
+      (a.metrics?.thompson_beta ?? 1) as number,
+    );
+    return { ...legacy, sampled_score };
   });
 
   const finalActivities = isCandidatesMode
@@ -306,6 +317,11 @@ export async function runDiscoverByShapes(
     required_shapes,
   });
 
+  // FM-1: Thompson pick order — draw-sort so under-sampled arms (alpha≈beta≈1 →
+  // ~Uniform(0,1)) can beat an ev-mean-dominant incumbent, curing the
+  // composed-cap / fleet-health-pane lock-in. goal-host's stable scaffoldRank
+  // sort + .find then takes the sampled-best among equal-rank genuine producers.
+  finalActivities.sort((a: any, b: any) => (b.sampled_score ?? 0) - (a.sampled_score ?? 0));
   return {
     ok: true,
     activities: finalActivities,
