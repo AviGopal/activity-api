@@ -1504,6 +1504,8 @@ export async function updateShapeActivityScores(
       // Use composite record ID for multi-field key matching
       //
       // Phase B-followup: dual-write account_id + version on the MERGE.
+      // Precedence fix: in SurrealDB `x ?? 0 + inc` parses as `x ?? (0 + inc)`,
+      // so existing rows never incremented. The coalesce is now parenthesized.
       const query = `
         UPSERT impulse_shape_activity_score:[$org_id, $shape, $activity_id]
         MERGE {
@@ -1512,36 +1514,36 @@ export async function updateShapeActivityScores(
           org_id: $org_id,
           account_id: $account_id ?? NONE,
           account_id_version: $account_id_version,
-          success_count: (
+          success_count: ((
             SELECT VALUE success_count FROM ONLY impulse_shape_activity_score:[$org_id, $shape, $activity_id]
-          ) ?? 0 + ${success ? 1 : 0},
-          failure_count: (
+          ) ?? 0) + ${success ? 1 : 0},
+          failure_count: ((
             SELECT VALUE failure_count FROM ONLY impulse_shape_activity_score:[$org_id, $shape, $activity_id]
-          ) ?? 0 + ${success ? 0 : 1},
-          alpha: (
+          ) ?? 0) + ${success ? 0 : 1},
+          alpha: ((
             SELECT VALUE success_count FROM ONLY impulse_shape_activity_score:[$org_id, $shape, $activity_id]
-          ) ?? 0 + ${success ? 2 : 1},
-          beta: (
+          ) ?? 0) + ${success ? 2 : 1},
+          beta: ((
             SELECT VALUE failure_count FROM ONLY impulse_shape_activity_score:[$org_id, $shape, $activity_id]
-          ) ?? 0 + ${success ? 1 : 2},
+          ) ?? 0) + ${success ? 1 : 2},
           updated_at: time::now()
         }
       `;
 
       const params = {
         shape,
-        activity_id: activityId,
+        // Bare-id key: selection readers query the plain id form.
+        activity_id: normalizeActivityId(activityId),
         org_id: orgId,
         account_id: accountId,
         account_id_version: 1,
       };
 
-      // Use authenticated connection if JWT token provided, otherwise use root connection
-      if (jwtToken) {
-        await queryWithAuth(jwtToken, query, params);
-      } else {
-        await surrealDB.query(query, params);
-      }
+      // ROOT path (mirrors insertExecution): table PERMISSIONS evaluate
+      // $auth.org_id, which a JWT session does NOT populate ($token only), so
+      // queryWithAuth silently dropped every UPSERT (no error, empty result).
+      // Write via root with org_id carried explicitly so the row persists.
+      await surrealDB.query(query, params);
     }
 
     logger.debug('[paradigm] Updated shape activity scores', {
