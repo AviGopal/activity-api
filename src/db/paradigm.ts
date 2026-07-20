@@ -333,7 +333,10 @@ export async function insertExecution(
   try {
     const record: Record<string, any> = {
       id: execution.id,
-      activity_id: execution.activity_id,
+      // Normalize at write (strip the activity: table prefix and the angle
+      // bracket wrapper) so Thompson score updates and posterior readers that
+      // query bare activity ids find these rows.
+      activity_id: execution.activity_id ? normalizeActivityId(execution.activity_id) : execution.activity_id,
       input_impulses: execution.input_impulses || [],
       output_impulses: execution.output_impulses || [],
       success: execution.success,
