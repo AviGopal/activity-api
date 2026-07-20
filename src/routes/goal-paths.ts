@@ -483,7 +483,10 @@ app.post('/', async (c) => {
         avg_duration_ms: validated.duration_ms,
         avg_cost_usd: validated.cost_usd,
         avg_token_usage: validated.token_usage || 0,
-        inference_confidence: validated.inference_confidence ?? null,
+        // last_inference_confidence is option<number> in the schema: passing
+        // NULL fails the whole CREATE silently, so confidence-less senders
+        // (goal-walk pathway records) were never recorded. Default to 0.
+        inference_confidence: validated.inference_confidence ?? 0,
         typical_files_modified: validated.files_modified ?? undefined,
         typical_tools_used: validated.tools_used ?? undefined,
       });
