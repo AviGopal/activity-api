@@ -5547,7 +5547,16 @@ app.post('/recommend', async (c) => {
         // Try to get alpha/beta from v_activity_score first
         // Note: Use normalizeRecordId for consistent Map lookups and API output
         const activityId = normalizeRecordId(template.id || template.variant_id);
-        const scores = scoresMap.get(activityId);
+        // selector-unscored fix: the activity + shape-conditioned score maps are keyed by
+        // the BARE activity id — getActivityScores/getShapeConditionedScores strip the
+        // "activity:" prefix and ⟨⟩ brackets before matching and return `variant_id AS
+        // activity_id`. This lookup used the PREFIXED RecordId form, so every get() MISSED
+        // and alpha/beta fell back to the template's GLOBAL thompson metric — making
+        // recommend rank by global sample mass, blind to the goal's shape signature (the
+        // system's content-blind forward model). Try the bare key first; keep the prefixed
+        // key as a fallback so behaviour is preserved if a map is ever keyed the other way.
+        const scoreKey = normalizeActivityId(template.id || template.variant_id);
+        const scores = scoresMap.get(scoreKey) ?? scoresMap.get(activityId);
         let alpha = scores?.alpha || template.metrics?.thompson_alpha || 1.0;
         const betaVal = scores?.beta || template.metrics?.thompson_beta || 1.0;
 
