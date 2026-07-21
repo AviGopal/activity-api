@@ -3796,18 +3796,27 @@ router.post('/resolve', async (c) => {
       // Result body: { total, matches: [{ template_id, name, description,
       //   tags, output_shapes, metrics, score }] }
       case 'goalExecutionPath': {
-        const targetShape = (pointer.shape_reference ?? pointer.target_shape ?? '').toString();
+        // Accept endpoint_output_shape as an alias for the caller's key. The
+        // create-shape-provider-goal template's Signal-2 task resolves this shape with
+        // {endpoint_output_shape: "{{target_shape}}"} — the handler only read
+        // shape_reference/target_shape, so Signal-2 was ALWAYS empty (HTTP 400) and the
+        // family livelocked (~0% over ~84k dispatches) re-composing goals on no evidence.
+        const targetShape = (pointer.shape_reference ?? pointer.target_shape ?? (pointer as { endpoint_output_shape?: unknown }).endpoint_output_shape ?? '').toString();
         if (!targetShape) {
           return c.json({ error: 'goalExecutionPath resolve requires a target shape' }, 400);
         }
-        const gepResult = await (c as any).env.db.query(
+        // Use the shared surrealDB handle (the (c as any).env.db handle is undefined here
+        // and threw HTTP 500). Mirrors the proven goal_execution_paths query in
+        // routes/goal-paths.ts (migration 092) — surrealDB.query returns rows directly.
+        const gepAuth = getJwtAuthFromContext(c)!;
+        const gepRows = await surrealDB.query<Record<string, unknown>[]>(
           'SELECT * FROM goal_execution_paths WHERE $shape IN endpoint_output_shapes AND org_id = $org',
-          { shape: targetShape, org: (c as any).env.orgId }
+          { shape: targetShape, org: gepAuth.orgId }
         );
-        const gepRows = (gepResult[0]?.result ?? []) as Array<Record<string, unknown>>;
+        const paths = Array.isArray(gepRows) ? gepRows : [];
         return c.json({
           shape: 'goalExecutionPath',
-          body: { paths: gepRows },
+          body: { paths },
         }, 200);
       }
       case 'activity': {
