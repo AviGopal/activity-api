@@ -38,6 +38,7 @@ import { runTemplateAuditReport, type TemplateAuditInput } from './template-audi
 import { runExecutionTraceWithSignatures } from './execution-trace-with-signatures';
 import { runReplicationPull } from './replication-pull';
 import { runTraceAggregateReport } from './trace-aggregate-report';
+import { runGroupedExecutionStats } from './grouped-execution-stats';
 import { resolveDbAdmin } from './db-admin';
 import { queryActivitiesByFTS, getActivityScores } from '../db/paradigm';
 import {
@@ -3679,6 +3680,49 @@ router.post('/resolve', async (c) => {
             {
               success: false,
               error: err?.message || 'traceAggregateReport resolution failed',
+            } as ImpulseResolveResponse,
+            500,
+          );
+        }
+      }
+
+      case 'groupedExecutionStats': {
+        const authCheck = requireAuthenticated(c);
+        if (authCheck) {
+          return c.json(
+            { success: false, error: authCheck.error } as ImpulseResolveResponse,
+            authCheck.status,
+          );
+        }
+        const jwtAuth = getJwtAuthFromContext(c)!;
+        try {
+          const db =
+            jwtAuth.authType === 'apikey' || !jwtAuth.jwtToken
+              ? await surrealDB.getInstance()
+              : await createAuthenticatedClient(jwtAuth.jwtToken);
+          const report = await runGroupedExecutionStats(db, pointer as unknown, {
+            orgId: jwtAuth.orgId,
+            accountId: jwtAuth.accountId ?? null,
+            authType: jwtAuth.authType,
+          });
+          const worst = report.rows.slice().sort((a, b) => a.success_rate - b.success_rate)[0];
+          return c.json(
+            {
+              success: true,
+              content: JSON.stringify(report),
+              metadata: {
+                shape: 'groupedExecutionStats',
+                summary: `${report.total_groups} activit(y/ies) over ${report.window_hours}h${report.empty ? ' (no data)' : `; lowest success_rate ${worst?.activity_id ?? ''}=${worst ? (worst.success_rate * 100).toFixed(1) + '%' : ''} (${worst?.count ?? 0} runs, mode=${worst?.top_failure_mode ?? 'n/a'})`}`,
+              },
+            } as ImpulseResolveResponse,
+            200,
+          );
+        } catch (err: any) {
+          logger.error('groupedExecutionStats failed', { error: err?.message });
+          return c.json(
+            {
+              success: false,
+              error: err?.message || 'groupedExecutionStats resolution failed',
             } as ImpulseResolveResponse,
             500,
           );

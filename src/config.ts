@@ -294,6 +294,7 @@ export function loadConfig(): Config {
         // DB instead of shipping raw rows to the LLM (which timed out at 269K
         // rows). Read-only, bounded, returns empty-but-valid (never a timeout).
         'traceAggregateReport',
+        'groupedExecutionStats',
         // contextThompsonScores: paginated read over context_thompson_scores rows.
         // Supports filtering by templateId, signatureVersion, minObservations.
         // Powers harness discrimination stat (§6) and operator inspection.
@@ -391,6 +392,8 @@ export function loadConfig(): Config {
       shapeDescriptions: {
         traceAggregateReport:
           "Already-aggregated {key,value} rows computed in the database: failure/success/total counts or cost sums, grouped by activity template, status, or variant over a time window, sorted highest-first. THE direct answer to count/ranking/total/sum report goals — fast (~1s), no raw rows shipped. Config: group_by (activity_id|status|variant_id), metric (failure_count|success_count|count|cost_sum), window_hours, limit, order.",
+        groupedExecutionStats:
+          "Per-activity execution health in ONE row: count, success_count, success_rate, and dominant failure_mode over a window — the per-activity_id detail traceAggregateReport (single-metric {key,value}) cannot express. THE way to DETECT a livelock: a family with high count and near-zero success_rate. Config: window_hours, limit, min_count, activity_id (restrict to one family), order (asc|desc by count).",
         activityTemplatesByMetrics:
           "Activity templates filtered/ordered by performance metrics (Thompson posterior, success rate, execution count). Use for 'best/worst performing templates', 'top templates by success rate', or weak-family detection goals.",
         variantMetricsSummary:
