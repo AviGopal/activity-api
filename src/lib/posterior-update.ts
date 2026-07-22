@@ -29,6 +29,7 @@ import { enqueueVariantDelta, installPosteriorFlushOnShutdown } from './posterio
 import { embedSignatureForShapes } from '../jobs/signature-embed-backfill';
 import { applyClusterPosterior } from './cluster-posterior';
 import { getTuningParam } from './tuning-params';
+import { classifyReach } from './reach-classify';
 
 // Install the SIGTERM/SIGINT flush hook once on module load so buffered α/β
 // deltas are written out on shutdown rather than lost.
@@ -68,6 +69,10 @@ export interface TraceForPosterior {
   }>;
   org_id?: string;
   cost_usd?: number;
+  /** Execution id — read by the honest-reach gate to detect satisfier satellites (walk-satisfier- prefix). Absent on non-ingest callers. */
+  execution_id?: string;
+  /** Trace tags carrying the walk's persisted reach verdict ('reached:true'/'reached:false'/'dispatcher_used:goal-host'). Absent => legacy success-based (fail-open). */
+  tags?: string[];
   /**
    * Ancestor composition chain, root-first. When present, applyOutcomeToPosteriors
    * fires propagateCreditAlongChain as a fire-and-forget side effect.
@@ -193,7 +198,7 @@ export interface UpdateSummary {
    * than informative signal (M4 tier-restricted bandit).
    * Absent when the UPDATE ran normally.
    */
-  skipped_reason?: 'all_deterministic';
+  skipped_reason?: 'all_deterministic' | 'ungraded_reach';
 }
 
 // ---------------------------------------------------------------------------
@@ -678,7 +683,24 @@ export async function applyOutcomeToPosteriors(
   // Seam 3a: resolve the graded-yield references from authored tuning rows (TTL-cached,
   // env→default fallback). Behavior-preserving when no row exists.
   const yieldRefs = await resolveYieldRefs();
-  const { alphaDelta, betaDelta } = computeDeltas(trace.success, trace.failure_mode, warnings, trace, yieldRefs);
+  // Honest-reach gate (three-way). The walk's persisted reach verdict (trace.tags)
+  // overrides exit-status `success` for posterior credit/blame: reached -> credit,
+  // not-reached -> penalize, ungraded (satellite OR goal-host walk with no reach tag)
+  // -> SKIP so an ungraded outcome is neither credited nor BLAMED. Legacy no-tag rows
+  // fall through to success-based behavior (unchanged). {0,0} for ungraded is idiomatic
+  // (matches computeDeltas' 'cascading'/'user_abort') and suppresses S1-S4 via their
+  // existing (alphaDelta!==0||betaDelta!==0) guards for free.
+  const reachVerdict = classifyReach({
+    success: trace.success,
+    execution_id: trace.execution_id,
+    activity_id: trace.activity_id,
+    tags: trace.tags,
+  });
+  const ungraded = reachVerdict === 'ungraded';
+  const effectiveSuccess = reachVerdict === 'reached' || reachVerdict === 'legacy-success';
+  const { alphaDelta, betaDelta } = ungraded
+    ? { alphaDelta: 0, betaDelta: 0 }
+    : computeDeltas(effectiveSuccess, trace.failure_mode, warnings, trace, yieldRefs);
   const failureModeType = trace.failure_mode?.type ?? null;
 
   // M4 tier-restricted bandit: when every task on the trace is deterministic,
@@ -880,6 +902,7 @@ export async function applyOutcomeToPosteriors(
   // Impulse-relevance side-write for verifier_negative (and null→verifier fallback)
   let impulseRelevanceWrites = 0;
   const isVerifierFailure =
+    !ungraded &&
     !trace.success &&
     (failureModeType === 'verifier_negative' || failureModeType === null);
 
@@ -894,19 +917,23 @@ export async function applyOutcomeToPosteriors(
     failure_mode_type: failureModeType,
     impulse_relevance_writes: impulseRelevanceWrites,
     warnings,
-    ...(skipVariantUpdate ? { skipped_reason: 'all_deterministic' as const } : {}),
+    ...(ungraded
+      ? { skipped_reason: 'ungraded_reach' as const }
+      : skipVariantUpdate
+        ? { skipped_reason: 'all_deterministic' as const }
+        : {}),
   };
 
   emitPosteriorUpdateMetric(summary);
 
   // Phase 18.4: fire-and-forget chain credit propagation when a composition
   // chain is present on the trace.
-  if (trace.composition_chain && trace.composition_chain.length > 0) {
+  if (!ungraded && trace.composition_chain && trace.composition_chain.length > 0) {
     propagateCreditAlongChain(
       {
         activity_id: activityId,
         composition_chain: trace.composition_chain,
-        success: trace.success,
+        success: effectiveSuccess,
         failure_mode: trace.failure_mode,
         sibling_group_size: trace.sibling_group_size,
       },

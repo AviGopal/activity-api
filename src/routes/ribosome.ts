@@ -14,6 +14,7 @@
 import { Hono } from 'hono';
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
+import { classifyReach } from '../lib/reach-classify';
 
 const app = new Hono();
 
@@ -60,25 +61,13 @@ interface ExecutionTrace {
   tags?: string[];
 }
 
-// Honest-reach gate: prefer the walk's persisted reach verdict (in `tags`) over
-// exit-status `success`. What honestly reaches is what the ribosome extracts into
-// a reusable template; what merely staged green does not get minted. Order:
-// explicit reach tag -> structural satisfier satellite -> goal-host provenance
-// (walk-emitted but ungraded == hollow) -> fail-open on success for genuine
-// legacy (pre-reach-tag) rows so historical learning is not nuked.
-function isHollowSatellite(t: { execution_id?: string; activity_id?: string }): boolean {
-  return (
-    (typeof t.execution_id === 'string' && t.execution_id.startsWith('walk-satisfier-')) ||
-    (typeof t.activity_id === 'string' && t.activity_id.startsWith('satisfier:'))
-  );
-}
+// Honest-reach gate — shared primitive in src/lib/reach-classify.ts. The ribosome
+// extracts a template only from an honestly-reached execution: an explicit reach
+// verdict, or a genuine legacy (pre-reach-tag) success. Behavior-identical to the
+// prior inline logic across all six input classes (verified by truth table).
 function isHonestlyReached(t: { success: boolean; execution_id?: string; activity_id?: string; tags?: string[] }): boolean {
-  const tags = t.tags ?? [];
-  if (tags.includes('reached:true')) return true;
-  if (tags.includes('reached:false')) return false;
-  if (isHollowSatellite(t)) return false;
-  if (tags.includes('dispatcher_used:goal-host')) return false;
-  return t.success;
+  const v = classifyReach(t);
+  return v === 'reached' || v === 'legacy-success';
 }
 
 interface ExtractedTask {

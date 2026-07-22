@@ -27,6 +27,7 @@ import { resolveLearningTrack, type LearningTrack } from '../lib/learning-track'
 import { incrementExemplarBurstCounter } from '../services/exemplar-selector';
 import { incrementTraceStoreCounter } from '../lib/trace-store-counters';
 import { applyOutcomeToPosteriors } from '../lib/posterior-update';
+import { classifyReach } from '../lib/reach-classify';
 import { updateSuccessorFeatures } from '../lib/successor-features';
 import { applyClusterPosterior } from '../lib/cluster-posterior';
 
@@ -2743,6 +2744,19 @@ app.post('/', async (c) => {
         }
       }
 
+      // Honest-reach verdict, computed once and reused across ALL posterior sinks in
+      // this handler (applyOutcomeToPosteriors, successor-features, context-bucket, the
+      // dual-write INSERT seed) so an ungraded/hollow outcome is neither credited nor
+      // blamed on ANY of them — the gate boundary must match the side-effect cluster.
+      const reachVerdict = classifyReach({
+        success: trace.success as boolean,
+        execution_id: trace.execution_id as string | undefined,
+        activity_id: trace.variant_id as string,
+        tags: Array.isArray((trace as any).tags) ? ((trace as any).tags as string[]) : undefined,
+      });
+      const reachUngraded = reachVerdict === 'ungraded';
+      const reachEffectiveSuccess = reachVerdict === 'reached' || reachVerdict === 'legacy-success';
+
       applyOutcomeToPosteriors(
         {
           activity_id: trace.variant_id as string,
@@ -2750,6 +2764,8 @@ app.post('/', async (c) => {
           failure_mode: (body.failure_mode ?? null) as any,
           tasks: trace.tasks as any,
           cost_usd: trace.cost_usd as number,
+          ...(typeof trace.execution_id === 'string' ? { execution_id: trace.execution_id as string } : {}),
+          ...(Array.isArray((trace as any).tags) && (trace as any).tags.length > 0 ? { tags: (trace as any).tags as string[] } : {}),
           ...(resolvedCompositionChain.length > 0 ? { composition_chain: resolvedCompositionChain } : {}),
           ...(v1Sig ? { signature: v1Sig, signature_version: v1SigVersion } : {}),
           // §7 horizontal-composition fan-out width, surfaced from the engine via
@@ -2778,7 +2794,7 @@ app.post('/', async (c) => {
       // ADDITIVE, env-flagged (SUCCESSOR_FEATURES, default ON), fire-and-forget —
       // mirrors the chain-credit path. Keyed on the same v1 signature the
       // conditional Thompson posterior uses, so ψ rides one-to-one alongside R.
-      if (v1Sig) {
+      if (v1Sig && !reachUngraded) {   // ungraded: trace's claimed output shapes are untrustworthy; do not accumulate psi
         // Use the RAW execution_trace.tasks (which carry per-task
         // output_impulse_shapes / outputShapes) for the discounted occupancy
         // walk — the normalized `trace.tasks` projection drops shape arrays.
@@ -2823,10 +2839,21 @@ app.post('/', async (c) => {
     const isValidBucket = (v: unknown): v is string =>
       typeof v === 'string' && /^[0-9a-f]{8}$/.test(v);
 
-    if (isValidBucket(rawContextBucket)) {
+    // Honest-reach verdict (local to this scope): ungraded => skip the context bandit
+    // write; otherwise credit/penalize the bucket on the REACH verdict, not exit-status.
+    const ctxReach = classifyReach({
+      success: trace.success as boolean,
+      execution_id: trace.execution_id as string | undefined,
+      activity_id: trace.variant_id as string,
+      tags: Array.isArray((trace as any).tags) ? ((trace as any).tags as string[]) : undefined,
+    });
+    const ctxUngraded = ctxReach === 'ungraded';
+    const ctxEffectiveSuccess = ctxReach === 'reached' || ctxReach === 'legacy-success';
+
+    if (isValidBucket(rawContextBucket) && !ctxUngraded) {
       try {
-        const ctxAlphaDelta = trace.success ? 1 : 0;
-        const ctxBetaDelta  = trace.success ? 0 : 1;
+        const ctxAlphaDelta = ctxEffectiveSuccess ? 1 : 0;
+        const ctxBetaDelta  = ctxEffectiveSuccess ? 0 : 1;
 
         // Phase B2: dual-tenant LET/UPDATE/CREATE. Reads use the dual-tenant
         // WHERE; writes carry account_id + account_id_version=1.
@@ -3032,8 +3059,8 @@ app.post('/', async (c) => {
           success_rate: $success_delta,
           avg_duration_ms: $duration_ms,
           avg_cost_usd: $cost,
-          thompson_alpha: $success_delta + 1,
-          thompson_beta: $failure_delta + 1,
+          thompson_alpha: $seed_alpha,
+          thompson_beta: $seed_beta,
           total_selections: 0,
           last_executed_at: time::now(),
           created_at: time::now(),
@@ -3046,6 +3073,15 @@ app.post('/', async (c) => {
         metadata: body.metadata,
       });
 
+      // Honest-reach verdict (local to the INSERT-seed scope) for first-execution seeding.
+      const seedReach = classifyReach({
+      success: trace.success as boolean,
+      execution_id: trace.execution_id as string | undefined,
+      activity_id: trace.variant_id as string,
+      tags: Array.isArray((trace as any).tags) ? ((trace as any).tags as string[]) : undefined,
+    });
+      const seedUngraded = seedReach === 'ungraded';
+      const seedEffectiveSuccess = seedReach === 'reached' || seedReach === 'legacy-success';
       for (const candidateId of metricsCandidateIds) {
         const variantMetricsParams = {
           // Phase E: account-keyed record-id slug; legacy `<variant>` slug
@@ -3058,6 +3094,11 @@ app.post('/', async (c) => {
           account_id: traceAccountId,
           success_delta: trace.success ? 1 : 0,
           failure_delta: trace.success ? 0 : 1,
+          // Honest-reach gate-seed for a template's FIRST execution (the INSERT path):
+          // reached/legacy -> (2,1) credit, not-reached -> (1,2) penalize, ungraded -> (1,1) neutral.
+          // Race-immune (the INSERT is the write itself), unlike neutralizing to (1,1).
+          seed_alpha: seedUngraded ? 1 : (seedEffectiveSuccess ? 2 : 1),
+          seed_beta:  seedUngraded ? 1 : (seedEffectiveSuccess ? 1 : 2),
           duration_ms: trace.duration_ms || 0,
           cost: trace.cost_usd || 0,
         };

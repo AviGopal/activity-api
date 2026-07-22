@@ -1982,6 +1982,11 @@ app.post('/executions', async (c) => {
         success: validated.success,
         failure_mode: null,
         cost_usd: validated.cost,
+        // Honest-reach floor: goal-host does not (yet) emit a reach verdict on this
+        // body, so an exit-status completion is UNGRADED, not credit. Synthetic
+        // goal-host tag => classifyReach => 'ungraded' => SKIP (learn nothing, never
+        // mis-credit). Remove once goal-host emits reach tags on this path.
+        tags: ['dispatcher_used:goal-host'],
       },
       surrealDB,
       orgId!,
