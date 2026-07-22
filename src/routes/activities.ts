@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import { getActivitiesWithTieredFallback } from "./activities.get-activities-with-tiered-fallback";
 /**
  * Activity Template Routes
@@ -17,6 +18,24 @@ import { surrealDB, queryWithAuth } from '../db/surreal';
 import { RedisClient } from '../db/redis';
 import { invalidateTemplateCache, invalidateTemplateCacheMany } from '../utils/template-cache';
 import { logger } from '../utils/logger';
+
+const activitiesApp = new Hono();
+
+// POST /header_added
+// Produces shape: 'header_added'
+activitiesApp.post('/header_added', async (c) => {
+  const body = await c.req.json();
+  const validated = z.object({
+    header: z.string().min(1),
+    context: z.record(z.unknown()).optional(),
+  }).parse(body);
+
+  return c.json({
+    shape: 'header_added',
+    header: validated.header,
+    context: validated.context ?? null,
+  });
+});
 import { ensureTags, computeTagPrefixes, deriveCategory } from '../utils/tags';
 import { analyzeTaskSemantics } from '../utils/semantic-tags';
 import {
@@ -129,6 +148,22 @@ const app = new Hono();
 // CLUSTER posterior instead of the cold leaf / Beta(1,1) prior. Read once at module
 // init. Default 5 (aligns with RECOMMEND_SIGNATURE_SAMPLING_FLOOR semantics).
 const SIGNATURE_CLUSTER_N_MIN = parseInt(process.env.SIGNATURE_CLUSTER_N_MIN ?? '5', 10);
+
+// POST /header_added
+// Produces shape: 'header_added'
+app.post('/header_added', async (c) => {
+  const body = await c.req.json();
+  const validated = z.object({
+    header: z.string().min(1),
+    context: z.record(z.unknown()).optional(),
+  }).parse(body);
+
+  return c.json({
+    shape: 'header_added',
+    header: validated.header,
+    context: validated.context ?? null,
+  });
+});
 
 // Cache configuration
 const TEMPLATE_CACHE_TTL = 3600; // 1 hour in seconds
@@ -518,9 +553,6 @@ app.post('/templates', async (c) => {
         activityId,
       });
     }
-
-    // Set version header for execution list responses
-    c.header('x-exec-list-version', '2');
 
     // Add optional fields only if provided
     if (validated.project_id || projectId) {
