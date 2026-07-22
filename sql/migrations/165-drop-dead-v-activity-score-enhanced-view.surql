@@ -1,0 +1,59 @@
+-- 165-drop-dead-v-activity-score-enhanced-view.surql
+-- ============================================================================
+-- Purpose: Remove the dead materialised view `v_activity_score_enhanced`.
+--
+-- WHY (write-amplification, core principle):
+--   `v_activity_score_enhanced` is a DEFINE TABLE ... AS SELECT view defined as
+--   `... FROM execution GROUP BY activity_id, org_id` with NO WHERE clause.
+--   A SurrealDB materialised view re-materialises on EVERY write to its base
+--   table. `execution` is the hottest table in the system (one row per task /
+--   execution), and — as migration 163 documents — an unfiltered GROUP BY
+--   "ALWAYS plans as `Iterate Table`; no index removes it." So every single
+--   execution insert triggers a full-table aggregate re-materialisation feeding
+--   this view. Pure write-amplification churn + latency on the hot path.
+--
+-- WHY SAFE (read by nothing — verified, not assumed):
+--   * ZERO source references across ALL repos/*/src (non-test). The live
+--     dispatch/selection scoring path reads `variant_performance_metrics` /
+--     `v_activity_score` (see db/paradigm.ts getVariantScores, lib/selection),
+--     NOT this view.
+--   * No other view selects FROM v_activity_score_enhanced (checked INFO FOR DB).
+--   * The only remaining references are the DEFINE in
+--     sql/schemas/042-enhanced-activity-score.surql and comments in
+--     migration 163.
+--   Removing it therefore changes NO selection outcome — it deletes dead
+--   write-amplification only. (Its ~1258 materialised rows are a pure cache of
+--   the aggregate; nothing consumes them.)
+--
+-- ORDERING: sql/migrations/* apply AFTER sql/schemas/* in init-database.ts, and
+--   already-applied files are skipped via init_migrations. On the live DB schema
+--   042 will not re-run, so this REMOVE is durable; on a fresh boot 042 DEFINEs
+--   then this 165 REMOVEs → net removed. (For a fully durable removal the parent
+--   should also neutralise the DEFINE TABLE in schemas/042 in a follow-up, since
+--   this migration only guarantees removal given the migrations-after-schemas
+--   apply order.)
+--
+-- REVERSIBILITY: recreate the view (and its indexes) exactly as it exists live:
+--   DEFINE TABLE v_activity_score_enhanced TYPE ANY SCHEMALESS AS
+--     SELECT activity_id, org_id, count() AS total_executions,
+--       count(IF success = true THEN 1 ELSE NONE END) + 1 AS alpha,
+--       count(IF success = false THEN 1 ELSE NONE END) + 1 AS beta,
+--       count(IF success = true THEN 1 ELSE NONE END) AS successes,
+--       count(IF success = false THEN 1 ELSE NONE END) AS failures,
+--       <float>(count(IF success = true THEN 1 ELSE NONE END) + 1)
+--         / <float>(count(IF success = true THEN 1 ELSE NONE END)
+--           + count(IF success = false THEN 1 ELSE NONE END) + 2) AS belief,
+--       IF count() > 0 THEN <float> count(IF success = true THEN 1 ELSE NONE END)
+--         / <float> count() ELSE 0f END AS success_rate,
+--       math::mean(<float> duration_ms) AS avg_duration_ms,
+--       math::mean(<float> cost_usd) AS avg_cost_usd,
+--       time::max(executed_at) AS last_executed_at
+--     FROM execution GROUP BY activity_id, org_id
+--     PERMISSIONS FOR select WHERE org_id = $auth.org_id,
+--       FOR create, update, delete NONE;
+--   plus the indexes on it (idx on activity_id; org_id; org_id,belief;
+--   org_id,success_rate) — see sql/schemas/042-enhanced-activity-score.surql.
+--   REMOVE TABLE cascades removal of the view's indexes automatically.
+-- ============================================================================
+
+REMOVE TABLE IF EXISTS v_activity_score_enhanced;
