@@ -42,6 +42,8 @@ import { logger } from '../utils/logger';
 import { config } from '../config';
 import { normalizeRecordId } from '../utils/surrealdb-types';
 import { TRACE_STORE_COUNTER_ID } from '../lib/trace-store-counters';
+import { isDualWriteEnabled } from '../db/paradigm';
+import { loadTraceRetentionConfig, runTraceRetentionSweep } from '../services/trace-retention';
 
 // ---------------------------------------------------------------------------
 // Fixed constants — no caller-supplied table names anywhere in this module.
@@ -277,7 +279,87 @@ export async function resolveReconcileTraceStore(pointer: any, actor: string | n
   }
 
   // -------------------------------------------------------------------------
+  // AET DECOMMISSIONED short-circuit — never swap a frozen, non-authoritative
+  // table (and never destructively rewrite the live `execution` store).
+  //
+  // The copy-forward swap below rewrites activity_execution_traces (AET). AET
+  // is the DUAL_WRITE shadow; once DUAL_WRITE is off (isDualWriteEnabled() ===
+  // false) AET is frozen and no longer authoritative — `execution` is. Running
+  // the swap on a frozen AET is not merely pointless, it LIVELOCKS: both
+  // keep-set sources yield 0 rows (the hot window finds nothing newer than
+  // now - hotWindowDays in a table that stopped growing; the stratified
+  // reservoir iterates activity_template, which is empty), so verify_next_count
+  // aborts every run at "keep-set is empty, refusing to swap" and
+  // last_reconciled_at never advances — the health observer then re-emits
+  // forever.
+  //
+  // Correct behavior when AET is decommissioned: skip the swap, delegate cap
+  // management to the trace-retention sweep over the authoritative `execution`
+  // table (src/services/trace-retention.ts — bounded, indexed, non-destructive
+  // reservoir delete), advance last_reconciled_at so the observer stops
+  // re-emitting, and return success. We honor trace-retention's own
+  // enabled/dryRun contract (loadTraceRetentionConfig), so this deletes nothing
+  // the operator has not explicitly enabled. row_count is intentionally left
+  // untouched: it is the O(1) counter kept in sync with `execution` via the
+  // per-insert increment + the retention decrement, so a blind reset here would
+  // desync it.
+  if (!isDualWriteEnabled()) {
+    let retention: Record<string, unknown>;
+    const rcfg = loadTraceRetentionConfig();
+    if (!rcfg.enabled) {
+      retention = { skipped: true, reason: 'trace-retention disabled (set TRACE_RETENTION_ENABLED=true)' };
+    } else {
+      try {
+        const sweep = await runTraceRetentionSweep(rcfg);
+        const deleted = sweep.results.reduce((n, r) => n + (r.deletedActual ?? 0), 0);
+        retention = { deleted, dry_run: rcfg.dryRun, strata: sweep.results.length, duration_ms: sweep.durationMs };
+      } catch (err: any) {
+        retention = { error: err?.message ?? String(err) };
+      }
+    }
+
+    // Advance last_reconciled_at (and re-affirm the cap) so the observer's
+    // staleness signal clears. Do NOT overwrite row_count here.
+    try {
+      await ctx.surrealDB.query(
+        `UPSERT ${TRACE_STORE_COUNTER_ID} SET
+           table_name = 'execution',
+           cap = (cap ?? $cap),
+           last_reconciled_at = time::now()`,
+        { cap: config.traceStore.cap },
+      );
+    } catch (err: any) {
+      logger.warn('reconcile_trace_store: last_reconciled_at advance failed (non-fatal)', { error: err?.message });
+    }
+
+    const result = {
+      dry_run: false,
+      aet_decommissioned: true,
+      swap_skipped: true,
+      delegated_to: 'trace-retention sweep over `execution`',
+      retention,
+      before_row_count: counters.row_count,
+      cap: counters.cap,
+      over_cap: overCap,
+    };
+    await ctx.writeAudit({
+      operation,
+      params: { dry_run: false },
+      applied: true,
+      actor,
+      impact_count: counters.row_count,
+      detail: result,
+    });
+    return ok(
+      result,
+      'db_admin_reconcile_trace_store',
+      `reconcile_trace_store: AET decommissioned — swap skipped, delegated to trace-retention over execution`,
+    );
+  }
+
+  // -------------------------------------------------------------------------
   // LIVE RUN — bounded copy-forward swap (design.md "The swap").
+  // Only reached while DUAL_WRITE is on (AET rollback window).
   // -------------------------------------------------------------------------
   const startedAt = Date.now();
   let step = 'start';
