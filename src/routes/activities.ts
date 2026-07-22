@@ -4801,6 +4801,7 @@ app.post('/feedback', async (c) => {
             alpha: 1,
             beta: 1,
             updated_at: time::now(),
+        created_at: time::now(),
             initialized_from_feedback: true
           }`,
           {
