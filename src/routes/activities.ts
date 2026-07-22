@@ -4678,6 +4678,7 @@ app.get('/family/:baseId', async (c) => {
  * Updates impulse_shape_activity_score table for all shapes the activity handles.
  */
 app.post('/feedback', async (c) => {
+  c.header('x-complexity-probe-feedback', '1');
   try {
     // Check for JWT auth
     const jwtAuth = getJwtAuthFromContext(c);
@@ -4998,6 +4999,7 @@ app.post('/feedback', async (c) => {
  * - Backward mode: "I have shape Y, what can consume it?" (next step discovery)
  */
 app.post('/discover-by-shapes', async (c) => {
+  c.header('x-complexity-probe-discover', '1');
     logger.debug('discover-by-shapes request received');
   try {
     const body = await c.req.json();
