@@ -576,7 +576,7 @@ app.get('/', async (c) => {
       }
       return trimmed; // already ISO (or a value SurrealDB will reject loudly)
     };
-    const startDate = coerceToIso(c.req.query('start_date') ?? c.req.query('since'));
+    const startDate = coerceToIso(c.req.query('start_date') ?? c.req.query('since') ?? c.req.query('since_iso'));
     const endDate = coerceToIso(c.req.query('end_date'));
     const includeSelection = c.req.query('include_selection') === 'true';
     // Opt-in narrow projection for the list view (2026-06-21). The DEFAULT
@@ -592,7 +592,7 @@ app.get('/', async (c) => {
     const fieldsParam = c.req.query('fields');
     const detailParam = c.req.query('detail');
     const summaryProjection =
-      fieldsParam === 'summary' || detailParam === 'false';
+      fieldsParam === 'summary' || detailParam !== 'true';
 
     // Validate and cap limit
     const limit = Math.min(Math.max(limitParam, 1), 100);
