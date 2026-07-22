@@ -6239,6 +6239,7 @@ app.post('/recommend', async (c) => {
       surrealDB.query(`
         FOR $log IN $logs {
           CREATE thompson_selection_log CONTENT {
+            selected_at: time::now(),
             correlation_id: $log.correlation_id,
             execution_id: $log.execution_id,
             activity_id: $log.activity_id,
