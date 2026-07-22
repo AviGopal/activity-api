@@ -4771,7 +4771,7 @@ app.post('/feedback', async (c) => {
             shape: $shape,
             activity_id: $activity_id,
             org_id: $org_id,
-            account_id: $account_id,
+            account_id: $account_id ?? NONE,
             account_id_version: $account_id_version,
             success_count: 0,
             failure_count: 0,
