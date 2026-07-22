@@ -1056,22 +1056,21 @@ export async function getShapeConditionedScores(
 }
 
 /**
- * Query activities using full-text search on name, description, and tags.
- * Uses BM25 scoring from three FTS indexes:
- *   idx_activity_name_fts        → score index 0 (weight ×2)
- *   idx_activity_description_fts → score index 1 (weight ×1)
- *   idx_activity_tags_fts        → score index 2 (weight ×1.5)
+ * Query activities using full-text search on name and tags (BM25).
+ * Two live SEARCH indexes back this query (migration 136):
+ *   idx_activity_fts_name → field `name`  (field boost ×2.0)
+ *   idx_activity_fts_tags → field `tags`  (field boost ×1.5)
+ * Both are `SEARCH ANALYZER analyzer_activity BM25(1.2,0.75) HIGHLIGHTS`.
+ * There is NO description FTS index, so `description` is matched by substring
+ * (CONTAINS, weight 0.5) in the score only — never via @N@.
  *
- * The search uses the @N@ operator for FTS matching with score indices:
- * - @0@ binds to name index (search::score(0))
- * - @1@ binds to description index (search::score(1))
- * - @2@ binds to tags index (search::score(2))
- *
- * SurrealDB 3.x note: triple-@ (@N@@) is a parser bug — it splits as
- * `@@ @` and rejects the RHS literal. Use single-@ (@N@).
- *
- * Combined ranking: search::score(0)*2 + search::score(2)*1.5 + search::score(1)
- * This prioritises name matches, then tag matches, then description matches.
+ * The phrase is split into tokens (OR-combined for recall on multi-word input).
+ * Each (token, field) pair binds a UNIQUE match ref: name → @2*i@, tags → @2*i+1@,
+ * and its real BM25 score is read back via search::score(ref). On the deployed
+ * SurrealDB 2.3.3, search::score returns non-zero BM25 values as long as the index
+ * carries HIGHLIGHTS; the earlier IF/CONTAINS workaround (attributed to a "3.0.0
+ * zero-score bug", a version never deployed here) bypassed real ranking.
+ * Note: single-@ (@N@) is the correct operator; triple-@ (@N@@) mis-parses.
  *
  * @param searchQuery - Search query string (tokenized and stemmed by activity_analyzer)
  * @param orgId - Organization ID for multi-tenant filtering (optional)
@@ -1116,13 +1115,12 @@ export async function queryActivitiesByFTS(
       limit,
     };
 
-    // FTS matching on name (score index 0) and tags (score index 2).
-    //
-    // SurrealDB 3.x quirk: the `@N@` full-text-match operator requires an
-    // inline string literal (not a bound parameter). Sanitise to safe chars.
-    // Sanitise to single-quote-safe alphanumerics + spaces; everything
-    // else (backticks, quotes, semicolons, parens, control chars) is
-    // dropped so we never produce a malformed SurrealQL literal.
+    // FTS matching on name and tags via per-token, per-field @N@ match refs
+    // (assigned below). The @N@ full-text-match operator takes an inline string
+    // literal (not a bound parameter), so sanitise to single-quote-safe
+    // alphanumerics + spaces; everything else (backticks, quotes, semicolons,
+    // parens, control chars) is dropped so we never emit a malformed SurrealQL
+    // literal.
     const ftsLiteral = trimmedQuery.replace(/[^A-Za-z0-9_\- ]+/g, ' ').replace(/\s+/g, ' ').trim();
     if (!ftsLiteral) {
       // Pre-sanitised input was non-empty but contained nothing index-able
@@ -1136,14 +1134,13 @@ export async function queryActivitiesByFTS(
       return { data: [], path: 'new', latency_ms: latencyMs };
     }
 
-    // Per-token OR-semantics: split phrase into tokens and match any token in
-    // name or tags. Two SurrealDB 3.x bugs drive this design:
-    // 1. Multi-word @N@ uses AND semantics — all tokens must appear in the same
-    //    field. A 4-word query rarely matches even when all words exist across
-    //    name+tags combined. Fix: per-token OR, so any single token hit qualifies.
-    // 2. Mixing @0@, @1@, @2@ in an OR clause with an AND filter produces
-    //    incorrect results (query-planner bug). Fix: use only @0@ (name) and
-    //    @2@ (tags) in WHERE; use description CONTAINS in SELECT only.
+    // Per-token OR-semantics: split the phrase into tokens and match any token in
+    // name or tags. A single-field multi-word @N@ match uses AND semantics (all
+    // terms must appear in that one field), so a multi-word query rarely matches
+    // even when the words exist across name+tags combined; per-token OR fixes recall
+    // (any single token hit qualifies the row). Each (token, field) uses its own
+    // match ref so per-field BM25 scores sum in the SELECT. description is not
+    // FTS-indexed and stays a substring bonus in the SELECT only, never in WHERE.
     // Activities matching more tokens rank higher via summed per-token scoring.
     // Stop words are excluded so common English words don't dilute ranking for
     // long natural-language goal_text queries (recommend path). Short queries
@@ -1166,9 +1163,16 @@ export async function queryActivitiesByFTS(
       .slice(0, 10);
     if (tokens.length === 0) tokens.push(ftsLiteral);
 
-    const tokenWhereParts = tokens.flatMap(tok => {
+    // Native BM25 match via the two live SEARCH indexes (migration 136):
+    // idx_activity_fts_name (field `name`) and idx_activity_fts_tags (field `tags`).
+    // Each (token, field) gets a UNIQUE match ref so its per-field BM25 score is
+    // retrievable via search::score(ref) below: name → 2*i, tags → 2*i+1. The
+    // analyzer already lowercases + snowball-stems, so no string::lowercase wrapper
+    // is needed; `lt` is pre-sanitised to [A-Za-z0-9_- ] with quotes stripped, so
+    // the inline literal is injection-safe.
+    const tokenWhereParts = tokens.flatMap((tok, i) => {
       const lt = tok.toLowerCase().replace(/'/g, '');
-      return ["string::lowercase(name) CONTAINS '" + lt + "'", "tags CONTAINS '" + lt + "'"];
+      return [`name @${2 * i}@ '${lt}'`, `tags @${2 * i + 1}@ '${lt}'`];
     });
     whereClauses.push(`(${tokenWhereParts.join(' OR ')})`);
 
@@ -1196,15 +1200,18 @@ export async function queryActivitiesByFTS(
 
     const whereClause = whereClauses.join(' AND ');
 
-    // Score = sum of per-token-per-field presence weights.
-    // name (2.0) > tags (1.5) > description substring (1.0).
-    // SurrealDB 3.0.0 search::score(N) always returns 0.0 (known bug, fixed in
-    // 3.0.5). Workaround: IF/THEN presence check assigns static field weights.
-    const scoreTerms = tokens.flatMap(tok => {
+    // Score = field-boosted sum of the REAL BM25 relevance per matched (token, field).
+    // On the deployed SurrealDB 2.3.3, search::score(ref) returns the actual BM25 score
+    // for the row against match ref `ref` (0.0 when that ref did not match the row), so
+    // the sum rewards rows that match more / rarer tokens. Field boosts name ×2.0 >
+    // tags ×1.5 preserve the prior field-priority intent (BM25F-style weighting).
+    // description has NO live SEARCH index, so it stays a substring bonus (score-only,
+    // never in WHERE) to retain its prior tie-break coverage without an index.
+    const scoreTerms = tokens.flatMap((tok, i) => {
       const lt = tok.toLowerCase().replace(/'/g, '');
       return [
-        "(IF string::lowercase(name) CONTAINS '" + lt + "' THEN 2.0 ELSE 0.0 END)",
-        "(IF tags CONTAINS '" + lt + "' THEN 1.5 ELSE 0.0 END)",
+        `(2.0 * search::score(${2 * i}))`,
+        `(1.5 * search::score(${2 * i + 1}))`,
         `(IF description CONTAINS '${lt}' THEN 0.5 ELSE 0.0 END)`,
       ];
     });
