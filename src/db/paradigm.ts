@@ -199,6 +199,14 @@ export interface ParadigmExecution {
   output_impulse_shapes?: string[];
   metadata?: Record<string, any>;
   tags?: string[];
+  /**
+   * Honest-reach verdict persisted at write time (previously unstored — NONE on
+   * ~all rows). Set from the trace's explicit verdict (tags reached:true/false,
+   * or body/trace.reached); left undefined for ungraded/legacy traces so the
+   * column stays NONE rather than fabricating a boolean. A later reach
+   * write-back can still populate it.
+   */
+  reached?: boolean;
   account_id?: string;
   account_id_version?: number;
   // Cross-instance replication provenance (intra-identity-group trace sync).
@@ -363,7 +371,7 @@ export async function insertExecution(
     // Lossless passthrough of AET learning fields + replication provenance
     // (migration 157) so `execution` can become authoritative without dropping
     // reader-critical columns.
-    for (const k of ['variant_id','status','signature','signature_version','repair_signature','failure_mode','correlation_id','component_changes','improvisation','input_impulse_shapes','output_impulse_shapes','metadata','tags','account_id','account_id_version','origin_substrate_id','origin_instance','version'] as const) {
+    for (const k of ['variant_id','status','signature','signature_version','repair_signature','failure_mode','correlation_id','component_changes','improvisation','input_impulse_shapes','output_impulse_shapes','metadata','tags','reached','account_id','account_id_version','origin_substrate_id','origin_instance','version'] as const) {
       const v = (execution as any)[k];
       if (v !== undefined && v !== null) record[k] = v;
     }

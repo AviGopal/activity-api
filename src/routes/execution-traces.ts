@@ -2473,6 +2473,17 @@ app.post('/', async (c) => {
         account_id_version: (trace as any).account_id_version,
         origin_substrate_id: process.env.FED_SUBSTRATE_ID || process.env.SUBSTRATE_ID || undefined,
         origin_instance: process.env.ACTIVITY_API_INSTANCE_ID || process.env.VESSEL_ID || undefined,
+        // Persist the honest-reach verdict at write time so `execution.reached`
+        // is queryable (previously NONE on ~all rows). Only set when the trace
+        // carries an explicit verdict — ungraded/legacy traces leave the column
+        // NONE rather than fabricating a boolean (mirrors classifyReach's tag
+        // authority). A later reach write-back can still set it.
+        reached:
+          typeof (body as any).reached === 'boolean' ? (body as any).reached
+          : typeof (trace as any).reached === 'boolean' ? (trace as any).reached
+          : Array.isArray((trace as any).tags) && (trace as any).tags.includes('reached:true') ? true
+          : Array.isArray((trace as any).tags) && (trace as any).tags.includes('reached:false') ? false
+          : undefined,
         version: 0,
       };
 
