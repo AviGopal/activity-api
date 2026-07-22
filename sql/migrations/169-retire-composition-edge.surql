@@ -1,0 +1,41 @@
+-- 169-retire-composition-edge.surql
+-- ============================================================================
+-- Purpose: Retire the vestigial `composition_edge` subsystem.
+--
+-- WHY (dead orphan):
+--   composition_edge was the Phase-3 "shape-based composition edge" learner
+--   (defined by sql/schemas/046-composition-graph.surql + migration
+--   063-composition-edges.surql). It never carried live signal: 0 rows, the
+--   fn::update_composition_edge helper was never applied to the live DB (its
+--   writer/reader silently no-op'd), the writer route
+--   (POST /v2/activities/composition/edges) and reader route
+--   (GET /v2/activities/composition/edges/successors/:activityId) had no
+--   remaining callers, and the OpenSpec change that introduced it is absent
+--   from the tree.
+--
+--   The LIVING reuse surface is the SIBLING table `activity_composition_graph`
+--   (producer->consumer edges, served by the compositionSuccess /
+--   compositionGraph read shapes). It is UNTOUCHED by this migration.
+--
+-- WHY SAFE (verified 2026-07-22):
+--   * 0 rows live. No live view / field / event / index / record-link depends
+--     on composition_edge. The account-id back-compat view
+--     v_composition_edge_by_account was already dropped by migration 166; it is
+--     re-dropped below for fresh-boot durability (166 runs before 169 on a
+--     fresh apply, but REMOVE TABLE IF EXISTS is idempotent).
+--   * All runtime .ts references are removed in the same change: the writer
+--     route + reader route (src/routes/activities.ts), the updateEdge() method
+--     (src/services/composition-graph.ts, the sole caller of
+--     fn::update_composition_edge), and the compositionEdge_write impulse shape
+--     (src/config.ts + src/routes/impulses.ts).
+--
+-- REVERSIBILITY:
+--   The table definition survives in history. Recreate by re-applying
+--   sql/schemas/046-composition-graph.surql (table + fn::update_composition_edge)
+--   or migration 063-composition-edges.surql, plus the account_id scaffold from
+--   migration 096-back-compat-account-views.surql. REMOVE TABLE IF EXISTS is
+--   idempotent and safe on a fresh deploy.
+-- ============================================================================
+
+REMOVE TABLE IF EXISTS composition_edge;
+REMOVE TABLE IF EXISTS v_composition_edge_by_account;

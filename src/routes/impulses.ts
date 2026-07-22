@@ -2700,15 +2700,6 @@ router.post('/resolve', async (c) => {
         return c.json(buildWriteResolverResponse('execution_write', delegated, 'execution recorded') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
       }
 
-      case 'compositionEdge_write': {
-        const writePointer = pointer as typeof pointer & { edgeData?: unknown };
-        if (!writePointer.edgeData) {
-          return c.json({ success: false, error: 'edgeData required for compositionEdge_write' } as ImpulseResolveResponse, 400);
-        }
-        const delegated = await delegateWriteToRouter(c, activitiesRouter, '/composition/edges', writePointer.edgeData);
-        return c.json(buildWriteResolverResponse('compositionEdge_write', delegated, 'composition edge recorded') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
-      }
-
       // =============================================================================
       // goal_verification_label_write: insert a ground-truth label into the oracle
       // corpus (migration 101). No existing REST endpoint — writes directly to

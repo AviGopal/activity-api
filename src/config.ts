@@ -348,7 +348,6 @@ export function loadConfig(): Config {
         'similarState_write',
         'goalSeeking_write',
         'execution_write',
-        'compositionEdge_write',
         'goal_verification_label_write',
         // Admin/destructive shapes (admin scope required at route level)
         'activityTemplate_update',

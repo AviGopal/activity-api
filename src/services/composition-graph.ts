@@ -28,22 +28,6 @@ export interface CompositionNode {
   updated_at?: string;
 }
 
-export interface CompositionEdge {
-  id?: string;
-  from_activity: string;
-  to_activity: string;
-  shape_produced: string;
-  alpha: number;
-  beta: number;
-  weight: number;
-  success_count: number;
-  failure_count: number;
-  total_count: number;
-  org_id: string;
-  public: boolean;
-  updated_at?: string;
-}
-
 export interface CompositionChain {
   id?: string;
   orchestrator_id: string;
@@ -207,39 +191,6 @@ export class CompositionGraphService {
   }
 
   /**
-   * Update composition edge after traversal
-   */
-  async updateEdge(
-    fromActivity: string,
-    toActivity: string,
-    shapeProduced: string,
-    success: boolean,
-    orgId: string
-  ): Promise<void> {
-    try {
-      // Use the helper function defined in schema
-      const updateQuery = `
-        RETURN fn::update_composition_edge($from, $to, $shape, $success);
-      `;
-
-      await surrealDB.query(updateQuery, {
-        from: fromActivity,
-        to: toActivity,
-        shape: shapeProduced,
-        success,
-      });
-
-      logger.info(`Updated composition edge: ${fromActivity} → ${toActivity}`, {
-        shape: shapeProduced,
-        success,
-      });
-    } catch (error) {
-      logger.error('Failed to update composition edge', { error });
-      throw error;
-    }
-  }
-
-  /**
    * Record a composition chain from an orchestration execution
    *
    * Phase B-followup: dual-write account_id alongside org_id on CREATE
@@ -278,14 +229,6 @@ export class CompositionGraphService {
         chain_length: chain.activity_sequence.length,
       });
 
-      // Update edges in the chain
-      for (let i = 0; i < chain.activity_sequence.length - 1; i++) {
-        const from = chain.activity_sequence[i];
-        const to = chain.activity_sequence[i + 1];
-        const shape = chain.shape_sequence[i + 1] || 'unknown';
-
-        await this.updateEdge(from, to, shape, chain.success, chain.org_id);
-      }
     } catch (error) {
       logger.error('Failed to record composition chain', { error });
       throw error;
