@@ -6272,7 +6272,7 @@ app.post('/recommend', async (c) => {
             candidates_count: $log.candidates_count,
             exploration_slot: $log.exploration_slot,
             org_id: $org_name,
-            account_id: $account_id,
+            account_id: IF $account_id IS NULL THEN NONE ELSE $account_id END,
             account_id_version: 1,
             project_id: IF $project_name IS NOT NONE AND $project_name IS NOT NULL THEN type::record('projects', $project_name) ELSE NONE END
           }
