@@ -2213,6 +2213,7 @@ app.post('/executions', async (c) => {
  * Data Flow: Dashboard → GET /executions → SurrealDB query → execution history
  */
 app.get('/executions', async (c) => {
+    c.header('x-exec-list-version', '2');
   try {
     // Extract session from context for multi-tenant filtering
     const session = (c.get as any)('session') as SessionData | undefined;
