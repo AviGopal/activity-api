@@ -4998,6 +4998,7 @@ app.post('/feedback', async (c) => {
  * - Backward mode: "I have shape Y, what can consume it?" (next step discovery)
  */
 app.post('/discover-by-shapes', async (c) => {
+    logger.debug('discover-by-shapes request received');
   try {
     const body = await c.req.json();
     // output_shapes: optional additive filter on backward mode — see OpenSpec change 2026-04-26-validators-and-failure-modes.
