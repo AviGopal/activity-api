@@ -656,17 +656,15 @@ app.post('/extract-from-session', async (c) => {
       return c.json({ error: 'Missing required field: session_id' }, 400);
     }
 
-    // Fetch traces for session
-    let query = `
-      SELECT * FROM v_paradigm_execution_traces
-      WHERE variant_id CONTAINS $session_id
-      ORDER BY executed_at ASC
-    `;
+    // Fetch traces for session. OOM-safe two-step projection (migration-162):
+    // step 1 sorts ONLY the narrow (execution_id, executed_at) keys under a
+    // bounded LIMIT so the SELECT * blobs never enter a MemoryOrderedLimit
+    // sort; step 2 hydrates the full rows for the chosen ids.
+    let whereClause = `variant_id CONTAINS $session_id`;
 
     if (success_only) {
-      query = `
-        SELECT * FROM v_paradigm_execution_traces
-        WHERE variant_id CONTAINS $session_id
+      whereClause = `
+        variant_id CONTAINS $session_id
           AND (
             tags CONTAINS "reached:true"
             OR (
@@ -676,11 +674,31 @@ app.post('/extract-from-session', async (c) => {
               AND success = true
             )
           )
-        ORDER BY executed_at ASC
       `;
     }
 
-    const traces = await surrealDB.query<ExecutionTrace>(query, { session_id });
+    const idQuery = `
+      SELECT execution_id, executed_at
+      FROM v_paradigm_execution_traces
+      WHERE ${whereClause}
+      ORDER BY executed_at ASC
+      LIMIT 500
+    `;
+    const idRows = await surrealDB.query<{ execution_id: string }>(idQuery, { session_id });
+    const traceIds = (idRows || []).map(r => r.execution_id).filter(id => id != null);
+
+    let traces: ExecutionTrace[] = [];
+    if (traceIds.length > 0) {
+      const placeholders = traceIds.map((_, i) => `$id_${i}`).join(', ');
+      const hydrateParams: Record<string, string> = {};
+      traceIds.forEach((id, i) => { hydrateParams[`id_${i}`] = id; });
+      const hydrateQuery = `
+        SELECT * FROM v_paradigm_execution_traces
+        WHERE execution_id IN [${placeholders}]
+        ORDER BY executed_at ASC
+      `;
+      traces = await surrealDB.query<ExecutionTrace>(hydrateQuery, hydrateParams);
+    }
 
     if (!traces || traces.length < (min_traces || 1)) {
       return c.json({

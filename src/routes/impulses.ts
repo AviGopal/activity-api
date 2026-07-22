@@ -1949,16 +1949,34 @@ router.post('/resolve', async (c) => {
           whereClause += ' AND (status = "failure" OR status = "failed")';
         }
 
-        const tracesQuery = `
-          SELECT execution_id, variant_id, status, duration_ms, cost_usd,
-                 error_message, failed_task_id, execution_trace, created_at
+        // OOM-safe two-step projection (migration-162): sort ONLY the narrow
+        // ordering keys so the execution_trace blob never enters the
+        // MemoryOrderedLimit sort; then hydrate the full rows (incl. blob) for
+        // the chosen ids, re-applying ORDER BY over the bounded id set.
+        const traceIdsQuery = `
+          SELECT execution_id, created_at
           FROM v_paradigm_execution_traces
           ${whereClause}
           ORDER BY created_at DESC
           LIMIT $limit
         `;
 
-        const traces = await executeAsAuth<any>(jwtAuthCtx, tracesQuery, params);
+        const idRows = await executeAsAuth<any>(jwtAuthCtx, traceIdsQuery, params);
+        const traceIds = (idRows || [])
+          .map((r: any) => r.execution_id)
+          .filter((id: any) => id != null);
+
+        let traces: any[] = [];
+        if (traceIds.length > 0) {
+          const tracesQuery = `
+            SELECT execution_id, variant_id, status, duration_ms, cost_usd,
+                   error_message, failed_task_id, execution_trace, created_at
+            FROM v_paradigm_execution_traces
+            WHERE execution_id IN $trace_ids
+            ORDER BY created_at DESC
+          `;
+          traces = await executeAsAuth<any>(jwtAuthCtx, tracesQuery, { ...params, trace_ids: traceIds });
+        }
 
         if (traces.length === 0) {
           const filterDesc = success === true ? 'successful' : success === false ? 'failed' : 'any';
@@ -3980,19 +3998,40 @@ router.post('/resolve', async (c) => {
             params.q = queryFragment;
           }
 
-          const sql = `
-            SELECT
-              execution_id, activity_id, success, duration_ms, cost_usd,
-              metadata, executed_at,
-              tasks
+          // OOM-safe two-step projection (migration-162): sort ONLY the narrow
+          // (execution_id, executed_at) keys so the metadata/tasks blobs never
+          // enter the MemoryOrderedLimit sort; then hydrate full rows for the
+          // chosen ids, re-applying ORDER BY over the bounded id set.
+          const idSql = `
+            SELECT execution_id, executed_at
             FROM v_paradigm_execution_traces
             WHERE ${whereClauses.join(' AND ')}
             ORDER BY executed_at DESC
             LIMIT $limit
           `;
-          const rows = (jwtAuthCtx.jwtToken
-            ? await queryWithAuth<any>(jwtAuthCtx.jwtToken, sql, params)
-            : await surrealDB.query<any>(sql, params)) as any[];
+          const idRows = (jwtAuthCtx.jwtToken
+            ? await queryWithAuth<any>(jwtAuthCtx.jwtToken, idSql, params)
+            : await surrealDB.query<any>(idSql, params)) as any[];
+          const traceIds = (Array.isArray(idRows) ? idRows : [])
+            .map((r: any) => r.execution_id)
+            .filter((id: any) => id != null);
+
+          let rows: any[] = [];
+          if (traceIds.length > 0) {
+            const sql = `
+              SELECT
+                execution_id, activity_id, success, duration_ms, cost_usd,
+                metadata, executed_at,
+                tasks
+              FROM v_paradigm_execution_traces
+              WHERE execution_id IN $trace_ids
+              ORDER BY executed_at DESC
+            `;
+            const hydrateParams = { ...params, trace_ids: traceIds };
+            rows = (jwtAuthCtx.jwtToken
+              ? await queryWithAuth<any>(jwtAuthCtx.jwtToken, sql, hydrateParams)
+              : await surrealDB.query<any>(sql, hydrateParams)) as any[];
+          }
 
           const traces = (Array.isArray(rows) ? rows : []).map((row: any, i: number) => {
             const tasks = Array.isArray(row.tasks) ? row.tasks : [];
