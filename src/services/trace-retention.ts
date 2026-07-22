@@ -1,5 +1,5 @@
 /**
- * Trace retention sweep — stratified, bounded reservoir over activity_execution_traces.
+ * Trace retention sweep — stratified, bounded reservoir over the authoritative `execution` table.
  *
  * Why: activity_execution_traces re-bloats past ~100K rows (lifecycle activities such
  * as validator-dispatch / slot-binding POST a trace per fire), and the
@@ -17,12 +17,12 @@
  *  - GROUP BY <field> and math::* are unreliable on this table; we therefore sweep
  *    an explicit configured list of activity_ids and use direct
  *    `WHERE ... GROUP ALL count()` per stratum (reliable).
- *  - created_at is a SurrealDB `datetime` (verified via type::is::datetime), NOT a
+ *  - executed_at is a SurrealDB `datetime` (verified via type::is::datetime), NOT a
  *    string — comparing it against a string literal silently matches nothing. Convert
  *    the ISO cutoff with the `type::datetime($cut)` FUNCTION, NOT the `<datetime>$cut`
  *    CAST: the cast is an "Unsupported value" to the query planner and forces a full
  *    table scan (Iterate Table, ~610ms on 72k rows), whereas type::datetime() keeps the
- *    (activity_id,status) index live (Iterate Index, ~120ms). Verified via EXPLAIN.
+ *    (activity_id, success, executed_at) index live (Iterate Index, ~120ms). Verified via EXPLAIN.
  *  - Deletes go through the ROOT path (surrealDB.query), never queryWithAuth — the
  *    table's PERMISSIONS would otherwise drop the delete silently.
  *  - rand::float() is evaluated per-record in a WHERE clause → uniform reservoir.
@@ -33,6 +33,7 @@
 
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
+import { decrementTraceStoreCounter } from '../lib/trace-store-counters';
 
 // WRITE-FLIP/decommission: retention now bounds the canonical `execution`
 // table (root path). AET is the DUAL_WRITE shadow; when DUAL_WRITE is off it
@@ -121,18 +122,18 @@ function policyFor(cfg: TraceRetentionConfig, activityId: string): StratumPolicy
 }
 
 /** Reliable per-stratum count: GROUP ALL aggregate (not GROUP BY <field>). */
-async function countCold(activityId: string, status: string, coldCutoffIso: string): Promise<number> {
+async function countCold(activityId: string, succeeded: boolean, coldCutoffIso: string): Promise<number> {
   try {
     const rows = await surrealDB.query<{ count: number }>(
       `SELECT count() FROM ${TABLE}
-         WHERE activity_id = $aid AND status = $st AND created_at < type::datetime($cut)
+         WHERE activity_id = $aid AND success = $ok AND executed_at < type::datetime($cut)
          GROUP ALL`,
-      { aid: activityId, st: status, cut: coldCutoffIso },
+      { aid: activityId, ok: succeeded, cut: coldCutoffIso },
     );
     return Array.isArray(rows) && rows.length > 0 ? Number(rows[0]?.count ?? 0) : 0;
   } catch (err) {
     logger.warn('[trace-retention] countCold failed; treating stratum as empty this cycle', {
-      activityId, status, error: err instanceof Error ? err.message : String(err),
+      activityId, succeeded, error: err instanceof Error ? err.message : String(err),
     });
     return 0;
   }
@@ -188,8 +189,9 @@ export async function runTraceRetentionSweep(
   for (const activityId of sweepActivities) {
     const policy = policyFor(cfg, activityId);
     for (const status of statuses) {
+      const succeeded = status === 'success';
       const cap = status === 'success' ? policy.successCap : policy.failureCap;
-      const coldCount = await countCold(activityId, status, coldCutoffIso);
+      const coldCount = await countCold(activityId, succeeded, coldCutoffIso);
 
       if (coldCount <= cap) {
         results.push({
@@ -222,10 +224,10 @@ export async function runTraceRetentionSweep(
           const thisBatch = Math.min(batchSize, target - removed);
           const ids = await surrealDB.query<unknown>(
             `SELECT VALUE id FROM ${TABLE}
-               WHERE activity_id = $aid AND status = $st
-                 AND created_at < type::datetime($cut) AND rand::float() >= $keepProb
+               WHERE activity_id = $aid AND success = $ok
+                 AND executed_at < type::datetime($cut) AND rand::float() >= $keepProb
                LIMIT $batch`,
-            { aid: activityId, st: status, cut: coldCutoffIso, keepProb, batch: thisBatch },
+            { aid: activityId, ok: succeeded, cut: coldCutoffIso, keepProb, batch: thisBatch },
           );
           if (!Array.isArray(ids) || ids.length === 0) break; // tail exhausted
           await surrealDB.query('DELETE $ids RETURN NONE', { ids });
@@ -236,6 +238,16 @@ export async function runTraceRetentionSweep(
 
       results.push({ activityId, status, coldCount, cap, keepProb, deletedEstimate, deletedActual });
     }
+  }
+
+  // Reconcile the O(1) trace_store_counters row (migration 156) against the
+  // rows actually removed from `execution` this cycle. The counter is
+  // incremented once per insert (execution-traces.ts / activities.ts) and read
+  // by /metrics/db + the reconciliation observer, so a live prune MUST decrement
+  // it or the over-cap signal never clears. Dry-run touches nothing.
+  if (!cfg.dryRun) {
+    const totalDeleted = results.reduce((n, r) => n + (r.deletedActual ?? 0), 0);
+    if (totalDeleted > 0) await decrementTraceStoreCounter(totalDeleted);
   }
 
   const durationMs = Date.now() - startedAt;

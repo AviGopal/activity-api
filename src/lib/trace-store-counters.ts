@@ -44,3 +44,25 @@ export async function incrementTraceStoreCounter(): Promise<void> {
     });
   }
 }
+
+/**
+ * Decrement the row counter by `n` after a retention prune of the authoritative
+ * `execution` store (src/services/trace-retention.ts). Clamped at 0 WITHOUT
+ * math::* (unreliable on this deployment — see trace-retention.ts header) via an
+ * IF/ELSE guard. Same root-path, fire-and-forget, never-throws contract as the
+ * increment.
+ */
+export async function decrementTraceStoreCounter(n: number): Promise<void> {
+  if (!Number.isFinite(n) || n <= 0) return;
+  try {
+    await surrealDB.query(
+      `UPSERT ${TRACE_STORE_COUNTER_ID} SET
+         row_count = IF ((row_count ?? 0) - $n) < 0 THEN 0 ELSE (row_count ?? 0) - $n END`,
+      { n },
+    );
+  } catch (err: any) {
+    logger.warn('trace_store_counters decrement failed (non-blocking)', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
