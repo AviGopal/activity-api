@@ -6234,6 +6234,26 @@ app.post('/recommend', async (c) => {
         exploration_slot: rec.selection_metadata.exploration_slot,
       }));
 
+      // Guard the all-or-nothing FOR batch: one row violating a schema ASSERT
+      // (alpha>0, beta>0, thompson_sample in [0,1], non-empty correlation/exec/
+      // activity ids) aborts the ENTIRE insert, and SurrealDB returns the
+      // statement error rather than throwing, so the .catch never fires — which
+      // is how thompson_selection_log (and v_selection_outcomes) stayed
+      // permanently empty. Drop invalid rows so valid selections still land.
+      const validSelectionLogs = selectionLogs.filter((l: any) =>
+        typeof l.correlation_id === 'string' && l.correlation_id.length > 0 &&
+        typeof l.execution_id === 'string' && l.execution_id.length > 0 &&
+        typeof l.activity_id === 'string' && l.activity_id.length > 0 &&
+        typeof l.thompson_sample === 'number' && l.thompson_sample >= 0 && l.thompson_sample <= 1 &&
+        typeof l.alpha === 'number' && l.alpha > 0 &&
+        typeof l.beta === 'number' && l.beta > 0,
+      );
+      if (validSelectionLogs.length !== selectionLogs.length) {
+        logger.debug('thompson_selection_log: dropped invalid selection rows before insert', {
+          total: selectionLogs.length, kept: validSelectionLogs.length,
+        });
+      }
+
       // Insert selection logs (fire-and-forget for performance)
       // Use FOR loop to handle array inserts properly
       // NOTE: org_id is STRING type in schema, not a record
@@ -6258,7 +6278,7 @@ app.post('/recommend', async (c) => {
           }
         }
       `, {
-        logs: selectionLogs,
+        logs: validSelectionLogs,
         org_name: orgId, // Plain string org_id
         account_id: jwtAuth?.accountId ?? null,
         project_name: projectId, // project_id can be record or string
