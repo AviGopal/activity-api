@@ -559,6 +559,23 @@ app.post('/extract', async (c) => {
 
     const traces = await surrealDB.query<ExecutionTrace>(query, params);
 
+    // Hydrate tasks (dropped from the compat view; migration-167) from the
+    // canonical `execution.trace.tasks` blob — extractTemplateFromTraces groups
+    // trace.tasks[].tool_calls into template tasks.
+    if (traces && traces.length > 0) {
+      const tThings = traces.map((_, i) => `type::thing('execution', $ht_${i})`).join(', ');
+      const tParams: Record<string, string> = {};
+      traces.forEach((t, i) => { tParams[`ht_${i}`] = t.execution_id; });
+      const taskRows = await surrealDB.query<{ execution_id: string; tasks: unknown }>(
+        `SELECT meta::id(id) AS execution_id, trace.tasks AS tasks FROM execution WHERE id IN [${tThings}]`,
+        tParams,
+      );
+      const tMap = new Map((taskRows || []).map((r) => [r.execution_id, r.tasks]));
+      for (const t of traces) {
+        (t as ExecutionTrace).tasks = (Array.isArray(tMap.get(t.execution_id)) ? tMap.get(t.execution_id) : []) as ExecutionTrace['tasks'];
+      }
+    }
+
     if (!traces || traces.length === 0) {
       return c.json({
         error: 'No execution traces found for the provided IDs',
@@ -698,6 +715,23 @@ app.post('/extract-from-session', async (c) => {
         ORDER BY executed_at ASC
       `;
       traces = await surrealDB.query<ExecutionTrace>(hydrateQuery, hydrateParams);
+
+      // Hydrate tasks (dropped from the compat view; migration-167) from the
+      // canonical `execution.trace.tasks` blob — extractTemplateFromTraces groups
+      // trace.tasks[].tool_calls into template tasks.
+      if (traces && traces.length > 0) {
+        const tThings = traces.map((_, i) => `type::thing('execution', $ht_${i})`).join(', ');
+        const tParams: Record<string, string> = {};
+        traces.forEach((t, i) => { tParams[`ht_${i}`] = t.execution_id; });
+        const taskRows = await surrealDB.query<{ execution_id: string; tasks: unknown }>(
+          `SELECT meta::id(id) AS execution_id, trace.tasks AS tasks FROM execution WHERE id IN [${tThings}]`,
+          tParams,
+        );
+        const tMap = new Map((taskRows || []).map((r) => [r.execution_id, r.tasks]));
+        for (const t of traces) {
+          (t as ExecutionTrace).tasks = (Array.isArray(tMap.get(t.execution_id)) ? tMap.get(t.execution_id) : []) as ExecutionTrace['tasks'];
+        }
+      }
     }
 
     if (!traces || traces.length < (min_traces || 1)) {

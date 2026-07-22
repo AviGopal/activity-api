@@ -1235,6 +1235,26 @@ app.get('/:executionId', async (c) => {
       logger.debug('trace content source', { executionId, content_source: contentSource });
     }
 
+    // The v_paradigm compat view no longer carries `trace AS execution_trace` or
+    // `trace.tasks AS tasks` (migration-167). Hydrate the trace blob (and tasks
+    // for the legacy, non-split path) from the canonical `execution` row so the
+    // response shape is unchanged. Single point-lookup by record id.
+    try {
+      const blobRows = await surrealDB.query<any>(
+        `SELECT trace, trace.tasks AS tasks FROM type::thing('execution', $eid) LIMIT 1`,
+        { eid: (trace as any).execution_id || executionId },
+      );
+      const b = Array.isArray(blobRows) ? blobRows[0] : undefined;
+      if (b) {
+        (trace as any).execution_trace = b.trace ?? (trace as any).execution_trace ?? null;
+        if (contentSource !== 'split' && !(Array.isArray((trace as any).tasks) && (trace as any).tasks.length > 0)) {
+          (trace as any).tasks = Array.isArray(b.tasks) ? b.tasks : [];
+        }
+      }
+    } catch (blobErr) {
+      logger.warn('trace blob hydrate failed', { executionId, err: blobErr instanceof Error ? blobErr.message : String(blobErr) });
+    }
+
     // Return trace with optional selection data
     // Ensure execution_id is populated (use SurrealDB id as fallback for legacy data)
     const traceNormalized: any = {

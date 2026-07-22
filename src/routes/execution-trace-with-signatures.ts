@@ -512,7 +512,6 @@ async function queryExecutions(
       created_at,
       parent_execution_id,
       composition_chain,
-      tasks,
       org_id
     FROM v_paradigm_execution_traces
     WHERE execution_id IN $legacyIds
@@ -534,6 +533,57 @@ async function queryExecutions(
     logger.warn('[execution-trace-with-signatures] legacy execution query failed', {
       error: err instanceof Error ? err.message : String(err),
     });
+  }
+
+  // The v_paradigm compat view no longer projects `tasks` (migration-167).
+  // Hydrate tasks for legacy rows from where the per-task structure now lives:
+  // the split-write execution_trace_content table (indexed on execution_id),
+  // falling back to the canonical `execution.trace.tasks` blob for pre-split rows.
+  if (legacyRows.length > 0) {
+    const lids = legacyRows.map((r) => primaryIdString(r.id)).filter((x) => x.length > 0);
+    if (lids.length > 0) {
+      const tmap = new Map<string, unknown>();
+      try {
+        const cRes = await db.query<Array<Array<{ execution_id?: unknown; tasks?: unknown }>>>(
+          `SELECT execution_id, tasks FROM execution_trace_content WHERE execution_id IN $lids`,
+          { lids },
+        );
+        const cSet = Array.isArray(cRes) && Array.isArray(cRes[0]) ? cRes[0] : [];
+        for (const cr of cSet as Array<{ execution_id?: unknown; tasks?: unknown }>) {
+          const k = primaryIdString(cr.execution_id);
+          if (k && Array.isArray(cr.tasks)) tmap.set(k, cr.tasks);
+        }
+      } catch (err) {
+        logger.warn('[execution-trace-with-signatures] legacy content-tasks hydrate failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      const missing = lids.filter((k) => !tmap.has(k));
+      if (missing.length > 0) {
+        try {
+          const things = missing.map((_, i) => `type::thing('execution', $m_${i})`).join(', ');
+          const mp: Record<string, unknown> = {};
+          missing.forEach((k, i) => { mp[`m_${i}`] = k; });
+          const bRes = await db.query<Array<Array<{ execution_id?: unknown; tasks?: unknown }>>>(
+            `SELECT meta::id(id) AS execution_id, trace.tasks AS tasks FROM execution WHERE id IN [${things}]`,
+            mp,
+          );
+          const bSet = Array.isArray(bRes) && Array.isArray(bRes[0]) ? bRes[0] : [];
+          for (const br of bSet as Array<{ execution_id?: unknown; tasks?: unknown }>) {
+            const k = primaryIdString(br.execution_id);
+            if (k && Array.isArray(br.tasks)) tmap.set(k, br.tasks);
+          }
+        } catch (err) {
+          logger.warn('[execution-trace-with-signatures] legacy execution-tasks hydrate failed', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      for (const r of legacyRows) {
+        const k = primaryIdString(r.id);
+        if (tmap.has(k)) r.tasks = tmap.get(k);
+      }
+    }
   }
 
   // Merge: legacy rows that don't already appear in paradigm rows

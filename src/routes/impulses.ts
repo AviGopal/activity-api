@@ -982,6 +982,17 @@ router.post('/resolve', async (c) => {
 
           if (legacyResult && legacyResult.length > 0) {
             trace = legacyResult[0];
+            // The v_paradigm compat view no longer projects `trace AS execution_trace`
+            // (migration-167). Hydrate the full trace blob from the canonical
+            // `execution` row — formatExecutionTraceAsMarkdown reads trace.execution_trace.
+            const blobRows = await executeAsAuth<any>(
+              jwtAuthCtx,
+              `SELECT trace FROM type::thing('execution', $bare_execution_id) LIMIT 1`,
+              { bare_execution_id: trace.execution_id },
+            );
+            trace.execution_trace = (Array.isArray(blobRows) && blobRows.length > 0)
+              ? (blobRows[0] as any).trace ?? null
+              : null;
             queryPath = 'legacy';
           }
         }
@@ -1970,12 +1981,30 @@ router.post('/resolve', async (c) => {
         if (traceIds.length > 0) {
           const tracesQuery = `
             SELECT execution_id, variant_id, status, duration_ms, cost_usd,
-                   error_message, failed_task_id, execution_trace, created_at
+                   error_message, failed_task_id, created_at
             FROM v_paradigm_execution_traces
             WHERE execution_id IN $trace_ids
             ORDER BY created_at DESC
           `;
           traces = await executeAsAuth<any>(jwtAuthCtx, tracesQuery, { ...params, trace_ids: traceIds });
+
+          // Hydrate execution_trace (dropped from the compat view; migration-167)
+          // from the canonical `execution` rows. formatMultipleTracesAsMarkdown
+          // reads trace.execution_trace.{tasks,filesModified}.
+          if (traces.length > 0) {
+            const traceThings = traceIds.map((_: string, i: number) => `type::thing('execution', $et_${i})`).join(', ');
+            const etParams: Record<string, unknown> = {};
+            traceIds.forEach((id: string, i: number) => { etParams[`et_${i}`] = id; });
+            const blobRows = await executeAsAuth<any>(
+              jwtAuthCtx,
+              `SELECT meta::id(id) AS execution_id, trace AS execution_trace FROM execution WHERE id IN [${traceThings}]`,
+              etParams,
+            );
+            const blobMap = new Map<string, any>(
+              (Array.isArray(blobRows) ? blobRows : []).map((r: any) => [r.execution_id, r.execution_trace]),
+            );
+            for (const t of traces) { t.execution_trace = blobMap.get(t.execution_id) ?? null; }
+          }
         }
 
         if (traces.length === 0) {
@@ -4021,8 +4050,7 @@ router.post('/resolve', async (c) => {
             const sql = `
               SELECT
                 execution_id, activity_id, success, duration_ms, cost_usd,
-                metadata, executed_at,
-                tasks
+                metadata, executed_at
               FROM v_paradigm_execution_traces
               WHERE execution_id IN $trace_ids
               ORDER BY executed_at DESC
@@ -4031,6 +4059,22 @@ router.post('/resolve', async (c) => {
             rows = (jwtAuthCtx.jwtToken
               ? await queryWithAuth<any>(jwtAuthCtx.jwtToken, sql, hydrateParams)
               : await surrealDB.query<any>(sql, hydrateParams)) as any[];
+
+            // Hydrate tasks (dropped from the compat view; migration-167) from the
+            // canonical `execution.trace.tasks` blob, keyed by execution id.
+            if (Array.isArray(rows) && rows.length > 0) {
+              const taskThings = traceIds.map((_: string, i: number) => `type::thing('execution', $tk_${i})`).join(', ');
+              const tkParams: Record<string, unknown> = {};
+              traceIds.forEach((id: string, i: number) => { tkParams[`tk_${i}`] = id; });
+              const taskSql = `SELECT meta::id(id) AS execution_id, trace.tasks AS tasks FROM execution WHERE id IN [${taskThings}]`;
+              const taskRows = (jwtAuthCtx.jwtToken
+                ? await queryWithAuth<any>(jwtAuthCtx.jwtToken, taskSql, tkParams)
+                : await surrealDB.query<any>(taskSql, tkParams)) as any[];
+              const taskMap = new Map<string, any>(
+                (Array.isArray(taskRows) ? taskRows : []).map((r: any) => [r.execution_id, r.tasks]),
+              );
+              for (const row of rows) { row.tasks = taskMap.get(row.execution_id) ?? []; }
+            }
           }
 
           const traces = (Array.isArray(rows) ? rows : []).map((row: any, i: number) => {
