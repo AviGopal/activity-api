@@ -72,6 +72,18 @@ export interface TraceRetentionConfig {
   autoDiscover: boolean;
   /** Bound on auto-discovered strata swept per cycle (keeps cycles bounded). */
   autoDiscoverMax: number;
+  /**
+   * Global row-count ceiling across ALL strata — the safety valve that bounds the
+   * store's TOTAL size, i.e. the invariant the health observer actually measures
+   * (trace_store_counters.row_count > cap). The stratified caps above bound each
+   * (activity_id,status) stratum, but the live fleet spreads across ~1000+ distinct
+   * activity_ids, so the sum can sit far over the global cap while every stratum is
+   * individually under its per-stratum cap. Defaults to TRACE_STORE_CAP so ENFORCE
+   * == SENSE by construction; set TRACE_RETENTION_GLOBAL_CEILING to decouple. 0 = off.
+   */
+  globalCeiling: number;
+  /** Toggle just the global-ceiling valve (still overall-gated by enabled + dryRun). */
+  globalCeilingEnabled: boolean;
 }
 
 export function loadTraceRetentionConfig(env = process.env): TraceRetentionConfig {
@@ -110,6 +122,14 @@ export function loadTraceRetentionConfig(env = process.env): TraceRetentionConfi
     overrides,
     autoDiscover: env.TRACE_RETENTION_AUTO !== 'false', // on by default; ENABLED already gates the job
     autoDiscoverMax: parseInt(env.TRACE_RETENTION_AUTO_MAX ?? '60', 10),
+    // Global ceiling defaults to the sensor's own cap (TRACE_STORE_CAP; config.ts
+    // default 50_000) so the enforced global bound is EXACTLY the number the health
+    // observer alarms on — SENSE and ENFORCE become one number, and a sweep clears
+    // the over-cap signal instead of re-emitting a gap that can never close.
+    // TRACE_RETENTION_GLOBAL_CEILING overrides for headroom (keeps the stratified
+    // policy primary); 0 disables. Still overall-gated by enabled + dryRun.
+    globalCeiling: parseInt(env.TRACE_RETENTION_GLOBAL_CEILING ?? env.TRACE_STORE_CAP ?? '50000', 10),
+    globalCeilingEnabled: env.TRACE_RETENTION_GLOBAL_CEILING_ENABLED !== 'false', // on by default
   };
 }
 
@@ -237,6 +257,81 @@ export async function runTraceRetentionSweep(
       }
 
       results.push({ activityId, status, coldCount, cap, keepProb, deletedEstimate, deletedActual });
+    }
+  }
+
+  // ── Global ceiling safety valve ────────────────────────────────────────────
+  // The stratified sweep above bounds each (activity_id,status) stratum, but the
+  // store's global row_count is the SUM over ALL strata. The live fleet spreads
+  // across 1000+ distinct activity_ids (every composed-cap-*, learned-*,
+  // auto-bridge-*, and probe mint is its own stratum), so the total can sit far
+  // above the global cap while EVERY individual stratum is under its per-stratum
+  // cap — the exact condition trace_store_health_observer alarms on
+  // (trace_store_counters.row_count > cap). A purely stratified enforcer can
+  // therefore NEVER clear a global-cap alarm, and the unbounded growth axis is the
+  // strata COUNT, not any one stratum's depth (the OOM re-pressure risk).
+  //
+  // This valve keeps the newest `globalCeiling` rows globally by executed_at and
+  // drops the oldest surplus, so SENSE (the sensor's global cap) and ENFORCE (this
+  // prune) measure the SAME invariant and the loop is honest. It runs AFTER the
+  // stratified sweep (which does the per-stratum-balanced work first), reuses the
+  // same enabled/dryRun gating and the same bounded-batch delete, and pushes a
+  // synthetic StratumResult so the shared counter-decrement below AND the reconcile
+  // route's `deleted` tally both account for it (no separate decrement — that would
+  // double-count). Default ceiling == TRACE_STORE_CAP so the enforced number is the
+  // sensed number; TRACE_RETENTION_GLOBAL_CEILING decouples, and
+  // TRACE_RETENTION_GLOBAL_CEILING_ENABLED=false disables just this valve.
+  if (cfg.globalCeilingEnabled && cfg.globalCeiling > 0) {
+    let total = 0;
+    try {
+      const rows = await surrealDB.query<{ count: number }>(`SELECT count() FROM ${TABLE} GROUP ALL`);
+      total = Array.isArray(rows) && rows.length > 0 ? Number(rows[0]?.count ?? 0) : 0;
+    } catch (err) {
+      logger.warn('[trace-retention] global-ceiling count failed; skipping valve this cycle', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      total = 0;
+    }
+
+    if (total > cfg.globalCeiling) {
+      const surplus = total - cfg.globalCeiling;
+      const keepProb = cfg.globalCeiling / total;
+      let removed: number | null = null;
+      if (!cfg.dryRun) {
+        const batchSize = cfg.deleteBatchSize;
+        const maxIters = Math.ceil(surplus / batchSize) + 10; // generous guard
+        let done = 0;
+        for (let iter = 0; iter < maxIters && done < surplus; iter++) {
+          const thisBatch = Math.min(batchSize, surplus - done);
+          // Oldest-first paging: executed_at is index-backed (idx_execution_executed_at
+          // → Iterate Index, bounded range scan) and MUST appear in the projection —
+          // SurrealDB 2.3.x requires any ORDER BY field to be selected. Delete that id
+          // list with RETURN NONE so no row bodies are hauled back. Re-querying from the
+          // head each iteration converges because the prior batch is already deleted.
+          const rows = await surrealDB.query<{ id: unknown }>(
+            `SELECT id, executed_at FROM ${TABLE} ORDER BY executed_at ASC LIMIT $batch`,
+            { batch: thisBatch },
+          );
+          const ids = (Array.isArray(rows) ? rows : [])
+            .map((r) => (r as { id?: unknown })?.id)
+            .filter((id) => id != null);
+          if (ids.length === 0) break; // table drained
+          await surrealDB.query('DELETE $ids RETURN NONE', { ids });
+          done += ids.length;
+        }
+        removed = done;
+      }
+      // Synthetic stratum so the counter-decrement below and the reconcile route's
+      // `deleted` reduce both include the valve's deletions.
+      results.push({
+        activityId: '__global_ceiling__',
+        status: 'all',
+        coldCount: total,
+        cap: cfg.globalCeiling,
+        keepProb,
+        deletedEstimate: surplus,
+        deletedActual: removed,
+      });
     }
   }
 
