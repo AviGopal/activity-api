@@ -1,0 +1,44 @@
+-- 162-vpet-org-time-index.surql
+-- Indexes on the hot compat view v_paradigm_execution_traces to stop the
+-- SurrealDB OOM-kill loop.
+--
+-- ROOT CAUSE (verified 2026-07-22 by live capture + controlled queries):
+-- v_paradigm_execution_traces is a MATERIALIZED view (DEFINE TABLE AS SELECT over
+-- `execution`, migrations 069/158) that stores the FULL trace blob per row
+-- (`trace AS execution_trace`, `trace.tasks AS tasks`) — ~107k rows, ~220MB of
+-- blob when fully scanned. Migration 158 repointed reads onto it but dropped the
+-- (org_id, executed_at) index that 102/122 had on the decommissioned
+-- activity_execution_traces table.
+--
+-- The balloon is NOT scalar aggregation (`SELECT count() ... GROUP ALL` = 63ms).
+-- It is any query that SELECTs the blob columns AND applies ORDER BY over a large
+-- filtered set: SurrealDB 2.3.3 collects ALL matching rows into a
+-- `MemoryOrderedLimit` sort BEFORE the LIMIT, so a full-view `SELECT * ... ORDER
+-- BY executed_at` materialises ~4.7GB of anon RAM in one query (measured, 14.5s).
+-- Under the concurrent /resolve pileup that stacks to the 26G cgroup cap → OOM
+-- (86 kills/24h even with the cap; the cap only contains, it does not prevent).
+--
+-- These indexes convert the hot filtered scans from `Iterate Table` (all 107k
+-- blob rows) to `Iterate Index` scoped to the matched key, so MemoryOrderedLimit
+-- sorts only that key's rows:
+--   * idx_vpet_org_time     — list reads: WHERE org_id = $org ORDER BY executed_at
+--   * idx_vpet_variant_exec — trace-by-variant reads (impulses resolve, ribosome):
+--                             WHERE variant_id = $v ORDER BY executed_at
+--   * idx_vpet_variant_time — same, ordered by created_at
+--
+-- NOTE: SurrealDB 2.3.3's planner still applies MemoryOrderedLimit for the ORDER
+-- BY (it does not use the second index field to satisfy ordering). So for a
+-- MEGA-variant with thousands of traces (e.g. `gap-closing:auto` families) the
+-- scoped scan still materialises that variant's blob rows. The remaining durable
+-- fix is a NARROW PROJECTION in the route handlers: select execution_id (narrow)
+-- ordered+limited first, then fetch the blob columns by id — so the sort never
+-- touches the trace blob. That is a response-shape-sensitive code change in
+-- src/routes/{impulses,ribosome}.ts, tracked separately from this migration.
+--
+-- IF NOT EXISTS: on the live populated DB these were built out-of-band
+-- (2026-07-22); the migration runner pre-marks migrations applied when the table
+-- has rows, so this never triggers a blocking bulk build there. On a fresh deploy
+-- the table is empty at migration time so the build is instant.
+DEFINE INDEX IF NOT EXISTS idx_vpet_org_time ON v_paradigm_execution_traces FIELDS org_id, executed_at;
+DEFINE INDEX IF NOT EXISTS idx_vpet_variant_exec ON v_paradigm_execution_traces FIELDS variant_id, executed_at;
+DEFINE INDEX IF NOT EXISTS idx_vpet_variant_time ON v_paradigm_execution_traces FIELDS variant_id, created_at;
