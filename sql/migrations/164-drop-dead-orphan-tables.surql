@@ -1,0 +1,38 @@
+-- 164-drop-dead-orphan-tables.surql
+-- Schema-hygiene: remove confirmed-dead orphan tables. Conservative -- only
+-- tables that are BOTH empty AND have no live dependent (view / field / event /
+-- index / record-link) AND no runtime code reference are dropped. REMOVE TABLE
+-- IF EXISTS is idempotent and safe on a fresh deploy (where an early schema
+-- file may or may not have created them).
+--
+-- CONFIRMED DROPPED (verified live 2026-07-22 -- rowcount 0, INFO FOR DB shows
+-- no view/field/event/index/record-link referencing them, and no runtime .ts
+-- reference; only historical DDL in sql/001,002,020,030,053 defines them):
+--
+--   * activity_executions -- 0 rows. TYPE NORMAL SCHEMAFULL. Explicitly
+--     superseded: sql/schemas/020-paradigm-core-tables.surql states
+--     "Replaces: activity_execution_traces, activity_executions, tool_usage,
+--     execution_sequences". No live dependent object; no `record<activity_executions>`
+--     field in the live schema.
+--   * activity_execution_trace (SINGULAR) -- 0 rows. TYPE ANY SCHEMALESS. The
+--     migration-053 external-validation fields are NOT present in the live
+--     schema (INFO shows a bare table). No live `record<activity_execution_trace>`
+--     link field remains (external_validation_history is 0 rows and no longer
+--     types execution_id against it). Distinct from the live plural table below.
+--
+-- DELIBERATELY KEPT (candidates that FAILED the both-empty-and-unreferenced bar):
+--
+--   * execution_traces -- 0 rows, BUT it is the live base of the view
+--     v_execution_traces_by_account
+--     (`... AS SELECT *, (account_id ?? org_id) AS effective_account_id
+--       FROM execution_traces`). Dropping the base would orphan a live view.
+--     Kept.
+--   * activity_execution_traces (PLURAL) -- 18,135 rows AND referenced in code
+--     as AET_TABLE in src/routes/db-admin-reconcile.ts (plus its index set).
+--     Not a candidate; kept.
+--   * All 47 v_*_by_account views -- an intentional back-compat surface defined
+--     by migrations 096/098, not orphans. Several sit over 0-row bases by design
+--     (the base can populate later); dropping them contradicts their purpose and
+--     carries large blast radius. Kept.
+REMOVE TABLE IF EXISTS activity_executions;
+REMOVE TABLE IF EXISTS activity_execution_trace;
