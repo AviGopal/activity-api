@@ -519,6 +519,9 @@ app.post('/templates', async (c) => {
       });
     }
 
+    // Set version header for execution list responses
+    c.header('x-exec-list-version', '2');
+
     // Add optional fields only if provided
     if (validated.project_id || projectId) {
       activityRecord.project_id = validated.project_id || projectId;
