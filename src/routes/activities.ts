@@ -953,6 +953,7 @@ app.get('/validation-patterns', async (c) => {
  * 2. Redis session auth (Dashboard): Application-level filtering via WHERE clauses
  */
 app.get('/templates', async (c) => {
+  c.header('x-templates-count-version', '1');
   try {
     // Check for JWT auth first (MiniBob instances)
     const jwtAuth = getJwtAuthFromContext(c);
