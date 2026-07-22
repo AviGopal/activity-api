@@ -57,6 +57,28 @@ interface ExecutionTrace {
     };
   };
   executed_at: string;
+  tags?: string[];
+}
+
+// Honest-reach gate: prefer the walk's persisted reach verdict (in `tags`) over
+// exit-status `success`. What honestly reaches is what the ribosome extracts into
+// a reusable template; what merely staged green does not get minted. Order:
+// explicit reach tag -> structural satisfier satellite -> goal-host provenance
+// (walk-emitted but ungraded == hollow) -> fail-open on success for genuine
+// legacy (pre-reach-tag) rows so historical learning is not nuked.
+function isHollowSatellite(t: { execution_id?: string; activity_id?: string }): boolean {
+  return (
+    (typeof t.execution_id === 'string' && t.execution_id.startsWith('walk-satisfier-')) ||
+    (typeof t.activity_id === 'string' && t.activity_id.startsWith('satisfier:'))
+  );
+}
+function isHonestlyReached(t: { success: boolean; execution_id?: string; activity_id?: string; tags?: string[] }): boolean {
+  const tags = t.tags ?? [];
+  if (tags.includes('reached:true')) return true;
+  if (tags.includes('reached:false')) return false;
+  if (isHollowSatellite(t)) return false;
+  if (tags.includes('dispatcher_used:goal-host')) return false;
+  return t.success;
 }
 
 interface ExtractedTask {
@@ -300,7 +322,7 @@ function extractValidation(traces: ExecutionTrace[]): {
   const successIndicators: string[] = [];
 
   for (const trace of traces) {
-    if (!trace.success) continue;
+    if (!isHonestlyReached(trace)) continue;
 
     // Extract files that were created/modified
     if (trace.state_snapshot?.output_state?.filesCreated) {
@@ -431,7 +453,7 @@ function calculateConfidence(traces: ExecutionTrace[]): number {
   confidence += Math.min(0.3, traces.length * 0.05);
 
   // Higher success rate = higher confidence
-  const successRate = traces.filter(t => t.success).length / traces.length;
+  const successRate = traces.filter(t => isHonestlyReached(t)).length / traces.length;
   confidence += successRate * 0.3;
 
   // Consistent tool usage = higher confidence
@@ -491,7 +513,7 @@ function extractTemplateFromTraces(traces: ExecutionTrace[]): ExtractedTemplate 
     extractedFrom: {
       executionIds: traces.map(t => t.execution_id),
       traceCount: traces.length,
-      successRate: traces.filter(t => t.success).length / traces.length,
+      successRate: traces.filter(t => isHonestlyReached(t)).length / traces.length,
     },
     tasks,
     validation,
@@ -655,7 +677,16 @@ app.post('/extract-from-session', async (c) => {
     if (success_only) {
       query = `
         SELECT * FROM v_paradigm_execution_traces
-        WHERE variant_id CONTAINS $session_id AND success = true
+        WHERE variant_id CONTAINS $session_id
+          AND (
+            tags CONTAINS "reached:true"
+            OR (
+              tags CONTAINSNONE ["reached:false", "dispatcher_used:goal-host"]
+              AND string::contains(<string> execution_id, 'walk-satisfier-') = false
+              AND string::contains(<string> activity_id, 'satisfier:') = false
+              AND success = true
+            )
+          )
         ORDER BY executed_at ASC
       `;
     }
@@ -707,7 +738,14 @@ app.get('/candidates', async (c) => {
       SELECT
         activity_id,
         count() as execution_count,
-        math::sum(IF success THEN 1 ELSE 0 END) as success_count,
+        math::sum(
+          IF tags CONTAINS "reached:true" THEN 1
+          ELSE IF tags CONTAINS "reached:false" THEN 0
+          ELSE IF string::contains(<string> execution_id, 'walk-satisfier-') THEN 0
+          ELSE IF string::contains(<string> activity_id, 'satisfier:') THEN 0
+          ELSE IF tags CONTAINS "dispatcher_used:goal-host" THEN 0
+          ELSE IF success THEN 1 ELSE 0 END
+        ) as success_count,
         array::group(execution_id) as execution_ids
       FROM v_paradigm_execution_traces
       GROUP BY activity_id
