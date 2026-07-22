@@ -68,16 +68,34 @@ export async function runReplicationPull(
     params.excl = excludeOrigin;
   }
 
-  const sql = `SELECT * FROM execution WHERE ${where.join(
+  // OOM-safe two-step (migration-162): `SELECT *` carries the full trace blob,
+  // so ORDER BY executed_at over the watermark window makes SurrealDB's
+  // MemoryOrderedLimit collect every matched blob row into RAM before LIMIT.
+  // Step 1 sorts ONLY the narrow (id, executed_at) keys under LIMIT; step 2
+  // hydrates the full rows verbatim for the chosen ids (replication needs every
+  // field), preserving executed_at ASC order.
+  const idSql = `SELECT id, executed_at FROM execution WHERE ${where.join(
     ' AND ',
   )} ORDER BY executed_at ASC LIMIT $lim;`;
 
-  const res = await surrealDB.query<Record<string, unknown>>(sql, params);
-  const rows: Record<string, unknown>[] = Array.isArray(res)
-    ? Array.isArray((res as unknown[])[0])
-      ? ((res as unknown[])[0] as Record<string, unknown>[])
-      : (res as Record<string, unknown>[])
+  const idRes = await surrealDB.query<Record<string, unknown>>(idSql, params);
+  const idRows: Record<string, unknown>[] = Array.isArray(idRes)
+    ? Array.isArray((idRes as unknown[])[0])
+      ? ((idRes as unknown[])[0] as Record<string, unknown>[])
+      : (idRes as Record<string, unknown>[])
     : [];
+  const ids = idRows.map((r) => r.id).filter((x) => x != null);
+
+  let rows: Record<string, unknown>[] = [];
+  if (ids.length > 0) {
+    const sql = `SELECT * FROM execution WHERE id IN $ids ORDER BY executed_at ASC;`;
+    const res = await surrealDB.query<Record<string, unknown>>(sql, { ...params, ids });
+    rows = Array.isArray(res)
+      ? Array.isArray((res as unknown[])[0])
+        ? ((res as unknown[])[0] as Record<string, unknown>[])
+        : (res as Record<string, unknown>[])
+      : [];
+  }
 
   return {
     shape: 'executionReplicationPull',

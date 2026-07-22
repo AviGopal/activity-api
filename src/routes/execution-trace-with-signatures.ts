@@ -425,7 +425,19 @@ async function queryExecutions(
     params.minDuration = input.min_duration_ms;
   }
 
-  const sql = `
+  // OOM-safe two-step (migration-162): the projection carries the full `trace`
+  // blob, so ORDER BY executed_at over it makes SurrealDB's MemoryOrderedLimit
+  // collect every matched blob row into RAM before LIMIT. Step 1 sorts ONLY the
+  // narrow (id, executed_at) keys under the bounded LIMIT; step 2 hydrates the
+  // fat rows for the chosen ids.
+  const idSql = `
+    SELECT id, executed_at
+    FROM execution
+    WHERE ${where.join(' AND ')}
+    ORDER BY executed_at DESC
+    LIMIT $lim
+  `;
+  const hydrateSql = `
     SELECT
       id,
       activity_id,
@@ -441,9 +453,8 @@ async function queryExecutions(
       trace,
       org_id
     FROM execution
-    WHERE ${where.join(' AND ')}
+    WHERE id IN $ids
     ORDER BY executed_at DESC
-    LIMIT $lim
   `;
 
   let paradigmRows: RawExecutionRow[] = [];
@@ -456,9 +467,16 @@ async function queryExecutions(
   // is sufficient.
   if (!input.execution_id) {
     try {
-      const result = await db.query(sql, params);
-      const firstSet = Array.isArray(result) && result.length > 0 ? result[0] : [];
-      paradigmRows = Array.isArray(firstSet) ? (firstSet as RawExecutionRow[]) : [];
+      const idResult = await db.query(idSql, params);
+      const idSet = Array.isArray(idResult) && idResult.length > 0 ? idResult[0] : [];
+      const ids = (Array.isArray(idSet) ? (idSet as RawExecutionRow[]) : [])
+        .map((r) => r.id)
+        .filter((x) => x != null);
+      if (ids.length > 0) {
+        const result = await db.query(hydrateSql, { ...params, ids });
+        const firstSet = Array.isArray(result) && result.length > 0 ? result[0] : [];
+        paradigmRows = Array.isArray(firstSet) ? (firstSet as RawExecutionRow[]) : [];
+      }
     } catch (err) {
       logger.warn('[execution-trace-with-signatures] execution query failed', {
         error: err instanceof Error ? err.message : String(err),
@@ -473,7 +491,18 @@ async function queryExecutions(
   const seenIds = new Set(paradigmRows.map((r) => primaryIdString(r.id)));
   // Build a separate legacy query with the same filters (activity_execution_traces
   // shares executed_at, success, org_id field names with the paradigm table).
-  const legacySql = `
+  // OOM-safe two-step (migration-162): the legacy projection carries the fat
+  // `tasks` blob, so the ORDER BY executed_at path (execution_id absent) would
+  // pull every matched blob row into MemoryOrderedLimit before LIMIT. Sort only
+  // the narrow (execution_id, executed_at) keys, then hydrate the chosen ids.
+  const legacyIdSql = `
+    SELECT execution_id, executed_at
+    FROM v_paradigm_execution_traces
+    WHERE ${where.join(' AND ')}
+    ${input.execution_id ? '' : 'ORDER BY executed_at DESC'}
+    LIMIT $lim
+  `;
+  const legacyHydrateSql = `
     SELECT
       execution_id AS id,
       activity_id,
@@ -486,15 +515,21 @@ async function queryExecutions(
       tasks,
       org_id
     FROM v_paradigm_execution_traces
-    WHERE ${where.join(' AND ')}
+    WHERE execution_id IN $legacyIds
     ${input.execution_id ? '' : 'ORDER BY executed_at DESC'}
-    LIMIT $lim
   `;
   let legacyRows: RawExecutionRow[] = [];
   try {
-    const legacyResult = await db.query(legacySql, params);
-    const legacySet = Array.isArray(legacyResult) && legacyResult.length > 0 ? legacyResult[0] : [];
-    legacyRows = Array.isArray(legacySet) ? (legacySet as RawExecutionRow[]) : [];
+    const legacyIdResult = await db.query(legacyIdSql, params);
+    const legacyIdSet = Array.isArray(legacyIdResult) && legacyIdResult.length > 0 ? legacyIdResult[0] : [];
+    const legacyIds = (Array.isArray(legacyIdSet) ? (legacyIdSet as RawExecutionRow[]) : [])
+      .map((r) => r.execution_id)
+      .filter((x) => x != null);
+    if (legacyIds.length > 0) {
+      const legacyResult = await db.query(legacyHydrateSql, { ...params, legacyIds });
+      const legacySet = Array.isArray(legacyResult) && legacyResult.length > 0 ? legacyResult[0] : [];
+      legacyRows = Array.isArray(legacySet) ? (legacySet as RawExecutionRow[]) : [];
+    }
   } catch (err) {
     logger.warn('[execution-trace-with-signatures] legacy execution query failed', {
       error: err instanceof Error ? err.message : String(err),

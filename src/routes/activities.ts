@@ -2207,7 +2207,13 @@ app.get('/executions', async (c) => {
 
     // Build query with filters
     // TEMPORARY: Query execution table directly (view not yet applied)
-    let query = `
+    // OOM-safe two-step (migration-162): the full projection carries the fat
+    // `trace` blob, so ORDER BY executed_at over it makes SurrealDB's
+    // MemoryOrderedLimit collect every matched blob row into RAM before LIMIT.
+    // `query` now selects ONLY the narrow (id, executed_at) ordering keys under
+    // the page window (filters + ORDER + LIMIT/START are appended below); the fat
+    // rows are hydrated for the chosen ids afterwards.
+    const hydrateProjection = `
       SELECT
         id AS execution_id,
         activity_id,
@@ -2236,6 +2242,9 @@ app.get('/executions', async (c) => {
         created_at,
         created_at AS stored_at,
         created_at AS updated_at
+      FROM execution`;
+    let query = `
+      SELECT id, executed_at
       FROM execution WHERE 1=1
     `.trim();
     const params: Record<string, any> = {};
@@ -2274,9 +2283,22 @@ app.get('/executions', async (c) => {
     
     logger.debug('Execution history query', { query, params });
     
-    const result = await surrealDB.query(query, params);
+    // Step 1: sort only the narrow id keys under the page window.
+    const idResult = await surrealDB.query<any>(query, params);
     // Note: surrealDB.query() already extracts result[0], so result is the array directly
-    const executions = Array.isArray(result) ? result : [];
+    const idRows = Array.isArray(idResult) ? idResult : [];
+    const pageIds = idRows.map((r: any) => r.id).filter((x: any) => x != null);
+
+    // Step 2: hydrate the full projection for the chosen ids only, preserving order.
+    let executions: any[] = [];
+    if (pageIds.length > 0) {
+      const hydrateQuery = `${hydrateProjection}
+        WHERE id IN $page_ids
+        ORDER BY executed_at DESC
+      `.trim();
+      const result = await surrealDB.query(hydrateQuery, { ...params, page_ids: pageIds });
+      executions = Array.isArray(result) ? result : [];
+    }
     
     logger.debug('Execution history results', { count: executions.length });
 
