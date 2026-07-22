@@ -4799,7 +4799,8 @@ app.post('/feedback', async (c) => {
             failure_count: 0,
             alpha: 1,
             beta: 1,
-            updated_at: time::now()
+            updated_at: time::now(),
+            initialized_from_feedback: true
           }`,
           {
             shape,
