@@ -181,21 +181,8 @@ export async function runDiscoverByShapes(
         if (vid && !scoreMap.has(vid)) scoreMap.set(vid, sr);
       }
     };
-    try {
-      const scoreRes = await surrealDB.query('SELECT * FROM v_activity_score WHERE activity_id IN $activity_ids', { activity_ids: activityIds });
-      addScoreRows((Array.isArray(scoreRes) ? scoreRes : ((scoreRes as any)?.[0]?.result ?? [])) as Array<Record<string, any>>);
-    } catch (e) {
-      // view unavailable — legacy fallback below covers everything
-    }
-    try {
-      const missing = activityIds.filter((id) => !scoreMap.has(id));
-      if (missing.length > 0) {
-        const fbRes = await surrealDB.query('SELECT activity_id, variant_id, total_executions, successful_executions, thompson_alpha, thompson_beta, success_rate FROM variant_performance_metrics WHERE activity_id IN $activity_ids OR variant_id IN $activity_ids', { activity_ids: missing });
-        addScoreRows((Array.isArray(fbRes) ? fbRes : ((fbRes as any)?.[0]?.result ?? [])) as Array<Record<string, any>>);
-      }
-    } catch (e) {
-      // legacy table unavailable — rows keep the cold-start default below
-    }
+    const fbRes = await surrealDB.query('SELECT activity_id, variant_id, total_executions, successful_executions, thompson_alpha, thompson_beta, success_rate FROM variant_performance_metrics WHERE activity_id IN $activity_ids OR variant_id IN $activity_ids', { activity_ids: activityIds });
+    addScoreRows((Array.isArray(fbRes) ? fbRes : ((fbRes as any)?.[0]?.result ?? [])) as Array<Record<string, any>>);
 
   // Project metrics_row + comp_row into the legacy response shape.
   const activitiesWithScores = (activities || []).map((row: any) => {
