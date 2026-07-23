@@ -1,0 +1,34 @@
+-- =============================================================================
+-- 178 — drop dead git_state indexes on the hot `execution` table (churn/latency)
+--
+-- Same mechanism and rationale as migration 177 Group 5 (idx_execution_created_at):
+-- a fresh, higher-numbered migration → init-database.ts applies it once, then
+-- records it in init_migrations and skips it forever (durable across restarts).
+-- Numbered 178 so it runs AFTER the 061 DEFINEs it supersedes on BOTH a fresh
+-- boot (define-then-remove, in filename order) and a live DB (drop the surviving
+-- indexes). The original DEFINEs in 061 are already recorded in init_migrations,
+-- so 061 never re-runs and these indexes stay gone.
+--
+-- WHY SAFE (grep-verified, not assumed — 2026-07-23):
+--   * idx_execution_git_branch (061:22) ON execution FIELDS git_state.branch
+--   * idx_execution_git_dirty  (061:23) ON execution FIELDS git_state.dirty
+--   Both are maintained on EVERY `execution` INSERT (the highest write-volume
+--   table in the store, ~117k rows) but NO runtime query ever filters or orders
+--   `execution` by git_state.branch or git_state.dirty. The intended reader was
+--   the example query written as a COMMENT in 061:32
+--     (`-- SELECT * FROM execution WHERE git_state.branch = "main" AND ... dirty`)
+--   and it was never implemented. Exhaustive grep across all /vessels/*/src
+--   (+ dist, + sql) finds git_state.branch / git_state.dirty ONLY as (a) the
+--   061 DEFINE lines, (b) the 061 comment, and (c) an unrelated FIELD def on a
+--   DIFFERENT table (execution_state_snapshot, migration 065:37). An index on a
+--   nested field is only ever consulted by a query that constrains that field,
+--   so zero such queries ⇒ pure write-amplification, no read regression on drop.
+--   (state_signature's sibling index idx_execution_state_sig is KEPT — it IS
+--   live-read: activities.ts:8009 `WHERE state_signature = $state_signature`.)
+--
+-- REVERSIBILITY: a wrong index drop only costs a re-add + a scan; both indexes
+-- can be re-created verbatim from 061 if a git_state query is ever built.
+-- =============================================================================
+
+REMOVE INDEX IF EXISTS idx_execution_git_branch ON execution;
+REMOVE INDEX IF EXISTS idx_execution_git_dirty ON execution;
