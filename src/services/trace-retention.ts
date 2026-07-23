@@ -385,10 +385,18 @@ export async function runTraceRetentionSweep(
     let scanned = 0;
     try {
       while (orphanReaped < cfg.orphanReapPerSweepCap && Date.now() < budgetUntil) {
+        // NB: intentionally NO 'ORDER BY execution_id'. The unique idx_etc_execution_id
+        // range scan already yields rows in ascending execution_id order (verified
+        // live), so the `execution_id > $cursor` cursor paging still advances
+        // monotonically. An explicit ORDER BY here triggers SurrealDB 2.3.3
+        // MemoryOrderedLimit — a full-table materialize+sort of ALL ~1.2M big-blob
+        // rows — which timed out on EVERY sweep (reaped 0 for weeks; orphans stuck
+        // at ~1.08M) and spiked RSS. Measured: with ORDER BY even LIMIT 1 times out
+        // >30s; without it, LIMIT 1000 returns in ~1s.
         const page = await surrealDB.query<string>(
           `SELECT VALUE execution_id FROM execution_trace_content
              WHERE execution_id > $cursor AND created_at < type::datetime($safeCut)
-             ORDER BY execution_id ASC LIMIT $batch`,
+             LIMIT $batch`,
           { cursor: orphanReapCursor, safeCut: safeCutIso, batch },
         );
         if (!Array.isArray(page) || page.length === 0) {
