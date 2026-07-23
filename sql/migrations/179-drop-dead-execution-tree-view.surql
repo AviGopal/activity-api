@@ -1,0 +1,23 @@
+-- =============================================================================
+-- 179 — drop dead computed view v_execution_tree (churn)
+--
+-- v_execution_tree was `DEFINE TABLE ... AS SELECT ... FROM execution WHERE
+-- parent_execution_id IS NOT NONE` — a computed view that re-materialises on
+-- EVERY write to the ~117k-row hot `execution` table (highest write volume in
+-- the store) with ZERO runtime FROM-readers (exhaustive grep across repos/*/src
+-- + dist: 0 `FROM v_execution_tree`; not a record<> link target). Pure write-
+-- amplification.
+--
+-- DURABILITY (both halves, matching the mig 177 / account-view pattern):
+--   * Source neutralised: the DEFINE in schemas/021-paradigm-computed-views.surql
+--     and its -v3 sibling are converted to `REMOVE TABLE IF EXISTS` so a fresh
+--     boot and the 30-min db-maintenance reconcile never recreate it.
+--   * This migration (higher number → runs AFTER 021 on a fresh boot, and once
+--     on a live DB via init-database, then recorded in init_migrations) drops the
+--     surviving view from existing databases.
+--
+-- REVERSIBILITY: re-add the DEFINE from git history (021 @ HEAD~1) if a parent-
+-- child execution view is ever needed by a real reader.
+-- =============================================================================
+
+REMOVE TABLE IF EXISTS v_execution_tree;

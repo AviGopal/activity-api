@@ -111,16 +111,14 @@ DEFINE TABLE IF NOT EXISTS v_vessel_activity AS
 -- Purpose: Show parent-child execution relationships for compositions
 -- ============================================================================
 
-DEFINE TABLE IF NOT EXISTS v_execution_tree AS
-  SELECT
-    parent_execution_id AS parent,
-    id AS child,
-    activity_id,
-    success,
-    duration_ms,
-    org_id
-  FROM execution
-  WHERE parent_execution_id IS NOT NONE;
+-- RETIRED 2026-07-23 (source-DEFINE->REMOVE): v_execution_tree was a computed
+-- `AS SELECT ... FROM execution` view that re-materialised on EVERY write to the
+-- ~117k-row hot `execution` table (highest write volume in the store) with ZERO
+-- runtime FROM-readers (exhaustive grep across repos/*/src + dist). Pure write-
+-- amplification. Neutralised at source so a fresh boot / the 30-min reconcile
+-- never recreates it; migration 179 drops it from existing live DBs. Re-add the
+-- DEFINE above from git history if a parent-child execution view is ever needed.
+REMOVE TABLE IF EXISTS v_execution_tree;
 
 -- ============================================================================
 -- View: v_activity_shapes

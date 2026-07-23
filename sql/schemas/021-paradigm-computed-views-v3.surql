@@ -116,16 +116,10 @@ DEFINE TABLE IF NOT EXISTS v_vessel_activity AS
 -- Purpose: Show parent-child execution relationships for compositions
 -- ============================================================================
 
-DEFINE TABLE IF NOT EXISTS v_execution_tree AS
-  SELECT
-    parent_execution_id AS parent,
-    id AS child,
-    activity_id,
-    success,
-    duration_ms,
-    org_id
-  FROM execution
-  WHERE parent_execution_id IS NOT NONE;
+-- RETIRED 2026-07-23 (source-DEFINE->REMOVE): dead 0-reader computed view that
+-- re-materialised on every write to the hot ~117k-row `execution` table. See the
+-- companion note in 021-paradigm-computed-views.surql; migration 179 drops it live.
+REMOVE TABLE IF EXISTS v_execution_tree;
 
 -- ============================================================================
 -- View: v_activity_shapes
