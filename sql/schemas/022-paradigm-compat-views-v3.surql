@@ -104,25 +104,8 @@ DEFINE TABLE IF NOT EXISTS v_paradigm_execution_traces AS
 -- Maps: impulse -> old impulse_data format
 -- ============================================================================
 
-DEFINE TABLE IF NOT EXISTS v_paradigm_impulse_data AS
-  SELECT
-    id AS impulse_id,
-    id,
-    pointer AS impulse_data,
-    pointer.type AS impulse_type,
-    pointer,
-    content,
-    shape,
-    summary,
-    token_estimate AS budget,
-    (content IS NOT NONE) AS loaded,
-    org_id,
-    project_id,
-    vessel_id,
-    created_by,
-    created_at,
-    expires_at
-  FROM impulse;
+-- RETIRED (churn: recomputes on every impulse write; 0 runtime FROM-readers). Was DEFINE TABLE v_paradigm_impulse_data AS SELECT ... — converted to REMOVE so the db-maintenance reconcile retires it durably.
+REMOVE TABLE IF EXISTS v_paradigm_impulse_data;
 
 -- ============================================================================
 -- View: v_paradigm_minibob_instance

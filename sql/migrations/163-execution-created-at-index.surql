@@ -1,52 +1,12 @@
--- 163-execution-created-at-index.surql
--- Index on execution.created_at to remove a full-table scan on the created_at
--- range-filtered read path.
+-- =============================================================================
+-- 163 — idx_execution_created_at (RETIRED → REMOVE)
 --
--- WHAT THIS DOES (verified 2026-07-22 by live EXPLAIN on the populated DB):
---   `SELECT ... FROM execution WHERE created_at > time::now() - 7d` currently
---   plans as `Iterate Table` (full scan of ~108k blob-bearing rows), whereas the
---   identical predicate on the ALREADY-indexed `executed_at` column plans as an
---   `Iterate Index` bounded range scan (idx_execution_executed_at). `created_at`
---   was simply never indexed. This mirrors executed_at's coverage so the
---   created_at-filtered queries stop materialising the whole table (and its
---   `trace` blob) just to apply a time window -- the same blob-materialisation
---   pathology addressed for the trace view in migration 162.
---
--- WHO FILTERS created_at (grep-confirmed, non-test):
---   * src/middleware/runtime-tracing.ts RUNTIME_QUERIES -- hotPaths,
---     resolverPerformance, errorPatterns, reuseOpportunities dashboards all use
---     `... AND created_at > time::now() - 7d`.
---   * src/routes/db-admin-repair.ts -- `WHERE created_at > $after AND created_at
---     < $before` (range count) and the matching range DELETE.
---
--- WHAT THIS DELIBERATELY DOES NOT DO -- and why (verified live):
---   * It is NOT the (org_id, activity_id, success) "posterior" index. The hot
---     per-activity posterior read (routes/impulses.ts `thompson_posterior`,
---     `WHERE activity_id = $v AND <account/org scope>`) already resolves via
---     `Iterate Index` on the EXISTING idx_execution_org_activity -- it is not a
---     full scan.
---   * The only `Iterate Table` in the posterior aggregate is the UNFILTERED
---     GROUP BY that defines the materialised view v_activity_score_enhanced
---     (`FROM execution GROUP BY activity_id, org_id`, no WHERE). In SurrealDB
---     2.3.3 an unfiltered GROUP BY ALWAYS plans as `Iterate Table`; no index
---     removes it. (v_activity_score_enhanced is a computed/materialised view,
---     maintained incrementally -- this recompute is not on the per-read path.)
---   * A `success`-bearing composite would add no read benefit: 2.3.3 has no
---     covering-index-only aggregation. Verified -- an activity-only count picked
---     the single-field idx_execution_activity and ignored the success-bearing
---     idx_execution_activity_success_time; the record is always fetched to read
---     `success`. Such an index would be write-cost for zero read gain.
---
--- 2.3.3 CAVEAT (same as migration 162): this index accelerates the PREDICATE
--- (the created_at range becomes an index range scan). A query that also applies
--- ORDER BY over a large matched set still collects rows into MemoryOrderedLimit
--- before LIMIT; the index scopes the input to that sort, it does not remove the
--- sort. The listed consumers are GROUP-BY dashboards / bounded range deletes,
--- so the predicate win is the whole win here.
---
--- IF NOT EXISTS + live build note (same convention as migration 162): on the
--- live populated `execution` table this index should be built OUT-OF-BAND
--- (the migration runner pre-marks a migration applied when the table already
--- has rows, so this DDL never triggers a blocking bulk build there). On a fresh
--- deploy the table is empty at migration time, so the build is instant.
-DEFINE INDEX IF NOT EXISTS idx_execution_created_at ON execution FIELDS created_at;
+-- RETIRED. Formerly DEFINEd `idx_execution_created_at ON execution FIELDS
+-- created_at`. It is maintained on EVERY insert to the >1M-row, high-write
+-- `execution` table but NO runtime query filters/orders execution by created_at
+-- (every created_at ORDER BY/WHERE in src targets activity/impulse/
+-- goal_execution_paths/activity_template). Pure write cost, no reader. Converted
+-- to REMOVE so the db-maintenance reconcile retires it durably. Idempotent.
+-- =============================================================================
+
+REMOVE INDEX IF EXISTS idx_execution_created_at ON execution;
