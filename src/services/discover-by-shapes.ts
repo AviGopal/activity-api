@@ -152,9 +152,9 @@ export async function runDiscoverByShapes(
   }
 
   const query = `
-    SELECT *${compositionSubquery}
+    SELECT id, name, description, category, tasks, scope, org_id, input_shapes, output_shapes, ev, created_at, updated_at${compositionSubquery}
     FROM activity
-    WHERE ${whereClause}
+    WHERE ${whereClause.replace(/AND \(retired = false OR retired IS NONE\)/g, 'AND retired = false')}
     ORDER BY ev DESC, created_at DESC
     LIMIT $limit
   `;
