@@ -40,6 +40,13 @@ import { decrementTraceStoreCounter } from '../lib/trace-store-counters';
 // stops growing and ages out on its own.
 const TABLE = 'execution';
 
+// Resumable cursor for the orphaned-content reap (execution_trace_content).
+// execution_id-ordered; persists across sweeps within a process so each cycle
+// advances past already-scanned rows instead of re-paying the head prefix.
+// Resets to '' on process restart (re-scans from head — self-healing) and on
+// reaching the table tail (wrap). In-memory by design: no schema/migration.
+let orphanReapCursor = '';
+
 export interface StratumPolicy {
   /** Max cold-tail (older than hot window) traces to keep for status=success. */
   successCap: number;
@@ -84,6 +91,18 @@ export interface TraceRetentionConfig {
   globalCeiling: number;
   /** Toggle just the global-ceiling valve (still overall-gated by enabled + dryRun). */
   globalCeilingEnabled: boolean;
+  /**
+   * Reap ORPHANED execution_trace_content rows — content whose parent `execution`
+   * was already pruned by the sweeps above. Bounded per sweep + time-budgeted +
+   * age-windowed. On by default once the sweep is enabled and not dry-run.
+   */
+  orphanReapEnabled: boolean;
+  /** Max orphan content rows reaped per sweep (spreads the backlog over cycles). */
+  orphanReapPerSweepCap: number;
+  /** Hard wall-clock budget for the orphan reap step (yields under memory pressure). */
+  orphanReapBudgetMs: number;
+  /** Never reap content younger than this (guards a row whose parent execution is still mid dual-write). */
+  orphanReapMinAgeMs: number;
 }
 
 export function loadTraceRetentionConfig(env = process.env): TraceRetentionConfig {
@@ -130,6 +149,10 @@ export function loadTraceRetentionConfig(env = process.env): TraceRetentionConfi
     // policy primary); 0 disables. Still overall-gated by enabled + dryRun.
     globalCeiling: parseInt(env.TRACE_RETENTION_GLOBAL_CEILING ?? env.TRACE_STORE_CAP ?? '50000', 10),
     globalCeilingEnabled: env.TRACE_RETENTION_GLOBAL_CEILING_ENABLED !== 'false', // on by default
+    orphanReapEnabled: env.TRACE_RETENTION_ORPHAN_REAP_ENABLED !== 'false', // on by default
+    orphanReapPerSweepCap: parseInt(env.TRACE_RETENTION_ORPHAN_MAX ?? '20000', 10),
+    orphanReapBudgetMs: parseInt(env.TRACE_RETENTION_ORPHAN_BUDGET_MS ?? '120000', 10),
+    orphanReapMinAgeMs: parseInt(env.TRACE_RETENTION_ORPHAN_MIN_AGE_MS ?? String(60 * 60 * 1000), 10),
   };
 }
 
@@ -171,7 +194,7 @@ export interface StratumResult {
 
 export async function runTraceRetentionSweep(
   cfg: TraceRetentionConfig = loadTraceRetentionConfig(),
-): Promise<{ results: StratumResult[]; durationMs: number }> {
+): Promise<{ results: StratumResult[]; durationMs: number; orphanReaped: number }> {
   const startedAt = Date.now();
   const coldCutoffIso = new Date(startedAt - cfg.hotWindowMs).toISOString();
   const statuses = ['success', 'failure'] as const;
@@ -335,6 +358,84 @@ export async function runTraceRetentionSweep(
     }
   }
 
+  // ── Orphaned content reap ──────────────────────────────────────────────────
+  // execution_trace_content holds the split-out heavy FLEXIBLE payload (tasks,
+  // state_snapshot, impulse_resolutions, output_impulses) co-written per trace,
+  // keyed by execution_id = meta::id(execution.id). The stratified sweep and the
+  // global-ceiling valve above reap `execution` rows but NEVER the content table,
+  // so every reaped execution leaves its content row behind as an ORPHAN. Live,
+  // this backlog reached ~1.08M rows (1.2M content backing ~111k executions) — the
+  // single largest table, growing unbounded and re-inflating anon RSS (a storage/
+  // OOM-headroom leak, not latency: reads are execution_id-indexed). This step
+  // deletes content whose parent execution is PROVABLY absent, in bounded batches,
+  // capped per sweep and time-budgeted so one cycle can never attempt the whole
+  // backlog in a tight loop (which would spike RSS on this memory-pressured box).
+  // SurrealDB 2.3.x has no covering-index projection, so paging materializes row
+  // bodies (tens of ms/row under pressure) — hence the hard time budget and the
+  // resumable module-level cursor. A created_at safety window (orphanReapMinAgeMs)
+  // skips rows young enough to be mid dual-write, so a trace whose execution row
+  // has not yet committed is never false-reaped. No trace_store_counters decrement:
+  // that counter tracks `execution`, not this table. Same enabled/dryRun gating;
+  // dry-run scans + counts but deletes nothing.
+  let orphanReaped = 0;
+  if (cfg.orphanReapEnabled && cfg.orphanReapPerSweepCap > 0) {
+    const budgetUntil = Date.now() + cfg.orphanReapBudgetMs;
+    const safeCutIso = new Date(startedAt - cfg.orphanReapMinAgeMs).toISOString();
+    const batch = cfg.deleteBatchSize;
+    let scanned = 0;
+    try {
+      while (orphanReaped < cfg.orphanReapPerSweepCap && Date.now() < budgetUntil) {
+        const page = await surrealDB.query<string>(
+          `SELECT VALUE execution_id FROM execution_trace_content
+             WHERE execution_id > $cursor AND created_at < type::datetime($safeCut)
+             ORDER BY execution_id ASC LIMIT $batch`,
+          { cursor: orphanReapCursor, safeCut: safeCutIso, batch },
+        );
+        if (!Array.isArray(page) || page.length === 0) {
+          orphanReapCursor = ''; // index range exhausted — wrap for next sweep
+          break;
+        }
+        scanned += page.length;
+        orphanReapCursor = page[page.length - 1]; // advance + persist across sweeps
+
+        const existing = await surrealDB.query<string>(
+          `SELECT VALUE meta::id(id) FROM execution
+             WHERE id IN $eids.map(|$e| type::thing('execution', $e))`,
+          { eids: page },
+        );
+        const existingSet = new Set(Array.isArray(existing) ? existing : []);
+        const orphans = page.filter((eid) => !existingSet.has(eid));
+
+        if (orphans.length > 0 && !cfg.dryRun) {
+          await surrealDB.query(
+            'DELETE execution_trace_content WHERE execution_id IN $orphans RETURN NONE',
+            { orphans },
+          );
+        }
+        orphanReaped += orphans.length;
+
+        if (page.length < batch) {
+          orphanReapCursor = ''; // reached the tail — wrap for next sweep
+          break;
+        }
+      }
+    } catch (err) {
+      logger.warn('[trace-retention] orphan content reap failed; cursor retained for next sweep', {
+        error: err instanceof Error ? err.message : String(err),
+        scanned, orphanReaped, cursor: orphanReapCursor,
+      });
+    }
+    logger.info('[trace-retention] orphan content reap', {
+      dryRun: cfg.dryRun,
+      scanned,
+      [cfg.dryRun ? 'wouldReap' : 'reaped']: orphanReaped,
+      perSweepCap: cfg.orphanReapPerSweepCap,
+      budgetMs: cfg.orphanReapBudgetMs,
+      minAgeMs: cfg.orphanReapMinAgeMs,
+      resumeCursor: orphanReapCursor,
+    });
+  }
+
   // Reconcile the O(1) trace_store_counters row (migration 156) against the
   // rows actually removed from `execution` this cycle. The counter is
   // incremented once per insert (execution-traces.ts / activities.ts) and read
@@ -351,6 +452,7 @@ export async function runTraceRetentionSweep(
     hotWindowMs: cfg.hotWindowMs,
     coldCutoff: coldCutoffIso,
     durationMs,
+    orphanReaped,
     strata: results.map((r) => ({
       stratum: `${r.activityId}/${r.status}`,
       coldCount: r.coldCount,
@@ -359,7 +461,7 @@ export async function runTraceRetentionSweep(
     })),
   });
 
-  return { results, durationMs };
+  return { results, durationMs, orphanReaped };
 }
 
 /**
