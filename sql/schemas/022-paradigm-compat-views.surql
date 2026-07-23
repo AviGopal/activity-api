@@ -46,7 +46,18 @@ DEFINE TABLE IF NOT EXISTS v_paradigm_activity_template AS
 -- LOSSLESS UNION (migration 158): projects every AET column from `execution`.
 -- variant_id/status/component_changes fall back to the legacy surrogate for
 -- pre-157 rows (real column NONE) so both old and new rows read losslessly.
--- Keep BYTE-IDENTICAL to 022-paradigm-compat-views-v3.surql and migration 158.
+--
+-- NARROW (migration 167): the two trace-blob projections (`trace AS
+-- execution_trace`, `trace.tasks AS tasks`) were dropped from the live view on
+-- 2026-07-22 to stop the full-view scan balloon (SurrealDB 2.3.3 loads the FULL
+-- row even for a narrow projection, so a fat view makes every Iterate-Table
+-- read materialise the trace blob → single-query spikes to tens of GB). This
+-- SEED must match that intent so any fresh deploy or runtime view re-creation
+-- produces the NARROW view, not the pre-167 fat one — otherwise 167 (marked
+-- applied) never re-runs and the blob columns silently resurrect. The 5
+-- idx_vpet_* indexes below (migrations 162/167/172) are re-declared here with
+-- CONCURRENTLY + IF NOT EXISTS so re-creation restores index parity without a
+-- blocking build. Keep BYTE-IDENTICAL to 022-paradigm-compat-views-v3.surql.
 DEFINE TABLE IF NOT EXISTS v_paradigm_execution_traces AS
   SELECT
     meta::id(id) AS execution_id,
@@ -72,8 +83,6 @@ DEFINE TABLE IF NOT EXISTS v_paradigm_execution_traces AS
     output_impulses AS impulses_created,
     input_impulse_shapes,
     output_impulse_shapes,
-    trace AS execution_trace,
-    trace.tasks AS tasks,
     (component_changes ?? trace.state_transition.after) AS component_changes,
     improvisation,
     metadata,
@@ -93,6 +102,17 @@ DEFINE TABLE IF NOT EXISTS v_paradigm_execution_traces AS
     created_at AS stored_at,
     created_at AS updated_at
   FROM execution;
+
+-- Read-path indexes on the narrow view (migrations 162/167/172). CONCURRENTLY so
+-- a re-creation build over a populated view is non-blocking; IF NOT EXISTS so a
+-- normal restart is a no-op. idx_vpet_executed_at is the one that flips the
+-- unscoped `ORDER BY executed_at DESC LIMIT` hot list from Iterate Table (full
+-- scan) to Iterate Index ReverseOrder (top-N).
+DEFINE INDEX IF NOT EXISTS idx_vpet_execution_id ON v_paradigm_execution_traces FIELDS execution_id CONCURRENTLY;
+DEFINE INDEX IF NOT EXISTS idx_vpet_org_time ON v_paradigm_execution_traces FIELDS org_id, executed_at CONCURRENTLY;
+DEFINE INDEX IF NOT EXISTS idx_vpet_variant_exec ON v_paradigm_execution_traces FIELDS variant_id, executed_at CONCURRENTLY;
+DEFINE INDEX IF NOT EXISTS idx_vpet_variant_time ON v_paradigm_execution_traces FIELDS variant_id, created_at CONCURRENTLY;
+DEFINE INDEX IF NOT EXISTS idx_vpet_executed_at ON v_paradigm_execution_traces FIELDS executed_at CONCURRENTLY;
 
 -- ============================================================================
 -- View: v_paradigm_impulse_data
