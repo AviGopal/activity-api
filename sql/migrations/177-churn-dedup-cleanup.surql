@@ -46,6 +46,10 @@ REMOVE TABLE IF EXISTS ci_runs;
 REMOVE TABLE IF EXISTS code_variants;
 REMOVE TABLE IF EXISTS resolver;
 REMOVE TABLE IF EXISTS impulse_budget_log;
+-- NOTE: upkeep_stats was initially in this list but is NOT dead — it belongs to
+-- concept-db (concept-db/sql/upkeep/002-upkeep-views.surql, SCHEMAFULL), which
+-- shares this DB and recreates it on start. The activity-api-scoped audit missed
+-- it (cross-vessel shared-DB blind spot). Do NOT drop it here.
 
 -- ── Group 4: dead learning tables — DEFINE'd but never used (duplication) ────
 -- Schemafull DEFINEs exist (012-composition:217; 055-add-learning-table-
