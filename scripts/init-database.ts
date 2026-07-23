@@ -87,13 +87,24 @@ function buildHeaders(): Record<string, string> {
 // applied so this run is a no-op (they were all applied by previous deploys).
 
 async function runSQL(sql: string): Promise<SQLResult[]> {
-  const response = await fetch(`${SURREALDB_URL}/sql`, {
-    method: 'POST',
-    headers: buildHeaders(),
-    body: sql,
-  });
-  if (!response.ok) return [];
-  return response.json().catch(() => []);
+  // Per-request timeout: the `-` prefix on the unit's ExecStartPre neutralizes a
+  // non-zero EXIT, but not a HANG. A contended-but-up SurrealDB can otherwise
+  // stall a migration statement indefinitely and eat the unit's TimeoutStartSec
+  // budget -> SIGKILL despite the `-`. Bound every statement; migration tracking
+  // + idempotent DDL make a skipped/aborted statement safe to retry next start.
+  try {
+    const response = await fetch(`${SURREALDB_URL}/sql`, {
+      method: 'POST',
+      headers: buildHeaders(),
+      body: sql,
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) return [];
+    return await response.json().catch(() => []);
+  } catch {
+    // Aborted (timeout) or network error — treat as empty; caller tolerates it.
+    return [];
+  }
 }
 
 async function ensureMigrationsTable(): Promise<void> {
@@ -195,6 +206,7 @@ async function applySQLFile(filePath: string): Promise<boolean> {
       method: 'POST',
       headers,
       body: sqlContent,
+      signal: AbortSignal.timeout(30_000),
     });
 
     if (!response.ok) {
@@ -235,7 +247,9 @@ async function applySQLFile(filePath: string): Promise<boolean> {
   }
 }
 
-async function waitForDatabase(maxRetries = 30, delayMs = 2000): Promise<boolean> {
+async function waitForDatabase(maxRetries = 40, delayMs = 1000): Promise<boolean> {
+  // 40x1s = 40s bound: generous enough to cover a normal cold SurrealDB boot,
+  // but bounded so a genuinely-down store can't consume the whole start budget.
   console.log('[Init] Waiting for SurrealDB to be ready...');
 
   for (let i = 0; i < maxRetries; i++) {
@@ -245,7 +259,8 @@ async function waitForDatabase(maxRetries = 30, delayMs = 2000): Promise<boolean
         headers: {
           'surreal-ns': SURREALDB_NAMESPACE,
           'surreal-db': SURREALDB_DATABASE,
-        }
+        },
+        signal: AbortSignal.timeout(5000),
       });
 
       if (response.ok) {
@@ -284,6 +299,17 @@ async function main() {
   // Wait for database to be ready
   const dbReady = await waitForDatabase();
   if (!dbReady) {
+    // SurrealDB never answered within the bounded wait. Exit non-zero to signal
+    // "schema not applied" honestly — but the unit's ExecStartPre carries a `-`
+    // prefix, so this does NOT fail activity-api startup: ExecStart still runs,
+    // the server boots listener-first, serves /health, registers with discovery,
+    // and converges per-request once SurrealDB is reachable. The next restart
+    // re-runs init to apply any pending schema. On a live DB the schema is
+    // already applied (init_migrations tracking), so nothing is lost.
+    console.error(
+      '[Init] SurrealDB unreachable within bounded wait — skipping schema apply. ' +
+      'Non-fatal via ExecStartPre `-`; server will boot and converge.'
+    );
     process.exit(1);
   }
 
