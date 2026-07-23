@@ -5408,28 +5408,14 @@ app.post('/recommend', async (c) => {
     const EMPIRICAL_BADNESS_FLOOR_ENABLED = (await getTuningParam("EMPIRICAL_BADNESS_FLOOR", process.env.EMPIRICAL_BADNESS_FLOOR, 1)) >= 1;
     const EMPIRICAL_BADNESS_MIN_OBS = parseInt(process.env.EMPIRICAL_BADNESS_MIN_OBS ?? '20', 10);
     const EMPIRICAL_BADNESS_MIN_RATE = parseFloat(process.env.EMPIRICAL_BADNESS_MIN_RATE ?? '0.02');
-    // The floor needs the GLOBAL honest success/failure counts even when the primary
-    // scoresMap is shape-conditioned. A template whose failures live on the global
-    // (null-signature) row has NO per-signature row, so getShapeConditionedScores
-    // (exact shape_signature match) returns nothing for it and the shape-conditioned
-    // scoresMap misses it entirely — yet its chain-credit-poisoned GLOBAL thompson_alpha
-    // STILL reaches selection via the `template.metrics?.thompson_alpha` fallback below.
-    // Fetch the global counts once (the same getActivityScores the no-shapes branch uses,
-    // one batched query) so the antidote sees exactly what the poison does. Reuse
-    // scoresMap when it is already global/legacy; fail-open to per-signature-only on error.
-    let globalScoresMap: Map<string, ActivityScore> = scoresMap;
-    if (EMPIRICAL_BADNESS_FLOOR_ENABLED && scoreMethod === 'shape_conditioned' && activityIds.length > 0 && orgId) {
-      try {
-        const gRes = await getActivityScores(orgId, activityIds, jwtAuth?.jwtToken, jwtAuth?.accountId ?? null);
-        const gm = new Map<string, ActivityScore>();
-        for (const gScoreRow of gRes.data) gm.set(gScoreRow.activity_id, gScoreRow);
-        globalScoresMap = gm;
-      } catch (e) {
-        logger.debug('Empirical-badness floor: global scores fetch failed; floor uses per-signature evidence only', {
-          error: e instanceof Error ? e.message : String(e),
-        });
-      }
-    }
+    // The floor's GLOBAL honest counts come from `template.metrics`
+    // (successful_executions/failed_executions), populated by enrichTemplatesWithMetrics
+    // from variant_performance_metrics — the SAME durable counters selection reads
+    // thompson_alpha from. We deliberately do NOT read v_activity_score for this: it is
+    // computed by counting live execution rows, so a template whose raw traces were reaped
+    // shows an EMPTY row there (total_executions 0) even while variant_performance_metrics
+    // still records thousands of failures — which is exactly the pollution case
+    // (0 success / thousands fail, reaped). See the per-template application below.
     let stateSpaceSig: string | null = null;
     const sigScoresMap = new Map<string, { alpha: number; beta: number; n_observations: number }>();
     const repairScoresMap = new Map<string, number>();
@@ -5903,25 +5889,30 @@ app.post('/recommend', async (c) => {
         // template, its chain-credit, and the exploration budget otherwise intact.
         let empiricallyBroken = false;
         if (EMPIRICAL_BADNESS_FLOOR_ENABLED) {
-          // Judge on the STRONGEST available honest evidence: the per-signature scores
-          // (when a row exists) AND the GLOBAL row (which selection also reads via the
-          // alpha fallback). Broken if EITHER shows enough own-runs and a near-zero
-          // self-success rate. The global arm is what catches the primary pollution case:
-          // a template whose thousands of failures live on the global null-signature row
-          // and thus never appears in the shape-conditioned scoresMap.
-          const gScore = globalScoresMap.get(scoreKey) ?? globalScoresMap.get(activityId);
+          // Judge on the STRONGEST available honest evidence. Two sources:
+          //  - per-signature scores (scores.successes/failures) when a live row exists;
+          //  - the DURABLE global counters on template.metrics
+          //    (successful_executions/failed_executions), which enrichTemplatesWithMetrics
+          //    fills from variant_performance_metrics. This is the authoritative arm: it is
+          //    the same object selection reads thompson_alpha from, and it SURVIVES
+          //    execution-row reaping (v_activity_score does NOT — a reaped template shows an
+          //    empty row there while still carrying thousands of durable failures, which is
+          //    precisely the pollution case: 0 success / thousands fail, alpha ~10k).
+          // Broken if EITHER source shows enough own-runs and a near-zero self-success rate.
           const isBroken = (succ: number, fail: number): boolean => {
             const obs = succ + fail;
             return obs >= EMPIRICAL_BADNESS_MIN_OBS && (succ / obs) < EMPIRICAL_BADNESS_MIN_RATE;
           };
+          const durSucc = template.metrics?.successful_executions ?? 0;
+          const durFail = template.metrics?.failed_executions ?? 0;
           const sigBroken = isBroken(scores?.successes ?? 0, scores?.failures ?? 0);
-          const globalBroken = isBroken(gScore?.successes ?? 0, gScore?.failures ?? 0);
-          if (sigBroken || globalBroken) {
+          const durableBroken = isBroken(durSucc, durFail);
+          if (sigBroken || durableBroken) {
             empiricallyBroken = true;
             logger.debug('Empirical-badness floor: template self-failing, demoting from run-selection', {
-              template_id: activityId, sig_broken: sigBroken, global_broken: globalBroken,
+              template_id: activityId, sig_broken: sigBroken, durable_broken: durableBroken,
               sig_successes: scores?.successes ?? 0, sig_failures: scores?.failures ?? 0,
-              global_successes: gScore?.successes ?? 0, global_failures: gScore?.failures ?? 0,
+              durable_successes: durSucc, durable_failures: durFail,
               sample_before: sample,
             });
             sample = 0;
