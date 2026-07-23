@@ -1,0 +1,54 @@
+-- 172-vpet-executed-at-index.surql
+-- Standalone executed_at index on the hot compat view v_paradigm_execution_traces
+-- to close the UNSCOPED branch of the OOM/latency class that migration 162 opened
+-- for the org- and variant-scoped branches.
+--
+-- ROOT CAUSE (verified 2026-07-22 by live EXPLAIN on the running substrate):
+--   The trace-list hot path (src/routes/execution-traces.ts, the GET traces
+--   handler) builds its WHERE clause conditionally: an org filter is pushed ONLY
+--   when a browser JWT carries org_id. Service-to-service callers (root / ApiKey
+--   — including the learning loop's recent-posterior reads on every dispatch)
+--   arrive with no JWT, so whereClause is EMPTY and the query degrades to:
+--       SELECT * FROM v_paradigm_execution_traces ORDER BY executed_at DESC LIMIT $n
+--   EXPLAIN on the live DB showed this plan as `Iterate Table` (a full forward
+--   scan of all ~111k view rows) feeding a `MemoryOrderedLimit` — i.e. every list
+--   read walks the whole view before the LIMIT can apply. This is the same
+--   MemoryOrderedLimit full-materialise class migration 162 fixed for the SCOPED
+--   reads; 162 added (org_id, executed_at) and (variant_id, executed_at) but the
+--   planner will not use a composite index whose leading field is unconstrained,
+--   so the no-filter case stayed on Iterate Table.
+--
+-- THE FIX (verified live — plan flips):
+--   A standalone executed_at index lets SurrealDB 2.3.3 satisfy the pure
+--   `ORDER BY executed_at DESC LIMIT` with an ordered index walk. Live EXPLAIN
+--   after building this index shows the plan change from
+--       { operation: 'Iterate Table' }                       (all 111k rows)
+--   to
+--       { plan: { index: 'idx_vpet_executed_at', operator: 'ReverseOrder' },
+--         operation: 'Iterate Index' }                        (top-N only)
+--   so the collector reads only $limit rows instead of the whole view. The base
+--   `execution` table already gets this behaviour from idx_execution_executed_at;
+--   this brings the read-path view to parity. Migration 167 already stripped the
+--   trace blob columns off this view, so the scan (and this index build) is over
+--   narrow scalar rows only.
+--
+-- WHY SAFE:
+--   An index is a pure query-plan artifact: it changes HOW rows are found, never
+--   WHICH rows are returned or in what order, and it is invisible to selection /
+--   scoring / Thompson state. Purely additive; no field, view, event, or route
+--   changes.
+--
+-- BUILD COST / OUT-OF-BAND:
+--   Adding an index re-materialises the field across existing rows. On this view
+--   (~111k narrow scalar rows post-167) the live build completed sub-second and
+--   was applied out-of-band on 2026-07-22 before this migration was authored, so
+--   the migration is an idempotent no-op replay here. On a fresh deploy the view
+--   is empty at migration time so the build is instant. IF NOT EXISTS makes replay
+--   safe. (Had the view still carried the ~220MB blob, an index build would be
+--   heavier — call it out and build out-of-band; it does not here.)
+--
+-- REVERSIBILITY:
+--   REMOVE INDEX IF EXISTS idx_vpet_executed_at ON v_paradigm_execution_traces;
+--   No data is touched; dropping it only reverts the unscoped list plan to
+--   Iterate Table.
+DEFINE INDEX IF NOT EXISTS idx_vpet_executed_at ON v_paradigm_execution_traces FIELDS executed_at;

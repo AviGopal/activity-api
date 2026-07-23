@@ -1,0 +1,79 @@
+-- 171-drop-dead-paradigm-compat-views.surql
+-- ============================================================================
+-- Purpose: Remove four dead paradigm backward-compat materialised views:
+--            v_paradigm_impulse_data      (per-row mirror of `impulse`)
+--            view_goal_paths              (per-row mirror of `goal_execution_paths`)
+--            v_paradigm_goal_paths        (filtered mirror of `activity`)
+--            v_paradigm_minibob_instance  (per-row mirror of `vessel`)
+--
+-- WHY (write-amplification, core principle):
+--   Each is a DEFINE TABLE ... AS SELECT view with NO GROUP BY, i.e. a per-row
+--   projection mirror of its base table. A materialised projection re-projects
+--   (and re-stores) the changed row on EVERY write to its base table — pure
+--   duplication + per-insert view-maintenance latency. Ranked by base-table
+--   write pressure (worst first):
+--     * v_paradigm_impulse_data  -> `impulse` (6991 rows; impulses are minted
+--       continuously along every walk) — HIGHEST amplification.
+--     * view_goal_paths          -> `goal_execution_paths` (4737 rows; written
+--       per goal-path record) — HIGH.
+--     * v_paradigm_goal_paths    -> `activity` (3708 rows; re-evaluates its
+--       WHERE `execution_type='composition' AND 'goal' INSIDE input_shapes` on
+--       every activity write; output currently 0 rows) — LOW.
+--     * v_paradigm_minibob_instance -> `vessel` (0 rows) — NEGLIGIBLE now.
+--
+-- WHY SAFE (measured, not assumed):
+--   * These are the paradigm backward-compat scaffold from schema 022 /
+--     migration 069 (v_paradigm_*) and schema 012 (view_goal_paths) — declared
+--     header "backward-compatible queries during schema migration", a transient
+--     layer, not a permanent contract.
+--   * ZERO runtime references across ALL repos (every repo, every file type,
+--     excluding sql/ and node_modules) — verified by exact word-boundary grep of
+--     all four names: no live SELECT, no dynamic view-name construction, no
+--     federation/obsidian consumer, not even a comment.
+--   * All four carry PERMISSIONS NONE -> structurally unreadable by any tenant,
+--     so nothing can consume them (same safety basis as migration 166).
+--   * No migration after 069 re-DEFINEs any of them (only 022/069/012 define
+--     them, all < 171), so this REMOVE is the last word.
+--   Removing them changes NO application behaviour and CANNOT affect selection
+--   or scoring — it deletes dead write-amplification only.
+--
+-- ORDERING: sql/migrations/* apply AFTER sql/schemas/* in init-database.ts and
+--   already-applied files are skipped via init_migrations. On the live DB the
+--   defining schemas/069 have already run, so these REMOVEs are durable; on a
+--   fresh boot schema 012/022 + migration 069 DEFINE them, then this 171 REMOVEs
+--   -> net removed. (Follow-up, flagged not required: neutralise the DEFINEs in
+--   schemas 012/022 + migration 069 for explicit intent.)
+--
+-- REVERSIBILITY: no data loss — a view holds no state; it recomputes from its
+--   base table. Restore any view by re-running its live DEFINE verbatim:
+--
+--   DEFINE TABLE v_paradigm_impulse_data TYPE ANY SCHEMALESS AS SELECT
+--     id AS impulse_id, id, pointer AS impulse_data, pointer.type AS impulse_type,
+--     pointer, content, shape, summary, token_estimate AS budget,
+--     (content != NONE) AS loaded, org_id, project_id, vessel_id, created_by,
+--     created_at, expires_at FROM impulse PERMISSIONS NONE;
+--
+--   DEFINE TABLE view_goal_paths TYPE ANY SCHEMALESS AS SELECT
+--     (goal_hash + '-' + path_signature) AS id, goal_pattern, goal_embedding,
+--     initial_state, initial_impulses, activity_sequence, success,
+--     total_duration_ms, total_cost, goal_achieved, execution_count,
+--     success_count, success_rate, thompson_alpha, thompson_beta, created_at,
+--     updated_at FROM goal_execution_paths PERMISSIONS NONE;
+--
+--   DEFINE TABLE v_paradigm_goal_paths TYPE ANY SCHEMALESS AS SELECT
+--     id, id AS path_id, name AS goal_pattern, child_activities AS activity_sequence,
+--     input_shapes AS initial_impulses, output_shapes, org_id, project_id, public,
+--     created_at, updated_at FROM activity
+--     WHERE execution_type = 'composition' AND 'goal' INSIDE input_shapes
+--     PERMISSIONS NONE;
+--
+--   DEFINE TABLE v_paradigm_minibob_instance TYPE ANY SCHEMALESS AS SELECT
+--     id, id AS instance_id, name, resolves, api_key_hash, is_active, org_id,
+--     project_id, created_at, last_active_at, expires_at FROM vessel
+--     PERMISSIONS NONE;
+-- ============================================================================
+
+REMOVE TABLE IF EXISTS v_paradigm_impulse_data;
+REMOVE TABLE IF EXISTS view_goal_paths;
+REMOVE TABLE IF EXISTS v_paradigm_goal_paths;
+REMOVE TABLE IF EXISTS v_paradigm_minibob_instance;

@@ -1,0 +1,35 @@
+-- 170-drop-dead-orphan-tables-round2.surql
+-- Schema-hygiene (second pass, sibling of 164): remove two confirmed-dead orphan
+-- tables. Same conservative bar as 164 -- a table is dropped ONLY when it is
+-- BOTH empty (rowcount 0) AND has no live dependent (view/`lives`, field,
+-- event, incoming record-link) AND no runtime code reference (grep of
+-- repos/*/src across every vessel returns zero hits outside .surql DDL).
+-- REMOVE TABLE IF EXISTS is idempotent; on a fresh deploy the historical DDL
+-- (sql/007, sql/migrations/055) recreates these tables earlier in the run and
+-- this migration removes them again, converging to the same final state.
+--
+-- CONFIRMED DROPPED (verified live 2026-07-22):
+--
+--   * activity_execution_sequence -- 0 rows. Provisioned only by the PERMISSIONS
+--     migration sql/migrations/055-add-learning-table-permissions.surql (a bare
+--     SCHEMAFULL table + permissions block; never wired). INFO FOR TABLE shows
+--     empty fields/indexes/events/lives and no incoming record-link. `rg -n
+--     '\bactivity_execution_sequence\b' repos/*/src` = 0 hits. It is NOT the
+--     advertised `executionSequences` shape (that maps to the distinct, wired
+--     `execution_sequences` table, which is kept). Pure orphan.
+--
+--   * execution_step_patterns -- 0 rows. Defined only by the legacy monolith
+--     sql/007-control-flow-data-flow-learning.surql (table + 2 indexes
+--     idx_template_pattern/idx_source_execution + a self-test INSERT/DELETE).
+--     INFO FOR TABLE shows 0 rows, no lives, no incoming record-link. `rg -n
+--     '\bexecution_step_patterns\b' repos/*/src` = 0 hits (only the sql/007 DDL
+--     references it). Sibling tables from sql/007 (execution_pattern 15 refs,
+--     execution_sequences 16 refs) ARE wired and are kept; only this one is
+--     unreferenced. Pure orphan.
+--
+-- REVERSIBILITY: re-apply the original DEFINE TABLE/FIELD/INDEX blocks from
+--   sql/migrations/055-add-learning-table-permissions.surql (for
+--   activity_execution_sequence) and sql/007-control-flow-data-flow-learning.surql
+--   (for execution_step_patterns). Both tables were empty, so no data is lost.
+REMOVE TABLE IF EXISTS activity_execution_sequence;
+REMOVE TABLE IF EXISTS execution_step_patterns;
