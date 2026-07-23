@@ -37,8 +37,12 @@ DEFINE TABLE OVERWRITE v_composition_node_by_account AS
 -- Impulse-shape scoring
 -- -----------------------------------------------------------------------------
 
-DEFINE TABLE OVERWRITE v_impulse_shape_activity_score_by_account AS
-  SELECT *, (account_id ?? org_id) AS effective_account_id FROM impulse_shape_activity_score;
+-- NEUTRALIZED 2026-07-22 (migration 174): v_impulse_shape_activity_score_by_account
+-- withdrawn. Abandoned account-id back-compat view; 0 runtime readers,
+-- PERMISSIONS NONE. Removed from active DDL so it is never re-asserted on any
+-- replay path. Original DEFINE preserved here + in git history:
+-- DEFINE TABLE OVERWRITE v_impulse_shape_activity_score_by_account AS
+--   SELECT *, (account_id ?? org_id) AS effective_account_id FROM impulse_shape_activity_score;
 
 -- -----------------------------------------------------------------------------
 -- Tool patterns

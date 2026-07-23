@@ -44,8 +44,13 @@ DEFINE TABLE OVERWRITE v_activity_by_account AS
 DEFINE TABLE OVERWRITE v_execution_by_account AS
   SELECT *, (account_id ?? org_id) AS effective_account_id FROM execution;
 
-DEFINE TABLE OVERWRITE v_impulse_by_account AS
-  SELECT *, (account_id ?? org_id) AS effective_account_id FROM impulse;
+-- NEUTRALIZED 2026-07-22 (migration 174): v_impulse_by_account withdrawn.
+-- Abandoned account-id back-compat view; 0 runtime readers, PERMISSIONS NONE,
+-- write-amplification on the hot `impulse` table. Removed from active DDL so it
+-- is never re-asserted on any replay path (fresh-volume boot / manual re-run /
+-- init_migrations reset). Original DEFINE preserved here + in git history:
+-- DEFINE TABLE OVERWRITE v_impulse_by_account AS
+--   SELECT *, (account_id ?? org_id) AS effective_account_id FROM impulse;
 
 DEFINE TABLE OVERWRITE v_vessel_by_account AS
   SELECT *, (account_id ?? org_id) AS effective_account_id FROM vessel;
@@ -88,8 +93,12 @@ DEFINE TABLE OVERWRITE v_composite_sequence_patterns_by_account AS
 DEFINE TABLE OVERWRITE v_composition_edge_by_account AS
   SELECT *, (account_id ?? org_id) AS effective_account_id FROM composition_edge;
 
-DEFINE TABLE OVERWRITE v_context_thompson_scores_by_account AS
-  SELECT *, (account_id ?? org_id) AS effective_account_id FROM context_thompson_scores;
+-- NEUTRALIZED 2026-07-22 (migration 174): v_context_thompson_scores_by_account
+-- withdrawn. Abandoned account-id back-compat view; 0 runtime readers,
+-- PERMISSIONS NONE. Removed from active DDL so it is never re-asserted on any
+-- replay path. Original DEFINE preserved here + in git history:
+-- DEFINE TABLE OVERWRITE v_context_thompson_scores_by_account AS
+--   SELECT *, (account_id ?? org_id) AS effective_account_id FROM context_thompson_scores;
 
 DEFINE TABLE OVERWRITE v_discovered_state_pattern_by_account AS
   SELECT *, (account_id ?? org_id) AS effective_account_id FROM discovered_state_pattern;
@@ -115,15 +124,23 @@ DEFINE TABLE OVERWRITE v_state_feature_importance_by_account AS
 DEFINE TABLE OVERWRITE v_state_transition_by_account AS
   SELECT *, (account_id ?? org_id) AS effective_account_id FROM state_transition;
 
-DEFINE TABLE OVERWRITE v_thompson_selection_log_by_account AS
-  SELECT *, (account_id ?? org_id) AS effective_account_id FROM thompson_selection_log;
+-- NEUTRALIZED 2026-07-22 (migration 174): v_thompson_selection_log_by_account
+-- withdrawn. Abandoned account-id back-compat view; 0 runtime readers,
+-- PERMISSIONS NONE. Removed from active DDL so it is never re-asserted on any
+-- replay path. Original DEFINE preserved here + in git history:
+-- DEFINE TABLE OVERWRITE v_thompson_selection_log_by_account AS
+--   SELECT *, (account_id ?? org_id) AS effective_account_id FROM thompson_selection_log;
 
 -- -----------------------------------------------------------------------------
 -- Goal / path
 -- -----------------------------------------------------------------------------
 
-DEFINE TABLE OVERWRITE v_goal_execution_paths_by_account AS
-  SELECT *, (account_id ?? org_id) AS effective_account_id FROM goal_execution_paths;
+-- NEUTRALIZED 2026-07-22 (migration 174): v_goal_execution_paths_by_account
+-- withdrawn. Abandoned account-id back-compat view; 0 runtime readers,
+-- PERMISSIONS NONE. Removed from active DDL so it is never re-asserted on any
+-- replay path. Original DEFINE preserved here + in git history:
+-- DEFINE TABLE OVERWRITE v_goal_execution_paths_by_account AS
+--   SELECT *, (account_id ?? org_id) AS effective_account_id FROM goal_execution_paths;
 
 -- -----------------------------------------------------------------------------
 -- Impulse bookkeeping
@@ -172,8 +189,12 @@ DEFINE TABLE OVERWRITE v_shape_definition_by_account AS
 DEFINE TABLE OVERWRITE v_tool_usage_by_account AS
   SELECT *, (account_id ?? org_id) AS effective_account_id FROM tool_usage;
 
-DEFINE TABLE OVERWRITE v_variant_performance_metrics_by_account AS
-  SELECT *, (account_id ?? org_id) AS effective_account_id FROM variant_performance_metrics;
+-- NEUTRALIZED 2026-07-22 (migration 174): v_variant_performance_metrics_by_account
+-- withdrawn. Abandoned account-id back-compat view; 0 runtime readers,
+-- PERMISSIONS NONE. Removed from active DDL so it is never re-asserted on any
+-- replay path. Original DEFINE preserved here + in git history:
+-- DEFINE TABLE OVERWRITE v_variant_performance_metrics_by_account AS
+--   SELECT *, (account_id ?? org_id) AS effective_account_id FROM variant_performance_metrics;
 
 -- -----------------------------------------------------------------------------
 -- CI integration

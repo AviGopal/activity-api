@@ -13,58 +13,23 @@
 -- Usage: Direct dashboard queries without client-side computation
 -- ============================================================================
 
-DEFINE TABLE IF NOT EXISTS v_activity_score_enhanced AS
-  SELECT
-    activity_id,
-    org_id,
-    -- Execution counts
-    count() AS total_executions,
-    -- Thompson Sampling: Beta(alpha, beta) where alpha = successes + 1, beta = failures + 1
-    count(IF success = true THEN 1 ELSE NONE END) + 1 AS alpha,
-    count(IF success = false THEN 1 ELSE NONE END) + 1 AS beta,
-    -- Success/failure counts
-    count(IF success = true THEN 1 ELSE NONE END) AS successes,
-    count(IF success = false THEN 1 ELSE NONE END) AS failures,
-    -- Computed Thompson Sampling belief: alpha / (alpha + beta)
-    -- This is the expected value of the Beta distribution (mean posterior probability)
-    <float> (count(IF success = true THEN 1 ELSE NONE END) + 1) /
-    <float> (count(IF success = true THEN 1 ELSE NONE END) + count(IF success = false THEN 1 ELSE NONE END) + 2) AS belief,
-    -- Raw success rate: successes / total_executions
-    -- Note: Returns 0 if total_executions is 0 (edge case for computed views)
-    IF count() > 0 THEN
-      <float> count(IF success = true THEN 1 ELSE NONE END) / <float> count()
-    ELSE
-      0.0
-    END AS success_rate,
-    -- Aggregate metrics
-    math::mean(<float> duration_ms) AS avg_duration_ms,
-    math::mean(<float> cost_usd) AS avg_cost_usd,
-    -- Temporal data
-    time::max(executed_at) AS last_executed_at
-  FROM execution
-  GROUP BY activity_id, org_id
-PERMISSIONS
-  FOR select WHERE org_id = $auth.org_id;
+-- NEUTRALIZED 2026-07-22 (migration 165 + 174): v_activity_score_enhanced withdrawn.
+-- This materialised view re-aggregated the hot `execution` table (unfiltered
+-- GROUP BY, re-materialises on EVERY execution insert) = pure write-amplification,
+-- with 0 runtime readers across all repos/*/src (verified). Removed from active
+-- DDL so it is never re-asserted on any replay path (fresh-volume boot / manual
+-- re-run / init_migrations reset). Original DEFINE (and its indexes below)
+-- preserved in git history and in migration 165's REVERSIBILITY note; recreate
+-- from there if the account-scored dashboard view is ever resurrected.
 
 -- ============================================================================
 -- Indexes for efficient querying
 -- ============================================================================
 
--- Index for activity lookup
-DEFINE INDEX IF NOT EXISTS idx_v_activity_score_enhanced_activity
-  ON v_activity_score_enhanced FIELDS activity_id;
-
--- Index for org-scoped queries
-DEFINE INDEX IF NOT EXISTS idx_v_activity_score_enhanced_org
-  ON v_activity_score_enhanced FIELDS org_id;
-
--- Index for ranking by belief (Thompson Sampling selection)
-DEFINE INDEX IF NOT EXISTS idx_v_activity_score_enhanced_belief
-  ON v_activity_score_enhanced FIELDS org_id, belief;
-
--- Index for ranking by success rate
-DEFINE INDEX IF NOT EXISTS idx_v_activity_score_enhanced_success_rate
-  ON v_activity_score_enhanced FIELDS org_id, success_rate;
+-- (Indexes for v_activity_score_enhanced removed 2026-07-22 with the view — see
+--  the NEUTRALIZED note above and migrations 165/174. REMOVE TABLE cascades
+--  index removal; these DEFINE INDEX statements would otherwise error on a
+--  fresh-volume boot now that the view is gone. Originals in git history.)
 
 -- ============================================================================
 -- Usage Examples
