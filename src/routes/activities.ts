@@ -5400,6 +5400,14 @@ app.post('/recommend', async (c) => {
     const CROSS_SIG_MIN_GLOBAL_OBS = parseInt(
       process.env.CROSS_SIG_REPUTATION_MIN_GLOBAL_OBS ?? '5', 10
     );
+    // Empirical-badness floor (2026-07-23 law-12 causal-discipline fix, default ON).
+    // Full rationale at the per-template application in the recommendations map below.
+    // Bars a template that is PROVEN-self-failing (>= MIN_OBS own runs, own-success rate
+    // < MIN_RATE) from being SELECTED TO RUN, regardless of chain-credit-inflated alpha or
+    // declared output-shape coverage. Reversible: EMPIRICAL_BADNESS_FLOOR=0 restores prior.
+    const EMPIRICAL_BADNESS_FLOOR_ENABLED = (await getTuningParam("EMPIRICAL_BADNESS_FLOOR", process.env.EMPIRICAL_BADNESS_FLOOR, 1)) >= 1;
+    const EMPIRICAL_BADNESS_MIN_OBS = parseInt(process.env.EMPIRICAL_BADNESS_MIN_OBS ?? '20', 10);
+    const EMPIRICAL_BADNESS_MIN_RATE = parseFloat(process.env.EMPIRICAL_BADNESS_MIN_RATE ?? '0.02');
     let stateSpaceSig: string | null = null;
     const sigScoresMap = new Map<string, { alpha: number; beta: number; n_observations: number }>();
     const repairScoresMap = new Map<string, number>();
@@ -5858,6 +5866,34 @@ app.post('/recommend', async (c) => {
           sample = sample * reputationFactor;
         }
 
+        // EMPIRICAL-BADNESS FLOOR (2026-07-23, law-12 causal-discipline fix).
+        // The alpha read for selection is thompson_alpha, which CHAIN-CREDIT inflates for a
+        // template that is merely a useful ANCESTOR of other reached walks
+        // (posterior-update.ts propagateChainCredit) — the SAME column that also holds this
+        // template's own leaf failures. So a template that is ~0-success / thousands-fail
+        // when RUN ITSELF still samples ~0.5 AND, worse, wins the output-shape-coverage
+        // resort below on DECLARED outputs it never actually produces. Run-selection must
+        // key on a template's OWN empirical success, not its pathway/declared value. Derive
+        // an own-success gate from the HONEST counts (successes/failures from
+        // v_activity_score, NOT alpha) and use it to (a) zero the Thompson sample and
+        // (b) hard-demote in every ranking regime below. Conservative + reversible: fires
+        // only with enough own-runs to judge and a near-zero self-success rate; leaves the
+        // template, its chain-credit, and the exploration budget otherwise intact.
+        let empiricallyBroken = false;
+        if (EMPIRICAL_BADNESS_FLOOR_ENABLED) {
+          const ownSucc = scores?.successes ?? 0;
+          const ownFail = scores?.failures ?? 0;
+          const ownObs = ownSucc + ownFail;
+          if (ownObs >= EMPIRICAL_BADNESS_MIN_OBS && (ownSucc / ownObs) < EMPIRICAL_BADNESS_MIN_RATE) {
+            empiricallyBroken = true;
+            logger.debug('Empirical-badness floor: template self-failing, demoting from run-selection', {
+              template_id: activityId, own_successes: ownSucc, own_failures: ownFail,
+              own_rate: ownSucc / ownObs, sample_before: sample,
+            });
+            sample = 0;
+          }
+        }
+
         const rawTotalExecs = scores?.total_executions ?? 0;
         const rawSuccesses = scores?.successes ?? 0;
         const computed_ucb_score = ucbScore(rawTotalExecs, rawSuccesses);
@@ -5875,6 +5911,7 @@ app.post('/recommend', async (c) => {
           _ucb_score: computed_ucb_score,
           _total_executions: rawTotalExecs,
           _proposed: template.proposed === true,
+          _empirically_broken: empiricallyBroken,
           // Topology-exploration signal (Change 2 — additive observability).
           // `exploration` is patched to true after pool partitioning when the
           // recommendation lands in the explorationPool (low observations or
@@ -6058,6 +6095,9 @@ app.post('/recommend', async (c) => {
       c._proposed !== true && c._total_executions >= min_observations_threshold
     );
     explorationPool.sort((a: any, b: any) => {
+      // Empirical-badness floor: a proven-self-failing template sinks below every
+      // working alternative before any other key (UCB, ψ-blend, tiebreaks).
+      if (!!a._empirically_broken !== !!b._empirically_broken) return a._empirically_broken ? 1 : -1;
       // When the ψ blend is active, the look-ahead leads the ranking; UCB is the
       // tiebreak. Off (default), this is the prior UCB-then-Thompson order exactly.
       if (sfBlendApplied) {
@@ -6071,6 +6111,9 @@ app.post('/recommend', async (c) => {
       return (b.selection_metadata?.score ?? 0) - (a.selection_metadata?.score ?? 0);
     });
     exploitationPool.sort((a: any, b: any) => {
+      // Empirical-badness floor: a proven-self-failing template sinks below every
+      // working alternative before the UCB / ψ-blend argmax.
+      if (!!a._empirically_broken !== !!b._empirically_broken) return a._empirically_broken ? 1 : -1;
       // ψ look-ahead enters the exploitation argmax (the actual Thompson pick) when
       // SF_BLEND is on; UCB tiebreaks. Off, this is the prior pure-UCB order exactly.
       if (sfBlendApplied) {
@@ -6095,6 +6138,10 @@ app.post('/recommend', async (c) => {
     // ordering which places the exploration slot last by construction.
     if (expected_output_shapes.length > 0) {
       finalRecommendations.sort((a: any, b: any) => {
+        // Empirical-badness floor is the HARDEST key here: a proven-self-failing producer
+        // is useless no matter how completely it DECLARES the wanted output shape. This is
+        // the regime that let the 0/thousands learned composition win producer-selection.
+        if (!!a._empirically_broken !== !!b._empirically_broken) return a._empirically_broken ? 1 : -1;
         const bOsCov = b.selection_metadata?.boost_breakdown?.output_shape_coverage ?? 0;
         const aOsCov = a.selection_metadata?.boost_breakdown?.output_shape_coverage ?? 0;
         if (bOsCov !== aOsCov) return bOsCov - aOsCov;
