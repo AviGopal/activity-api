@@ -284,6 +284,37 @@ export async function runTraceRetentionSweep(
   }
 
   // ── Global ceiling safety valve ────────────────────────────────────────────
+  // trace_digest / concept_usage have no per-stratum sweep and grow unbounded
+  // (the re-thrash root at 1.57M / 614k rows). Reap cold rows older than the hot
+  // window in BOUNDED batches (select-ids then DELETE $ids, same pattern as the
+  // stratified sweep) so no giant transaction spikes RSS; capped per sweep so the
+  // backlog drains over cycles rather than in one memory-ballooning DELETE.
+  if (!cfg.dryRun) {
+    const auxTables: Array<{ table: string; timeField: string }> = [
+      { table: "trace_digest", timeField: "executed_at" },
+      { table: "concept_usage", timeField: "recorded_at" },
+    ];
+    const auxCutoffIso = new Date(Date.now() - cfg.hotWindowMs).toISOString();
+    const auxMaxPerSweep = 50000;
+    const auxBatch = cfg.deleteBatchSize;
+    for (const { table, timeField } of auxTables) {
+      let removed = 0;
+      try {
+        for (let iter = 0; iter < Math.ceil(auxMaxPerSweep / auxBatch) && removed < auxMaxPerSweep; iter++) {
+          const ids = await surrealDB.query<unknown>(
+            `SELECT VALUE id FROM ${table} WHERE ${timeField} < type::datetime($cut) LIMIT $batch`,
+            { cut: auxCutoffIso, batch: Math.min(auxBatch, auxMaxPerSweep - removed) },
+          );
+          if (!Array.isArray(ids) || ids.length === 0) break;
+          await surrealDB.query("DELETE $ids RETURN NONE", { ids });
+          removed += ids.length;
+        }
+        if (removed > 0) logger.info("[trace-retention] aux-table reap", { table, removed });
+      } catch (err) {
+        logger.warn("[trace-retention] aux-table reap failed", { table, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+  }
   // The stratified sweep above bounds each (activity_id,status) stratum, but the
   // store's global row_count is the SUM over ALL strata. The live fleet spreads
   // across 1000+ distinct activity_ids (every composed-cap-*, learned-*,
