@@ -68,6 +68,25 @@ class DbStats {
 export const dbStats = new DbStats();
 export function getDbStats() { return dbStats.snapshot(); }
 
+// Admission control (2026-07-24): a single embedded RocksDB node has no per-query
+// memory cap, so N concurrent heavy queries SUM into RAM and OOM instead of queueing.
+// This bounds concurrent in-flight db.query() calls; over the cap, callers await a
+// slot (degrade to latency, never memory-collapse). Tunable via env; default 16.
+class QuerySemaphore {
+  private slots: number;
+  private waiters: Array<() => void> = [];
+  constructor(max: number) { this.slots = max; }
+  async acquire(): Promise<void> {
+    if (this.slots > 0) { this.slots--; return; }
+    await new Promise<void>((resolve) => { this.waiters.push(resolve); });
+  }
+  release(): void {
+    const next = this.waiters.shift();
+    if (next) next(); else this.slots++;
+  }
+}
+const querySem = new QuerySemaphore(Number(process.env.SURREAL_MAX_CONCURRENT_QUERIES ?? 16));
+
 class SurrealDBClient {
   private db: Surreal | null = null;
   private connecting: Promise<void> | null = null;
@@ -161,7 +180,9 @@ class SurrealDBClient {
       // and drop the JSON.stringify(params) + raw-result serialization that fired
       // 3x per statement and flooded journald under load.
       logger.debug('Executing SurrealDB query', { sql });
-      const result = await this.db.query(sql, params);
+      await querySem.acquire();
+      let result;
+      try { result = await this.db.query(sql, params); } finally { querySem.release(); }
 
       // SurrealDB returns array of result sets, we typically want the first one
       const firstResult = Array.isArray(result) && result.length > 0 ? result[0] : [];
