@@ -262,6 +262,11 @@ export const CreateTemplateRequestSchema = z.object({
   // Without persisting these, composition tasks fail to bind interpolated values
   // at execute time and abort after the first non-interpolated task.
   variables: z.array(z.record(z.any())).optional(),
+  // Ratchet lineage (2026-07-24): the execution a learned/composed template was
+  // extracted from, so provenance is legible. extracted_from column already exists.
+  extracted_from: z.string().optional(),
+  source_execution_id: z.string().optional(),
+  metadata: z.record(z.any()).optional(),
 }).refine(
   data => data.tags?.length || data.category,
   { message: 'Either tags or category must be provided' }
@@ -733,6 +738,10 @@ export const PathRecordRequestSchema = z.object({
   // See sql/migrations/100-cc1-scope-narrowing-assert.surql §G2.
   parent_path_signature: z.string().optional(),
   parent_goal_hash: z.string().optional(),
+  // Ratchet legibility (2026-07-24): which walk tier reached this path
+  // (learned_pathway / satisfier / universal_tool_fallback / feature_compose /
+  // fresh_derivation). Optional; persisted once the DEFINE FIELD migration lands.
+  walk_tier: z.string().optional(),
 });
 
 export const PathQuerySchema = z.object({

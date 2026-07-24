@@ -581,6 +581,13 @@ app.post('/templates', async (c) => {
       }
     }
 
+    // Ratchet lineage (2026-07-24): persist the source execution a learned/composed
+    // template was extracted from (extracted_from column already exists on `activity`).
+    {
+      const _ef = validated.extracted_from ?? (validated as any).metadata?.extracted_from;
+      if (_ef) (activityRecord as any).extracted_from = _ef;
+    }
+
     // Build dynamic query with only provided fields.
     // IMPORTANT: omit 'id' from CONTENT — the UPSERT target clause already
     // specifies the record ID as activity:`${activityId}`. Including id: $id in

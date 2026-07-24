@@ -401,6 +401,7 @@ app.post('/', async (c) => {
             END,
           endpoint_output_shapes = $endpoint_output_shapes,
           last_executed_at = time::now(),
+          walk_tier = $walk_tier ?? walk_tier,
           updated_at = time::now()
         WHERE goal_hash = $goal_hash
           AND path_signature = $path_signature
@@ -417,6 +418,7 @@ app.post('/', async (c) => {
         token_usage: tokenUsage,
         inference_confidence: validated.inference_confidence ?? null,
         endpoint_output_shapes: endpointOutputShapes,
+        walk_tier: validated.walk_tier ?? null,
       });
       
       // @ts-ignore - SurrealDB query typing
@@ -462,6 +464,7 @@ app.post('/', async (c) => {
           typical_files_modified: $typical_files_modified,
           typical_tools_used: $typical_tools_used,
           last_executed_at: time::now(),
+          walk_tier: $walk_tier,
           created_at: time::now(),
           updated_at: time::now()
         }
@@ -489,6 +492,7 @@ app.post('/', async (c) => {
         inference_confidence: validated.inference_confidence ?? 0,
         typical_files_modified: validated.files_modified ?? undefined,
         typical_tools_used: validated.tools_used ?? undefined,
+        walk_tier: validated.walk_tier ?? null,
       });
       
       // @ts-ignore - SurrealDB query typing
