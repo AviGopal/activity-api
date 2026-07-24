@@ -2708,12 +2708,13 @@ app.post('/', async (c) => {
             const { RedisClient } = await import('../db/redis');
             const redis = RedisClient.getInstance();
 
-            // Invalidate both the specific template cache and the template list cache
+            // Invalidate ONLY the specific template cache. Do NOT del CACHE_LIST_KEY: the list set
+            // tracks template EXISTENCE not scores; removing it on every trace store empties the
+            // set so every /templates + /recommend full-scans the template store (the CPU floor).
+            // Mirrors the documented-correct posterior path in activities.ts (~2036).
             const CACHE_KEY_PREFIX = 'activity:template:';
-            const CACHE_LIST_KEY = 'activity:templates:list';
 
             await redis.del(`${CACHE_KEY_PREFIX}${candidateId}`);
-            await redis.del(CACHE_LIST_KEY);
 
             logger.debug('[learning] Redis cache invalidated after score update', {
               activity_id: candidateId,
