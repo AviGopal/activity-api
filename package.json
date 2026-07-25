@@ -16,6 +16,7 @@
     "seed:cleanup-test": "bun run scripts/seed-cleanup-test-data.ts",
     "backfill-embeddings": "bun run scripts/backfill-embeddings.ts",
     "test": "bun test",
+    "linecount": "bun run -e 'console.log(require(\"fs\").readFileSync(import.meta.resolve(\"package.json\"), \"utf8\").split(\"\\n\").length)'",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src --ext .ts && bun run scripts/check-shape-dispatch.ts",
     "lint:fix": "eslint src --ext .ts --fix",
