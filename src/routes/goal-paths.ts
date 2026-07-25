@@ -387,6 +387,7 @@ app.post('/', async (c) => {
         UPDATE goal_execution_paths
         SET
           total_executions = (total_executions ?? 0) + 1,
+          execution_count = (execution_count ?? 0) + 1,
           successful_executions = (successful_executions ?? 0) + $success_delta,
           failed_executions = (failed_executions ?? 0) + $failure_delta,
           thompson_alpha = (thompson_alpha ?? 1) + $success_delta,
