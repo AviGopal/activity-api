@@ -968,7 +968,6 @@ app.get('/validation-patterns', async (c) => {
  * 2. Redis session auth (Dashboard): Application-level filtering via WHERE clauses
  */
 app.get('/templates', async (c) => {
-  c.header('x-templates-count-version', '1');
   try {
     // Check for JWT auth first (MiniBob instances)
     const jwtAuth = getJwtAuthFromContext(c);
@@ -2229,9 +2228,6 @@ app.post('/executions', async (c) => {
  * Data Flow: Dashboard → GET /executions → SurrealDB query → execution history
  */
 app.get('/executions', async (c) => {
-  c.header('x-arbwork3-probe', '1');
-    c.header('x-arbwork2-probe', '1');
-    c.header('x-exec-list-version', '2');
   try {
     // Extract session from context for multi-tenant filtering
     const session = (c.get as any)('session') as SessionData | undefined;
