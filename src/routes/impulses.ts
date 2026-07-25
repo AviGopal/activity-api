@@ -2601,6 +2601,31 @@ router.post('/resolve', async (c) => {
           const td = writePointer.templateData as Record<string, unknown>;
           td.description = `${typeof td.name === 'string' ? td.name : String(td.id ?? 'learned template')} (description defaulted at write; synthesized proposal omitted it)`;
         }
+
+        // -------------------------------------------------------------------------
+        // Deterministic metadata stamp: read goalSignature from provenance execution
+        // and attach to templateData.metadata.goalSignature before persist.
+        // -------------------------------------------------------------------------
+        if (
+          typeof writePointer.templateData === 'object' &&
+          writePointer.templateData !== null
+        ) {
+          const tpl = writePointer.templateData as Record<string, unknown>;
+          const meta = (tpl.metadata ??= {}) as Record<string, unknown>;
+          const sourceExecutionId =
+            meta.sourceExecutionId ?? tpl.extracted_from;
+          if (typeof sourceExecutionId === 'string') {
+            const trace = await surrealDB.query<{ result: { goalSignature?: string } }>(
+              'SELECT goalSignature FROM activity_execution_traces WHERE id = $id LIMIT 1',
+              { id: sourceExecutionId }
+            );
+            const row = Array.isArray(trace) && trace.length > 0 ? trace[0] : null;
+            if (row?.result?.goalSignature) {
+              meta.goalSignature = row.result.goalSignature;
+            }
+          }
+        }
+
         const delegated = await delegateWriteToRouter(c, activitiesRouter, '/templates', writePointer.templateData);
         return c.json(buildWriteResolverResponse('activityTemplate_write', delegated, 'template proposed') as ImpulseResolveResponse, delegated.status >= 200 && delegated.status < 300 ? 200 : delegated.status as 400 | 401 | 403 | 404 | 500);
       }
