@@ -1,0 +1,41 @@
+-- =============================================================================
+-- Migration 182: activity.metadata field declaration
+-- =============================================================================
+--
+-- The `activity` table is SCHEMAFULL (per 071/074/083/099 OVERWRITE statements).
+-- Without an explicit DEFINE FIELD, SurrealDB silently drops any payload field
+-- not declared in the schema during UPSERT. The template `metadata` bag was
+-- discarded at the storage layer even after the write path was corrected to
+-- persist it.
+--
+-- This was the TRUE ROOT (layer 4) of "minted learned-* templates carry no
+-- metadata.goalSignature" — the causal-intent back-edge that names the goal a
+-- reusable template was extracted to serve. The fault was a four-layer onion,
+-- each fix correct at its layer but the real cause one layer deeper, every
+-- layer exposed only by verify-by-downstream-use (fetching the actual persisted
+-- template, never trusting dispatch status):
+--   1. impulses.ts activityTemplate_write STAMP SELECT'd a top-level
+--      `goalSignature` column on activity_execution_traces that never exists
+--      (the sink nests it under metadata) — a structural no-op.
+--   2. STAMP corrected to read writePointer.goalSignature and stamp
+--      templateData.metadata.goalSignature — correct at the STAMP layer, but
+--      dropped downstream.
+--   3. POST /v2/activities/templates corrected to persist the metadata bag from
+--      the raw request body (CreateTemplateRequestSchema strips unknown keys) —
+--      correct at the handler layer, but dropped at the DB.
+--   4. THIS migration — SCHEMAFULL `activity` had no `metadata` field, so
+--      SurrealDB dropped the column on every UPSERT. This is the real root.
+--
+-- With this field durable, the full deterministic chain works: the ribosome
+-- dispatch_write_attempt pointer carries goalSignature={{lifecycle.goalSignature}}
+-- (populated by mintReachedTrace) → activityTemplate_write STAMP writes it into
+-- templateData.metadata → POST /templates persists activityRecord.metadata →
+-- SurrealDB stores it → GET /templates/:variantId and activity_fetch return it.
+--
+-- TYPE option<object> FLEXIBLE — option because templates without a metadata bag
+-- are valid; FLEXIBLE so SurrealDB doesn't require declaring the inner shape of
+-- the bag (goalSignature, extractedAt, sourceTemplateId, probe, …). Same pattern
+-- as `tasks` (migration 054) and `variables` (migration 142).
+-- =============================================================================
+
+DEFINE FIELD IF NOT EXISTS metadata ON activity TYPE option<object> FLEXIBLE;
