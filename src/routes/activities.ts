@@ -588,6 +588,14 @@ app.post('/templates', async (c) => {
       if (_ef) (activityRecord as any).extracted_from = _ef;
     }
 
+    // Persist template metadata bag from raw request body so it survives to storage.
+    {
+      const _md = (body as any)?.metadata;
+      if (_md && typeof _md === 'object' && _md !== null && Object.keys(_md).length > 0) {
+        (activityRecord as any).metadata = _md;
+      }
+    }
+
     // Build dynamic query with only provided fields.
     // IMPORTANT: omit 'id' from CONTENT — the UPSERT target clause already
     // specifies the record ID as activity:`${activityId}`. Including id: $id in
