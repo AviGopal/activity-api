@@ -14,7 +14,7 @@ interface GapDetectorResult {
   }>;
 }
 
-const FAILURE_LESSONS_FILE = join(import.meta.dir, '..', '..', 'data', 'failure-lessons.json');
+const FAILURE_LESSONS_FILE = join(import.meta.dirname, '..', '..', 'data', 'failure-lessons.json');
 
 async function loadFailureLessons(): Promise<Record<string, FailureLesson[]>> {
   try {
@@ -33,10 +33,14 @@ export async function updateFailureLessons(result: GapDetectorResult): Promise<v
   const lessons = await loadFailureLessons();
 
   for (const gap of result.gaps) {
-    if (!gap.failureLessons) continue;
+    if (!gap.failureLessons) {
+    throw new Error(`No failure lessons found for gap ID: ${gap.id}`);
+  }
 
     const existing = lessons[gap.id] ?? [];
-    const updated = [...existing, ...gap.failureLessons].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+    const updated = [...existing, ...gap.failureLessons].filter((lesson, index, self) => 
+      index === self.findIndex(l => l.timestamp === lesson.timestamp && l.lesson === lesson.lesson)
+    ).sort((a, b) => a.timestamp.localeCompare(b.timestamp));
     lessons[gap.id] = updated;
   }
 
