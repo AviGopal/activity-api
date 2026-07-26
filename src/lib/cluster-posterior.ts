@@ -259,7 +259,7 @@ export async function readClusterPosterior(
   try {
     const slug = clusterRowSlug(orgId, templateId, signatureVersion, clusterId);
     const rows = await db.query<{ alpha?: number; beta?: number; n_observations?: number }>(
-      `SELECT alpha, beta, n_observations FROM type::record('context_thompson_scores', $slug)`,
+      `SELECT alpha, beta, n_observations FROM type::thing('context_thompson_scores', $slug)`,
       { slug },
     );
     const row = Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
