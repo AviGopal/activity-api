@@ -462,6 +462,24 @@ app.post('/templates', async (c) => {
       outputShapesProvided = activityRecord.output_shapes.length > 0;
     }
 
+    // TOPOLOGY-GROWTH FIX (2026-07-26, gap-ribosome-mint-input-shapes-leak-extractor-context):
+    // A ribosome-extracted template (id `learned-*`) must NOT have its input_shapes
+    // INFERRED from description prose. inferInputShapesFromPrompt harvests shape-name
+    // keywords out of the LLM-written summary (source_code/goal/trace/activity_template),
+    // stamping the EXTRACTOR's OWN consumed shapes onto the composite; the reuse binding
+    // gate (goal-host: c.inputShapes.every(s => producedShapes.has(s))) then fails for any
+    // real goal -> the composite is persisted but UNBINDABLE (topology grows, reuse dead).
+    // A composite's genuine entry is the pool/goal (its first compose-step consumes nothing
+    // declared), so an absent input_shapes must persist as explicit [] (which "matches
+    // anything" = bindable), NOT be back-filled from prose. Scoped to learned-* ids so
+    // normal template inference is untouched.
+    const isLearnedExtracted = typeof activityId === 'string' && activityId.startsWith('learned-');
+    if (isLearnedExtracted && !inputShapesProvided) {
+      activityRecord.input_shapes = [];
+      inputShapesProvided = true;
+      logger.info('Learned/composite template: input_shapes pinned to [] (bindable), skipping prose inference', { activityId });
+    }
+
     // Infer shapes from template if not explicitly provided
     if (!inputShapesProvided || !outputShapesProvided) {
       try {
