@@ -117,10 +117,39 @@ function hashPath(activities: string[]): string {
 }
 
 /**
+ * Deterministic 32-bit PRNG (mulberry32). Given the same seed it yields the
+ * same [0,1) stream, so a recommendation can be reproduced on a held-out
+ * re-run. Only used when a per-request seed is supplied; otherwise the
+ * handler passes Math.random and behaviour is byte-identical to before.
+ */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * Fold a per-request seed together with the goal_hash into a single 32-bit
+ * PRNG seed (FNV-1a over the goal_hash, mixed with the seed) so identical
+ * (seed, goal) pairs reproduce and different goals decorrelate.
+ */
+function seedForGoal(seed: number, goalHash: string): number {
+  let h = (seed >>> 0) ^ 0x811c9dc5;
+  for (let i = 0; i < goalHash.length; i++) {
+    h = Math.imul(h ^ goalHash.charCodeAt(i), 0x01000193);
+  }
+  return h >>> 0;
+}
+
+/**
  * Sample from Beta distribution (Thompson Sampling)
  * Uses Wilson score interval approximation for speed
  */
-function sampleBeta(alpha: number, beta: number): number {
+function sampleBeta(alpha: number, beta: number, rng: () => number = Math.random): number {
   // For small sample sizes, use Wilson score
   if (alpha + beta < 10) {
     const n = alpha + beta - 2;
@@ -135,7 +164,7 @@ function sampleBeta(alpha: number, beta: number): number {
 
   // For larger samples, use simple mean with small noise
   const mean = (alpha - 1) / (alpha + beta - 2);
-  const noise = (Math.random() - 0.5) * 0.1; // +/- 5%
+  const noise = (rng() - 0.5) * 0.1; // +/- 5%
   return Math.max(0, Math.min(1, mean + noise));
 }
 
@@ -692,6 +721,20 @@ app.post('/recommend', async (c) => {
 
     const goalHash = hashGoal(validated.goal_text);
 
+    // Optional per-request seed for reproducible recommendations. When
+    // provided, both the explore coin and the exploit Beta draws are taken
+    // from a deterministic PRNG seeded from (seed, goal_hash), so an
+    // identical goal + posteriors + seed reproduces the same selection on a
+    // held-out re-run. When absent, we pass Math.random and behaviour is
+    // byte-identical to before. Parsed off the raw body to avoid extending
+    // PathRecommendationRequestSchema.
+    const requestSeed: number | undefined =
+      typeof body?.seed === 'number' && Number.isFinite(body.seed)
+        ? body.seed
+        : undefined;
+    const rng: () => number =
+      requestSeed !== undefined ? mulberry32(seedForGoal(requestSeed, goalHash)) : Math.random;
+
     logger.info('Recommending path for goal', {
       goal: validated.goal_text,
       goal_hash: goalHash,
@@ -729,7 +772,7 @@ app.post('/recommend', async (c) => {
     }
     
     // Decide: exploration vs exploitation
-    const shouldExplore = Math.random() < validated.exploration_rate;
+    const shouldExplore = rng() < validated.exploration_rate;
     
     let recommendedPaths: RecommendedPath[];
     
@@ -793,7 +836,7 @@ app.post('/recommend', async (c) => {
       const samples = paths.map(p => ({
         path: p,
         // @ts-ignore
-        sample: sampleBeta(p.thompson_alpha || 1, p.thompson_beta || 1),
+        sample: sampleBeta(p.thompson_alpha || 1, p.thompson_beta || 1, rng),
       }));
 
       samples.sort((a, b) => b.sample - a.sample); // Descending
