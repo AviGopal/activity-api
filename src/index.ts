@@ -47,6 +47,18 @@ type AppEnv = {
 const app = new Hono<AppEnv>();
 
 // ============================================================================
+// Failure Lessons Update Route
+// ============================================================================
+
+import { updateFailureLessons } from './scripts/update-failure-lessons';
+
+app.post('/update-failure-lessons', async (c) => {
+  const result = await c.req.json();
+  await updateFailureLessons(result);
+  return c.json({ message: 'Failure lessons updated' }, 200);
+});
+
+// ============================================================================
 // Middleware
 // ============================================================================
 
