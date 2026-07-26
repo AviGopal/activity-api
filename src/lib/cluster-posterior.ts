@@ -23,7 +23,7 @@
  *         A dropped cluster write leaves the leaf posterior fully correct.
  *     (b) CONFLICT-SAFE upsert — we give the cluster row a DETERMINISTIC record id
  *         derived from (org_id, template_id, signature_version, cluster_id) and use
- *         SurrealDB 2.x `UPSERT <table>:⟨id⟩ SET alpha = (alpha ?? 1) + $delta ...`.
+ *         SurrealDB 2.x `UPSERT type::thing(<table>, ⟨id⟩) SET alpha = (alpha ?? 1) + $delta ...`.
  *         UPSERT-by-id is an atomic create-or-update keyed on the primary id — there
  *         is NO SELECT, so there is no SELECT→CREATE race that could mint duplicate
  *         rows. The server-side `(field ?? 1) + $delta` increment is the same atomic
@@ -340,7 +340,7 @@ export async function applyClusterPosterior(
     // and safe for the shared hot `cluster:<id>` row under concurrent writers.
     await db.query(
       `
-      UPSERT type::record('context_thompson_scores', $slug) SET
+      UPSERT type::thing('context_thompson_scores', $slug) SET
         org_id            = $org_id,
         template_id       = $template_id,
         signature_version = $sig_version,
