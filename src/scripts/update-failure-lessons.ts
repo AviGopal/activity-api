@@ -30,19 +30,26 @@ async function saveFailureLessons(lessons: Record<string, FailureLesson[]>): Pro
 }
 
 export async function updateFailureLessons(result: GapDetectorResult): Promise<void> {
-  const lessons = await loadFailureLessons();
+  const lessonsMap: Record<string, FailureLesson[]> = await loadFailureLessons();
+
+  for (const [gapId, existingLessons] of Object.entries(lessonsMap)) {
+    if (existingLessons && existingLessons.length > 0) {
+      const updated = [...existingLessons].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+      lessonsMap[gapId] = updated;
+    }
+  }
 
   for (const gap of result.gaps) {
     if (!gap.failureLessons) {
-    throw new Error(`No failure lessons found for gap ID: ${gap.id}`);
-  }
+      throw new Error(`No failure lessons found for gap ID: ${gap.id}`);
+    }
 
-    const existing = lessons[gap.id] ?? [];
+    const existing = lessonsMap[gap.id] ?? [];
     const updated = [...existing, ...gap.failureLessons].filter((lesson, index, self) => 
       index === self.findIndex(l => l.timestamp === lesson.timestamp && l.lesson === lesson.lesson)
     ).sort((a, b) => a.timestamp.localeCompare(b.timestamp));
-    lessons[gap.id] = updated;
+    lessonsMap[gap.id] = updated;
   }
 
-  await saveFailureLessons(lessons);
+  await saveFailureLessons(lessonsMap);
 }
