@@ -2041,7 +2041,11 @@ app.post('/', async (c) => {
       }
     }
     const failureModeTypeForSig = body.failure_mode?.type;
-      if (!success && typeof failureModeTypeForSig === 'string' && failureModeTypeForSig.length > 0) {
+    if (!success && typeof failureModeTypeForSig === 'string' && failureModeTypeForSig.length > 0) {
+      const anchor_not_found = body.failure_mode?.anchor_not_found;
+      if (anchor_not_found) {
+        (trace as any).repair_anchor_not_found = anchor_not_found;
+      }
         const repairShapes = deriveSignatureShapes(trace);
         if (repairShapes.length > 0) {
           try {
