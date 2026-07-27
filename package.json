@@ -5,6 +5,7 @@
   "main": "src/index.ts",
   "type": "module",
   "scripts": {
+    "update-failure-lessons": "ts-node --transpile-only scripts/update-failure-lessons.ts",
     "dev": "bun run --watch src/index.ts",
     "start": "bun run src/index.ts",
     "build": "bun run build:tsc",
