@@ -1,9 +1,9 @@
 {
+  "type": "module",
   "name": "metabob-activity-api",
   "version": "1.20.9",
   "description": "Lightweight TypeScript server for Metabob activity system - replaces Python RPC API v2 endpoints",
   "main": "src/index.ts",
-  "type": "module",
   "scripts": {
     "update-failure-lessons": "ts-node --transpile-only scripts/update-failure-lessons.ts",
     "dev": "bun run --watch src/index.ts",
