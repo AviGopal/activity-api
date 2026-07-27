@@ -1493,48 +1493,60 @@ router.post('/resolve', async (c) => {
         // are the fallback used only when the activity has no org-specific
         // execution history. This prevents system-seeded activities from
         // masking org-level learning.
-        const posteriorSelectClause = `
-          SELECT
-            count() AS total_executions,
-            count(success = true) AS success_count,
-            count(success = false) AS failure_count,
-            count(success = true) + 1 AS alpha,
-            count(success = false) + 1 AS beta
-          FROM execution
-          WHERE activity_id = $variant_id
-        `;
+        // HONEST POSTERIOR (2026-07-27, gap-thompson-posterior-shape-reads-legacy-execution-table).
+        // Read the DURABLE accumulated posterior — the SAME source activityMetrics reads and the
+        // selector samples — NOT a raw count()+1 recount of the `execution` table. The recount
+        // ignores the chain-credit fan-out + decay DELTAS applied in posterior-update.ts, so it
+        // provably DIVERGES from the real α/β the loop learns (thompson_posterior was a lying
+        // instrument: an integer per-row recount, never the accumulated float posterior). A
+        // context_bucket-precise read goes to the per-context durable store context_thompson_scores;
+        // otherwise the aggregate posterior comes from variant_performance_metrics (org-scope, then
+        // global baseline) — exactly like activityMetrics. shape_signature has NO durable per-sig
+        // posterior table, so a signature-scoped read aggregates at VPM and reports the contributing
+        // signature count via signaturesAggregated below (honest: "α aggregated over N signatures").
         const params: Record<string, unknown> = {
           variant_id: variantId,
           orgId: jwtAuthCtx.orgId,
           org_id: jwtAuthCtx.orgId,
           account_id: jwtAuthCtx.accountId ?? null,
         };
-
-        let orgQuery = posteriorSelectClause + ` AND ${accountIdScopedWhere()}`;
-        let globalQuery = posteriorSelectClause + ` AND (org_id IS NONE OR org_id = NONE)`;
-        if (typeof shapeSig === 'string' && shapeSig.length > 0) {
-          orgQuery += ` AND shape_signature = $shape_signature`;
-          globalQuery += ` AND shape_signature = $shape_signature`;
-          params.shape_signature = shapeSig;
-        }
-        if (typeof contextBucket === 'string' && contextBucket.length > 0) {
-          orgQuery += ` AND context_bucket = $context_bucket`;
-          globalQuery += ` AND context_bucket = $context_bucket`;
-          params.context_bucket = contextBucket;
-        }
-
-        // Track which scope produced the answer so callers can distinguish
-        // org-specific learning from global baseline (audit inv-029 #4).
+        if (typeof shapeSig === 'string' && shapeSig.length > 0) params.shape_signature = shapeSig;
         let resolvedScope: 'org' | 'account' | 'global' = 'global';
-        let rows = await executeAsAuth<any>(jwtAuthCtx, orgQuery, params);
-        if ((rows[0]?.total_executions ?? 0) > 0) {
-          resolvedScope = (jwtAuthCtx.accountId ? 'account' : 'org');
+        let rows: any[] = [];
+        if (typeof contextBucket === 'string' && contextBucket.length > 0) {
+          // Per-context durable posterior (the real conditional α/β the selector samples per bucket).
+          params.context_bucket = contextBucket;
+          const ctxSelect = `
+            SELECT (alpha ?? 1) AS alpha, (beta ?? 1) AS beta,
+                   n_observations AS total_executions,
+                   n_observations AS success_count, 0 AS failure_count
+            FROM context_thompson_scores
+            WHERE template_id = $variant_id AND context_bucket = $context_bucket
+          `;
+          rows = await executeAsAuth<any>(jwtAuthCtx, ctxSelect + ` AND org_id = $org_id`, params);
+          if ((rows[0]?.total_executions ?? 0) > 0) {
+            resolvedScope = (jwtAuthCtx.accountId ? 'account' : 'org');
+          } else {
+            const gr = await executeAsAuth<any>(jwtAuthCtx, ctxSelect + ` AND (org_id IS NONE OR org_id = NONE OR org_id = '')`, params);
+            if ((gr[0]?.total_executions ?? 0) > 0) { rows = gr; resolvedScope = 'global'; }
+          }
         } else {
-          // No org-specific execution history — fall back to global baseline rows.
-          const globalRows = await executeAsAuth<any>(jwtAuthCtx, globalQuery, params);
-          if ((globalRows[0]?.total_executions ?? 0) > 0) {
-            rows = globalRows;
-            resolvedScope = 'global';
+          // Aggregate durable posterior (activityMetrics-equivalent), org-scope then global.
+          const vpmSelect = `
+            SELECT total_executions,
+                   successful_executions AS success_count,
+                   failed_executions AS failure_count,
+                   (thompson_alpha ?? 1) AS alpha,
+                   (thompson_beta ?? 1) AS beta
+            FROM variant_performance_metrics
+            WHERE (variant_id = $variant_id OR activity_id = $variant_id)
+          `;
+          rows = await executeAsAuth<any>(jwtAuthCtx, vpmSelect + ` AND ${accountIdScopedWhere()}`, params);
+          if ((rows[0]?.total_executions ?? 0) > 0) {
+            resolvedScope = (jwtAuthCtx.accountId ? 'account' : 'org');
+          } else {
+            const gr = await executeAsAuth<any>(jwtAuthCtx, vpmSelect + ` AND (org_id IS NONE OR org_id = NONE)`, params);
+            if ((gr[0]?.total_executions ?? 0) > 0) { rows = gr; resolvedScope = 'global'; }
           }
         }
         const row = rows[0] || {
