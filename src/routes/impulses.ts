@@ -2741,11 +2741,15 @@ router.post('/resolve', async (c) => {
           limit?: number;
           verdict?: string;
           execution_id?: string;
+          goal?: string;
+          activity_id?: string;
         };
         const limit = Math.min(Math.max(gvlReadPointer.limit ?? 20, 1), 100);
         const validVerdicts = ['achieved', 'not_achieved', 'partial'];
         const hasVerdict = typeof gvlReadPointer.verdict === 'string' && validVerdicts.includes(gvlReadPointer.verdict);
         const hasExecId = typeof gvlReadPointer.execution_id === 'string' && gvlReadPointer.execution_id.length > 0;
+        const hasGoal = typeof gvlReadPointer.goal === 'string' && gvlReadPointer.goal.length > 0;
+        const hasActivityId = typeof gvlReadPointer.activity_id === 'string' && gvlReadPointer.activity_id.length > 0;
 
         try {
           let whereClause = '';
@@ -2753,6 +2757,8 @@ router.post('/resolve', async (c) => {
           const conditions: string[] = [];
           if (hasVerdict) { conditions.push('verdict = $verdict'); bindings.verdict = gvlReadPointer.verdict; }
           if (hasExecId) { conditions.push('execution_id = $execution_id'); bindings.execution_id = gvlReadPointer.execution_id; }
+          if (hasGoal) { conditions.push('goal = $goal'); bindings.goal = gvlReadPointer.goal; }
+          if (hasActivityId) { conditions.push('activity_id = $activity_id'); bindings.activity_id = gvlReadPointer.activity_id; }
           if (conditions.length > 0) whereClause = 'WHERE ' + conditions.join(' AND ');
 
           const sql = 'SELECT * FROM goal_verification_labels ' + whereClause + ' ORDER BY created_at DESC LIMIT $limit';
