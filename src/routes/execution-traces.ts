@@ -2913,7 +2913,7 @@ app.post('/', async (c) => {
               -- violates option<string> (NONE | string, never NULL) and aborts the
               -- account_id-keyed re-derive UPDATE path. Coerce NULL -> NONE at write time,
               -- matching variant_performance_metrics (line ~2821). (2026-06-26)
-              account_id: IF $account_id IS NULL THEN NONE ELSE $account_id END,
+              account_id: COALESCE($account_id, 'NONE'),
               account_id_version: 1,
               template_id: $template_id,
               context_bucket: $bucket,
@@ -2996,7 +2996,7 @@ app.post('/', async (c) => {
               -- account_id is option<string>: coerce JS-null -> NONE so it satisfies
               -- option<string> (never NULL). Same fix as the primary bucket write
               -- above and variant_performance_metrics (line ~2821). (2026-06-26)
-              account_id: IF $account_id IS NULL THEN NONE ELSE $account_id END,
+              account_id: COALESCE($account_id, 'NONE'),
               account_id_version: 1,
               template_id: $template_id,
               context_bucket: $bucket,
