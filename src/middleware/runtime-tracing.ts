@@ -272,6 +272,9 @@ export function withResolver<TArgs extends any[], TReturn>(
  * Store trace asynchronously to avoid blocking request
  */
 async function storeTraceAsync(trace: RuntimeExecutionTrace, endpoint: string): Promise<void> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 5000);
+  
   try {
     const response = await fetch(`${endpoint}/v2/activities/execution-traces`, {
       method: 'POST',
@@ -282,14 +285,24 @@ async function storeTraceAsync(trace: RuntimeExecutionTrace, endpoint: string): 
       body: JSON.stringify({
         ...trace,
         created_at: new Date().toISOString()
-      })
+      }),
+      signal: controller.signal
     });
 
     if (!response.ok) {
       console.error('[RuntimeTracing] Failed to store trace:', response.statusText);
     }
   } catch (error) {
-    console.error('[RuntimeTracing] Store trace error:', error);
+    const err = error as NodeJS.ErrnoException & { code?: string };
+    if (err.name === 'AbortError' || err.code === 'ERR_HTTP_REQUEST_TIMEOUT') {
+      console.warn('[RuntimeTracing] Store trace timeout (5s)');
+    } else if (err.code === 'ECONNRESET' || err.code === 'ECONNABORTED') {
+      console.warn('[RuntimeTracing] Store trace socket error:', err.code);
+    } else {
+      console.error('[RuntimeTracing] Store trace error:', error);
+    }
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
