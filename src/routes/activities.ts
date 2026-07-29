@@ -5837,18 +5837,7 @@ app.post('/recommend', async (c) => {
             posteriorSource = 'cluster';
             usedScope = 'cluster';
           } else {
-            // No usable cluster posterior — leaf / Beta(1,1) as today.
-            usedScope = 'fallback';
-          }
-        }
-        clusterShadowDecisions.push({
-          template_id: activityId,
-          n_signature: nSignature,
-          used_scope: usedScope,
-        });
-
-        // Sample from Beta(alpha, beta) distribution for Thompson Sampling.
-        // This enables exploration (high variance for uncertain templates) and
+            // This enables exploration (high variance for uncertain templates) and
         // exploitation (high mean for proven templates) tradeoff.
         //
         // Phase 10 P5A — task 10.14: dual-compute path. The DB-side
