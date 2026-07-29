@@ -3,6 +3,21 @@
  * Loads environment variables and provides typed configuration
  */
 
+// Fetch timeout configuration constants for HTTP operations
+export const FETCH_TIMEOUT_CONFIG = {
+  // Default timeout for LLM operations (milliseconds)
+  LLM_TIMEOUT_MS: 30000,
+  // Timeout for non-blocking operations (milliseconds)
+  DEFAULT_TIMEOUT_MS: 10000,
+  // Exponential backoff retry settings
+  RETRY: {
+    maxAttempts: 3,
+    initialDelayMs: 1000,
+    maxDelayMs: 10000,
+    backoffMultiplier: 2,
+  },
+};
+
 export interface Config {
   port: number;
   host: string;
