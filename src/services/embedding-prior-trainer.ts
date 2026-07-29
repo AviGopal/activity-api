@@ -1,5 +1,5 @@
 /**
- * In-process continuous-training observer for the M1 embedding-prior weights
+ * In-process continuous-training observer for the M1 embedding-prior weights with error handling
  * (concept_KKwxHmPfEMSY). Subscribes to broadcaster.subscribe() and, for each
  * task.completed event, looks up the (variant_id, signature) cell's current
  * Thompson α/β and the corresponding dense embedding. Eligible samples are
