@@ -669,6 +669,27 @@ export async function propagateCreditAlongChain(
  * @param db       DB client (surrealDB singleton or mock in tests)
  * @param orgId    Org context for multi-tenant scoping
  */
+/**
+ * Decay Thompson posterior counts toward the neutral prior 1 with a 3-day half-life.
+ *
+ * @param alpha Last observed alpha count
+ * @param beta Last observed beta count
+ * @param lastUpdatedMs Timestamp when the counts were last updated (milliseconds since epoch)
+ * @param nowMs Current time (milliseconds since epoch)
+ * @returns Decayed alpha and beta counts
+ */
+export function decayedThompsonCounts(
+  alpha: number,
+  beta: number,
+  lastUpdatedMs: number,
+  nowMs: number,
+): { alpha: number; beta: number } {
+  const d = Math.pow(0.5, Math.max(0, nowMs - lastUpdatedMs) / (3 * 24 * 60 * 60 * 1000));
+  return {
+    alpha: 1 + (alpha - 1) * d,
+    beta: 1 + (beta - 1) * d,
+  };
+}
 export async function applyOutcomeToPosteriors(
   trace: TraceForPosterior,
   db: DBQueryable,
