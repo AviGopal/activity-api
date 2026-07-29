@@ -242,8 +242,7 @@ export async function enrichTemplatesWithMetrics(
 
     logger.info('Enriching templates with metrics', {
       templateCount: templates.length,
-      sampleIds: activityIds.slice(0, 3),
-      fullIds: activityIds
+      sampleIds: activityIds.slice(0, 3)
     });
 
     // Query metrics for all activities in one go
@@ -341,8 +340,7 @@ export async function enrichTemplatesWithMetrics(
         alpha: m.thompson_alpha || m.alpha,
         beta: m.thompson_beta || m.beta,
         executions: m.total_executions
-      })),
-      allMetricIds: metricsResult?.map((m: any) => m.activity_id || m.variant_id)
+      }))
     });
 
     // Helper function to normalize IDs for consistent comparison
