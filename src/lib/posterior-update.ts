@@ -771,22 +771,41 @@ export async function applyOutcomeToPosteriors(
     !enqueueVariantDelta(activityId, orgId, alphaDelta, betaDelta)
   ) {
     try {
+      // Read current Thompson counts and apply decay before writing
+      const selectResult = await db.query<{
+        thompson_alpha?: number | null;
+        thompson_beta?: number | null;
+        updated_at?: string | null;
+      }>(
+        `SELECT thompson_alpha, thompson_beta, updated_at FROM variant_performance_metrics WHERE variant_id = $activity_id AND org_id = $org_id LIMIT 1`,
+        { activity_id: activityId, org_id: orgId },
+      );
+
+      const row = selectResult[0];
+      const alpha = row?.thompson_alpha ?? 1;
+      const beta = row?.thompson_beta ?? 1;
+      let lastUpdatedMs = 0;
+      if (row?.updated_at && typeof row.updated_at === 'string') {
+        const parsed = new Date(row.updated_at).getTime();
+        if (!Number.isNaN(parsed)) {
+          lastUpdatedMs = parsed;
+        }
+      }
+
+      const decayed = decayedThompsonCounts(alpha, beta, lastUpdatedMs, Date.now());
+      const newAlpha = decayed.alpha + alphaDelta;
+      const newBeta = decayed.beta + betaDelta;
+
       await db.query(
         `
         UPDATE variant_performance_metrics
         SET
-          thompson_alpha = (thompson_alpha ?? 1) + $alpha_delta,
-          thompson_beta  = (thompson_beta  ?? 1) + $beta_delta,
-          updated_at     = time::now()
-        WHERE variant_id = $activity_id
-          AND org_id     = $org_id
+          thompson_alpha = $new_alpha,
+          thompson_beta  = $new_beta,
+          updated_at = time::now()
+        WHERE variant_id = $activity_id AND org_id = $org_id
         `,
-        {
-          activity_id: activityId,
-          org_id: orgId,
-          alpha_delta: alphaDelta,
-          beta_delta: betaDelta,
-        },
+        { new_alpha: newAlpha, new_beta: newBeta, activity_id: activityId, org_id: orgId },
       );
     } catch (err) {
       const msg = `posterior-update DB write failed: ${err instanceof Error ? err.message : String(err)}`;
