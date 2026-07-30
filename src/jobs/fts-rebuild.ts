@@ -12,13 +12,12 @@ import { logger } from '../utils/logger';
 let isRebuildInProgress = false;
 
 const FTS_INDEXES = [
-  'idx_activity_name_fts',
-  'idx_activity_description_fts',
-  'idx_activity_tags_fts',
+  'idx_activity_fts_name',
+  'idx_activity_fts_tags',
 ] as const;
 
 /**
- * Rebuild all three FTS indexes sequentially.
+ * Rebuild the FTS indexes (name, tags) sequentially.
  * Returns immediately (no-op) if a rebuild is already running in this process.
  */
 export async function rebuildFtsIndexes(): Promise<void> {

@@ -951,6 +951,17 @@ if (vesselCleanupEnabled) {
   });
 }
 
+// ============================================================================
+// Activity Embedding Job — self-hosted vLLM / OpenAI-wire embedding provider.
+// Self-gated: startEmbedJob() itself no-ops (logs + returns a dummy interval)
+// when EMBEDDING_PROVIDER is unset, so this is safe to always import.
+// ============================================================================
+import('./jobs/embed-activities').then(({ startEmbedJob }) => {
+  startEmbedJob();
+}).catch(err => {
+  logger.error('[Server] Failed to start activity embedding job', { error: err.message });
+});
+
 // Exemplar selector — nightly job to refresh execution_exemplar table.
 // Interval: EXEMPLAR_SELECTOR_INTERVAL_MS (default 24h).
 const exemplarSelectorEnabled = process.env.EXEMPLAR_SELECTOR_ENABLED !== 'false';

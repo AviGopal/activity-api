@@ -4,9 +4,11 @@
  * Activity-api dispatches its write surface through the existing `*_write`
  * impulse shapes (see `case 'activityExecutionTrace_write'` in impulses.ts).
  * Per docs/specs/discovery-to-tools-bridge.md § "Relationship to impulse-write
- * resolver", that's the preferred dispatch path. The mcpTool resolver here is
- * therefore wired to advertise the shape but return an empty tool list, so
- * consumers fanning out to activity-api don't 4xx.
+ * resolver", that's the preferred dispatch path. The mcpTool resolver here
+ * additionally advertises READ tools with no write-shape equivalent
+ * (currently activity_search, dispatched back through /v2/impulses/resolve
+ * as pointer type activity_search), so consumers fanning out to activity-api
+ * get a real catalog instead of an empty array.
  *
  * These tests verify:
  *   - The resolver returns 200 (not 404) for `mcpTool` regardless of context
@@ -55,26 +57,31 @@ async function resolve(
 }
 
 describe('POST /v2/impulses/resolve → mcpTool (activity-api)', () => {
-  test('empty context returns success with empty tool list', async () => {
+  test('empty context returns success with the activity_search tool', async () => {
     const app = buildAppWithStubAuth();
     const { status, body } = await resolve(app, { type: 'mcpTool' });
     expect(status).toBe(200);
     expect(body.success).toBe(true);
     expect(body.metadata.shape).toBe('mcpTool');
-    expect(body.metadata.rowCount).toBe(0);
+    expect(body.metadata.rowCount).toBe(1);
     // content is JSON-encoded array (consistent with other resolvers)
     expect(typeof body.content).toBe('string');
-    expect(JSON.parse(body.content)).toEqual([]);
-    expect(body.metadata.summary).toContain('0 tools');
+    const tools = JSON.parse(body.content);
+    expect(tools).toHaveLength(1);
+    expect(tools[0].tool_name).toBe('activity_search');
+    expect(tools[0].resolve_endpoint).toBe('/v2/impulses/resolve');
+    expect(tools[0].resolve_request_format).toBe('pointer');
+    expect(tools[0].input_schema.required).toEqual(['query']);
+    expect(body.metadata.summary).toContain('1 tool');
   });
 
-  test('returns vessel_id in metadata so consumer can attribute the empty result', async () => {
+  test('returns vessel_id in metadata so consumer can attribute the result', async () => {
     const app = buildAppWithStubAuth();
     const { body } = await resolve(app, { type: 'mcpTool' });
     expect(body.metadata.vessel_id).toBe(config.discovery.vesselId);
   });
 
-  test('context fields are accepted but do not change the empty response', async () => {
+  test('context fields are accepted and boost the relevance score', async () => {
     const app = buildAppWithStubAuth();
     const { status, body } = await resolve(app, {
       type: 'mcpTool',
@@ -88,7 +95,9 @@ describe('POST /v2/impulses/resolve → mcpTool (activity-api)', () => {
     });
     expect(status).toBe(200);
     expect(body.success).toBe(true);
-    expect(body.metadata.rowCount).toBe(0);
+    expect(body.metadata.rowCount).toBe(1);
+    const tools = JSON.parse(body.content);
+    expect(tools[0].relevance_score).toBeGreaterThanOrEqual(0.15);
   });
 
   test('rejects unauthenticated requests (consistent with other shapes)', async () => {

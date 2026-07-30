@@ -25,6 +25,14 @@ export interface EmbeddingConfig {
   model: string;
   dimension: number;
   baseUrl?: string;
+  // OpenAI's `dimensions` request field is a Matryoshka-truncation feature —
+  // only some models support it, and vLLM's OpenAI-wire embeddings endpoint
+  // 400s ("does not support Matryoshka embeddings") for ones that don't (e.g.
+  // BAAI/bge-m3). Default OFF so self-hosted/custom baseUrl providers work
+  // out of the box; opt in via EMBEDDING_SEND_DIMENSIONS=true for a real
+  // OpenAI text-embedding-3-* deployment (or a Matryoshka-capable self-hosted
+  // model, e.g. Qwen3-Embedding) that should truncate to `dimension`.
+  sendDimensions?: boolean;
 }
 
 // Get config from environment
@@ -47,6 +55,7 @@ export function getEmbeddingConfig(): EmbeddingConfig | null {
     model: process.env.EMBEDDING_MODEL || getDefaultModel(provider),
     dimension: parseInt(process.env.EMBEDDING_DIMENSION || '1536', 10),
     baseUrl: process.env.EMBEDDING_BASE_URL,
+    sendDimensions: process.env.EMBEDDING_SEND_DIMENSIONS === 'true',
   };
 }
 
@@ -70,12 +79,14 @@ class OpenAIEmbeddingProvider implements EmbeddingProvider {
   private model: string;
   readonly dimension: number;
   private baseUrl: string;
+  private sendDimensions: boolean;
 
   constructor(config: EmbeddingConfig) {
     this.apiKey = config.apiKey;
     this.model = config.model;
     this.dimension = config.dimension;
     this.baseUrl = config.baseUrl || 'https://api.openai.com/v1';
+    this.sendDimensions = config.sendDimensions ?? false;
   }
 
   async generateEmbedding(text: string): Promise<number[]> {
@@ -93,7 +104,7 @@ class OpenAIEmbeddingProvider implements EmbeddingProvider {
       body: JSON.stringify({
         input: texts,
         model: this.model,
-        dimensions: this.dimension,
+        ...(this.sendDimensions ? { dimensions: this.dimension } : {}),
       }),
     });
 

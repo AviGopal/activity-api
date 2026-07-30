@@ -53,6 +53,12 @@ export interface AuthContext {
   /** Project IDs the user/key has access to - Required for PERMISSIONS enforcement */
   projectIds?: string[];
   reason?: string;
+  /**
+   * True when the failure is transient (identity-vessel 429/5xx or a network
+   * error) rather than a genuinely invalid key — callers must not
+   * negative-cache these for the full TTL.
+   */
+  transient?: boolean;
   /** Which method resolved the authentication */
   authMethod?: 'identity-vessel' | 'discovery';
 }
@@ -283,6 +289,7 @@ async function tryIdentityVesselValidation(
       return {
         authenticated: false,
         reason: `Identity vessel returned ${response.status}`,
+        transient: response.status === 429 || response.status >= 500,
       };
     }
 
@@ -331,6 +338,7 @@ async function tryIdentityVesselValidation(
     return {
       authenticated: false,
       reason: error instanceof Error ? error.message : 'Network error',
+      transient: true,
     };
   }
 }

@@ -322,12 +322,13 @@ export function loadConfig(): Config {
         // rows exist. Used by the Obsidian dashboard and topology-exploration
         // boredom goals to verify the substrate is making exploration progress.
         'topologyCoverage',
-        // mcpTool: discovery-to-tools bridge. Activity-api currently exposes
-        // its write surface through *_write impulse shapes (the preferred
-        // dispatch path per docs/specs/discovery-to-tools-bridge.md
-        // § "Relationship to impulse-write resolver"), not as MCP tools.
-        // The resolver is still wired so consumers can fan out to activity-api
-        // without 4xx-ing; it returns an empty tool list. See impulses.ts.
+        // mcpTool: discovery-to-tools bridge. Activity-api exposes its write
+        // surface through *_write impulse shapes (the preferred dispatch path
+        // per docs/specs/discovery-to-tools-bridge.md § "Relationship to
+        // impulse-write resolver"). The resolver additionally advertises
+        // READ tools with no write-shape equivalent — currently
+        // activity_search, dispatched back through /v2/impulses/resolve as
+        // pointer type activity_search. See impulses.ts.
         'mcpTool',
         // discoverByShapesQuery: pure-vessel shape
         // wrapping POST /v2/activities/discover-by-shapes. Pointer fields

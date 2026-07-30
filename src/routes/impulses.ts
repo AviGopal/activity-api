@@ -40,7 +40,7 @@ import { runReplicationPull } from './replication-pull';
 import { runTraceAggregateReport } from './trace-aggregate-report';
 import { runGroupedExecutionStats } from './grouped-execution-stats';
 import { resolveDbAdmin } from './db-admin';
-import { queryActivitiesByFTS, getActivityScores } from '../db/paradigm';
+import { queryActivitiesByFTS, getActivityScores, queryActivitiesByEmbeddingDense } from '../db/paradigm';
 import {
   runDiscoverByShapes,
   validateDiscoverByShapesInput,
@@ -3810,21 +3810,95 @@ router.post('/resolve', async (c) => {
       // resolver-tier accounting falls out for free, and we don't duplicate
       // a parallel MCP tool catalog over the same operations.
       //
-      // The resolver is wired so consumers can fan out to activity-api for
-      // mcpTool without 4xx-ing; it returns an empty content array. If a
-      // future use case calls for activity-api-specific MCP tools (e.g. an
-      // operation with no write-shape equivalent), wrap them inline here.
+      // The resolver advertises READ tools that have no *_write equivalent so
+      // the discovery-to-tools bridge can surface them to LLM reasoning.
+      // First entry (2026-07): activity_search — it had a working resolver
+      // case below but zero callers because nothing advertised it. Invocation
+      // needs no new route: each tool declares resolve_request_format
+      // 'pointer' against THIS endpoint, so a tool call is just another
+      // impulse-resolve with pointer.type = tool_name (per the
+      // ResolveRequestFormat contract in vessel-discovery-client/src/types.ts).
       // =============================================================================
 
       case 'mcpTool': {
+        const mcpPtr = pointer as typeof pointer & {
+          context?: {
+            goal_keywords?: string[];
+            input_shapes?: string[];
+            output_shapes?: string[];
+            task_description?: string;
+          };
+          goal_keywords?: string[];
+          task_description?: string;
+          limit?: number;
+          min_relevance?: number;
+        };
+        // Mirror concept-db's bridge scoring (routes/impulses.ts in concept-db):
+        // 0.4*shape_match + 0.3*keyword_match + 0.3*EMA-prior(0.5). No per-tool
+        // EMA exists yet, so the floor is the uninformed 0.15; keyword overlap
+        // between the caller's context and the tool's vocabulary adds on top.
+        const mcpQueryTokens = [
+          ...(mcpPtr.context?.goal_keywords ?? mcpPtr.goal_keywords ?? []),
+          ...String(mcpPtr.context?.task_description ?? mcpPtr.task_description ?? '')
+            .toLowerCase()
+            .split(/[^a-z0-9]+/),
+        ].filter((t) => t.length > 0);
+        const activitySearchTokens = new Set([
+          'activity', 'activities', 'template', 'templates', 'search', 'find',
+          'semantic', 'capability', 'registry', 'discover',
+        ]);
+        const mcpHits = mcpQueryTokens.filter((t) => activitySearchTokens.has(t)).length;
+        const mcpKeywordScore = mcpQueryTokens.length > 0 ? mcpHits / mcpQueryTokens.length : 0;
+        const mcpMinRelevance = typeof mcpPtr.min_relevance === 'number' ? mcpPtr.min_relevance : 0;
+        const mcpLimit = typeof mcpPtr.limit === 'number' && mcpPtr.limit > 0 ? Math.floor(mcpPtr.limit) : 20;
+        const mcpVesselEndpoint = process.env.VESSEL_ENDPOINT
+          || `http://${process.env.SERVICE_NAME || 'metabob-activity-api'}.${process.env.SURREALDB_NAMESPACE || 'activity-system'}.svc.cluster.local:${config.port}`;
+        const mcpTools = [
+          {
+            shape: 'mcpTool',
+            vessel_id: config.discovery.vesselId,
+            vessel_endpoint: mcpVesselEndpoint,
+            tool_name: 'activity_search',
+            description:
+              'Semantic search over the registered activity-template registry. Dense embedding KNN with BM25 full-text fallback; returns ranked templates with their declared output shapes and success metrics. Use to find an existing capability before composing a new one.',
+            input_schema: {
+              type: 'object',
+              properties: {
+                query: {
+                  type: 'string',
+                  description: 'Natural-language description of the capability or activity to find',
+                },
+                limit: {
+                  type: 'number',
+                  description: 'Maximum results to return',
+                  default: 5,
+                },
+                output_shapes: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: 'Expected output shapes; templates declaring them get a score boost',
+                },
+              },
+              required: ['query'],
+            },
+            resolve_endpoint: '/v2/impulses/resolve',
+            resolve_request_format: 'pointer',
+            auth_scheme: 'ApiKey',
+            relevance_score: 0.3 * mcpKeywordScore + 0.15,
+            matched_input_shapes: [],
+            matched_output_shapes: ['activity_search_result'],
+          },
+        ]
+          .filter((t) => t.relevance_score >= mcpMinRelevance)
+          .slice(0, mcpLimit);
         return c.json(
           {
             success: true,
-            content: JSON.stringify([]),
+            content: JSON.stringify(mcpTools),
             metadata: {
               shape: 'mcpTool',
-              summary: '0 tools (activity-api dispatches via *_write impulse shapes)',
-              rowCount: 0,
+              summary: `${mcpTools.length} tool(s) (write surface stays on *_write impulse shapes)`,
+              rowCount: mcpTools.length,
               vessel_id: config.discovery.vesselId,
             },
           } as ImpulseResolveResponse,
@@ -3956,14 +4030,39 @@ router.post('/resolve', async (c) => {
         const desiredShapes = Array.isArray(sp.output_shapes) ? sp.output_shapes : [];
 
         try {
-          const ftsResult = await queryActivitiesByFTS(
+          // Hybrid search: try dense KNN over the Qwen3 `embedding` field first
+          // (queryActivitiesByEmbeddingDense, paradigm.ts). It fails open ([])
+          // on provider-down, embed() error, or KNN query error — never throws
+          // — because only a fraction of activity rows have an embedding yet
+          // (the backfill job is still running) and the embedding pod is a
+          // network dependency. Whenever it returns 0 rows, for any of those
+          // reasons, fall back to the proven BM25 path (queryActivitiesByFTS)
+          // so activity_search never breaks.
+          let rows: any[] = [];
+          let searchMethod: 'dense' | 'fts' = 'fts';
+
+          const denseRows = await queryActivitiesByEmbeddingDense(
             sp.query,
             jwtAuthCtx.orgId,
             null,
             limit * 3, // over-fetch so the shape-overlap boost can re-rank
             jwtAuthCtx.jwtToken
           );
-          const rows = ftsResult.data || [];
+
+          if (denseRows.length > 0) {
+            rows = denseRows;
+            searchMethod = 'dense';
+          } else {
+            const ftsResult = await queryActivitiesByFTS(
+              sp.query,
+              jwtAuthCtx.orgId,
+              null,
+              limit * 3, // over-fetch so the shape-overlap boost can re-rank
+              jwtAuthCtx.jwtToken
+            );
+            rows = ftsResult.data || [];
+            searchMethod = 'fts';
+          }
 
           // Soft shape-overlap boost: +0.5 per matching declared output_shape.
           // Templates without declared output_shapes pass through neutral.
@@ -3973,7 +4072,8 @@ router.post('/resolve', async (c) => {
                 ? row.output_shapes
                 : [];
               const overlap = desiredShapes.filter((s) => declaredShapes.includes(s)).length;
-              const score = (row.fts_score ?? 0) + 0.5 * overlap;
+              const baseScore = searchMethod === 'dense' ? (row.dense_score ?? 0) : (row.fts_score ?? 0);
+              const score = baseScore + 0.5 * overlap;
               return { row, declaredShapes, score };
             })
             .filter((entry) => entry.score >= minScore)
@@ -3996,8 +4096,9 @@ router.post('/resolve', async (c) => {
             content: JSON.stringify({ total: matches.length, matches }),
             metadata: {
               shape: 'activity_search_result',
-              summary: `${matches.length} activity matches for "${sp.query.slice(0, 60)}"${desiredShapes.length ? ` (boosted on ${desiredShapes.length} expected shape(s))` : ''}`,
+              summary: `${matches.length} activity matches for "${sp.query.slice(0, 60)}" via ${searchMethod}${desiredShapes.length ? ` (boosted on ${desiredShapes.length} expected shape(s))` : ''}`,
               rowCount: matches.length,
+              searchMethod,
             },
           } as ImpulseResolveResponse, 200);
         } catch (err: any) {

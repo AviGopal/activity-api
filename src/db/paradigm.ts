@@ -11,7 +11,7 @@
 
 import { surrealDB, queryWithAuth } from './surreal';
 import { logger } from '../utils/logger';
-import { localEmbeddingService } from '../services/embedding-service';
+import { localEmbeddingService, getEmbeddingProvider } from '../services/embedding-service';
 import { resolveLearningTrack } from '../lib/learning-track';
 
 // =============================================================================
@@ -1473,6 +1473,153 @@ export async function queryActivitiesByDense(
     return results;
   } catch (error) {
     logger.error('[paradigm] queryActivitiesByDense: query failed', {
+      searchQuery: searchQuery.substring(0, 50),
+      error: error instanceof Error ? error.message : String(error),
+      latency_ms: Date.now() - startTime,
+    });
+    return [];
+  }
+}
+
+/**
+ * Query activities using dense semantic search over the Qwen3 (1024-dim)
+ * `embedding` field via the HNSW `<|K,EF|>` KNN operator
+ * (idx_activity_embedding_hnsw). Mirrors concept-db's searchConceptsByDense
+ * KNN pattern (index-backed, NOT a full-table scan) collapsed to a single
+ * field — activity has one `embedding`, unlike concept's summary/content
+ * pair, so no union/dedupe step is needed.
+ *
+ * Embeds the query via the configured EmbeddingProvider (getEmbeddingProvider(),
+ * wired at runtime to the Qwen3-Embedding-0.6B vLLM pod). Returns [] (never
+ * throws) when the provider is unavailable, the embed call fails, or the KNN
+ * query fails/errors — callers must fall back to BM25 (queryActivitiesByFTS)
+ * in that case.
+ *
+ * Only a fraction of activity rows have `embedding` populated as of 2026-07
+ * (the embed-activities.ts backfill job is still running); rows without an
+ * embedding are simply absent from the HNSW index, so this may legitimately
+ * return fewer than `limit` (or 0) results even when the provider and index
+ * are healthy.
+ */
+export async function queryActivitiesByEmbeddingDense(
+  searchQuery: string,
+  orgId?: string | null,
+  executionType?: 'template' | 'tool' | 'composition' | 'vessel_function' | null,
+  limit = 50,
+  jwtToken?: string | null
+): Promise<(ParadigmActivity & { dense_score: number })[]> {
+  if (!searchQuery || searchQuery.trim() === '') {
+    logger.warn('[paradigm] queryActivitiesByEmbeddingDense: empty searchQuery');
+    return [];
+  }
+
+  const provider = getEmbeddingProvider();
+  if (!provider) {
+    logger.warn('[paradigm] queryActivitiesByEmbeddingDense: no embedding provider configured');
+    return [];
+  }
+
+  const startTime = Date.now();
+
+  let queryVec: number[];
+  try {
+    queryVec = await provider.generateEmbedding(searchQuery.trim());
+  } catch (err) {
+    logger.warn('[paradigm] queryActivitiesByEmbeddingDense: embed failed', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
+
+  try {
+    // AUTH MODEL — root query + explicit app-layer filter, NOT table
+    // PERMISSIONS. On the deployed SurrealDB 2.3.3, the HNSW KNN operator
+    // `<|K,EF|>` silently returns 0 rows when the query runs under a
+    // record-access (JWT) session with table PERMISSIONS active — the same
+    // query root-authed returns correct neighbours. So this function ALWAYS
+    // executes via surrealDB.query (root) and replicates the activity
+    // table's `FOR select` scoping inline below; the app-layer filter is the
+    // load-bearing tenancy boundary for this one code path. Table
+    // PERMISSIONS stay in force as defense-in-depth for every non-KNN query.
+    // The filter follows the exact convention queryActivitiesByFTS uses for
+    // this table: global scope always visible; org rows matched on both bare
+    // ('metabob') and prefixed ('organizations:metabob') org_id spellings
+    // (both exist depending on seeding path); global-only when no orgId.
+    // `jwtToken` remains in the signature for call-site stability
+    // (routes/impulses.ts passes it) but is intentionally unused here.
+    void jwtToken;
+
+    const whereClauses: string[] = [
+      '(retired = false OR retired IS NONE)',
+    ];
+    const params: Record<string, any> = {};
+
+    if (orgId) {
+      const orgIdBare = orgId.replace(/^organizations:/, '');
+      whereClauses.push(`(scope = 'global' OR org_id = $org_id_bare OR org_id = $org_id_prefixed)`);
+      params.org_id_bare = orgIdBare;
+      params.org_id_prefixed = `organizations:${orgIdBare}`;
+    } else {
+      // Root-authed with no org context: never expose org-scoped rows.
+      whereClauses.push(`scope = 'global'`);
+    }
+    if (executionType) {
+      whereClauses.push('execution_type = $execution_type');
+      params.execution_type = executionType;
+    }
+
+    const filterStr = whereClauses.length > 0 ? ` AND ${whereClauses.join(' AND ')}` : '';
+    const ef = Math.max(limit * 2, 64);
+
+    // Index-backed KNN via idx_activity_embedding_hnsw, mirroring concept-db's
+    // searchConceptsByDense <|K,EF|> pattern (the K nearest neighbours via the
+    // index, NOT a full-table cosine scan). K and EF must be literal unsigned
+    // integers in this operator — SurrealDB rejects a bound parameter there
+    // ("Parse error: Unexpected token `a parameter`, expected an unsigned
+    // integer"). The query VECTOR is also inlined as a literal array rather
+    // than bound as $query_vec: binding it through this codebase's
+    // queryWithAuth/authenticated-client path silently returned 0 rows against
+    // data verified (via a direct root-authed query with the vector inlined)
+    // to have real, close matches — root-caused to how the SDK query() call
+    // serializes a bound float-array param for this specific KNN operator, not
+    // to org-scoping or the retired filter (both independently verified fine).
+    // Inlining sidesteps that path entirely and is proven to work. limit/ef
+    // are numbers computed above (not raw user input); queryVec is our own
+    // embedding-provider output — neither is attacker-controlled text, so
+    // string-building the array here carries the same trust level as binding.
+    const query = `
+      SELECT *, vector::distance::knn() AS _dense_dist
+      OMIT embedding
+      FROM activity
+      WHERE embedding <|${limit},${ef}|> ${JSON.stringify(queryVec)}${filterStr}
+      ORDER BY _dense_dist
+      LIMIT ${limit}
+    `;
+
+    const rows: any[] = await surrealDB.query<any>(query, params);
+
+    if (!rows || rows.length === 0) {
+      logger.warn('[paradigm] queryActivitiesByEmbeddingDense: 0 rows (sparse embedding coverage or index issue)');
+      return [];
+    }
+
+    // KNN returns cosine DISTANCE (lower = closer); convert to similarity so
+    // `dense_score` semantics match the rest of this file (higher = better).
+    const results = rows.map((row) => ({
+      ...row,
+      dense_score: 1 - (row._dense_dist ?? 1),
+    })) as (ParadigmActivity & { dense_score: number })[];
+
+    logger.info('[paradigm] queryActivitiesByEmbeddingDense: completed', {
+      searchQuery: searchQuery.substring(0, 50),
+      resultCount: results.length,
+      topScore: results[0]?.dense_score ?? null,
+      latency_ms: Date.now() - startTime,
+    });
+
+    return results;
+  } catch (error) {
+    logger.error('[paradigm] queryActivitiesByEmbeddingDense: query failed', {
       searchQuery: searchQuery.substring(0, 50),
       error: error instanceof Error ? error.message : String(error),
       latency_ms: Date.now() - startTime,

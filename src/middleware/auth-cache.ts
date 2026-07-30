@@ -33,6 +33,13 @@ import { logger } from '../utils/logger';
 import type { JwtAuthContext } from './jwtAuth';
 
 const DEFAULT_TTL_MS = 30_000;
+/**
+ * TTL for negative results caused by a TRANSIENT upstream failure (identity-
+ * vessel 429/5xx or a network error, signalled by the fetcher resolving to
+ * `undefined`). Long enough to absorb a same-instant burst via one entry,
+ * short enough that a rate-limit blip doesn't 401 all /v2/* traffic for 30s.
+ */
+const TRANSIENT_NEGATIVE_TTL_MS = 2_000;
 const MAX_ENTRIES_BEFORE_SWEEP = 1024;
 
 interface CacheEntry {
@@ -87,7 +94,11 @@ function sweepIfLarge(now: number): void {
  */
 export async function getOrFetchValidatedApiKey(
   apiKey: string,
-  fetcher: (apiKey: string) => Promise<JwtAuthContext | null>,
+  // `undefined` from the fetcher = transient upstream failure (429/5xx/
+  // network): treated as unauthenticated NOW, but negative-cached for only
+  // TRANSIENT_NEGATIVE_TTL_MS instead of the full TTL. `null` = genuinely
+  // invalid key, cached for the full negative TTL as before.
+  fetcher: (apiKey: string) => Promise<JwtAuthContext | null | undefined>,
 ): Promise<JwtAuthContext | null> {
   const now = Date.now();
   const cached = cache.get(apiKey);
@@ -113,10 +124,17 @@ export async function getOrFetchValidatedApiKey(
   const promise = (async () => {
     try {
       const value = await fetcher(apiKey);
-      const ttl = ttlMs();
-      cache.set(apiKey, { value, expiresAt: Date.now() + ttl });
+      const transient = value === undefined;
+      const ttl = transient ? TRANSIENT_NEGATIVE_TTL_MS : ttlMs();
+      cache.set(apiKey, { value: value ?? null, expiresAt: Date.now() + ttl });
       sweepIfLarge(Date.now());
-      return value;
+      if (transient) {
+        logger.warn('[auth-cache] transient upstream failure — short negative TTL', {
+          key_fp: keyFingerprint(apiKey),
+          ttl_ms: ttl,
+        });
+      }
+      return value ?? null;
     } finally {
       // Always clear the in-flight slot so the next miss can refetch.
       inflight.delete(apiKey);

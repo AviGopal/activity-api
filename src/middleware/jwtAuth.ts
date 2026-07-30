@@ -107,13 +107,19 @@ async function validateApiKey(apiKey: string): Promise<JwtAuthContext | null> {
   return getOrFetchValidatedApiKey(apiKey, _validateApiKeyUncached);
 }
 
-async function _validateApiKeyUncached(apiKey: string): Promise<JwtAuthContext | null> {
+async function _validateApiKeyUncached(apiKey: string): Promise<JwtAuthContext | null | undefined> {
   try {
     const result = await validateApiKeyWithFallback(apiKey);
 
     if (!result.authenticated) {
-      logger.warn('API key validation failed', { reason: result.reason });
-      return null;
+      logger.warn('API key validation failed', {
+        reason: result.reason,
+        transient: result.transient === true,
+      });
+      // `undefined` (vs null) tells auth-cache this was a transient upstream
+      // failure (429/5xx/network) — cache it only briefly, not for the full
+      // negative TTL, so a rate-limit blip can't lock callers out for 30s.
+      return result.transient ? undefined : null;
     }
 
     // Validate that keyId is present for API key auth
@@ -186,7 +192,9 @@ async function _validateApiKeyUncached(apiKey: string): Promise<JwtAuthContext |
   } catch (error) {
     const err = error as Error;
     logger.error('API key validation error', { error: err.message });
-    return null;
+    // A thrown error is a transient infrastructure failure, not proof the
+    // key is invalid — signal short negative caching.
+    return undefined;
   }
 }
 
