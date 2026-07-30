@@ -70,11 +70,14 @@ export async function computeVesselHealthScore(
     }
 
     const now = new Date();
-    const expiresAt = new Date(vessel.expires_at);
-    const lastHeartbeat = new Date(vessel.last_heartbeat);
+    // Parse ISO datetime strings with safeguards for both string and Date inputs
+    const expiresAtValue = typeof vessel.expires_at === 'string' ? new Date(vessel.expires_at) : vessel.expires_at;
+    const lastHeartbeatValue = typeof vessel.last_heartbeat === 'string' ? new Date(vessel.last_heartbeat) : vessel.last_heartbeat;
+    const expiresAt = expiresAtValue instanceof Date ? expiresAtValue : new Date(String(expiresAtValue));
+    const lastHeartbeat = lastHeartbeatValue instanceof Date ? lastHeartbeatValue : new Date(String(lastHeartbeatValue));
 
     // Heartbeat factor (0.0 to 1.0)
-    const isExpired = expiresAt <= now;
+    const isExpired = expiresAt.getTime() <= now.getTime();
     const timeSinceHeartbeat = now.getTime() - lastHeartbeat.getTime();
     const heartbeatFactor = isExpired
       ? 0
