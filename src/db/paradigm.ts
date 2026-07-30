@@ -1568,31 +1568,35 @@ export async function queryActivitiesByEmbeddingDense(
       params.execution_type = executionType;
     }
 
-    const filterStr = whereClauses.length > 0 ? ` AND ${whereClauses.join(' AND ')}` : '';
+    const outerFilter = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
     const ef = Math.max(limit * 2, 64);
 
-    // Index-backed KNN via idx_activity_embedding_hnsw, mirroring concept-db's
-    // searchConceptsByDense <|K,EF|> pattern (the K nearest neighbours via the
-    // index, NOT a full-table cosine scan). K and EF must be literal unsigned
-    // integers in this operator — SurrealDB rejects a bound parameter there
-    // ("Parse error: Unexpected token `a parameter`, expected an unsigned
-    // integer"). The query VECTOR is also inlined as a literal array rather
-    // than bound as $query_vec: binding it through this codebase's
-    // queryWithAuth/authenticated-client path silently returned 0 rows against
-    // data verified (via a direct root-authed query with the vector inlined)
-    // to have real, close matches — root-caused to how the SDK query() call
-    // serializes a bound float-array param for this specific KNN operator, not
-    // to org-scoping or the retired filter (both independently verified fine).
-    // Inlining sidesteps that path entirely and is proven to work. limit/ef
-    // are numbers computed above (not raw user input); queryVec is our own
-    // embedding-provider output — neither is attacker-controlled text, so
-    // string-building the array here carries the same trust level as binding.
+    // TWO-STAGE query — REQUIRED on SurrealDB 2.3.3. The HNSW `<|K,EF|>` KNN
+    // operator does NOT compose with sibling WHERE predicates in the same
+    // clause (verified live 2026-07-30, root-authed, real 1024-dim vector):
+    //   - bare KNN                              -> correct K nearest rows
+    //   - KNN AND scope = 'global' (equality)   -> K-limit silently DROPPED,
+    //                                              degrades to a full-table scan
+    //   - KNN AND (retired=false OR retired IS NONE) (disjunction) -> 0 rows,
+    //                                              the OR zeroes the planner result
+    // So the KNN runs ALONE in an inner subquery (pure index ANN); K/EF and the
+    // query vector are inlined as literals (this operator rejects bound params
+    // for K/EF, and binding the vector through the query() path also silently
+    // returned 0). The org/scope/retired/executionType filters + final LIMIT are
+    // then applied in the OUTER query, where normal predicate + bound-param
+    // evaluation works correctly. Inner K is the caller's already-over-fetched
+    // `limit` (routes/impulses.ts passes limit*3), so the outer filter+LIMIT
+    // still fills. limit/ef are computed numbers, queryVec is our own embedding
+    // output — neither is attacker-controlled, so inlining carries the same
+    // trust level as binding.
     const query = `
-      SELECT *, vector::distance::knn() AS _dense_dist
-      OMIT embedding
-      FROM activity
-      WHERE embedding <|${limit},${ef}|> ${JSON.stringify(queryVec)}${filterStr}
-      ORDER BY _dense_dist
+      SELECT * FROM (
+        SELECT *, vector::distance::knn() AS _dense_dist
+        OMIT embedding
+        FROM activity
+        WHERE embedding <|${limit},${ef}|> ${JSON.stringify(queryVec)}
+        ORDER BY _dense_dist
+      ) ${outerFilter}
       LIMIT ${limit}
     `;
 
