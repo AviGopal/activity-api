@@ -9,6 +9,15 @@ import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
 import { accountIdScopedWhere } from '../routes/activities';
 
+export interface ResolverHealth {
+  resolverId: string;
+  resolverName: string;
+  state: 'healthy' | 'degraded' | 'unhealthy';
+  failureCount: number;
+  successCount: number;
+  lastCheck: string;
+}
+
 export interface VesselHealthScore {
   vesselId: string;
   score: number; // 0.0 to 1.0
