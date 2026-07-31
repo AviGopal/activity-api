@@ -22,7 +22,7 @@
  *     metric?: "count" | "failure_count" | "success_count" | "cost_sum"
  *                                                            // default count
  *     window_hours?: number,    // default 24, clamped [1, 720]
- *     limit?: number,           // default 10, clamped [1, 100]
+ *     limit?: number,           // default 10, clamped [1, 1000]
  *     order?: "desc" | "asc",   // default desc (highest first)
  *   }
  *
@@ -68,7 +68,10 @@ export interface TraceAggregateReport {
   window_hours: number;
   generated_at: string;
   rows: TraceAggregateRow[];
+  /** Total distinct groups BEFORE the limit cap — not merely rows.length. */
   total_groups: number;
+  /** True when `rows` was capped at `limit` and more groups exist. */
+  truncated: boolean;
   empty: boolean;
   query_ms: number;
 }
@@ -99,7 +102,7 @@ export async function runTraceAggregateReport(
     : 'activity_id';
   const metric = METRICS.has(String(input.metric)) ? String(input.metric) : 'count';
   const windowHours = clampInt(input.window_hours, 24, 1, 720);
-  const limit = clampInt(input.limit, 10, 1, 100);
+  const limit = clampInt(input.limit, 10, 1, 1000);
   const order = String(input.order) === 'asc' ? 'ASC' : 'DESC';
 
   const since = new Date(Date.now() - windowHours * 3600_000).toISOString();
@@ -153,6 +156,8 @@ export async function runTraceAggregateReport(
 
   const startedAt = Date.now();
   let rows: TraceAggregateRow[] = [];
+  let totalGroups = 0;
+  let truncated = false;
   let queryOk = true;
   try {
     const result = await db.query(sql, params);
@@ -184,7 +189,11 @@ export async function runTraceAggregateReport(
     // degenerate single-bucket plan; the full group set is small — at most a few
     // hundred distinct templates — so JS sort is cheap and correct).
     rows.sort((a, b) => (order === 'ASC' ? a.value - b.value : b.value - a.value));
-    if (rows.length > limit) rows = rows.slice(0, limit);
+    totalGroups = rows.length;
+    if (rows.length > limit) {
+      rows = rows.slice(0, limit);
+      truncated = true;
+    }
   } catch (err) {
     queryOk = false;
     logger.error('[trace-aggregate-report] aggregate query failed', {
@@ -205,7 +214,8 @@ export async function runTraceAggregateReport(
     window_hours: windowHours,
     generated_at: new Date().toISOString(),
     rows,
-    total_groups: rows.length,
+    total_groups: totalGroups,
+    truncated,
     empty: rows.length === 0,
     query_ms: queryOk ? queryMs : -1,
   };

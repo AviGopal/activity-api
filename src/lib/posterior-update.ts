@@ -670,12 +670,49 @@ export async function propagateCreditAlongChain(
  * @param orgId    Org context for multi-tenant scoping
  */
 /**
- * Decay Thompson posterior counts toward the neutral prior 1 with a 3-day half-life.
+ * Default posterior-decay half-life in days. Overridable at use time via the
+ * authored `substrate_tuning_param` row THOMPSON_DECAY_HALFLIFE_DAYS (a shaped
+ * config the substrate can steer without a restart — see
+ * resolveThompsonDecayHalfLifeDays). 3 days matches the llm-resolver-vessel
+ * decayedCounts fix this mirrors
+ * (openspec/changes/2026-07-29-thompson-posterior-time-decay).
+ */
+export const THOMPSON_DECAY_HALFLIFE_DAYS_DEFAULT = 3;
+
+/**
+ * Resolve the posterior-decay half-life (days), consuming the
+ * substrate_tuning_param row 'THOMPSON_DECAY_HALFLIFE_DAYS' (seam 3a pattern,
+ * same as resolveTdLambda). No env fallback by design — decay is runtime
+ * behavior and must stay steerable through the shaped tuning row, not a
+ * process-start-frozen variable. Non-finite / non-positive values fall back
+ * to the default with a warn-log.
+ */
+export async function resolveThompsonDecayHalfLifeDays(): Promise<number> {
+  const value = await getTuningParam(
+    'THOMPSON_DECAY_HALFLIFE_DAYS',
+    undefined,
+    THOMPSON_DECAY_HALFLIFE_DAYS_DEFAULT,
+  );
+  if (!Number.isFinite(value) || value <= 0) {
+    logger.warn('thompson_decay_halflife_invalid', {
+      event: 'thompson_decay_halflife_invalid',
+      raw: value,
+      fallback: THOMPSON_DECAY_HALFLIFE_DAYS_DEFAULT,
+    });
+    return THOMPSON_DECAY_HALFLIFE_DAYS_DEFAULT;
+  }
+  return value;
+}
+
+/**
+ * Decay Thompson posterior counts toward the neutral prior 1 with an
+ * exponential half-life (default 3 days).
  *
  * @param alpha Last observed alpha count
  * @param beta Last observed beta count
  * @param lastUpdatedMs Timestamp when the counts were last updated (milliseconds since epoch)
  * @param nowMs Current time (milliseconds since epoch)
+ * @param halfLifeDays Half-life in days (default THOMPSON_DECAY_HALFLIFE_DAYS_DEFAULT)
  * @returns Decayed alpha and beta counts
  */
 export function decayedThompsonCounts(
@@ -683,8 +720,9 @@ export function decayedThompsonCounts(
   beta: number,
   lastUpdatedMs: number,
   nowMs: number,
+  halfLifeDays: number = THOMPSON_DECAY_HALFLIFE_DAYS_DEFAULT,
 ): { alpha: number; beta: number } {
-  const d = Math.pow(0.5, Math.max(0, nowMs - lastUpdatedMs) / (3 * 24 * 60 * 60 * 1000));
+  const d = Math.pow(0.5, Math.max(0, nowMs - lastUpdatedMs) / (halfLifeDays * 24 * 60 * 60 * 1000));
   return {
     alpha: 1 + (alpha - 1) * d,
     beta: 1 + (beta - 1) * d,
@@ -792,7 +830,8 @@ export async function applyOutcomeToPosteriors(
         }
       }
 
-      const decayed = decayedThompsonCounts(alpha, beta, lastUpdatedMs, Date.now());
+      const decayHalfLifeDays = await resolveThompsonDecayHalfLifeDays();
+      const decayed = decayedThompsonCounts(alpha, beta, lastUpdatedMs, Date.now(), decayHalfLifeDays);
       const newAlpha = decayed.alpha + alphaDelta;
       const newBeta = decayed.beta + betaDelta;
 
@@ -843,6 +882,14 @@ export async function applyOutcomeToPosteriors(
         if (e) embedding = e;
       }
       const seed = await seedPriorFromConcepts(activityId, trace.signature, orgId, embedding);
+      // Write-time posterior decay (openspec 2026-07-29-thompson-posterior-time-decay):
+      // decay the STORED alpha/beta toward the neutral prior (1,1) before adding the
+      // delta, using the row's own last_updated_at. Done in SurrealQL (not TS) here
+      // because the existence-check + cardinality-capped CREATE below is one atomic
+      // script — a TS read-modify-write would reintroduce the race the script avoids.
+      // math::max([0, ...]) clamps clock skew (datetime subtraction errors on negative
+      // durations in SurrealDB 2.3.3, so we diff time::unix seconds instead).
+      // Expression verified against the live 2.3.3 instance.
       await db.query(
         `
         LET $existing = (SELECT * FROM context_thompson_scores
@@ -858,8 +905,8 @@ export async function applyOutcomeToPosteriors(
           GROUP ALL)[0].count ?? 0;
         IF array::len($existing) > 0 THEN
           UPDATE context_thompson_scores
-          SET alpha = alpha + $alpha_delta,
-              beta  = beta  + $beta_delta,
+          SET alpha = 1 + (alpha - 1) * math::pow(0.5, math::max([0, time::unix(time::now()) - time::unix(last_updated_at ?? time::now())]) / $half_life_secs) + $alpha_delta,
+              beta  = 1 + (beta - 1) * math::pow(0.5, math::max([0, time::unix(time::now()) - time::unix(last_updated_at ?? time::now())]) / $half_life_secs) + $beta_delta,
               n_observations = n_observations + 1,
               last_updated_at = time::now()
           WHERE org_id = $org_id
@@ -890,6 +937,7 @@ export async function applyOutcomeToPosteriors(
           cap: CARDINALITY_CAP,
           alpha0: seed.alpha0,
           beta0: seed.beta0,
+          half_life_secs: (await resolveThompsonDecayHalfLifeDays()) * 86400,
         },
       );
       logger.debug('posterior_update_v1_conditional', {

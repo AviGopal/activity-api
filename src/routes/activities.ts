@@ -134,7 +134,7 @@ import {
 } from '../models/schemas';
 import { broadcaster } from '../websocket/broadcaster';
 import { autoCreateVariantIfNeeded, checkAndRetireTemplate } from '../services/variant-creator';
-import { applyOutcomeToPosteriors } from '../lib/posterior-update';
+import { applyOutcomeToPosteriors, decayedThompsonCounts, resolveThompsonDecayHalfLifeDays } from '../lib/posterior-update';
 import { incrementTraceStoreCounter } from '../lib/trace-store-counters';
 import { classifyTemplateTiers } from '../services/tier-classifier';
 import { lookupAssignment, readClusterPosterior } from '../lib/cluster-posterior';
@@ -318,7 +318,7 @@ app.post('/templates', async (c) => {
     // and SurrealDB angle-bracket / backtick wrapping so the upsert always
     // targets the canonical bare-name record.
     const rawActivityId = validated.id || validated.variant_id;
-    const activityId = typeof rawActivityId === 'string'
+    let activityId = typeof rawActivityId === 'string'
       ? rawActivityId.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '').trim()
       : rawActivityId;
     const activityName = validated.name || validated.variant_name;
@@ -614,6 +614,84 @@ app.post('/templates', async (c) => {
       }
     }
 
+    // MINT DEDUP (law 3 — a wrong mint is negative value, not zero). The compose
+    // loop re-mints the SAME capability hourly under `-<timestamp>`-suffixed names
+    // (e.g. `pulsevitals2-composed-aggregator-author-1753657200123`); each landed as
+    // a fresh row with a fresh Beta(1,1) posterior, splitting Thompson selection
+    // traffic across uninformed clones (52-62% of a week's mints in the audit).
+    // When the incoming name/id carries a trailing timestamp suffix, look for an
+    // existing template with the same NORMALIZED name AND the same consumed/produced
+    // shape signature; if found, UPSERT onto that record — its accumulated posterior
+    // is preserved (the metrics UPSERT below uses `??` defaults), body fields update.
+    const TS_SUFFIX_RE = /-\d{10,}$/;
+    const hadTimestampSuffix =
+      TS_SUFFIX_RE.test(String(activityName)) || TS_SUFFIX_RE.test(String(activityId));
+    let dedupedOntoExisting = false;
+    if (hadTimestampSuffix) {
+      try {
+        const normalizedName = String(activityName).replace(TS_SUFFIX_RE, '');
+        const shapeSig = (arr: unknown): string =>
+          Array.isArray(arr) ? arr.map(String).slice().sort().join(',') : '';
+        const incomingSig = `${shapeSig(activityRecord.input_shapes)}|${shapeSig(activityRecord.output_shapes)}`;
+        const dedupWhere = activityRecord.org_id
+          ? `(name = $norm_name OR string::starts_with(name, $norm_prefix)) AND org_id = $dedup_org`
+          : `(name = $norm_name OR string::starts_with(name, $norm_prefix))`;
+        const dedupQuery = `
+          SELECT meta::id(id) AS id_str, name, input_shapes, output_shapes FROM activity
+          WHERE ${dedupWhere}
+          LIMIT 50
+        `;
+        const dedupParams: Record<string, any> = {
+          norm_name: normalizedName,
+          norm_prefix: `${normalizedName}-`,
+          ...(activityRecord.org_id ? { dedup_org: activityRecord.org_id } : {}),
+        };
+        const dedupCandidates = jwtAuth?.jwtToken
+          ? await queryWithAuth<any>(jwtAuth.jwtToken, dedupQuery, dedupParams)
+          : await surrealDB.query<any>(dedupQuery, dedupParams);
+        // Prefer an exact normalized-name match; fall back to the first
+        // timestamp-suffixed sibling with the same shape signature.
+        const matches = (dedupCandidates || []).filter((cand: any) => {
+          const candName = String(cand?.name ?? '');
+          if (candName.replace(TS_SUFFIX_RE, '') !== normalizedName) return false;
+          const candId = String(cand?.id_str ?? '');
+          if (!candId || candId === activityId) return false;
+          return `${shapeSig(cand?.input_shapes)}|${shapeSig(cand?.output_shapes)}` === incomingSig;
+        });
+        matches.sort((a: any, b: any) =>
+          Number(String(b?.name ?? '') === normalizedName) - Number(String(a?.name ?? '') === normalizedName));
+        const dedupTarget = matches[0];
+        if (dedupTarget) {
+          logger.info('Template mint dedup: UPSERT onto existing capability (posterior preserved)', {
+            incoming_id: activityId,
+            incoming_name: activityName,
+            existing_id: dedupTarget.id_str,
+            existing_name: dedupTarget.name,
+            normalized_name: normalizedName,
+            shape_signature: incomingSig,
+          });
+          activityId = String(dedupTarget.id_str);
+          // Pin the stored name to the normalized form so the row stops churning
+          // through timestamped names and future dedup hits it by exact name.
+          activityRecord.name = normalizedName;
+          dedupedOntoExisting = true;
+        } else {
+          logger.info('Template mint dedup: no existing capability matched — INSERT as new', {
+            incoming_id: activityId,
+            normalized_name: normalizedName,
+            shape_signature: incomingSig,
+            candidates_seen: (dedupCandidates || []).length,
+          });
+        }
+      } catch (dedupErr) {
+        // Dedup is best-effort: any failure falls through to the historical insert path.
+        logger.warn('Template mint dedup check failed (non-blocking, inserting as new)', {
+          id: activityId,
+          error: dedupErr instanceof Error ? dedupErr.message : String(dedupErr),
+        });
+      }
+    }
+
     // Build dynamic query with only provided fields.
     // IMPORTANT: omit 'id' from CONTENT — the UPSERT target clause already
     // specifies the record ID as activity:`${activityId}`. Including id: $id in
@@ -655,6 +733,7 @@ app.post('/templates', async (c) => {
       name: activityName,
       scope: activityRecord.scope,
       public: activityRecord.public,
+      mint_deduped: dedupedOntoExisting,
     });
 
     // Create initial performance metrics
@@ -5386,13 +5465,27 @@ app.post('/recommend', async (c) => {
       templates = await enrichTemplatesWithMetrics(templates);
     }
 
+    // Selection-time posterior decay (openspec 2026-07-29-thompson-posterior-time-decay):
+    // decay stored alpha/beta toward the neutral prior (1,1) by row staleness at READ
+    // time, so a posterior poisoned during a transient outage (and then never selected,
+    // hence never re-written) still heals. Mirrors the write-time decay in
+    // posterior-update.ts; half-life is a shaped tuning row, read at use time.
+    const decayHalfLifeDays = await resolveThompsonDecayHalfLifeDays();
+    const decayNowMs = Date.now();
+    const decayRow = (alpha: number, beta: number, lastUpdated: unknown): { alpha: number; beta: number } => {
+      const ms = lastUpdated ? new Date(lastUpdated as any).getTime() : NaN;
+      // No timestamp on the row -> leave counts untouched (never zero out blind rows at read).
+      if (!Number.isFinite(ms)) return { alpha, beta };
+      return decayedThompsonCounts(alpha, beta, ms, decayNowMs, decayHalfLifeDays);
+    };
+
     // Lookup per-bucket Thompson scores (Spec 3)
     // Phase B1: dual-scope by account_id; legacy rows match via org_id.
     let contextScoresMap = new Map<string, { alpha: number; beta: number; n_observations: number }>();
     if (contextBucket && activityIds.length > 0) {
       try {
         const ctxResult = await surrealDB.query<any>(`
-          SELECT template_id, alpha, beta, n_observations
+          SELECT template_id, alpha, beta, n_observations, last_updated_at
           FROM context_thompson_scores
           WHERE ${accountIdScopedWhere()} AND context_bucket = $bucket AND template_id IN $ids
         `, {
@@ -5403,9 +5496,10 @@ app.post('/recommend', async (c) => {
         });
 
         for (const row of (ctxResult || [])) {
+          const decayedCtx = decayRow(row.alpha ?? 1, row.beta ?? 1, row.last_updated_at);
           contextScoresMap.set(row.template_id, {
-            alpha: row.alpha ?? 1,
-            beta: row.beta ?? 1,
+            alpha: decayedCtx.alpha,
+            beta: decayedCtx.beta,
             n_observations: row.n_observations ?? 0,
           });
         }
@@ -5494,7 +5588,7 @@ app.post('/recommend', async (c) => {
         });
 
         const sigResult = await surrealDB.query<any>(`
-          SELECT template_id, alpha, beta, n_observations
+          SELECT template_id, alpha, beta, n_observations, last_updated_at
           FROM context_thompson_scores
           WHERE org_id = $org_id AND signature_version = 1 AND context_bucket = $sig AND template_id IN $ids
         `, {
@@ -5505,9 +5599,10 @@ app.post('/recommend', async (c) => {
 
         for (const row of (sigResult || [])) {
           if (row.template_id) {
+            const decayedSig = decayRow(row.alpha ?? 1, row.beta ?? 1, row.last_updated_at);
             sigScoresMap.set(row.template_id, {
-              alpha: row.alpha ?? 1,
-              beta: row.beta ?? 1,
+              alpha: decayedSig.alpha,
+              beta: decayedSig.beta,
               n_observations: row.n_observations ?? 0,
             });
           }
@@ -5674,7 +5769,16 @@ app.post('/recommend', async (c) => {
         const scoreKey = normalizeActivityId(template.id || template.variant_id);
         const scores = scoresMap.get(scoreKey) ?? scoresMap.get(activityId);
         let alpha = scores?.alpha || template.metrics?.thompson_alpha || 1.0;
-        const betaVal = scores?.beta || template.metrics?.thompson_beta || 1.0;
+        let betaVal = scores?.beta || template.metrics?.thompson_beta || 1.0;
+        // Selection-time decay of the global posterior (see decayRow above): the only
+        // staleness anchor v_activity_score / legacy metrics carry is last_executed_at —
+        // exactly the "has not run in a long time" signal the decay is for. Rows without
+        // it (or metrics-fallback values) are left untouched.
+        if (scores?.last_executed_at) {
+          const decayedGlobal = decayRow(alpha, betaVal, scores.last_executed_at);
+          alpha = decayedGlobal.alpha;
+          betaVal = decayedGlobal.beta;
+        }
 
         // HEURISTIC BOOSTS: Encode domain knowledge as informative priors
         const templateTags = template.tags || [];
