@@ -7193,7 +7193,7 @@ app.post('/composition', async (c) => {
         weight: validated.success ? 1.0 : 0.0,
         input_impulse_shapes: validated.input_impulse_shapes || [],
         output_impulse_shapes: validated.output_impulse_shapes || [],
-        account_id: compositionAccountId,
+        ...(compositionAccountId != null ? { account_id: compositionAccountId } : {}),
         account_id_version: 1,
         edge_kind: compositionEdgeKind,
         genuine: compositionEdgeIsGenuine,
