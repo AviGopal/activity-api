@@ -11,26 +11,34 @@
 --
 -- This is the historical-rows counterpart of that write-path guard: set
 -- output_shapes to the placeholder-stripped union of the tasks' own declared
--- outputShapes — the authoritative produced shapes. After this, the 218 fixable
+-- outputShapes — the authoritative produced shapes. After this the ~216 fixable
 -- rows become shape-eligible and the existing embedding-conditioned priors
 -- warm-start them (retrieval is by shape; scoring already exists).
 --
+-- NONE-safety: some learned rows have `tasks` absent entirely (projection ->
+-- NONE) and others have tasks whose `outputShapes` are null (-> [null, ...]).
+-- array::flatten(NONE) errors, and a null element would violate the SCHEMAFULL
+-- array<string> assert on output_shapes. So coalesce the projection with `?? []`
+-- (absent case) AND array::filter to type::is::string non-placeholder elements
+-- (null / placeholder case). Rows whose real-shape set is empty are left as-is.
+--
 -- SAFE + IDEMPOTENT: only rows still carrying a placeholder AND whose tasks
--- declare >= 1 real shape are touched. The 48 rows whose tasks declare no real
--- shape are left untouched (nothing to derive). Only the output_shapes column is
--- written — provenance (extracted_from / goalSignature / metadata) and the
--- separate posterior/metric tables are untouched. Re-running is a no-op once the
--- placeholder is gone (the array::any WHERE clause stops matching).
--- (2026-07-31, gap-ribosome-reuse-hop-cold-blocked)
+-- declare >= 1 real (string, non-placeholder) shape are touched. Only the
+-- output_shapes column is written — provenance (extracted_from / goalSignature /
+-- metadata) and the separate posterior/metric tables are untouched. Re-running is
+-- a no-op once the placeholder is gone (the array::any WHERE clause stops
+-- matching). (2026-07-31, gap-ribosome-reuse-hop-cold-blocked)
 
 UPDATE activity
-  SET output_shapes = array::distinct(array::complement(
+  SET output_shapes = array::distinct(array::filter(
         array::flatten(tasks[*].outputShapes ?? []),
-        ['tool_output', 'tool_result', 'toolOutput', 'unknown_output']
+        |$s| type::is::string($s)
+             AND !($s IN ['tool_output', 'tool_result', 'toolOutput', 'unknown_output'])
       ))
   WHERE string::starts_with(meta::id(id), 'learned-')
     AND array::any(output_shapes, |$s| $s IN ['tool_output', 'tool_result', 'toolOutput', 'unknown_output'])
-    AND array::len(array::distinct(array::complement(
+    AND array::len(array::distinct(array::filter(
         array::flatten(tasks[*].outputShapes ?? []),
-        ['tool_output', 'tool_result', 'toolOutput', 'unknown_output']
+        |$s| type::is::string($s)
+             AND !($s IN ['tool_output', 'tool_result', 'toolOutput', 'unknown_output'])
       ))) > 0;
