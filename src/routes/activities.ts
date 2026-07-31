@@ -494,18 +494,23 @@ app.post('/templates', async (c) => {
     // declare no real shapes. Scoped to learned-* ids so normal inference is untouched.
     if (isLearnedExtracted) {
       const PLACEHOLDER_OUT = new Set(['tool_output', 'tool_result', 'toolOutput', 'unknown_output']);
-      const onlyPlaceholder = Array.isArray(activityRecord.output_shapes)
-        && activityRecord.output_shapes.length > 0
-        && activityRecord.output_shapes.every((s: any) => PLACEHOLDER_OUT.has(s));
-      if (!outputShapesProvided || onlyPlaceholder) {
-        const taskOut = Array.from(new Set(
-          (activityTasks || []).flatMap((t: any) => Array.isArray(t?.outputShapes) ? t.outputShapes : [])
-        )).filter((s: any) => typeof s === 'string' && s.length > 0 && !PLACEHOLDER_OUT.has(s));
-        if (taskOut.length > 0) {
-          activityRecord.output_shapes = taskOut;
-          outputShapesProvided = true;
-          logger.info('Learned/composite template: output_shapes derived from task outputShapes (skipping tool_output placeholder)', { activityId, derivedOutputShapes: taskOut });
-        }
+      const taskOut = Array.from(new Set(
+        (activityTasks || []).flatMap((t: any) => Array.isArray(t?.outputShapes) ? t.outputShapes : [])
+      )).filter((s: any) => typeof s === 'string' && s.length > 0 && !PLACEHOLDER_OUT.has(s));
+      const provided = Array.isArray(activityRecord.output_shapes) ? activityRecord.output_shapes : [];
+      const providedReal = provided.filter((s: any) => typeof s === 'string' && s.length > 0 && !PLACEHOLDER_OUT.has(s));
+      const hasPlaceholder = provided.some((s: any) => PLACEHOLDER_OUT.has(s));
+      // Real produced shapes = provided real shapes UNION task-declared real shapes.
+      // Fires when output was absent, was ONLY a placeholder, OR was mixed real+placeholder
+      // (strip the placeholder in that case too — the earlier version only fixed pure- or
+      // empty-placeholder rows, leaving mixed ['analysis','tool_output'] extractions still
+      // carrying the poison shape). Falls through to prose/category inference only when NO
+      // real shape exists anywhere. law 8: the tasks' declared outputShapes are the fact.
+      const real = Array.from(new Set([...providedReal, ...taskOut]));
+      if (real.length > 0 && (!outputShapesProvided || hasPlaceholder)) {
+        activityRecord.output_shapes = real;
+        outputShapesProvided = true;
+        logger.info('Learned/composite template: output_shapes set to task-derived real shapes (placeholder stripped)', { activityId, output_shapes: real });
       }
     }
 
