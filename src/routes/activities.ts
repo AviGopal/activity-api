@@ -1066,6 +1066,58 @@ app.get('/shape-gap-resolution', async (c) => {
   }
 });
 
+// GET /v2/activities/deliverable-shapes — curated vocabulary of shapes that learned
+// composites actually DELIVER (terminal = produced-minus-consumed WITHIN a composite),
+// evidence-gated (ev>0), hygiene- and frequency-filtered, capped. goal-host unions this
+// into fetchKnownShapes (B2, 2026-07-31, gap-ribosome-reuse-hop-cold-blocked) so goal->target
+// inference can AIM a goal at a learned-only deliverable (e.g. conceptDescription) WITHOUT
+// flooding the inference vocabulary with intermediate byproducts. Read-only; fail-open.
+app.get('/deliverable-shapes', async (c) => {
+  try {
+    const FLOOR = 5;
+    const CAP = 40;
+    const GENERIC_NOISE = new Set([
+      'fileContent', 'source_code', 'codeReadResult', 'tool_output', 'tool_result', 'toolOutput',
+      'tool_call', 'httpResponse', 'commandResult', 'filePaths', 'activity_template',
+      'fileWriteResult', 'activityExecutionSummary', 'trace', 'patch_proposal', 'patch',
+      'analysis', 'json_extracted_value', 'llm_completion_result',
+    ]);
+    const denyRe = /(^producer_|^consumer_|^pool_|^validated_|^normalized_|^guard|^escalation_|^llm_filled|^gap_resolution|^enforced_|_metadata$|_validated$|_state$|_status$|_check$|_extracted$|^autoDraftedOutput_|^composedDeliverable_)/;
+    const stepRe = /_s\d+$/;
+    const result = await surrealDB.query<any>(
+      `SELECT meta::id(id) AS id, tasks FROM activity
+         WHERE (retired = false OR retired IS NONE) AND ev > 0
+           AND (string::starts_with(meta::id(id), 'learned-') OR string::starts_with(meta::id(id), 'composed-cap'))`,
+      {},
+    );
+    const rows = (result || []).flat?.() || result || [];
+    const freq = new Map<string, number>();
+    for (const row of (Array.isArray(rows) ? rows : [])) {
+      const tasks = Array.isArray((row as any)?.tasks) ? (row as any).tasks : [];
+      if (tasks.length === 0) continue;
+      const produced = new Set<string>();
+      const consumed = new Set<string>();
+      for (const t of tasks) {
+        for (const sh of (Array.isArray(t?.outputShapes) ? t.outputShapes : [])) if (typeof sh === 'string' && sh) produced.add(sh);
+        for (const sh of (Array.isArray(t?.inputShapes) ? t.inputShapes : [])) if (typeof sh === 'string' && sh) consumed.add(sh);
+      }
+      for (const sh of produced) {
+        if (consumed.has(sh)) continue;                        // terminal = produced-minus-consumed
+        if (GENERIC_NOISE.has(sh) || denyRe.test(sh) || stepRe.test(sh) || sh.includes('.')) continue;
+        freq.set(sh, (freq.get(sh) ?? 0) + 1);                 // distinct-composite frequency
+      }
+    }
+    const shapes = [...freq.entries()]
+      .filter(([, n]) => n >= FLOOR)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, CAP)
+      .map(([sh]) => sh);
+    return c.json({ shapes });
+  } catch {
+    return c.json({ shapes: [] }, 200); // fail-open: goal-host falls back to registry-only vocab
+  }
+});
+
 app.get('/validation-patterns', async (c) => {
   try {
     const { detectValidationPatterns } = await import('../utils/validation-traces');
