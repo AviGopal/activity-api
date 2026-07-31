@@ -178,6 +178,65 @@ export function extractOutputShapes(executionTrace: {
 }
 
 /**
+ * Thompson Sampling Service — conceptDescription
+ *
+ * This module implements Thompson Sampling for activity template selection with shape match scoring.
+ * It provides a Bayesian multi-armed bandit solution that learns which activity templates reliably
+ * produce expected output shapes.
+ *
+ * **Core Algorithm:**
+ * Thompson Sampling maintains Beta(alpha, beta) posteriors per template. On each execution feedback,
+ * the module scores the outcome (execution success + shape match quality), splits that score between
+ * alpha (success) and beta (failure) deltas, and updates the posterior. Arm selection uses Monte Carlo
+ * sampling from posteriors to balance exploration and exploitation.
+ *
+ * **Shape Match Scoring:**
+ * Expected shapes (from template definition) are compared to actual shapes (from execution trace)
+ * using Jaccard similarity: |intersection| / |union|. This detects shape drift (execution succeeds
+ * but output shapes differ from declared ones), enabling the learner to favor templates that
+ * reliably produce the specified shapes.
+ *
+ * **Weighted Success:**
+ * Final score combines execution success with shape quality:
+ * - Failed execution → 0.0 (no partial credit)
+ * - Success with perfect shapes → 1.0 (0.7 * 1.0 + 0.3 base)
+ * - Success with partial shapes → 0.3-0.9 (proportional to match quality)
+ * - Success with no shapes → 0.3 (base only)
+ *
+ * This weighting ensures the learner can distinguish between executions that merely completed
+ * versus those that produced the expected schema.
+ *
+ * **Key Functions:**
+ * - `computeShapeMatchScore()`: Jaccard similarity between expected/actual shapes
+ * - `computeWeightedSuccessScore()`: Combined execution success + shape quality score
+ * - `computeThompsonSamplingUpdates()`: Compute alpha/beta parameter deltas from weighted score
+ * - `extractOutputShapes()`: Extract shape array from execution trace (handles multiple formats)
+ * - `ShapeMatchMetadata`: Interface for storing shape validation results in traces
+ *
+ * **Usage:**
+ * After execution, extract actual shapes, compute shape match score, then compute parameter
+ * updates to apply to the template's posterior. The posterior is sampled during template selection
+ * to decide which template to activate next.
+ */
+export const conceptDescription = {
+  moduleName: 'thompson-sampling',
+  purpose: 'Thompson Sampling for activity template selection with shape match scoring',
+  keyAlgorithms: [
+    'Thompson Sampling (Bayesian multi-armed bandit)',
+    'Jaccard similarity for shape matching',
+    'Beta distribution posteriors per template',
+    'Weighted success scoring (execution + shape quality)',
+  ],
+  exports: [
+    'computeShapeMatchScore: Jaccard similarity between expected and actual output shapes',
+    'computeWeightedSuccessScore: Combined execution success and shape match quality score',
+    'computeThompsonSamplingUpdates: Compute alpha/beta parameter deltas from weighted score',
+    'extractOutputShapes: Extract shape array from execution trace (multiple format support)',
+    'ShapeMatchMetadata: Interface for storing shape validation results',
+  ],
+} as const;
+
+/**
  * Shape match metadata for execution trace storage
  */
 export interface ShapeMatchMetadata {
