@@ -2808,7 +2808,7 @@ router.post('/resolve', async (c) => {
           } as ImpulseResolveResponse, 400);
         }
 
-        const validLabelers = ['human', 'automated'];
+        const validLabelers = ['human', 'automated', 'deterministic'];
         if (!validLabelers.includes(gvlPointer.labeler)) {
           return c.json({
             success: false,
