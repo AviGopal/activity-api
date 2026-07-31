@@ -480,6 +480,35 @@ app.post('/templates', async (c) => {
       logger.info('Learned/composite template: input_shapes pinned to [] (bindable), skipping prose inference', { activityId });
     }
 
+    // OUTPUT-SHAPE CONFORMANCE for learned composites (2026-07-31,
+    // gap-ribosome-learned-output-shapes-tool-output-placeholder). Symmetric to the
+    // input_shapes guard above: inferShapesFromTemplate derives output shapes from task
+    // PROSE + a category fallback ('tool' -> 'tool_output'), IGNORING each task's
+    // authoritative `outputShapes`. Shape-less learned writes therefore get the generic
+    // 'tool_output' placeholder baked in, which makes the extracted composite
+    // UNSELECTABLE (goal-host advancesTarget never matches 'tool_output' against a real
+    // goal target -> reuse dead: 266/424 learned rows sat permanently unreusable).
+    // Derive the produced shapes DIRECTLY from the tasks' declared outputShapes (the
+    // load-bearing fact, law 8), and also replace a bare ['tool_output'] the synthesiser
+    // may have emitted. Fall through to prose/category inference only when the tasks
+    // declare no real shapes. Scoped to learned-* ids so normal inference is untouched.
+    if (isLearnedExtracted) {
+      const PLACEHOLDER_OUT = new Set(['tool_output', 'tool_result', 'toolOutput', 'unknown_output']);
+      const onlyPlaceholder = Array.isArray(activityRecord.output_shapes)
+        && activityRecord.output_shapes.length > 0
+        && activityRecord.output_shapes.every((s: any) => PLACEHOLDER_OUT.has(s));
+      if (!outputShapesProvided || onlyPlaceholder) {
+        const taskOut = Array.from(new Set(
+          (activityTasks || []).flatMap((t: any) => Array.isArray(t?.outputShapes) ? t.outputShapes : [])
+        )).filter((s: any) => typeof s === 'string' && s.length > 0 && !PLACEHOLDER_OUT.has(s));
+        if (taskOut.length > 0) {
+          activityRecord.output_shapes = taskOut;
+          outputShapesProvided = true;
+          logger.info('Learned/composite template: output_shapes derived from task outputShapes (skipping tool_output placeholder)', { activityId, derivedOutputShapes: taskOut });
+        }
+      }
+    }
+
     // Infer shapes from template if not explicitly provided
     if (!inputShapesProvided || !outputShapesProvided) {
       try {
