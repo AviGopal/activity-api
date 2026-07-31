@@ -7049,6 +7049,15 @@ app.post('/composition', async (c) => {
     // Phase B1: pull account_id from JWT auth context for dual-write.
     const compositionJwtAuth = getJwtAuthFromContext(c);
     const compositionAccountId: string | null = compositionJwtAuth?.accountId ?? null;
+    // org_id is REQUIRED by the schema (org_id ... ASSERT $value != NONE) and its
+    // VALUE default `<string> $auth.org_id` resolves to NONE here: surrealDB.query
+    // runs on the ROOT connection, so there is no JWT $auth in the DB session. A
+    // new-edge CREATE that omits org_id is swallowed by the assert and never
+    // persists. Thread an explicit org_id, defaulting to this substrate's canonical
+    // org (matches every existing edge). Existing-row UPDATEs are unaffected.
+    const compositionSession = (c.get as any)('session') as SessionData | undefined;
+    const compositionOrgId: string =
+      compositionJwtAuth?.orgId || compositionSession?.org_id || 'organizations:substrate';
 
     logger.info('POST /v2/activities/composition', {
       parent: validated.parent_activity_id,
@@ -7177,6 +7186,7 @@ app.post('/composition', async (c) => {
         parent_activity_id: validated.parent_activity_id,
         child_activity_id: validated.child_activity_id,
         execution_id: validated.execution_id,
+        org_id: compositionOrgId,
         goal_context: validated.goal_context || '',
         success: validated.success,
         success_count: validated.success ? 1 : 0,
