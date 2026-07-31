@@ -136,7 +136,19 @@ export async function runDiscoverByShapes(
            WHERE child_activity_id = $parent.id GROUP ALL)[0] AS comp_row`
     : '';
 
-  const params: Record<string, unknown> = { required_shapes, limit };
+  // Selection-learning admission (Thompson correctness): the query's
+  // `ORDER BY ev DESC, created_at DESC` truncation runs BEFORE the per-candidate
+  // betaSample draw below. `ev` is ~flat across activity rows, so a bare
+  // `LIMIT $limit` degenerates to RECENCY truncation and can cut a learned
+  // high-posterior producer before the Thompson draw ever sees it. Admit a
+  // bounded superset instead (all viable producers in practice), draw over the
+  // whole pool, and slice to `limit` AFTER the sampled_score sort below —
+  // sample-then-truncate, the correct order. The CONTAINSANY shape filter scans
+  // every matching row regardless of LIMIT, so widening the cap barely changes
+  // query cost.
+  const ADMISSION_CAP = 200;
+  const admissionLimit = Math.max(limit, ADMISSION_CAP);
+  const params: Record<string, unknown> = { required_shapes, admission_limit: admissionLimit };
   if (predecessor_activity_id) params.predecessor_activity_id = predecessor_activity_id;
 
   let whereClause: string;
@@ -156,7 +168,7 @@ export async function runDiscoverByShapes(
     FROM activity
     WHERE ${whereClause.replace(/AND \(retired = false OR retired IS NONE\)/g, 'AND retired = false')}
     ORDER BY ev DESC, created_at DESC
-    LIMIT $limit
+    LIMIT $admission_limit
   `;
 
   const activities = await surrealDB.query(query, params);
@@ -309,9 +321,14 @@ export async function runDiscoverByShapes(
   // composed-cap / fleet-health-pane lock-in. goal-host's stable scaffoldRank
   // sort + .find then takes the sampled-best among equal-rank genuine producers.
   finalActivities.sort((a: any, b: any) => (b.sampled_score ?? 0) - (a.sampled_score ?? 0));
+  // sample-then-truncate: the caller asked for `limit` producers; return the
+  // top-`limit` by Thompson draw from the admitted pool (never more than the
+  // caller expects, but now drawn from ALL viable producers, not the recency
+  // head). Bounded pre-draw admission cannot silently starve a learned arm.
+  const selected = finalActivities.slice(0, limit);
   return {
     ok: true,
-    activities: finalActivities,
-    total: finalActivities.length,
+    activities: selected,
+    total: selected.length,
   };
 }
