@@ -89,6 +89,8 @@ export interface TraceForSuccessorFeatures {
     outputShapes?: string[];
   }>;
   org_id?: string;
+  completion_shapes?: string[];
+  missing?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -199,14 +201,23 @@ export async function updateSuccessorFeatures(
     // Robbins-Monro running mean with η = 1/(n+1):
     //   ψ_{n+1}[k] = ψ_n[k] + (sample[k] - ψ_n[k]) / (n+1)
     // Union of keys present in either prior or sample.
+    const needed = new Set<string>();
+    if (Array.isArray(trace.missing)) trace.missing.forEach(s => needed.add(String(s)));
+    if (Array.isArray(trace.completion_shapes)) {
+      for (const s of trace.completion_shapes) {
+        if (typeof s === 'string' && !(sample[s] > 0)) needed.add(s);
+      }
+    }
+
     const eta = 1 / (n + 1);
     const blended: SparseVector = {};
-    const allKeys = new Set<string>([...Object.keys(prior), ...sampleKeys]);
+    const allKeys = new Set<string>([...Object.keys(prior), ...sampleKeys, ...needed]);
     for (const k of allKeys) {
       const pv = prior[k] ?? 0;
-      const sv = sample[k] ?? 0;
+      // residual-corrected: if needed but missing, target is -1 (penalty)
+      const sv = needed.has(k) ? -1 : (sample[k] ?? 0);
       const next = pv + (sv - pv) * eta;
-      if (next > 1e-6) blended[k] = next;
+      if (Math.abs(next) > 1e-6) blended[k] = next;
     }
 
     // Bound the vocabulary: keep top-K by occupancy.
@@ -214,7 +225,7 @@ export async function updateSuccessorFeatures(
     const keys = Object.keys(blended);
     if (keys.length > SF_TOPK) {
       const top = keys
-        .sort((a, b) => blended[b] - blended[a])
+        .sort((a, b) => Math.abs(blended[b]) - Math.abs(blended[a]))
         .slice(0, SF_TOPK);
       vector = {};
       for (const k of top) vector[k] = blended[k];

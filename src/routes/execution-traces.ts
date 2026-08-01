@@ -2847,6 +2847,8 @@ app.post('/', async (c) => {
             signature: v1Sig,
             output_impulse_shapes: (trace as any).output_impulse_shapes,
             tasks: sfTasks,
+            completion_shapes: (body as any).completion_shapes ?? (trace as any).completion_shapes ?? [],
+            missing: (body as any).missing ?? (trace as any).missing ?? [],
           },
           surrealDB,
           trace.org_id as string,
@@ -3834,16 +3836,38 @@ app.post('/reach', async (c) => {
     const completion_shapes: string[] = Array.isArray(body.completion_shapes)
       ? body.completion_shapes.map(String)
       : [];
+    const missing: string[] = Array.isArray(body.missing)
+      ? body.missing.map(String)
+      : [];
     const res = await surrealDB.query(
-      `UPDATE activity_execution_traces SET reached = $reached, completion_shapes = $completion_shapes WHERE execution_id = $execution_id`,
-      { reached: body.reached, completion_shapes, execution_id: String(execId) },
+      `UPDATE activity_execution_traces SET reached = $reached, completion_shapes = $completion_shapes, missing = $missing WHERE execution_id = $execution_id`,
+      { reached: body.reached, completion_shapes, missing, execution_id: String(execId) },
     );
+    const updatedTrace: any = Array.isArray(res) && Array.isArray(res[0]) && res[0].length > 0 ? res[0][0] : null;
+    if (updatedTrace && updatedTrace.signature) {
+      import('../lib/successor-features').then(({ updateSuccessorFeatures }) => {
+        updateSuccessorFeatures(
+          {
+            activity_id: updatedTrace.variant_id as string,
+            signature: updatedTrace.signature as string,
+            output_impulse_shapes: updatedTrace.output_impulse_shapes,
+            tasks: updatedTrace.tasks,
+            completion_shapes,
+            missing,
+          },
+          surrealDB,
+          updatedTrace.org_id as string
+        ).catch((err) => {
+          logger.warn('successor-features (reach): update failed', { error: err.message });
+        });
+      }).catch(() => {});
+    }
     // WRITE-FLIP: mirror the reach verdict onto the authoritative `execution`
     // row (the load-bearing learning signal; point update, non-fatal).
     try {
       await surrealDB.query(
-        `UPDATE type::thing('execution', $execution_id) SET reached = $reached, completion_shapes = $completion_shapes`,
-        { reached: body.reached, completion_shapes, execution_id: String(execId) },
+        `UPDATE type::thing('execution', $execution_id) SET reached = $reached, completion_shapes = $completion_shapes, missing = $missing`,
+        { reached: body.reached, completion_shapes, missing, execution_id: String(execId) },
       );
     } catch (e) {
       logger.warn('[reach-patch] execution mirror update failed (non-fatal)', { error: e instanceof Error ? e.message : String(e) });
