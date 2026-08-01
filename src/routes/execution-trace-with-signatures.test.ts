@@ -259,6 +259,31 @@ describe('extractTasks', () => {
   test('returns empty array when tasks is missing', () => {
     expect(_internals.extractTasks({} as any)).toEqual([]);
   });
+
+  test('shape-routed step (no config/shapes) reconstructs executable config:{type:<shape>} + output_shapes:[<shape>]', () => {
+    const out = _internals.extractTasks({
+      tasks: [{ task_id: 'compose-step-1', resolver_id: 'substrateGap_write', task_index: 0, status: 'completed' }],
+    } as any);
+    expect(out[0].resolver).toBe('substrateGap_write');
+    expect((out[0] as any).config).toEqual({ type: 'substrateGap_write' });
+    expect(out[0].output_shapes).toEqual(['substrateGap_write']);
+  });
+
+  test('meta-resolver (llm_completion_dispatch) is NOT synthesized a bare {type} config (no false-executable)', () => {
+    const out = _internals.extractTasks({
+      tasks: [{ task_id: 't', resolver_id: 'llm_completion_dispatch', task_index: 0, status: 'completed' }],
+    } as any);
+    expect(out[0].resolver).toBe('llm_completion_dispatch');
+    expect((out[0] as any).config).toBeUndefined();
+    expect(out[0].output_shapes).toEqual([]);
+  });
+
+  test('a real persisted config is preferred over synthesis', () => {
+    const out = _internals.extractTasks({
+      tasks: [{ task_id: 't', resolver_id: 'http_fetch', config: { type: 'http_fetch', url: 'x' }, task_index: 0, status: 'completed' }],
+    } as any);
+    expect((out[0] as any).config).toEqual({ type: 'http_fetch', url: 'x' });
+  });
 });
 
 // ---------------------------------------------------------------------------

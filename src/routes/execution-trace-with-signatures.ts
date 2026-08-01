@@ -87,6 +87,12 @@ export interface ExecutionTraceTaskEntry {
    *  populated when the source row carries them (notably the execution_trace_content
    *  tasks read on an execution_id point-lookup). */
   resolver?: string;
+  /** Per-task resolver config. The store strips config (normalizePersistedTask
+   *  whitelists a fixed field set), so for a SHAPE-ROUTED step this is synthesized
+   *  as the executable shape-routing form { type: <resolver> } (the mintResolverWrapper
+   *  body the engine pre-registers a VesselResolver for), letting the ribosome emit a
+   *  re-executable composite instead of a config:{} hollow shell. */
+  config?: Record<string, unknown>;
   description?: string;
   input_shapes?: string[];
   output_shapes?: string[];
@@ -322,6 +328,27 @@ function extractTasks(row: RawExecutionRow): ExecutionTraceTaskEntry[] {
     ];
 
     const tt = t as Record<string, unknown>;
+    const resolverName =
+      (typeof tt.resolver_id === 'string' && tt.resolver_id) ||
+      (typeof tt.resolver === 'string' && tt.resolver) || undefined;
+    // The persistence layer strips per-task config; reconstruct the EXECUTABLE body so the
+    // ribosome emits a re-runnable composite, not a config:{} hollow shell. Prefer a real
+    // persisted config if a future write carries one; else, for a SHAPE-ROUTED step (resolver
+    // is a produced shape, not a meta-resolver like llm_completion_dispatch/bash/http_fetch),
+    // synthesize { type: <resolver> } — the mintResolverWrapper form the engine registers a
+    // discovery VesselResolver for. Meta-resolvers are NOT synthesized (their real config,
+    // e.g. an LLM prompt, was never persisted, so a bare { type } would be misleadingly
+    // "executable"); those stay config-less exactly as today (no regression).
+    const META_RESOLVERS = new Set([
+      'llm_completion_dispatch', 'http_fetch', 'bash', 'file', 'git', 'noop',
+      'impulse-resolve', 'impulse_resolve', 'validation', 'iteration',
+    ]);
+    const persistedCfg = tt.config && typeof tt.config === 'object' && !Array.isArray(tt.config)
+      ? (tt.config as Record<string, unknown>) : undefined;
+    const config = (persistedCfg && Object.keys(persistedCfg).length > 0)
+      ? persistedCfg
+      : (resolverName && !META_RESOLVERS.has(resolverName) ? { type: resolverName } : undefined);
+    const outShapes = toStringArray(tt.outputShapes ?? tt.output_shapes);
     out.push({
       task_id,
       task_index: i,
@@ -331,10 +358,13 @@ function extractTasks(row: RawExecutionRow): ExecutionTraceTaskEntry[] {
       input_impulse_ids: Array.from(new Set(inputImpulseIds)),
       output_impulse_ids: Array.from(new Set(outputImpulseIds)),
       // Carry per-task structure for template reconstruction (ribosome-extract).
-      resolver: (typeof tt.resolver_id === 'string' && tt.resolver_id) || (typeof tt.resolver === 'string' && tt.resolver) || undefined,
+      resolver: resolverName,
+      ...(config ? { config } : {}),
       description: typeof tt.description === 'string' ? tt.description : undefined,
       input_shapes: toStringArray(tt.inputShapes ?? tt.input_shapes),
-      output_shapes: toStringArray(tt.outputShapes ?? tt.output_shapes),
+      // Store drops per-task outputShapes; a shape-routed step's produced shape IS its
+      // resolver, so default to [resolver] when empty (discovery + reuse depend on it).
+      output_shapes: outShapes.length > 0 ? outShapes : (resolverName && !META_RESOLVERS.has(resolverName) ? [resolverName] : []),
     });
   }
   return out;
