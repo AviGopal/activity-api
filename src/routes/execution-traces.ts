@@ -3270,11 +3270,20 @@ app.post('/', async (c) => {
           // abandoned mid-flight persists non-terminal tasks; subtracting only
           // failures would score those as successes and let an observer treat a
           // partial execution as a clean one.
+          // TWO VOCABULARIES. The TaskRecord type declares
+          // 'pending' | 'in_progress' | 'completed' | 'failed', but the write path
+          // at ~:415 persists `t.success === false ? 'failure' : 'success'` — so
+          // real rows carry 'success'/'failure' and the declared type is aspirational.
+          // Counting only the declared spelling returns 0 on every real trace, which
+          // reads identically to "nothing succeeded" and silently disables any
+          // consumer gating on it. Accept both spellings; anything else (pending /
+          // in_progress) is deliberately counted as NEITHER, so a run abandoned
+          // mid-flight cannot pass for a clean one.
           completed_task_count: Array.isArray(trace.tasks)
-            ? trace.tasks.filter((t) => t?.status === 'completed').length
+            ? trace.tasks.filter((t) => t?.status === 'completed' || (t as { status?: string })?.status === 'success').length
             : 0,
           failed_task_count: Array.isArray(trace.tasks)
-            ? trace.tasks.filter((t) => t?.status === 'failed').length
+            ? trace.tasks.filter((t) => t?.status === 'failed' || (t as { status?: string })?.status === 'failure').length
             : 0,
           duration_ms: trace.duration_ms || 0,
           cost: trace.cost_usd || 0,
