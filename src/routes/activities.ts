@@ -4947,6 +4947,7 @@ app.post('/feedback', async (c) => {
 
     // Map intensity to multiplier (0=1.5x, 1=2x, 2=2.5x, 3=3x)
     const multiplier = 1.5 + (validated.intensity * 0.5);
+    const increment = 1 + validated.intensity;
 
     // Verify activity exists - normalize ID format
     // SurrealDB uses three ID formats:
@@ -5063,12 +5064,12 @@ app.post('/feedback', async (c) => {
     // loop did SELECT-then-UPDATE over `existingScores`, which loses
     // increments under concurrent feedback (two writes read the same
     // alpha, both compute newAlpha, second UPDATE clobbers first).
-    // Single bulk UPDATE with `math::ceil((alpha ?? 1) * $multiplier)`
+    // Single bulk UPDATE computes server-side and is race-free at the row level; that race-freedom must be preserved. The update is ADDITIVE rather than multiplicative because a Beta posterior updates by adding one observation. Multiplying grew concentration exponentially in the evidence count, collapsing variance so Thompson stopped exploring, and it saturated int64 after ~48 observations, making every later feedback POST 500 with 'Cannot perform addition with '1' and '9223372036854775807''. math::min caps each parameter so a row can never saturate again.
     // computes server-side and is race-free at the row level.
     if (validated.direction === 'positive') {
       await surrealDB.query(
         `UPDATE impulse_shape_activity_score
-         SET alpha = math::ceil((alpha ?? 1) * $multiplier), updated_at = time::now()
+         SET alpha = math::min(1000000, (alpha ?? 1) + $increment), updated_at = time::now()
          WHERE ${accountIdScopedWhere()}
            AND activity_id = $activity_id`,
         {
@@ -5098,7 +5099,7 @@ app.post('/feedback', async (c) => {
     } else {
       await surrealDB.query(
         `UPDATE impulse_shape_activity_score
-         SET beta = math::ceil((beta ?? 1) * $multiplier), updated_at = time::now()
+         SET beta = math::min(1000000, (beta ?? 1) + $increment), updated_at = time::now()
          WHERE ${accountIdScopedWhere()}
            AND activity_id = $activity_id`,
         {
