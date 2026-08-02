@@ -44,6 +44,9 @@ export interface ExecutionCompletedMessage extends WebSocketMessage {
     success: boolean;
     /** Total tasks recorded on the durable trace (0 when the trace carries none). */
     task_count?: number;
+    /** Tasks whose status is 'completed' on the durable trace. Counted positively:
+     *  non-terminal ('pending' / 'in_progress') tasks are neither completed nor failed. */
+    completed_task_count?: number;
     /** Tasks whose status is 'failed' on the durable trace. */
     failed_task_count?: number;
     duration_ms: number;

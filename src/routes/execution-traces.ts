@@ -3265,6 +3265,14 @@ app.post('/', async (c) => {
           // This emitter already holds the authoritative trace, so it forwards
           // the census rather than making every observer re-derive it.
           task_count: Array.isArray(trace.tasks) ? trace.tasks.length : 0,
+          // Counted POSITIVELY, not as (total - failed). A task's status is
+          // 'pending' | 'in_progress' | 'completed' | 'failed', so a run
+          // abandoned mid-flight persists non-terminal tasks; subtracting only
+          // failures would score those as successes and let an observer treat a
+          // partial execution as a clean one.
+          completed_task_count: Array.isArray(trace.tasks)
+            ? trace.tasks.filter((t) => t?.status === 'completed').length
+            : 0,
           failed_task_count: Array.isArray(trace.tasks)
             ? trace.tasks.filter((t) => t?.status === 'failed').length
             : 0,
