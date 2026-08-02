@@ -4987,14 +4987,110 @@ app.post('/feedback', async (c) => {
       }
     }
 
-    if (!activityLookup || activityLookup.length === 0 || !activityLookup[0]) {
-      return c.json({
-        error: 'Activity not found',
-        message: `Activity ${validated.activity_id} does not exist`,
-      }, 404);
+    const SATISFIER_PREFIX = 'satisfier:';
+    let activityRow = activityLookup?.[0];
+
+    if (!activityRow) {
+      const satisfiedShape = validated.activity_id.startsWith(SATISFIER_PREFIX)
+        ? validated.activity_id.slice(SATISFIER_PREFIX.length)
+        : '';
+
+      // GUARD: ONLY the literal `satisfier:` prefix with a non-empty shape
+      // auto-admits. Every other unknown id still 404s.
+      if (satisfiedShape.length === 0) {
+        return c.json({
+          error: 'Activity not found',
+          message: `Activity ${validated.activity_id} does not exist`,
+        }, 404);
+      }
+
+      // input_shapes/output_shapes stay EMPTY: discover-by-shapes selects
+      // producers with output_shapes CONTAINSANY (forward) / input_shapes
+      // CONTAINSANY (reverse); a row carrying the shape with tasks: [] would
+      // become a selectable producer that executes nothing.
+      try {
+        await surrealDB.query(
+          `CREATE type::thing('activity', $activity_id) CONTENT {
+            name: $name,
+            description: $description,
+            category: 'satisfier',
+            tags: ['satisfier'],
+            tasks: [],
+            input_shapes: [],
+            output_shapes: [],
+            satisfies_shape: $shape,
+            admitted_from_feedback: true,
+            scope: 'org',
+            org_id: $org_id,
+            account_id: $account_id ?? NONE,
+            account_id_version: $account_id_version,
+            retired: false,
+            created_at: time::now(),
+            updated_at: time::now()
+          }`,
+          {
+            activity_id: validated.activity_id,
+            name: `vessel-resolve satisfier (${satisfiedShape})`,
+            description: `Direct vessel resolution of shape ${satisfiedShape}; admitted from feedback so the pick becomes gradable.`,
+            shape: satisfiedShape,
+            org_id: orgId,
+            account_id: accountId,
+            account_id_version: 1,
+          }
+        );
+        logger.info('Admitted satisfier activity from feedback', {
+          activity_id: validated.activity_id,
+          shape: satisfiedShape,
+          org_id: orgId,
+        });
+      } catch (admitError) {
+        // Fixed record id: a concurrent first-feedback may already have created
+        // it. Never turn a 404 into a 500.
+        logger.debug('Satisfier activity CREATE did not apply (likely already admitted)', {
+          activity_id: validated.activity_id,
+          error: admitError instanceof Error ? admitError.message : String(admitError),
+        });
+      }
+
+      // Seed the neutral posterior. The `initialized_from_feedback` loop below
+      // cannot: it is gated on input_shapes being non-empty.
+      const existingSatisfierScore = await surrealDB.query<ImpulseShapeActivityScore>(
+        `SELECT * FROM impulse_shape_activity_score
+         WHERE ${accountIdScopedWhere()} AND activity_id = $activity_id AND shape = $shape
+         LIMIT 1`,
+        { org_id: orgId, account_id: accountId, activity_id: validated.activity_id, shape: satisfiedShape }
+      );
+      if (!existingSatisfierScore || existingSatisfierScore.length === 0) {
+        await surrealDB.query(
+          `CREATE impulse_shape_activity_score CONTENT {
+            shape: $shape,
+            activity_id: $activity_id,
+            org_id: $org_id,
+            account_id: $account_id ?? NONE,
+            account_id_version: $account_id_version,
+            success_count: 0,
+            failure_count: 0,
+            alpha: 1,
+            beta: 1,
+            updated_at: time::now(),
+            created_at: time::now(),
+            initialized_from_feedback: true,
+            admitted_as_satisfier: true
+          }`,
+          {
+            shape: satisfiedShape,
+            activity_id: validated.activity_id,
+            org_id: orgId,
+            account_id: accountId,
+            account_id_version: 1,
+          }
+        );
+      }
+
+      activityRow = { id: validated.activity_id, input_shapes: [] };
     }
 
-    const activity = activityLookup[0];
+    const activity = activityRow;
     const inputShapes = activity.input_shapes || [];
 
     // Find all shape scores for this activity
