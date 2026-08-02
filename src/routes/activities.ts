@@ -5073,6 +5073,7 @@ app.post('/feedback', async (c) => {
          WHERE ${accountIdScopedWhere()}
            AND activity_id = $activity_id`,
         {
+          increment,
           multiplier,
           org_id: orgId,
           account_id: accountId,
@@ -5103,6 +5104,7 @@ app.post('/feedback', async (c) => {
          WHERE ${accountIdScopedWhere()}
            AND activity_id = $activity_id`,
         {
+          increment,
           multiplier,
           org_id: orgId,
           account_id: accountId,
