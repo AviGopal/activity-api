@@ -5064,12 +5064,12 @@ app.post('/feedback', async (c) => {
     // loop did SELECT-then-UPDATE over `existingScores`, which loses
     // increments under concurrent feedback (two writes read the same
     // alpha, both compute newAlpha, second UPDATE clobbers first).
-    // Single bulk UPDATE computes server-side and is race-free at the row level; that race-freedom must be preserved. The update is ADDITIVE rather than multiplicative because a Beta posterior updates by adding one observation. Multiplying grew concentration exponentially in the evidence count, collapsing variance so Thompson stopped exploring, and it saturated int64 after ~48 observations, making every later feedback POST 500 with 'Cannot perform addition with '1' and '9223372036854775807''. math::min caps each parameter so a row can never saturate again.
+    // Single bulk UPDATE computes server-side and is race-free at the row level; that race-freedom must be preserved. The update is ADDITIVE rather than multiplicative because a Beta posterior updates by adding one observation. Multiplying grew concentration exponentially in the evidence count, collapsing variance so Thompson stopped exploring, and it saturated int64 after ~48 observations, making every later feedback POST 500 with 'Cannot perform addition with '1' and '9223372036854775807''. math::min caps each parameter so a row can never saturate again — note it takes a SINGLE ARRAY argument in SurrealDB (math::min([a, b])), as used at ~:8153; the two-scalar form fails at runtime with 'Incorrect arguments for function math::min(). Expected 1 argument.'
     // computes server-side and is race-free at the row level.
     if (validated.direction === 'positive') {
       await surrealDB.query(
         `UPDATE impulse_shape_activity_score
-         SET alpha = math::min(1000000, (alpha ?? 1) + $increment), updated_at = time::now()
+         SET alpha = math::min([1000000, (alpha ?? 1) + $increment]), updated_at = time::now()
          WHERE ${accountIdScopedWhere()}
            AND activity_id = $activity_id`,
         {
@@ -5100,7 +5100,7 @@ app.post('/feedback', async (c) => {
     } else {
       await surrealDB.query(
         `UPDATE impulse_shape_activity_score
-         SET beta = math::min(1000000, (beta ?? 1) + $increment), updated_at = time::now()
+         SET beta = math::min([1000000, (beta ?? 1) + $increment]), updated_at = time::now()
          WHERE ${accountIdScopedWhere()}
            AND activity_id = $activity_id`,
         {
