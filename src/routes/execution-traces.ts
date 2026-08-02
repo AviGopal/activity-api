@@ -3257,6 +3257,17 @@ app.post('/', async (c) => {
           activity_id: trace.variant_id || (body as Record<string, unknown>)['template_id'] as string || (body as Record<string, unknown>)['activity_id'] as string || '',
           variant_id: trace.variant_id || '',
           success: trace.success,
+          // Task census (2026-08-02). The ribosome gates template extraction on
+          // "reached AND at least one task succeeded AND none failed", but it was
+          // counting tasks from per-task WS events that mostly never reach it —
+          // so it saw `completed=0` on the overwhelming majority of reached
+          // executions and NEVER dispatched an extraction (0 in 12h, measured).
+          // This emitter already holds the authoritative trace, so it forwards
+          // the census rather than making every observer re-derive it.
+          task_count: Array.isArray(trace.tasks) ? trace.tasks.length : 0,
+          failed_task_count: Array.isArray(trace.tasks)
+            ? trace.tasks.filter((t) => t?.status === 'failed').length
+            : 0,
           duration_ms: trace.duration_ms || 0,
           cost: trace.cost_usd || 0,
           completed_at: new Date().toISOString(),

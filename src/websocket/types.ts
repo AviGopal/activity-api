@@ -42,6 +42,10 @@ export interface ExecutionCompletedMessage extends WebSocketMessage {
     execution_id: string;
     variant_id: string;
     success: boolean;
+    /** Total tasks recorded on the durable trace (0 when the trace carries none). */
+    task_count?: number;
+    /** Tasks whose status is 'failed' on the durable trace. */
+    failed_task_count?: number;
     duration_ms: number;
     cost: number;
     completed_at: string;
