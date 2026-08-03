@@ -4,7 +4,17 @@
 -- Enables semantic search on activity name and description fields for
 -- improved activity discovery and recommendation.
 --
--- SurrealDB 3.x uses analyzers with tokenizers and filters to process text
+-- 2026-08-03: the index keyword is SEARCH, not FULLTEXT. This file shipped with the
+-- 3.x spelling while the engine is 2.3.3, so it failed to PARSE on every boot and
+-- — because a .surql applies as ONE unit — NEITHER the analyzer NOR any index ever
+-- existed. Verified against the live engine:
+--   DEFINE INDEX .. FULLTEXT ANALYZER az BM25(..)  -> Parse error `an identifier`
+--   DEFINE INDEX .. SEARCH   ANALYZER az BM25(..)  -> OK
+-- Consequence: GET /v2/activities/templates?q=... takes the FTS branch
+-- (activities.ts:1198) and returns {total:0, fts:true} for EVERY query. boredom's
+-- candidate refresh uses q=boredomtargettemplate as its ONLY source, so it got zero
+-- pages forever and silently served a stale candidate cache.
+-- SurrealDB 2.x uses analyzers with tokenizers and filters to process text
 -- for full-text indexing. This schema defines an analyzer optimized for
 -- activity search and creates a BM25-scored FULLTEXT index.
 -- =============================================================================
@@ -101,12 +111,12 @@ DEFINE ANALYZER IF NOT EXISTS activity_analyzer
 DEFINE INDEX IF NOT EXISTS idx_activity_name_fts
   ON activity
   FIELDS name
-  FULLTEXT ANALYZER activity_analyzer BM25(1.2, 0.75);
+  SEARCH ANALYZER activity_analyzer BM25(1.2, 0.75);
 
 DEFINE INDEX IF NOT EXISTS idx_activity_description_fts
   ON activity
   FIELDS description
-  FULLTEXT ANALYZER activity_analyzer BM25(1.2, 0.75);
+  SEARCH ANALYZER activity_analyzer BM25(1.2, 0.75);
 
 -- Tags FTS index (migration 126, 2026-05-09)
 -- Enables tag-token matching in the unified FTS scoring expression.
@@ -116,7 +126,7 @@ DEFINE INDEX IF NOT EXISTS idx_activity_description_fts
 DEFINE INDEX IF NOT EXISTS idx_activity_tags_fts
   ON activity
   FIELDS tags
-  FULLTEXT ANALYZER activity_analyzer BM25(1.2, 0.75)
+  SEARCH ANALYZER activity_analyzer BM25(1.2, 0.75)
   HIGHLIGHTS;
 
 -- =============================================================================
