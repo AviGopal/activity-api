@@ -243,7 +243,9 @@ SELECT
   org_id
 FROM tool_argument_pattern
 WHERE times_failed > 0
-ORDER BY times_failed DESC
+-- ORDER BY removed: SurrealDB 2.3.3 rejects ORDER BY inside DEFINE TABLE ... AS
+-- (verified: `DEFINE TABLE z AS SELECT a FROM t ORDER BY a` -> Parse error `ORDER`).
+-- View ordering was cosmetic; consumers order at query time.
 PERMISSIONS
   FOR select WHERE org_id = $auth.org_id;
 

@@ -39,7 +39,11 @@ DEFINE TABLE IF NOT EXISTS v_shape_conditioned_score AS
   FROM execution
   WHERE input_impulse_shapes IS NOT NONE
     AND array::len(input_impulse_shapes) > 0
-  GROUP BY activity_id, org_id, array::sort(array::distinct(input_impulse_shapes))
+  -- GROUP BY the ALIAS, not the expression: SurrealDB 2.3.3 raises
+  -- "Missing group idiom `array` in statement selection" when a GROUP BY repeats a
+  -- function call (verified against the live engine). shape_signature is the same
+  -- projection, so grouping is unchanged.
+  GROUP BY activity_id, org_id, shape_signature
 PERMISSIONS
   FOR select WHERE org_id = $auth.org_id;
 
@@ -74,7 +78,8 @@ DEFINE TABLE IF NOT EXISTS v_shape_pattern_performance AS
   FROM execution
   WHERE input_impulse_shapes IS NOT NONE
     AND array::len(input_impulse_shapes) > 0
-  GROUP BY array::sort(array::distinct(input_impulse_shapes)), org_id
+  -- GROUP BY the ALIAS (see note above); shape_pattern is the same projection.
+  GROUP BY shape_pattern, org_id
 PERMISSIONS
   FOR select WHERE org_id = $auth.org_id;
 

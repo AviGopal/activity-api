@@ -258,5 +258,6 @@ DEFINE TABLE IF NOT EXISTS v_learning_progression AS
     avg_cost_usd,
     last_execution_at
   FROM activity_model_stats
-  WHERE total_task_executions > 0
-  ORDER BY optimization_score DESC;
+  WHERE total_task_executions > 0;
+-- ORDER BY removed: SurrealDB 2.3.3 rejects it inside DEFINE TABLE ... AS.
+-- Consumers order by optimization_score at query time.
