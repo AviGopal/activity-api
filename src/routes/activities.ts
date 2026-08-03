@@ -4277,7 +4277,7 @@ app.get('/templates/:templateId/metrics', async (c) => {
         count(IF success = true THEN 1 ELSE NONE END) AS success_count
       FROM v_paradigm_execution_traces
       WHERE activity_id = $template_id
-      GROUP BY time::format(executed_at, '%Y-%m-%d')
+      GROUP BY date
       ORDER BY date DESC
       LIMIT 30
     `, { template_id: templateId });
