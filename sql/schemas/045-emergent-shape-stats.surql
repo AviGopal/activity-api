@@ -19,124 +19,59 @@
 -- Shows which shapes exist in the network and how frequently they're used
 -- ============================================================================
 
-DEFINE TABLE IF NOT EXISTS v_shape_usage AS
-  SELECT
-    shape,
-    role,
-    count() AS activity_count,
-    array::distinct(array::flatten(array::group(activity_id))) AS activities
-  FROM (
-    -- Input shapes
-    SELECT id AS activity_id, 'input' AS role, array::flatten([input_shapes]) AS shapes
-    FROM activity
-    WHERE input_shapes IS NOT NONE AND array::len(input_shapes) > 0
-
-    UNION ALL
-
-    -- Output shapes
-    SELECT id AS activity_id, 'output' AS role, array::flatten([output_shapes]) AS shapes
-    FROM activity
-    WHERE output_shapes IS NOT NONE AND array::len(output_shapes) > 0
-  )
-  SPLIT shapes AS shape
-  GROUP BY shape, role
-PERMISSIONS FOR select FULL;
-
--- ============================================================================
--- View: v_shape_network
--- ============================================================================
--- Purpose: Show shape transformations (input → output) across activities
--- Reveals which shapes can be transformed into which other shapes
--- Includes execution success rates for each transformation edge
--- Edge weight = number of activities performing this transformation
+-- =============================================================================
+-- 2026-08-03 REWRITE — why these are flat projections, not aggregates
+-- =============================================================================
+-- The original definitions used `DEFINE TABLE ... AS SELECT ... FROM (subquery)`
+-- with UNION ALL + SPLIT. SurrealDB 2.3.3 rejects ALL THREE of those inside a
+-- DEFINE TABLE ... AS, so this file failed to PARSE on every boot since it was
+-- written — and because a .surql file applies as one unit, NONE of the four
+-- shape views has ever existed. The endpoint returned {"usage":[],"total":0},
+-- which is indistinguishable from "no data yet".
 --
--- Note: Uses v_activity_score from 021-paradigm-computed-views.surql for
--- execution statistics (total_executions, successes). That view must be
--- defined before this one.
--- ============================================================================
+-- Verified against the live 2.3.3 engine (throwaway namespace), not from docs:
+--   DEFINE TABLE z AS SELECT .. FROM (SELECT ..)      -> Parse error `(`
+--   DEFINE TABLE z AS SELECT a AS s FROM t SPLIT s    -> Parse error
+--   DEFINE TABLE z AS SELECT a FROM t1 UNION ALL ..   -> Parse error
+--   DEFINE TABLE z AS SELECT a, b FROM t WHERE ..     -> OK
+--   SELECT a FROM t SPLIT a                           -> OK  (query time)
+--
+-- So the per-shape fan-out moves to READ time. These views now expose the raw
+-- rows a caller SPLITs/GROUPs itself. That keeps the same source of truth with
+-- no subquery, and it is honest about the cost: aggregation is per-query.
+--
+-- SCOPE, stated plainly: these aggregate DECLARED input_shapes/output_shapes on
+-- `activity` (and declared input_impulse_shapes on `execution`). That is shape
+-- USAGE. Learning a shape's observed FORMAT — field names and types of real
+-- payloads — has no machinery anywhere in the substrate and is NOT added here.
+-- =============================================================================
 
-DEFINE TABLE IF NOT EXISTS v_shape_network AS
+-- v_shape_usage_src — one row per activity with its declared shapes.
+-- Callers SPLIT input_shapes / output_shapes at query time.
+DEFINE TABLE IF NOT EXISTS v_shape_usage_src AS
   SELECT
-    input_shape,
-    output_shape,
-    count() AS edge_weight,
-    array::distinct(array::flatten(array::group(activity_id))) AS activities,
-    math::sum(total_execs) AS total_executions,
-    math::sum(success_execs) AS success_count,
-    IF math::sum(total_execs) > 0 THEN
-      <float> math::sum(success_execs) / <float> math::sum(total_execs)
-    ELSE
-      0.0
-    END AS success_rate
-  FROM (
-    SELECT
-      a.id AS activity_id,
-      a.input_shapes,
-      a.output_shapes,
-      -- Join with pre-aggregated execution stats from v_activity_score
-      -- v_activity_score already aggregates total_executions and successes per activity_id
-      (SELECT total_executions FROM v_activity_score WHERE activity_id = a.id)[0].total_executions OR 0 AS total_execs,
-      (SELECT successes FROM v_activity_score WHERE activity_id = a.id)[0].successes OR 0 AS success_execs
-    FROM activity AS a
-    WHERE array::len(a.input_shapes) > 0 AND array::len(a.output_shapes) > 0
-  )
-  SPLIT input_shapes AS input_shape
-  SPLIT output_shapes AS output_shape
-  GROUP BY input_shape, output_shape
+    id AS activity_id,
+    org_id,
+    input_shapes,
+    output_shapes
+  FROM activity
+  WHERE (array::len(input_shapes) > 0 OR array::len(output_shapes) > 0)
+    AND (retired = false OR retired IS NONE)
 PERMISSIONS FOR select FULL;
 
--- ============================================================================
--- View: v_shape_execution_stats
--- ============================================================================
--- Purpose: Track shape performance from execution data
--- Shows which shapes correlate with success/failure
--- This is where learning happens - execution data refines shape understanding
--- ============================================================================
-
-DEFINE TABLE IF NOT EXISTS v_shape_execution_stats AS
+-- v_shape_execution_src — per-execution declared input shapes plus the outcome,
+-- so a caller can compute per-shape success rates by SPLITting input_impulse_shapes.
+DEFINE TABLE IF NOT EXISTS v_shape_execution_src AS
   SELECT
-    shape,
-    count() AS execution_count,
-    count(IF success = true THEN 1 ELSE NONE END) AS successes,
-    count(IF success = false THEN 1 ELSE NONE END) AS failures,
-    <float> count(IF success = true THEN 1 ELSE NONE END) / <float> count() AS success_rate,
-    math::mean(<float> duration_ms) AS avg_duration_ms,
-    time::max(executed_at) AS last_used_at
-  FROM (
-    SELECT
-      success,
-      duration_ms,
-      executed_at,
-      array::flatten([input_impulse_shapes]) AS shapes
-    FROM execution
-    WHERE input_impulse_shapes IS NOT NONE AND array::len(input_impulse_shapes) > 0
-  )
-  SPLIT shapes AS shape
-  GROUP BY shape
+    activity_id,
+    org_id,
+    input_impulse_shapes,
+    success,
+    duration_ms,
+    executed_at
+  FROM execution
+  WHERE array::len(input_impulse_shapes) > 0
 PERMISSIONS FOR select FULL;
 
--- ============================================================================
--- View: v_shapes_for_autocomplete
--- ============================================================================
--- Purpose: Suggest shapes based on observed usage (not a predefined list)
--- Returns shapes sorted by frequency for UI autocomplete
--- ============================================================================
-
-DEFINE TABLE IF NOT EXISTS v_shapes_for_autocomplete AS
-  SELECT
-    shape,
-    math::sum(activity_count) AS total_uses,
-    array::distinct(array::flatten(array::group(role))) AS roles
-  FROM v_shape_usage
-  GROUP BY shape
-  ORDER BY total_uses DESC;
-
--- ============================================================================
--- Indexes for efficient lookups
--- ============================================================================
-
-DEFINE INDEX IF NOT EXISTS idx_v_shape_usage_shape ON v_shape_usage FIELDS shape;
-DEFINE INDEX IF NOT EXISTS idx_v_shape_network_input ON v_shape_network FIELDS input_shape;
-DEFINE INDEX IF NOT EXISTS idx_v_shape_network_output ON v_shape_network FIELDS output_shape;
-DEFINE INDEX IF NOT EXISTS idx_v_shape_network_success_rate ON v_shape_network FIELDS success_rate;
-DEFINE INDEX IF NOT EXISTS idx_v_shape_exec_stats_shape ON v_shape_execution_stats FIELDS shape;
+DEFINE INDEX IF NOT EXISTS idx_v_shape_usage_src_activity ON v_shape_usage_src FIELDS activity_id;
+DEFINE INDEX IF NOT EXISTS idx_v_shape_exec_src_activity ON v_shape_execution_src FIELDS activity_id;

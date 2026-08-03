@@ -202,11 +202,20 @@ async function applySQLFile(filePath: string): Promise<boolean> {
 
     const headers = buildHeaders();
 
+    // 30s was too short for a DEFINE TABLE ... AS over a large base table: SurrealDB
+    // backfills the computed view at definition time, so cost scales with the source
+    // rows (execution is ~143k). 023-shape-conditioned-scores and
+    // 048-goal-execution-alignment both timed out here AFTER their syntax was fixed,
+    // and the failure is indistinguishable from a parse error at the call site — the
+    // file is skipped wholesale and its views silently never exist.
+    // Measured on the live store: the 023 aggregation alone takes ~4s to return rows,
+    // and the DEFINE's index build is a multiple of that. 300s is bounded (init-database
+    // is an ExecStartPre that must not hang a boot) but large enough for a full backfill.
     const response = await fetch(`${SURREALDB_URL}/sql`, {
       method: 'POST',
       headers,
       body: sqlContent,
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(300_000),
     });
 
     if (!response.ok) {
