@@ -492,7 +492,7 @@ app.post('/templates', async (c) => {
     // load-bearing fact, law 8), and also replace a bare ['tool_output'] the synthesiser
     // may have emitted. Fall through to prose/category inference only when the tasks
     // declare no real shapes. Scoped to learned-* ids so normal inference is untouched.
-    if (isLearnedExtracted) {
+    if (activityTasks && activityTasks.length > 0) {
       const PLACEHOLDER_OUT = new Set(['tool_output', 'tool_result', 'toolOutput', 'unknown_output']);
       const taskOut = Array.from(new Set(
         (activityTasks || []).flatMap((t: any) => Array.isArray(t?.outputShapes) ? t.outputShapes : [])
