@@ -2629,7 +2629,7 @@ app.get('/metrics/trend', async (c) => {
         math::sum(cost_usd) AS total_cost
       FROM v_paradigm_execution_traces
       WHERE created_at > time::now() - duration::from::days($days)
-      GROUP BY time::format(created_at, '%Y-%m-%d')
+      GROUP BY date
       ORDER BY date ASC
     `;
 
