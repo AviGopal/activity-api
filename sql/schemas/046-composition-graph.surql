@@ -228,11 +228,11 @@ DEFINE FUNCTION fn::update_composition_edge($from: string, $to: string, $shape: 
   IF $edge {
     -- Edge exists, update Thompson Sampling parameters
     UPDATE composition_edge SET
-      success_count = IF($success, success_count + 1, success_count),
-      failure_count = IF($success, failure_count, failure_count + 1),
+      success_count = IF $success THEN success_count + 1 ELSE success_count END,
+      failure_count = IF $success THEN failure_count ELSE failure_count + 1 END,
       total_count = total_count + 1,
-      alpha = IF($success, alpha + 1, alpha),
-      beta = IF($success, beta, beta + 1),
+      alpha = IF $success THEN alpha + 1 ELSE alpha END,
+      beta = IF $success THEN beta ELSE beta + 1 END,
       updated_at = time::now()
     WHERE id = $edge.id;
   } ELSE {
@@ -241,11 +241,11 @@ DEFINE FUNCTION fn::update_composition_edge($from: string, $to: string, $shape: 
       from_activity = $from,
       to_activity = $to,
       shape_produced = $shape,
-      success_count = IF($success, 1, 0),
-      failure_count = IF($success, 0, 1),
+      success_count = IF $success THEN 1 ELSE 0 END,
+      failure_count = IF $success THEN 0 ELSE 1 END,
       total_count = 1,
-      alpha = IF($success, 2.0, 1.0),
-      beta = IF($success, 1.0, 2.0),
+      alpha = IF $success THEN 2.0 ELSE 1.0 END,
+      beta = IF $success THEN 1.0 ELSE 2.0 END,
       weight = 0.5,
       org_id = $auth.org_id,
       public = false;
