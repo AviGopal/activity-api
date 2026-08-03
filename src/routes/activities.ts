@@ -10280,7 +10280,7 @@ app.get('/shapes/usage', async (c) => {
       params.role = role;
     }
 
-    let usageQuery = 'SELECT * FROM v_shape_usage';
+    let usageQuery = "SELECT shape, role, count() AS activity_count FROM (SELECT id AS activity_id, input_shapes AS shape, input AS role FROM v_shape_usage_src SPLIT shape) GROUP BY shape, role";
     if (whereClauses.length > 0) {
       usageQuery += ` WHERE ${whereClauses.join(' AND ')}`;
     }
