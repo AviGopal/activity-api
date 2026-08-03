@@ -215,7 +215,15 @@ async function applySQLFile(filePath: string): Promise<boolean> {
       method: 'POST',
       headers,
       body: sqlContent,
-      signal: AbortSignal.timeout(300_000),
+      // 2026-08-03 REVERTED from 300_000 back to 45_000. Raising this to 300s to let a
+      // DEFINE TABLE ... AS backfill finish turned a FAST failure into a SLOW one: on the hub
+      // (execution = 143k rows) 023/048 each burned minutes, init-database is an ExecStartPre,
+      // and the unit never reached ready — measured 10 PIDs and 9 re-runs of the same migration
+      // in 25 minutes, a restart loop that took the trace store offline and blinded the ribosome
+      // (its WS closed every 150s; last trace 03:15). 45s is above the ~4s the 023 aggregation
+      // needs and well under the boot budget. A view too expensive to define inside that window
+      // must be built OUT OF BAND, not by extending a startup gate.
+      signal: AbortSignal.timeout(45_000),
     });
 
     if (!response.ok) {
