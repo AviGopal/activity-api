@@ -109,7 +109,7 @@ async function delegateWriteToRouter(
  * (API key, JWT, or MiniBob token). We deliberately do NOT require
  * `jwtToken` to be non-empty — for API-key auth, generateJwtToken can fail
  * silently when the canary JWT_SECRET is misaligned (see
- * `repos/metabob-activity-api/CLAUDE.md` §"JWT Secret"), but the API-key
+ * `repos/activity-api/CLAUDE.md` §"JWT Secret"), but the API-key
  * org_id has already been validated by identity-vessel and is usable for
  * org-scoped reads via the executeAsAuth root-credentials fallback.
  *
@@ -3852,7 +3852,7 @@ router.post('/resolve', async (c) => {
         const mcpMinRelevance = typeof mcpPtr.min_relevance === 'number' ? mcpPtr.min_relevance : 0;
         const mcpLimit = typeof mcpPtr.limit === 'number' && mcpPtr.limit > 0 ? Math.floor(mcpPtr.limit) : 20;
         const mcpVesselEndpoint = process.env.VESSEL_ENDPOINT
-          || `http://${process.env.SERVICE_NAME || 'metabob-activity-api'}.${process.env.SURREALDB_NAMESPACE || 'activity-system'}.svc.cluster.local:${config.port}`;
+          || `http://${process.env.SERVICE_NAME || 'activity-api'}.${process.env.SURREALDB_NAMESPACE || 'activity-system'}.svc.cluster.local:${config.port}`;
         const mcpTools = [
           {
             shape: 'mcpTool',

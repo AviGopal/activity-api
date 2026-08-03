@@ -94,7 +94,7 @@ const CONFIG = {
   // Target repositories for self-development
   targetRepos: [
     'repos/minibob',
-    'repos/metabob-activity-api',
+    'repos/activity-api',
     'repos/activity-dashboard',
   ],
 };

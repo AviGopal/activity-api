@@ -1,5 +1,5 @@
 /**
- * Configuration module for metabob-activity-api
+ * Configuration module for activity-api
  * Loads environment variables and provides typed configuration
  */
 
@@ -121,7 +121,7 @@ function parseEnvInt(key: string, defaultValue: number): number {
  *     substituted by scripts/init-database.ts at deploy time)
  *
  * In production, the value MUST come from the `JWT_SECRET` env var (sourced
- * from the k8s secret `metabob-activity-api.jwt-secret`). If unset, this
+ * from the k8s secret `activity-api.jwt-secret`). If unset, this
  * throws at startup — better to refuse to boot than to ship a known-bad
  * secret that causes silent auth mismatches like the v1.12.0 canary bug
  * (POST /v2/impulses/resolve returning "The access method cannot be used in
@@ -139,7 +139,7 @@ function resolveJwtSecret(): string {
   if (nodeEnv === 'production') {
     throw new Error(
       'JWT_SECRET environment variable is required in production. ' +
-      'It must come from the k8s secret `metabob-activity-api.jwt-secret`. ' +
+      'It must come from the k8s secret `activity-api.jwt-secret`. ' +
       'Refusing to start with a fallback default — see CLAUDE.md "JWT secret".'
     );
   }

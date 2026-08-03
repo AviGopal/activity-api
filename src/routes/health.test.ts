@@ -22,7 +22,7 @@ describe('Health Endpoint with Discovery', () => {
 
     const body = await res.json();
 
-    expect(body).toHaveProperty('service', 'metabob-activity-api');
+    expect(body).toHaveProperty('service', 'activity-api');
     expect(body).toHaveProperty('version');
     expect(body).toHaveProperty('checks');
     expect(body.checks).toHaveProperty('discovery');

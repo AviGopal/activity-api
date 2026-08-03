@@ -137,7 +137,7 @@ export class DiscoveryClient {
 
       const registration: VesselRegistration = {
         vesselId: config.discovery.vesselId,
-        vesselName: 'metabob-activity-api',
+        vesselName: 'activity-api',
         version: packageJson.version,
         endpoint: this.getEndpoint(),
         shapes: safeShapes,
@@ -470,7 +470,7 @@ export class DiscoveryClient {
 
     // In Kubernetes, construct from service name
     const namespace = process.env.SURREALDB_NAMESPACE || 'activity-system';
-    const serviceName = process.env.SERVICE_NAME || 'metabob-activity-api';
+    const serviceName = process.env.SERVICE_NAME || 'activity-api';
     const port = config.port;
 
     return `http://${serviceName}.${namespace}.svc.cluster.local:${port}`;

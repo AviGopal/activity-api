@@ -300,7 +300,7 @@ describe('DiscoveryClient', () => {
       await client.register();
 
       // Contract fields must not clobber pre-existing payload shape
-      expect(capturedBody.vesselName).toBe('metabob-activity-api');
+      expect(capturedBody.vesselName).toBe('activity-api');
       expect(capturedBody.protocol).toBe('http');
       expect(Array.isArray(capturedBody.shapes)).toBe(true);
       expect(capturedBody.metadata).toBeDefined();

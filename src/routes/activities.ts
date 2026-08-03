@@ -3449,7 +3449,7 @@ app.post('/templates/auto-promote', async (c) => {
                 alpha_hat: $alpha, beta_hat: $beta, projected_mean: $mean,
                 total_samples: $samples, k_neighbors: 0,
                 threshold_mean: $threshold_mean, threshold_samples: $threshold_samples,
-                neighbor_template_ids: [], source_vessel_id: 'metabob-activity-api',
+                neighbor_template_ids: [], source_vessel_id: 'activity-api',
                 evaluated_at: time::now(), created_at: time::now()
               }`,
               {
@@ -3492,7 +3492,7 @@ app.post('/templates/auto-promote', async (c) => {
               timestamp: new Date().toISOString(),
               data: {
                 template_id: p.template_id,
-                source_vessel_id: 'metabob-activity-api',
+                source_vessel_id: 'activity-api',
                 promoter: 'autonomous',
                 evidence,
                 thresholds: { min_samples, min_success_rate },
@@ -3503,7 +3503,7 @@ app.post('/templates/auto-promote', async (c) => {
               timestamp: new Date().toISOString(),
               data: {
                 template_id: p.template_id,
-                source_vessel_id: 'metabob-activity-api',
+                source_vessel_id: 'activity-api',
                 promoter: 'autonomous',
               },
             });
@@ -3533,7 +3533,7 @@ app.post('/templates/auto-promote', async (c) => {
                 threshold_mean: $threshold_mean,
                 threshold_samples: $threshold_samples,
                 neighbor_template_ids: [],
-                source_vessel_id: 'metabob-activity-api',
+                source_vessel_id: 'activity-api',
                 evaluated_at: time::now(),
                 created_at: time::now()
               }`,
@@ -3754,7 +3754,7 @@ app.post('/templates/:templateId/promote', async (c) => {
               type: "intervention.refused" as any,
               timestamp: refusedAtIso,
               data: {
-                source_vessel_id: "metabob-activity-api",
+                source_vessel_id: "activity-api",
                 refusal_type: refusalData.type,
                 template_id: cleanId,
                 unregistered_resolvers: refusalData.unregistered_resolvers,
@@ -3778,7 +3778,7 @@ app.post('/templates/:templateId/promote', async (c) => {
             await surrealDB.query(
               `CREATE refusal_events CONTENT {
                 refusal_type: $refusal_type,
-                source_vessel_id: 'metabob-activity-api',
+                source_vessel_id: 'activity-api',
                 expected_output_shapes: $expected_output_shapes,
                 candidates_examined: $candidates_examined,
                 task_description: $task_description,
@@ -4028,7 +4028,7 @@ app.post('/templates/:templateId/promote', async (c) => {
             type: 'promote_gate.evaluated' as any,
             timestamp: gateEvaluatedAtIso,
             data: {
-              source_vessel_id: 'metabob-activity-api',
+              source_vessel_id: 'activity-api',
               ...gateEvaluation,
             },
           });
@@ -4058,7 +4058,7 @@ app.post('/templates/:templateId/promote', async (c) => {
             "threshold_mean: $threshold_mean",
             "threshold_samples: $threshold_samples",
             "neighbor_template_ids: $neighbor_template_ids",
-            "source_vessel_id: 'metabob-activity-api'",
+            "source_vessel_id: 'activity-api'",
             "evaluated_at: time::now()",
           ];
           const params: Record<string, unknown> = {
@@ -4135,7 +4135,7 @@ app.post('/templates/:templateId/promote', async (c) => {
               type: 'intervention.refused' as any,
               timestamp: refusedAtIso,
               data: {
-                source_vessel_id: 'metabob-activity-api',
+                source_vessel_id: 'activity-api',
                 refusal_type: gateRefusalData.type,
                 template_id: cleanId,
                 reason: gateRefusalData.reason,
@@ -4156,7 +4156,7 @@ app.post('/templates/:templateId/promote', async (c) => {
             await surrealDB.query(
               `CREATE refusal_events CONTENT {
                 refusal_type: $refusal_type,
-                source_vessel_id: 'metabob-activity-api',
+                source_vessel_id: 'activity-api',
                 expected_output_shapes: $expected_output_shapes,
                 candidates_examined: $candidates_examined,
                 task_description: $task_description,
@@ -4208,7 +4208,7 @@ app.post('/templates/:templateId/promote', async (c) => {
         broadcaster.emit({
           type: 'activity_template.promoted' as any,
           timestamp: new Date().toISOString(),
-          data: { template_id: cleanId, source_vessel_id: 'metabob-activity-api' },
+          data: { template_id: cleanId, source_vessel_id: 'activity-api' },
         });
       } catch (err) {
         logger.warn('promote bus emit failed', { error: (err as Error).message });
@@ -6890,7 +6890,7 @@ app.post('/recommend', async (c) => {
               type: 'intervention.refused' as any,
               timestamp: refusedAtIso,
               data: {
-                source_vessel_id: 'metabob-activity-api',
+                source_vessel_id: 'activity-api',
                 refusal_type: refusalForEmit.type,
                 expected_output_shapes: refusalForEmit.expected_output_shapes,
                 candidates_examined: refusalForEmit.candidates_examined,
@@ -6915,7 +6915,7 @@ app.post('/recommend', async (c) => {
           try {
             const fields: string[] = [
               "refusal_type: $refusal_type",
-              "source_vessel_id: 'metabob-activity-api'",
+              "source_vessel_id: 'activity-api'",
               "expected_output_shapes: $expected_output_shapes",
               "candidates_examined: $candidates_examined",
               "refused_at: time::now()",
