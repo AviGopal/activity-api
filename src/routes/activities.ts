@@ -1205,7 +1205,7 @@ app.get('/templates', async (c) => {
         useRbacJwtQuery && jwtAuth?.jwtToken ? jwtAuth.jwtToken : null
       );
       const ftsTemplates = (ftsResult.data ?? []) as unknown as ActivityTemplate[];
-      return c.json({ templates: ftsTemplates, total: ftsTemplates.length, limit, offset: 0, fts: true });
+      if (ftsTemplates.length > 0) return c.json({ templates: ftsTemplates, total: ftsTemplates.length, limit, offset: 0, fts: true });
     }
 
     logger.info('GET /v2/activities/templates', {
