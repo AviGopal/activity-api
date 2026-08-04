@@ -451,7 +451,7 @@ app.post('/', async (c) => {
         inference_confidence: validated.inference_confidence ?? null,
         endpoint_output_shapes: endpointOutputShapes,
         expected_output_shapes: validated.expected_output_shapes ?? null,
-        walk_tier: validated.walk_tier ?? null,
+        walk_tier: validated.walk_tier ?? 'fresh_derivation',
       });
       
       // @ts-ignore - SurrealDB query typing
