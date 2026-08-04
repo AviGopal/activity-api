@@ -396,14 +396,25 @@ async function main() {
   // step. Ensuring here (a sub-second DEFINE FIELD IF NOT EXISTS) guarantees the
   // field exists on every start regardless of how far the slow loop gets — the
   // same lockstep guarantee the JWT ACCESS re-apply provides for auth.
+  // Use OVERWRITE, not IF NOT EXISTS: a partial/failed earlier application of 188
+  // can leave expected_output_shapes present-but-broken, and IF NOT EXISTS then
+  // no-ops (thinks it exists) so the field never becomes writable — the SCHEMAFULL
+  // table silently drops it on write. OVERWRITE force-redefines to the correct
+  // shape every start (idempotent). And ACTUALLY inspect runSQL's per-statement
+  // result instead of logging ✓ unconditionally, so a real DEFINE error surfaces.
   try {
-    await runSQL(
-      `DEFINE FIELD IF NOT EXISTS endpoint_output_shapes ON goal_execution_paths TYPE option<array<string>>;\n` +
-      `DEFINE FIELD IF NOT EXISTS expected_output_shapes ON goal_execution_paths TYPE option<array<string>>;\n` +
+    const _ensureRes = await runSQL(
+      `DEFINE FIELD OVERWRITE endpoint_output_shapes ON goal_execution_paths TYPE option<array<string>>;\n` +
+      `DEFINE FIELD OVERWRITE expected_output_shapes ON goal_execution_paths TYPE option<array<string>>;\n` +
       `DEFINE INDEX IF NOT EXISTS idx_goal_paths_endpoint_shapes ON goal_execution_paths FIELDS endpoint_output_shapes;\n` +
       `DEFINE INDEX IF NOT EXISTS idx_goal_paths_expected_shapes ON goal_execution_paths FIELDS expected_output_shapes;`
     );
-    console.log('[Init] ✓ goal_execution_paths endpoint/expected_output_shapes fields ensured (pre-loop)');
+    const _ensureErrs = (Array.isArray(_ensureRes) ? _ensureRes : []).filter((r: any) => r && r.status === 'ERR');
+    if (_ensureErrs.length > 0) {
+      console.error('[Init] ✗ shape-field ensure had errors:', JSON.stringify(_ensureErrs).slice(0, 800));
+    } else {
+      console.log('[Init] ✓ goal_execution_paths endpoint/expected_output_shapes fields ensured (pre-loop, OVERWRITE)');
+    }
   } catch (error) {
     console.warn('[Init] ⚠ could not ensure goal_execution_paths shape fields:', error);
   }
