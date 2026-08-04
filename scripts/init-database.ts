@@ -385,6 +385,29 @@ async function main() {
   // On a live DB where the table is brand-new (empty), bootstrap it by marking
   // all current files as already applied — they were applied by prior deploys.
   await ensureMigrationsTable();
+
+  // ── Load-bearing denormalized fields: ensure FIRST, before the migration loop ──
+  // endpoint_output_shapes (mig 092) + expected_output_shapes (mig 188/189) on
+  // goal_execution_paths carry the OBSERVED and EXPECTED shape sets the learning
+  // loop reconciles. These MUST be ensured up front: the migration loop below
+  // re-runs slow/broken migrations (e.g. 048 DEFINE-AS backfill ~45s, 030 parse
+  // error) that were never tracked, and can burn the whole ExecStartPre boot
+  // budget → SIGKILL before the loop reaches a late migration or any post-loop
+  // step. Ensuring here (a sub-second DEFINE FIELD IF NOT EXISTS) guarantees the
+  // field exists on every start regardless of how far the slow loop gets — the
+  // same lockstep guarantee the JWT ACCESS re-apply provides for auth.
+  try {
+    await runSQL(
+      `DEFINE FIELD IF NOT EXISTS endpoint_output_shapes ON goal_execution_paths TYPE option<array<string>>;\n` +
+      `DEFINE FIELD IF NOT EXISTS expected_output_shapes ON goal_execution_paths TYPE option<array<string>>;\n` +
+      `DEFINE INDEX IF NOT EXISTS idx_goal_paths_endpoint_shapes ON goal_execution_paths FIELDS endpoint_output_shapes;\n` +
+      `DEFINE INDEX IF NOT EXISTS idx_goal_paths_expected_shapes ON goal_execution_paths FIELDS expected_output_shapes;`
+    );
+    console.log('[Init] ✓ goal_execution_paths endpoint/expected_output_shapes fields ensured (pre-loop)');
+  } catch (error) {
+    console.warn('[Init] ⚠ could not ensure goal_execution_paths shape fields:', error);
+  }
+
   let appliedMigrations = await getAppliedMigrations();
   let bootstrapped = false;
 
@@ -439,28 +462,6 @@ async function main() {
         console.warn(`[Init] ⚠ Migration ${file} had errors but continuing...`);
       }
     }
-  }
-
-  // ── Load-bearing denormalized fields: ALWAYS ensure, outside tracking ────
-  // endpoint_output_shapes (mig 092) + expected_output_shapes (mig 188) on
-  // goal_execution_paths carry the OBSERVED and EXPECTED shape sets the learning
-  // loop reconciles. A contended-startup false bootstrap (see getAppliedMigrations)
-  // could mark 188 applied WITHOUT running its DEFINE FIELD, leaving the SCHEMAFULL
-  // table to SILENTLY DROP the field on write (empty) or reject it (non-empty) —
-  // so plan-vs-observed reconciliation could never persist. Re-ensure idempotently
-  // every start so the fields exist regardless of tracking state; DEFINE ... IF NOT
-  // EXISTS is a no-op once present. This is the same lockstep guarantee the JWT
-  // ACCESS re-apply below provides for auth.
-  try {
-    await runSQL(
-      `DEFINE FIELD IF NOT EXISTS endpoint_output_shapes ON goal_execution_paths TYPE option<array<string>>;\n` +
-      `DEFINE FIELD IF NOT EXISTS expected_output_shapes ON goal_execution_paths TYPE option<array<string>>;\n` +
-      `DEFINE INDEX IF NOT EXISTS idx_goal_paths_endpoint_shapes ON goal_execution_paths FIELDS endpoint_output_shapes;\n` +
-      `DEFINE INDEX IF NOT EXISTS idx_goal_paths_expected_shapes ON goal_execution_paths FIELDS expected_output_shapes;`
-    );
-    console.log('[Init] ✓ goal_execution_paths endpoint/expected_output_shapes fields ensured');
-  } catch (error) {
-    console.warn('[Init] ⚠ could not ensure goal_execution_paths shape fields:', error);
   }
 
   // ── Secret-bearing DDL: ALWAYS re-apply, outside migration tracking ──────
