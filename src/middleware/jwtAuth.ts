@@ -245,8 +245,21 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
     // 401s before the handler ever runs — and minibob's pending-sync queue
     // grows indefinitely while logs spam "Context is not finalized" 500s
     // (the missing-return on the wrapper at index.ts compounded the bug).
+    // SCOPED to the paths the fleet actually calls with this header. An unscoped
+    // passthrough let ANY request carrying ANY value reach EVERY /v2/* handler with
+    // jwtAuth=null - including activities.ts's 57 unguarded list routes. The header
+    // is only presence-checked, never compared to a secret (`grep -c INTERNAL
+    // /etc/substrate/env` = 0), so its safe blast radius is only where a handler
+    // re-checks it or where the fleet genuinely depends on it:
+    //   /v2/impulses                    - impulses.ts:350/627/734 each 401 on miss
+    //   /v2/events/publish              - development-vessel substrate-gap.ts:454
+    //   /v2/activities/execution-traces - identity-vessel trace.ts:54
+    // The last two were found by grepping the OTHER vessels, not this repo: scoping
+    // to /v2/impulses alone typechecked, left the suite at 962/192 unchanged, and
+    // would still have silently 401'd gap-write events and auth traces fleet-wide.
+    const INTERNAL_KEY_PATHS = ['/v2/impulses', '/v2/events/publish', '/v2/activities/execution-traces'];
     const internalApiKey = c.req.header('X-Internal-Api-Key');
-    if (internalApiKey) {
+    if (internalApiKey && INTERNAL_KEY_PATHS.some((prefix) => c.req.path.startsWith(prefix))) {
       c.set('jwtAuth', null);
       await next();
       return;
@@ -267,12 +280,23 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
     const jwtAuth = await validateApiKey(apiKey);
     c.set('jwtAuth', jwtAuth);
 
-    if (jwtAuth) {
-      logger.info('API key authenticated', { orgId: jwtAuth.orgId, authType: jwtAuth.authType });
-    } else {
-      logger.warn('API key validation failed');
+    // FAIL CLOSED. This previously fell through to next() with jwtAuth=null, so a
+    // revoked or forged key still reached the handlers. That is only survivable if
+    // every handler re-checks, and they do not: `requireAuthenticated` appears 25
+    // times in impulses.ts and ZERO times across activities.ts's 57 routes, which
+    // query through the module-level ROOT surreal client. There the tenant
+    // predicate sits inside `if (orgId)`, so a null org context does not narrow the
+    // query - it REMOVES the filter. Falling through without an identity is
+    // therefore not an unauthenticated read, it is a cross-tenant read.
+    if (!jwtAuth) {
+      logger.warn('API key validation failed', { path: c.req.path });
+      return c.json(
+        { error: { code: 'INVALID_API_KEY', message: 'API key is invalid or has been revoked' } },
+        401,
+      );
     }
 
+    logger.info('API key authenticated', { orgId: jwtAuth.orgId, authType: jwtAuth.authType });
     await next();
     return;
   }
@@ -280,10 +304,20 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
   // Check for Bearer prefix (JWT tokens)
   const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
   if (!bearerMatch) {
-    logger.debug('Unrecognized auth header format');
-    c.set('jwtAuth', null);
-    await next();
-    return;
+    // A header that is neither `ApiKey ...` nor `Bearer ...` is a malformed
+    // credential, not an anonymous request: presenting one and being admitted with
+    // jwtAuth=null was the cheapest of the three fall-throughs to exploit. Public
+    // paths stay open so health and bootstrap probes are unaffected.
+    logger.debug('Unrecognized auth header format', { path: c.req.path });
+    if (isPublicPath(c.req.path)) {
+      c.set('jwtAuth', null);
+      await next();
+      return;
+    }
+    return c.json(
+      { error: { code: 'MALFORMED_AUTH', message: 'Authorization must be "ApiKey <key>" or "Bearer <token>"' } },
+      401,
+    );
   }
 
   const token = bearerMatch[1];

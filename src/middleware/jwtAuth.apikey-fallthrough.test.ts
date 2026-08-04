@@ -145,11 +145,14 @@ describe('API-key auth fall-through when generateJwtToken returns null', () => {
       method: 'POST',
       headers: { Authorization: 'ApiKey invalid-key' },
     });
-    // No reject-by-default in middleware for ApiKey scheme — handler runs
-    // with jwtAuth=null and is responsible for its own gate.
-    expect(res.status).toBe(200);
+    // FAIL CLOSED. This previously asserted 200 — the middleware admitted a
+    // rejected key and left the handler "responsible for its own gate", which
+    // activities.ts never implemented (0 requireAuthenticated across 57 routes).
+    // The assertion was locking in the vulnerability, so it is inverted here
+    // deliberately rather than because the test became inconvenient.
+    expect(res.status).toBe(401);
     const body = await res.json();
-    expect(body.jwtAuth).toBeNull();
+    expect(body.error.code).toBe('INVALID_API_KEY');
   });
 
   test('missing keyId: identity-vessel succeeds without keyId → jwtAuth is null (audit-trail invariant)', async () => {
@@ -167,11 +170,62 @@ describe('API-key auth fall-through when generateJwtToken returns null', () => {
       method: 'POST',
       headers: { Authorization: 'ApiKey weird-key' },
     });
-    expect(res.status).toBe(200);
+    // Missing keyId breaks the audit trail, so validateApiKey returns null and the
+    // request is now rejected outright instead of proceeding un-auditable.
+    expect(res.status).toBe(401);
     const body = await res.json();
-    // No keyId means audit trail is broken — we keep the existing strict reject.
-    // (Different from the empty-jwtToken case: missing keyId is upstream identity-vessel breakage,
-    // not a JWT_SECRET drift, so falling through would silently degrade audit.)
-    expect(body.jwtAuth).toBeNull();
+    expect(body.error.code).toBe('INVALID_API_KEY');
+  });
+});
+
+describe('fail-closed admission (regression guards for the auth fall-through)', () => {
+  beforeEach(() => {
+    _resetAuthKeyCache();
+    validateApiKeyWithFallbackImpl.mockImplementation(async () => ({
+      authenticated: false,
+      reason: 'should never be consulted for these cases',
+    }));
+  });
+
+  function appWithPaths(): Hono {
+    const app = new Hono();
+    app.use('/v2/*', async (c, next) => jwtAuthMiddleware(c, next));
+    const probe = (c: any) => c.json({ ok: true, jwtAuth: c.get('jwtAuth') ?? null });
+    app.post('/v2/impulses', probe);
+    app.post('/v2/events/publish', probe);
+    app.post('/v2/activities/execution-traces', probe);
+    app.get('/v2/activities/templates', probe);
+    return app;
+  }
+
+  // The three paths the fleet genuinely calls with X-Internal-Api-Key. If any of
+  // these starts 401ing, gap-write events (development-vessel substrate-gap.ts)
+  // or auth traces (identity-vessel trace.ts) stop flowing fleet-wide.
+  for (const path of ['/v2/impulses', '/v2/events/publish', '/v2/activities/execution-traces']) {
+    test(`X-Internal-Api-Key is still admitted on ${path}`, async () => {
+      const res = await appWithPaths().request(path, {
+        method: 'POST',
+        headers: { 'X-Internal-Api-Key': 'development-vessel' },
+      });
+      expect(res.status).toBe(200);
+    });
+  }
+
+  // The actual hole: activities.ts has zero requireAuthenticated across 57 routes
+  // and queries via the root client, where a null org context REMOVES the tenant
+  // predicate rather than restricting it. Admission here is cross-tenant read.
+  test('X-Internal-Api-Key does NOT admit an unguarded activities route', async () => {
+    const res = await appWithPaths().request('/v2/activities/templates', {
+      headers: { 'X-Internal-Api-Key': 'anything-at-all' },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  test('a malformed Authorization header is rejected, not treated as anonymous', async () => {
+    const res = await appWithPaths().request('/v2/activities/templates', {
+      headers: { Authorization: 'Basic dXNlcjpwYXNz' },
+    });
+    expect(res.status).toBe(401);
+    expect((await res.json()).error.code).toBe('MALFORMED_AUTH');
   });
 });
