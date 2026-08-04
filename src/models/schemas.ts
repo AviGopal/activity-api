@@ -694,6 +694,8 @@ export const GoalExecutionPathSchema = z.object({
   // Denormalized terminal output shapes accumulated from path_activities[*].output_shapes.
   // Indexed for shape-keyed lookup. See OpenSpec change 2026-04-26-shape-provider-goal-creation.
   endpoint_output_shapes: z.array(z.string()).optional(),
+  // Denormalized PLANNED/expected terminal output shapes (goal target set) supplied by the walk.
+  expected_output_shapes: z.array(z.string()).optional(),
   path_signature: z.string(),
   
   // Thompson Sampling
