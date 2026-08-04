@@ -404,14 +404,14 @@ async function main() {
   // result instead of logging ✓ unconditionally, so a real DEFINE error surfaces.
   try {
     const _ensureRes = await runSQL(
-      // Plain DEFINE FIELD (no OVERWRITE / IF NOT EXISTS): this SurrealDB build
-      // does NOT parse the OVERWRITE keyword (`Unexpected token OVERWRITE`), and
-      // IF NOT EXISTS no-ops on a present-but-broken field. Plain DEFINE FIELD
-      // (re)defines unconditionally and is what migration 092 used for
-      // endpoint_output_shapes, which works — so it force-corrects the field here.
-      `DEFINE FIELD endpoint_output_shapes ON goal_execution_paths TYPE option<array<string>>;\n` +
+      // This SurrealDB build: OVERWRITE doesn't parse, plain DEFINE FIELD ERRORS on
+      // an existing field ("already exists"), and IF NOT EXISTS no-ops. The surfaced
+      // error showed expected_output_shapes ALREADY EXISTS but stores null (endpoint,
+      // same type, works) — i.e. it's defined in a broken form and can't be redefined
+      // in place. REMOVE then DEFINE force-recreates it cleanly. endpoint works, so
+      // leave it untouched.
+      `REMOVE FIELD expected_output_shapes ON goal_execution_paths;\n` +
       `DEFINE FIELD expected_output_shapes ON goal_execution_paths TYPE option<array<string>>;\n` +
-      `DEFINE INDEX IF NOT EXISTS idx_goal_paths_endpoint_shapes ON goal_execution_paths FIELDS endpoint_output_shapes;\n` +
       `DEFINE INDEX IF NOT EXISTS idx_goal_paths_expected_shapes ON goal_execution_paths FIELDS expected_output_shapes;`
     );
     const _ensureErrs = (Array.isArray(_ensureRes) ? _ensureRes : []).filter((r: any) => r && r.status === 'ERR');
