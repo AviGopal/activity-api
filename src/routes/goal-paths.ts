@@ -300,7 +300,9 @@ app.post('/', async (c) => {
     // join at read-time. Failure to accumulate is non-fatal: the helper
     // returns [] on error, the field is nullable, and the read-time
     // fallback in predictEndpointState recomputes for legacy rows.
-    const endpointOutputShapes = await accumulateEndpointShapes(validated.path_activities);
+    const endpointOutputShapes = validated.endpoint_output_shapes !== undefined
+      ? validated.endpoint_output_shapes
+      : await accumulateEndpointShapes(validated.path_activities);
 
     // Phase G2 — CC1 scope-narrowing validator (2026-04-28).
     // When the caller declares a parent path (sub-goal lineage), enforce
