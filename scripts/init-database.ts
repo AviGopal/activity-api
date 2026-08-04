@@ -424,6 +424,33 @@ async function main() {
     console.warn('[Init] ⚠ could not ensure goal_execution_paths shape fields:', error);
   }
 
+  // DIAGNOSTIC: dump the actual live field definitions so we can see WHY a written
+  // expected_output_shapes silently vanishes while endpoint_output_shapes (same
+  // type) round-trips. Uses init-database's own DB connection (no external creds).
+  try {
+    const _info = await runSQL('INFO FOR TABLE goal_execution_paths;');
+    const _fields = (Array.isArray(_info) && _info[0] && (_info[0] as any).result)
+      ? (_info[0] as any).result.fields
+      : undefined;
+    if (_fields) {
+      console.log('[Init] DIAG field def endpoint_output_shapes = ' + JSON.stringify(_fields.endpoint_output_shapes ?? '(absent)'));
+      console.log('[Init] DIAG field def expected_output_shapes = ' + JSON.stringify(_fields.expected_output_shapes ?? '(absent)'));
+    } else {
+      console.log('[Init] DIAG INFO FOR TABLE goal_execution_paths (raw) = ' + JSON.stringify(_info).slice(0, 700));
+    }
+    // Round-trip write probe: create a throwaway row with expected set, read it
+    // back, then delete it — proves store-at-write independent of the API layer.
+    const _pk = 'diag_' + String(Date.now());
+    await runSQL(
+      `CREATE goal_execution_paths CONTENT { goal_hash: '${_pk}', path_signature: '${_pk}', expected_output_shapes: ['DIAGA','DIAGB'], endpoint_output_shapes: ['DIAGO'] };`
+    );
+    const _rb = await runSQL(`SELECT goal_hash, expected_output_shapes, endpoint_output_shapes FROM goal_execution_paths WHERE goal_hash = '${_pk}';`);
+    console.log('[Init] DIAG write-probe readback = ' + JSON.stringify(Array.isArray(_rb) && _rb[0] ? (_rb[0] as any).result : _rb).slice(0, 500));
+    await runSQL(`DELETE goal_execution_paths WHERE goal_hash = '${_pk}';`);
+  } catch (e) {
+    console.warn('[Init] DIAG failed:', e);
+  }
+
   let appliedMigrations = await getAppliedMigrations();
   let bootstrapped = false;
 
