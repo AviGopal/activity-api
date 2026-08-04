@@ -742,6 +742,8 @@ export const PathRecordRequestSchema = z.object({
   // (learned_pathway / satisfier / universal_tool_fallback / feature_compose /
   // fresh_derivation). Optional; persisted once the DEFINE FIELD migration lands.
   walk_tier: z.string().optional(),
+  endpoint_output_shapes: z.array(z.string()).optional(),
+  expected_output_shapes: z.array(z.string()).optional(),
 });
 
 export const PathQuerySchema = z.object({
