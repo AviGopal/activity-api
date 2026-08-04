@@ -450,6 +450,7 @@ app.post('/', async (c) => {
         token_usage: tokenUsage,
         inference_confidence: validated.inference_confidence ?? null,
         endpoint_output_shapes: endpointOutputShapes,
+        expected_output_shapes: validated.expected_output_shapes ?? null,
         walk_tier: validated.walk_tier ?? null,
       });
       
@@ -481,6 +482,7 @@ app.post('/', async (c) => {
           path_activities: $path_activities,
           path_signature: $path_signature,
           endpoint_output_shapes: $endpoint_output_shapes,
+          expected_output_shapes: $expected_output_shapes,
           total_executions: 1,
           execution_count: 1,
           success_count: $successful_executions,
