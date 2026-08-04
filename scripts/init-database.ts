@@ -117,9 +117,15 @@ async function ensureMigrationsTable(): Promise<void> {
   `);
 }
 
-async function getAppliedMigrations(): Promise<Set<string>> {
+async function getAppliedMigrations(): Promise<Set<string> | null> {
   const results = await runSQL('SELECT filename FROM init_migrations;');
-  if (!results[0] || results[0].status !== 'OK') return new Set();
+  // Distinguish a genuine empty result from a FAILED read (timeout/contention).
+  // Returning an empty Set on failure is what let a contended-startup timeout
+  // trigger the live-DB bootstrap, which marks every pending migration (e.g. a
+  // freshly pull-synced DEFINE FIELD like 188) as applied WITHOUT running it —
+  // silently skipping it forever. A failed read must NOT look like "nothing
+  // applied", so the caller can tell the two apart and refuse to bootstrap.
+  if (!results[0] || results[0].status !== 'OK') return null;
   const rows: any[] = Array.isArray(results[0].result) ? results[0].result : [];
   return new Set(rows.map((r: any) => r.filename));
 }
@@ -382,35 +388,79 @@ async function main() {
   let appliedMigrations = await getAppliedMigrations();
   let bootstrapped = false;
 
-  if (appliedMigrations.size === 0) {
-    bootstrapped = await bootstrapMigrationsTable(sqlFiles);
-    if (bootstrapped) {
-      appliedMigrations = await getAppliedMigrations();
-    }
+  // A null result means the tracking read FAILED (timeout/contention), NOT that
+  // the table is empty. Retry a few times; a transient failure here is the exact
+  // trigger for the false bootstrap that silently skips pending migrations.
+  for (let r = 0; appliedMigrations === null && r < 3; r++) {
+    console.warn(`[Init] init_migrations unreadable — retry ${r + 1}/3`);
+    await new Promise((res) => setTimeout(res, 2000));
+    appliedMigrations = await getAppliedMigrations();
   }
 
   // Apply each migration
   let successCount = 0;
   let skippedCount = 0;
-  for (const file of sqlFiles) {
-    const filename = file.split('/').pop()!;
 
-    if (appliedMigrations.has(filename)) {
-      console.log(`[Migration] ⏭ Skipping ${filename} (already applied)`);
-      successCount++;
-      skippedCount++;
-      continue;
+  if (appliedMigrations === null) {
+    // Still unreadable after retries: do NOT bootstrap (which would mark every
+    // pending migration applied-without-running) and do NOT blindly re-apply all.
+    // Skip the tracked-migration pass this run; the unconditional idempotent
+    // re-ensure below still runs, and the next start retries. Safe because DDL is
+    // idempotent and nothing is silently marked.
+    console.error(
+      '[Init] init_migrations still unreadable after retries — skipping the tracked ' +
+      'migration pass this run to avoid a false bootstrap. Next start retries.'
+    );
+  } else {
+    if (appliedMigrations.size === 0) {
+      bootstrapped = await bootstrapMigrationsTable(sqlFiles);
+      if (bootstrapped) {
+        appliedMigrations = (await getAppliedMigrations()) ?? new Set<string>();
+      }
     }
 
-    const filePath = join(SQL_DIR, file);
-    const success = await applySQLFile(filePath);
-    if (success) {
-      successCount++;
-      await markMigrationApplied(filename);
-    } else {
-      // Continue even on failure (for idempotency)
-      console.warn(`[Init] ⚠ Migration ${file} had errors but continuing...`);
+    for (const file of sqlFiles) {
+      const filename = file.split('/').pop()!;
+
+      if (appliedMigrations.has(filename)) {
+        console.log(`[Migration] ⏭ Skipping ${filename} (already applied)`);
+        successCount++;
+        skippedCount++;
+        continue;
+      }
+
+      const filePath = join(SQL_DIR, file);
+      const success = await applySQLFile(filePath);
+      if (success) {
+        successCount++;
+        await markMigrationApplied(filename);
+      } else {
+        // Continue even on failure (for idempotency)
+        console.warn(`[Init] ⚠ Migration ${file} had errors but continuing...`);
+      }
     }
+  }
+
+  // ── Load-bearing denormalized fields: ALWAYS ensure, outside tracking ────
+  // endpoint_output_shapes (mig 092) + expected_output_shapes (mig 188) on
+  // goal_execution_paths carry the OBSERVED and EXPECTED shape sets the learning
+  // loop reconciles. A contended-startup false bootstrap (see getAppliedMigrations)
+  // could mark 188 applied WITHOUT running its DEFINE FIELD, leaving the SCHEMAFULL
+  // table to SILENTLY DROP the field on write (empty) or reject it (non-empty) —
+  // so plan-vs-observed reconciliation could never persist. Re-ensure idempotently
+  // every start so the fields exist regardless of tracking state; DEFINE ... IF NOT
+  // EXISTS is a no-op once present. This is the same lockstep guarantee the JWT
+  // ACCESS re-apply below provides for auth.
+  try {
+    await runSQL(
+      `DEFINE FIELD IF NOT EXISTS endpoint_output_shapes ON goal_execution_paths TYPE option<array<string>>;\n` +
+      `DEFINE FIELD IF NOT EXISTS expected_output_shapes ON goal_execution_paths TYPE option<array<string>>;\n` +
+      `DEFINE INDEX IF NOT EXISTS idx_goal_paths_endpoint_shapes ON goal_execution_paths FIELDS endpoint_output_shapes;\n` +
+      `DEFINE INDEX IF NOT EXISTS idx_goal_paths_expected_shapes ON goal_execution_paths FIELDS expected_output_shapes;`
+    );
+    console.log('[Init] ✓ goal_execution_paths endpoint/expected_output_shapes fields ensured');
+  } catch (error) {
+    console.warn('[Init] ⚠ could not ensure goal_execution_paths shape fields:', error);
   }
 
   // ── Secret-bearing DDL: ALWAYS re-apply, outside migration tracking ──────
