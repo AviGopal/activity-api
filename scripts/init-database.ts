@@ -404,8 +404,13 @@ async function main() {
   // result instead of logging ✓ unconditionally, so a real DEFINE error surfaces.
   try {
     const _ensureRes = await runSQL(
-      `DEFINE FIELD OVERWRITE endpoint_output_shapes ON goal_execution_paths TYPE option<array<string>>;\n` +
-      `DEFINE FIELD OVERWRITE expected_output_shapes ON goal_execution_paths TYPE option<array<string>>;\n` +
+      // Plain DEFINE FIELD (no OVERWRITE / IF NOT EXISTS): this SurrealDB build
+      // does NOT parse the OVERWRITE keyword (`Unexpected token OVERWRITE`), and
+      // IF NOT EXISTS no-ops on a present-but-broken field. Plain DEFINE FIELD
+      // (re)defines unconditionally and is what migration 092 used for
+      // endpoint_output_shapes, which works — so it force-corrects the field here.
+      `DEFINE FIELD endpoint_output_shapes ON goal_execution_paths TYPE option<array<string>>;\n` +
+      `DEFINE FIELD expected_output_shapes ON goal_execution_paths TYPE option<array<string>>;\n` +
       `DEFINE INDEX IF NOT EXISTS idx_goal_paths_endpoint_shapes ON goal_execution_paths FIELDS endpoint_output_shapes;\n` +
       `DEFINE INDEX IF NOT EXISTS idx_goal_paths_expected_shapes ON goal_execution_paths FIELDS expected_output_shapes;`
     );
