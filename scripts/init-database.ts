@@ -396,59 +396,30 @@ async function main() {
   // step. Ensuring here (a sub-second DEFINE FIELD IF NOT EXISTS) guarantees the
   // field exists on every start regardless of how far the slow loop gets — the
   // same lockstep guarantee the JWT ACCESS re-apply provides for auth.
-  // Use OVERWRITE, not IF NOT EXISTS: a partial/failed earlier application of 188
-  // can leave expected_output_shapes present-but-broken, and IF NOT EXISTS then
-  // no-ops (thinks it exists) so the field never becomes writable — the SCHEMAFULL
-  // table silently drops it on write. OVERWRITE force-redefines to the correct
-  // shape every start (idempotent). And ACTUALLY inspect runSQL's per-statement
-  // result instead of logging ✓ unconditionally, so a real DEFINE error surfaces.
+  // Non-destructive idempotent re-assert. An earlier revision force-recreated the
+  // field with `REMOVE FIELD ... ; DEFINE FIELD ...` on every start, on a FALSE
+  // diagnosis that the field def was broken — a credential-free `INFO FOR TABLE`
+  // probe (since removed) proved endpoint_output_shapes and expected_output_shapes
+  // are defined identically and correctly; the real null-on-write cause was an
+  // UNBOUND $expected_output_shapes param in the API CREATE (fixed in the route
+  // handler, 4d0f627). REMOVE FIELD every startup is a standing hazard on a
+  // SCHEMAFULL table, so this is back to a sub-second `IF NOT EXISTS` guard that
+  // only creates the field if a deploy somehow lacks migration 188/189. Inspect
+  // runSQL's per-statement result so a real DEFINE error surfaces (never log ✓
+  // unconditionally).
   try {
     const _ensureRes = await runSQL(
-      // This SurrealDB build: OVERWRITE doesn't parse, plain DEFINE FIELD ERRORS on
-      // an existing field ("already exists"), and IF NOT EXISTS no-ops. The surfaced
-      // error showed expected_output_shapes ALREADY EXISTS but stores null (endpoint,
-      // same type, works) — i.e. it's defined in a broken form and can't be redefined
-      // in place. REMOVE then DEFINE force-recreates it cleanly. endpoint works, so
-      // leave it untouched.
-      `REMOVE FIELD expected_output_shapes ON goal_execution_paths;\n` +
-      `DEFINE FIELD expected_output_shapes ON goal_execution_paths TYPE option<array<string>>;\n` +
+      `DEFINE FIELD IF NOT EXISTS expected_output_shapes ON goal_execution_paths TYPE option<array<string>>;\n` +
       `DEFINE INDEX IF NOT EXISTS idx_goal_paths_expected_shapes ON goal_execution_paths FIELDS expected_output_shapes;`
     );
     const _ensureErrs = (Array.isArray(_ensureRes) ? _ensureRes : []).filter((r: any) => r && r.status === 'ERR');
     if (_ensureErrs.length > 0) {
       console.error('[Init] ✗ shape-field ensure had errors:', JSON.stringify(_ensureErrs).slice(0, 800));
     } else {
-      console.log('[Init] ✓ goal_execution_paths endpoint/expected_output_shapes fields ensured (pre-loop, OVERWRITE)');
+      console.log('[Init] ✓ goal_execution_paths.expected_output_shapes field ensured (pre-loop, non-destructive)');
     }
   } catch (error) {
     console.warn('[Init] ⚠ could not ensure goal_execution_paths shape fields:', error);
-  }
-
-  // DIAGNOSTIC: dump the actual live field definitions so we can see WHY a written
-  // expected_output_shapes silently vanishes while endpoint_output_shapes (same
-  // type) round-trips. Uses init-database's own DB connection (no external creds).
-  try {
-    const _info = await runSQL('INFO FOR TABLE goal_execution_paths;');
-    const _fields = (Array.isArray(_info) && _info[0] && (_info[0] as any).result)
-      ? (_info[0] as any).result.fields
-      : undefined;
-    if (_fields) {
-      console.log('[Init] DIAG field def endpoint_output_shapes = ' + JSON.stringify(_fields.endpoint_output_shapes ?? '(absent)'));
-      console.log('[Init] DIAG field def expected_output_shapes = ' + JSON.stringify(_fields.expected_output_shapes ?? '(absent)'));
-    } else {
-      console.log('[Init] DIAG INFO FOR TABLE goal_execution_paths (raw) = ' + JSON.stringify(_info).slice(0, 700));
-    }
-    // Round-trip write probe: create a throwaway row with expected set, read it
-    // back, then delete it — proves store-at-write independent of the API layer.
-    const _pk = 'diag_' + String(Date.now());
-    await runSQL(
-      `CREATE goal_execution_paths CONTENT { goal_hash: '${_pk}', path_signature: '${_pk}', expected_output_shapes: ['DIAGA','DIAGB'], endpoint_output_shapes: ['DIAGO'] };`
-    );
-    const _rb = await runSQL(`SELECT goal_hash, expected_output_shapes, endpoint_output_shapes FROM goal_execution_paths WHERE goal_hash = '${_pk}';`);
-    console.log('[Init] DIAG write-probe readback = ' + JSON.stringify(Array.isArray(_rb) && _rb[0] ? (_rb[0] as any).result : _rb).slice(0, 500));
-    await runSQL(`DELETE goal_execution_paths WHERE goal_hash = '${_pk}';`);
-  } catch (e) {
-    console.warn('[Init] DIAG failed:', e);
   }
 
   let appliedMigrations = await getAppliedMigrations();

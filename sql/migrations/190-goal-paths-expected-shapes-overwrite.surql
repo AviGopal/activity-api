@@ -1,17 +1,16 @@
--- 190: Cleanly recreate goal_execution_paths.expected_output_shapes.
+-- 190: Non-destructive idempotent (re)assert of expected_output_shapes.
 --
--- The field ALREADY EXISTS (init-database's surfaced DEFINE error confirmed it)
--- but stores null on write, while the sibling endpoint_output_shapes (same
--- option<array<string>> type) works — so expected is defined in a broken form.
--- This SurrealDB build can't redefine in place: OVERWRITE doesn't parse, plain
--- DEFINE FIELD errors "already exists", IF NOT EXISTS no-ops. REMOVE then DEFINE
--- force-recreates it cleanly. The authoritative fix runs pre-loop in
--- scripts/init-database.ts; this file is the matching sql/ change that triggers
--- substrate-pull-sync to restart activity-api and run it.
+-- SUPERSEDED DIAGNOSIS: this file originally ran `REMOVE FIELD ... ; DEFINE FIELD`
+-- to "cleanly recreate" the field, on the false belief that it was defined in a
+-- broken form. A credential-free `INFO FOR TABLE` probe proved endpoint_output_shapes
+-- and expected_output_shapes are defined identically and correctly; the real
+-- null-on-write cause was an UNBOUND $expected_output_shapes param in the API
+-- CREATE (fixed in the goal-paths route handler, commit 4d0f627). REMOVE FIELD is
+-- destructive on a SCHEMAFULL table, so it is removed here — 188/189 already define
+-- the field and this is a harmless re-assert kept only so the filename stays valid
+-- in the migration sequence.
 
-REMOVE FIELD expected_output_shapes ON goal_execution_paths;
-
-DEFINE FIELD expected_output_shapes ON goal_execution_paths TYPE option<array<string>>
+DEFINE FIELD IF NOT EXISTS expected_output_shapes ON goal_execution_paths TYPE option<array<string>>
   COMMENT "Planned terminal output shapes (goal target set) from the goal-host walk. Sibling of endpoint_output_shapes.";
 
 DEFINE INDEX IF NOT EXISTS idx_goal_paths_expected_shapes
