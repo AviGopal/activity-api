@@ -35,7 +35,11 @@ on:
 
 env:
   # Set from repository secrets
-  ACTIVITY_API_URL: ${{ secrets.ACTIVITY_API_URL || 'http://api.minibob.local' }}
+  # Default target for the CI-outcome webhook. `api.minibob.local` was a retired name that
+  # resolves nowhere, so once the workflow was parseable again the webhook still died with
+  # curl exit 5 (could not resolve host). Point the fallback at the public hub that actually
+  # serves /v2/activities/ci-result. Set the ACTIVITY_API_URL repo secret to override.
+  ACTIVITY_API_URL: ${{ secrets.ACTIVITY_API_URL || 'http://syzygy.host:18080' }}
   ACTIVITY_API_KEY: ${{ secrets.ACTIVITY_API_KEY || '' }}
 
 jobs:
@@ -180,6 +184,11 @@ jobs:
 
       - name: Send webhook to Activity API
         if: always()
+        # This step OBSERVES the build; it does not judge it. A telemetry POST that cannot be
+        # delivered must never turn a green build red — otherwise the reporting channel starts
+        # manufacturing the failures it is supposed to report. (Observed: with the host
+        # unresolvable, curl exit 5 failed the whole job even though `|| echo` was present.)
+        continue-on-error: true
         env:
           EXECUTION_ID: ${{ github.event.inputs.execution_id || github.event.head_commit.message }}
         run: |
