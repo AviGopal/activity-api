@@ -1,6 +1,17 @@
 name: CI with Webhook Integration
 
 on:
+  # NOTE: `branches` and `branches-ignore` cannot both be set for the same event — GitHub
+  # rejects the file outright, schedules ZERO jobs, and every run fails at 0s with "This run
+  # likely failed because of a workflow file issue". That is what happened here: 741 runs,
+  # 741 failures, none of which ever executed a step, going back to the workflow's first run
+  # on 2026-07-05. The webhook step below (`if: always()`) therefore never fired once, and it
+  # is the ONLY commit-keyed path that feeds CI outcomes back into Thompson posteriors
+  # (POST /v2/activities/ci-result -> src/routes/ci.ts). So the substrate has never observed
+  # whether any landed change helped or hurt.
+  #
+  # The `branches-ignore` block was also redundant: the allowlist below does not include
+  # main/master/production, so they were already excluded. Dropping it is sufficient.
   push:
     branches:
       - dev
@@ -9,11 +20,6 @@ on:
       - refactor/*
       - tool/*
       - infrastructure/*
-    # Exclude main/master branches (they use different deployment workflows)
-    branches-ignore:
-      - main
-      - master
-      - production
   pull_request:
     types: [opened, synchronize, reopened]
   workflow_dispatch:
