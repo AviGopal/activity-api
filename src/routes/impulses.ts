@@ -3167,7 +3167,19 @@ router.post('/resolve', async (c) => {
           return c.json({ success: false, error: 'templateId and updates (object) required for activityTemplate_update' } as ImpulseResolveResponse, 400);
         }
 
-        const allowedFields = new Set(['name', 'description', 'tags', 'tasks', 'input_shapes', 'optional_input_shapes', 'output_shapes', 'deprecated']);
+        // `retired` is updatable so a retirement can be REVERSED through the system. It is the
+        // operative lifecycle flag — selection, shape-discovery and the template listing all
+        // filter on it — and until now nothing could clear it: `activityTemplate_deprecate` sets
+        // it, and no impulse, endpoint or service unsets it. A lifecycle decision that can only
+        // be made in one direction is not a managed lifecycle; the only remaining recourse was
+        // hand-editing the database, which this repo forbids for good reason.
+        //
+        // Concretely: an automated sweep retired 21 arms on a miscomputed `success_rate`
+        // (2026-08-05) and there was no supported way to give them back. Restoring an arm is the
+        // SAFE direction — it returns a producer to the candidate pool rather than removing one —
+        // so it belongs with the ordinary write-scope updates rather than behind the Thompson
+        // evidence gate that guards deprecation.
+        const allowedFields = new Set(['name', 'description', 'tags', 'tasks', 'input_shapes', 'optional_input_shapes', 'output_shapes', 'deprecated', 'retired']);
         const rejected = Object.keys(updatePointer.updates).filter((k) => !allowedFields.has(k));
         if (rejected.length > 0) {
           return c.json({
