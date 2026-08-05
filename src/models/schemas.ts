@@ -29,12 +29,6 @@ import { z } from 'zod';
  * returns a plain string or a richer object is unaffected.
  */
 export const TimestampSchema = z.preprocess(
-  // DUCK-TYPE, do not instanceof. The SurrealDB 2.x driver returns a date WRAPPER
-  // that is not `instanceof Date` (different class/realm), so the check missed and
-  // every timestamp fell through to the passthrough-object branch and serialized as
-  // `{}` — written and stored but unreadable, which is indistinguishable from never
-  // written. Any object exposing toISOString() is a date for this purpose; plain
-  // strings and genuinely unrelated objects still pass through unchanged.
   (v) => (v && typeof (v as { toISOString?: unknown }).toISOString === "function" ? (v as Date).toISOString() : v),
   z.union([z.string(), z.object({}).passthrough()]),
 );
