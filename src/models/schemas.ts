@@ -714,7 +714,18 @@ export const GoalExecutionPathSchema = z.object({
   // Context
   typical_files_modified: z.array(z.string()).optional(),
   typical_tools_used: z.array(z.string()).optional(),
-  
+
+  // Walk provenance. These ARE written by recordGoalPath and stored, but were
+  // absent from this response schema — and PathsResponseSchema.parse() strips
+  // unknown keys, so every GET /v2/goal-paths silently dropped them. walk_tier is
+  // the field that says whether a goal ran over a REUSED pathway
+  // (learned_pathway) or was re-derived from scratch (fresh_derivation), so
+  // without it the cross-goal reuse rate is unmeasurable from outside the vessel
+  // — the mechanism looked dead when it was merely invisible. inference_confidence
+  // likewise grades how sure the goal-target inference was about the plan set.
+  walk_tier: z.string().optional(),
+  inference_confidence: z.number().nullable().optional(),
+
   // Timestamps
   last_executed_at: z.union([z.string(), z.object({}).passthrough()]).optional(),
   created_at: z.union([z.string(), z.object({}).passthrough()]),
