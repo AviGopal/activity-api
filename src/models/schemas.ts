@@ -1,6 +1,39 @@
 import { z } from 'zod';
 
 // =============================================================================
+// TIMESTAMPS
+// =============================================================================
+
+/**
+ * A timestamp as it comes back from SurrealDB, normalized to an ISO string.
+ *
+ * WHY this exists: response rows were declared
+ * `TimestampSchema`. The SurrealDB driver hands
+ * back a real `Date`, which fails the string branch and matches the object branch —
+ * and a Date has no own enumerable keys, so zod returns `{}` and every timestamp
+ * JSON-serializes as an empty object. Measured on the live hub: created_at,
+ * updated_at and last_executed_at were `{}` on 4421/4421 goal_execution_paths rows,
+ * zero strings. The values were stored correctly the whole time (the un-parsed
+ * activities route returns proper ISO strings from the same database) — the loss was
+ * introduced by the response parse.
+ *
+ * The cost is not cosmetic: with no readable write time you cannot order by recency,
+ * attribute a row to a deploy, or measure gap latency — the second leg of the gap
+ * metrics triple. This is the same read-side-destruction class as walk_tier being
+ * stripped for want of a schema declaration: data that is written and stored but
+ * unreadable is indistinguishable from data never written.
+ *
+ * Normalizing BEFORE the union (rather than adding a `z.date()` branch) means every
+ * consumer sees one type — an ISO string — instead of a Date on some paths and a
+ * string on others. Non-Date shapes still pass through unchanged, so a driver that
+ * returns a plain string or a richer object is unaffected.
+ */
+export const TimestampSchema = z.preprocess(
+  (v) => (v instanceof Date ? v.toISOString() : v),
+  z.union([z.string(), z.object({}).passthrough()]),
+);
+
+// =============================================================================
 // HIERARCHICAL TAG SYSTEM
 // =============================================================================
 
@@ -134,9 +167,9 @@ export const TemplateMetricsSchema = z.object({
   thompson_alpha: z.number(),
   thompson_beta: z.number(),
   total_selections: z.number().optional(),
-  last_executed_at: z.union([z.string(), z.object({}).passthrough()]).optional(),
-  created_at: z.union([z.string(), z.object({}).passthrough()]),
-  updated_at: z.union([z.string(), z.object({}).passthrough()]),
+  last_executed_at: TimestampSchema.optional(),
+  created_at: TimestampSchema,
+  updated_at: TimestampSchema,
 });
 
 export const ActivityTemplateSchema = z.object({
@@ -168,8 +201,8 @@ export const ActivityTemplateSchema = z.object({
   output_shapes: z.array(z.string()).min(1, 'output_shapes must have at least one shape'),
   execution_type: z.string().optional(),
   variant_of: z.record(z.any()).optional(),
-  created_at: z.union([z.string(), z.object({}).passthrough()]),
-  updated_at: z.union([z.string(), z.object({}).passthrough()]),
+  created_at: TimestampSchema,
+  updated_at: TimestampSchema,
   // Metrics merged in from template_metrics
   metrics: TemplateMetricsSchema.optional(),
 });
@@ -414,8 +447,8 @@ export const ImpulseResponseSchema = z.object({
   api_key: z.string(),
   project_id: z.string(),
   impulse_data: ImpulseDataSchema,
-  created_at: z.union([z.string(), z.object({}).passthrough()]),
-  updated_at: z.union([z.string(), z.object({}).passthrough()]),
+  created_at: TimestampSchema,
+  updated_at: TimestampSchema,
 });
 
 export const ImpulseListResponseSchema = z.object({
@@ -443,8 +476,8 @@ export const CompositionEdgeSchema = z.object({
   execution_count: z.number().int().default(1),
   success_count: z.number().int().default(0),
   weight: z.number().min(0).max(1), // Computed: success_count / execution_count
-  created_at: z.union([z.string(), z.object({}).passthrough()]),
-  updated_at: z.union([z.string(), z.object({}).passthrough()]),
+  created_at: TimestampSchema,
+  updated_at: TimestampSchema,
   // Impulse flow fields (goal-execution-foundation-alignment)
   input_impulse_shapes: z.array(z.string()).optional(),
   output_impulse_shapes: z.array(z.string()).optional(),
@@ -527,8 +560,8 @@ export const ImpulseRelevanceMetricSchema = z.object({
   resolver_success_count: z.number().int().default(0),
   resolver_failure_count: z.number().int().default(0),
 
-  created_at: z.union([z.string(), z.object({}).passthrough()]),
-  updated_at: z.union([z.string(), z.object({}).passthrough()]),
+  created_at: TimestampSchema,
+  updated_at: TimestampSchema,
 });
 
 export const ImpulseRelevanceRecordRequestSchema = z.object({
@@ -597,8 +630,8 @@ export const ToolUsagePatternSchema = z.object({
   avg_params_complexity: z.number().default(0), // Average param object size
   typical_error_rate: z.number().min(0).max(1).default(0),
   
-  created_at: z.union([z.string(), z.object({}).passthrough()]),
-  updated_at: z.union([z.string(), z.object({}).passthrough()]),
+  created_at: TimestampSchema,
+  updated_at: TimestampSchema,
 });
 
 export const ToolUsageRecordRequestSchema = z.object({
@@ -651,8 +684,8 @@ export const ExecutionSequenceSchema = z.object({
   total_duration_ms: z.number(),
   total_cost_usd: z.number(),
   total_activities: z.number().int(),
-  created_at: z.union([z.string(), z.object({}).passthrough()]),
-  updated_at: z.union([z.string(), z.object({}).passthrough()]),
+  created_at: TimestampSchema,
+  updated_at: TimestampSchema,
 });
 
 export const ExecutionSequenceRecordRequestSchema = z.object({
@@ -731,9 +764,9 @@ export const GoalExecutionPathSchema = z.object({
   last_inference_confidence: z.number().nullable().optional(),
 
   // Timestamps
-  last_executed_at: z.union([z.string(), z.object({}).passthrough()]).optional(),
-  created_at: z.union([z.string(), z.object({}).passthrough()]),
-  updated_at: z.union([z.string(), z.object({}).passthrough()]),
+  last_executed_at: TimestampSchema.optional(),
+  created_at: TimestampSchema,
+  updated_at: TimestampSchema,
 });
 
 export const PathRecordRequestSchema = z.object({
@@ -1344,7 +1377,7 @@ export const CIResultsListResponseSchema = z.object({
       provider: z.string(),
       completed_at: z.string(),
     }).passthrough(),
-    created_at: z.union([z.string(), z.object({}).passthrough()]),
+    created_at: TimestampSchema,
   })),
   total: z.number().int(),
   limit: z.number().int(),
@@ -1475,7 +1508,7 @@ export const ToolArgumentPatternSchema = z.object({
   success_rate: z.number(),
   times_used: z.number().int(),
   avg_execution_ms: z.number().optional(),
-  last_used_at: z.union([z.string(), z.object({}).passthrough()]).optional(),
+  last_used_at: TimestampSchema.optional(),
   org_id: z.string().optional(),
   // Phase A: optional account_id alongside org_id.
   account_id: z.string().optional(),
@@ -1520,7 +1553,7 @@ export const CompositionImpulseFlowSchema = z.object({
   // Phase A: optional account_id alongside org_id.
   account_id: z.string().optional(),
   project_id: z.string().optional(),
-  created_at: z.union([z.string(), z.object({}).passthrough()]).optional(),
+  created_at: TimestampSchema.optional(),
 });
 
 /**
@@ -1792,7 +1825,7 @@ export const ImpulseShapeActivityScoreSchema = z.object({
   failure_count: z.number().int(),
   alpha: z.number().int(), // success_count + 1
   beta: z.number().int(),  // failure_count + 1
-  updated_at: z.union([z.string(), z.object({}).passthrough()]),
+  updated_at: TimestampSchema,
 });
 
 // Type exports for Impulse Shape Activity Scoring
