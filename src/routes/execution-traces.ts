@@ -769,7 +769,33 @@ app.get('/', async (c) => {
     // COUNT query omitted — full table scan with GROUP ALL causes OOMKills on
     // tables >25k rows. Clients receive the page size via executions.length;
     // total is returned as -1 to signal "unknown count" without an extra scan.
+    // COUNT is OPT-IN (`?include_total=true`). The default stays -1 = "unknown":
+    // an unconditional count doubles DB work on this hot path on this hot path (the learning loop
+    // reads this route on every dispatch), which is the OOM class the count was
+    // disabled for. When asked, count the SAME bounded row set the page came from
+    // — whereClause always carries an executed_at bound, and the executed_at index
+    // makes it a range walk over narrow scalar rows: no JSONB hydration, no ORDER
+    // BY, no LIMIT materialise. A count FAILURE must never be swallowed into a
+    // plausible 0 — it falls back to the -1 sentinel and logs loudly. So total=0
+    // means "genuinely zero rows in the window" and total=-1 means "not counted
+    // or count failed"; conflating those two is the exact mistake this endpoint
+    // currently forces on every caller.
     countResult = [{ total: -1 }];
+    if (c.req.query('include_total') === 'true') {
+      const countQuery = `SELECT count() AS total FROM v_paradigm_execution_traces ${whereClause} GROUP ALL`;
+      try {
+        const countRows = (useJwtAuth && jwtAuth?.jwtToken && jwtAuth.authType !== 'apikey')
+          ? await queryWithAuth<{ total: number }>(jwtAuth.jwtToken, countQuery, params)
+          : await surrealDB.query<{ total: number }>(countQuery, params);
+        countResult = [{ total: Number(countRows?.[0]?.total ?? 0) }];
+        logger.info('[traces-count] include_total served', { total: countResult[0].total, whereClause });
+      } catch (countErr) {
+        logger.error('[traces-count] include_total COUNT failed — returning -1 sentinel, NOT 0', {
+          error: countErr instanceof Error ? countErr.message : String(countErr),
+          whereClause,
+        });
+      }
+    }
 
     logger.info('Raw executions result from SurrealDB', {
       executionsType: typeof executions,
