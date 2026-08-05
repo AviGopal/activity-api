@@ -767,15 +767,58 @@ app.post('/recommend', async (c) => {
       ORDER BY total_executions DESC
     `;
     
-    const paths = await surrealDB.query<GoalExecutionPath[]>(selectQuery, params);
-    
-    if (!paths || paths.length === 0) {
+    const allPaths = await surrealDB.query<GoalExecutionPath[]>(selectQuery, params);
+
+    // PROVEN-FAILING PATHS ARE NOT REUSABLE PATHWAYS.
+    //
+    // Recommendation was per-goal_hash with no ABSOLUTE bar: Thompson picks the best of the
+    // paths recorded for this goal, and when the only recorded path has never reached, Beta
+    // sampling over a single arm returns it anyway. The walk then labels the replay
+    // `learned_pathway` and re-runs a path that is known not to work.
+    //
+    // Measured 2026-08-05 over 4,494 recorded paths / 9,704 executions:
+    //   learned_pathway  765 executions,  14 successes  —  1%
+    //   fresh_derivation 1,194 executions, 417 successes — 34%
+    // The tier that is supposed to be the CEILING was the floor by a factor of thirty, and
+    // 3,727 executions (38% of all execution) went to 352 paths that have never once reached.
+    // 630 of 2,265 distinct goals have no reaching path at all, so for those goals every
+    // recommendation was a replay of failure.
+    //
+    // Deriving fresh is strictly better than replaying something proven not to reach, so a path
+    // with enough observations to have reached and none is withheld. Returning NO recommendation
+    // is the useful answer here — it sends the walk down the fresh-derivation path rather than
+    // handing it a known-bad plan. "Reuse before mint" does not mean reuse what never worked.
+    //
+    // The bar is deliberately observation-gated, not a rate threshold: a path with one or two
+    // failures may simply be new or unlucky, and is kept so exploration can still find it. Only
+    // an explicit, repeated, zero-success record disqualifies.
+    const PROVEN_FAILING_MIN_EXECUTIONS = 3;
+    const isProvenFailing = (p: any): boolean => {
+      const execs = (p as any).total_executions ?? 0;
+      const succ = (p as any).successful_executions ?? null;
+      // A MISSING success counter must never disqualify a path — only an observed zero does.
+      return succ !== null && succ === 0 && execs >= PROVEN_FAILING_MIN_EXECUTIONS;
+    };
+    const paths = ((allPaths ?? []) as any[]).filter((p) => !isProvenFailing(p));
+    const withheld = (allPaths?.length ?? 0) - paths.length;
+    if (withheld > 0) {
+      logger.info('Withheld proven-failing paths from recommendation', {
+        goal_hash: goalHash,
+        withheld,
+        remaining: paths.length,
+        min_executions: PROVEN_FAILING_MIN_EXECUTIONS,
+      });
+    }
+
+    if (paths.length === 0) {
+      // Either nothing was recorded, or everything recorded is proven-failing. Both mean the
+      // same thing to the caller: there is no pathway worth reusing, derive one.
       return c.json(PathRecommendationResponseSchema.parse({
         goal_hash: goalHash,
         recommended_paths: [],
       }));
     }
-    
+
     // Decide: exploration vs exploitation
     const shouldExplore = rng() < validated.exploration_rate;
     
