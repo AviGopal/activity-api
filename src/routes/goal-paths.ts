@@ -434,6 +434,7 @@ app.post('/', async (c) => {
           endpoint_output_shapes = $endpoint_output_shapes,
           last_executed_at = time::now(),
           walk_tier = $walk_tier ?? walk_tier,
+          expected_output_shapes = $expected_output_shapes ?? expected_output_shapes,
           updated_at = time::now()
         WHERE goal_hash = $goal_hash
           AND path_signature = $path_signature
