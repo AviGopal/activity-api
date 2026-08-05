@@ -2913,9 +2913,14 @@ app.post('/', async (c) => {
               org_id: $org_id,
               -- account_id is option<string>: a JS null binds as SurrealDB NULL, which
               -- violates option<string> (NONE | string, never NULL) and aborts the
-              -- account_id-keyed re-derive UPDATE path. Coerce NULL -> NONE at write time,
-              -- matching variant_performance_metrics (line ~2821). (2026-06-26)
-              account_id: COALESCE($account_id, 'NONE'),
+              -- account_id-keyed re-derive UPDATE path. Coerce NULL -> NONE at write time.
+              -- NOT COALESCE: SurrealDB has no such function, so the whole statement failed to
+              -- PARSE and every new context bucket silently failed to be created — the error was
+              -- caught as "non-blocking" and logged 172 times in two hours while contextual
+              -- Thompson scoring quietly had no write path. COALESCE(..., 'NONE') would also
+              -- have stored the STRING 'NONE' rather than the NONE value, so it was wrong twice.
+              -- This is the idiom already used for the same coercion further down this file.
+              account_id: IF $account_id IS NULL THEN NONE ELSE $account_id END,
               account_id_version: 1,
               template_id: $template_id,
               context_bucket: $bucket,
@@ -2996,9 +3001,9 @@ app.post('/', async (c) => {
             CREATE context_thompson_scores CONTENT {
               org_id: $org_id,
               -- account_id is option<string>: coerce JS-null -> NONE so it satisfies
-              -- option<string> (never NULL). Same fix as the primary bucket write
-              -- above and variant_performance_metrics (line ~2821). (2026-06-26)
-              account_id: COALESCE($account_id, 'NONE'),
+              -- option<string> (never NULL). Same fix as the primary bucket write above.
+              -- NOT COALESCE — SurrealDB has no such function; see the note there.
+              account_id: IF $account_id IS NULL THEN NONE ELSE $account_id END,
               account_id_version: 1,
               template_id: $template_id,
               context_bucket: $bucket,
