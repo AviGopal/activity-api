@@ -724,7 +724,11 @@ export const GoalExecutionPathSchema = z.object({
   // — the mechanism looked dead when it was merely invisible. inference_confidence
   // likewise grades how sure the goal-target inference was about the plan set.
   walk_tier: z.string().optional(),
-  inference_confidence: z.number().nullable().optional(),
+  // Stored column is last_inference_confidence (the request field is
+  // inference_confidence; the CREATE maps one to the other), so declare the STORED
+  // name — declaring the request name silently yields nothing, which is the same
+  // read-side invisibility this block exists to fix.
+  last_inference_confidence: z.number().nullable().optional(),
 
   // Timestamps
   last_executed_at: z.union([z.string(), z.object({}).passthrough()]).optional(),
