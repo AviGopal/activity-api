@@ -414,6 +414,23 @@ app.post('/', async (c) => {
       const successDelta = validated.success ? 1 : 0;
       const failureDelta = validated.success ? 0 : 1;
       const tokenUsage = validated.token_usage !== undefined ? validated.token_usage : null;
+      // success_rate below divides in FLOAT deliberately (the `* 1.0`). Both counters are
+      // TYPE int (sql/003-goal-execution-paths.surql:40,44) and SurrealDB 2.3.3 divides
+      // int/int as INTEGER division, so every partially-successful path stored
+      // success_rate = 0. Verified on that engine version:
+      //   RETURN (244 + 0) / (489 + 1)          => 0
+      //   RETURN ((244 + 0) * 1.0) / (489 + 1)  => 0.49795918367346936
+      // Measured before this fix across all 4632 rows: success_rate held only two distinct
+      // values, 0 and 1. All 130 paths with 0 < successful_executions < total_executions
+      // read 0, and those carried 544 of the store's 1370 successes (39.7%).
+      // goal-host's reuse hook (index.ts:3381) tests this field for truthiness and the
+      // ?? operator does not fall through on 0, so all 130 were unselectable: the MIDDLE
+      // tier of the execution contract was switched off by an integer division. It is also
+      // the ORDER BY key of the operator-facing list endpoints below, which therefore
+      // ranked the best pathways in the store last.
+      // Written as `* 1.0` rather than a cast so it stays correct however the operands
+      // happen to be typed at runtime. NOTE: no SQL-level comment here on purpose — this
+      // file's queries contain no `--` comments and that parse was not worth risking.
       const updateQuery = `
         UPDATE goal_execution_paths
         SET
@@ -424,7 +441,7 @@ app.post('/', async (c) => {
           thompson_alpha = (thompson_alpha ?? 1) + $success_delta,
           thompson_beta = (thompson_beta ?? 1) + $failure_delta,
           last_inference_confidence = $inference_confidence ?? last_inference_confidence,
-          success_rate = ((successful_executions ?? 0) + $success_delta) / ((total_executions ?? 0) + 1),
+          success_rate = (((successful_executions ?? 0) + $success_delta) * 1.0) / ((total_executions ?? 0) + 1),
           avg_duration_ms = (((avg_duration_ms ?? 0) * (total_executions ?? 0)) + $duration_ms) / ((total_executions ?? 0) + 1),
           avg_cost_usd = (((avg_cost_usd ?? 0) * (total_executions ?? 0)) + $cost_usd) / ((total_executions ?? 0) + 1),
           avg_token_usage = IF $token_usage IS NULL
