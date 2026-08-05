@@ -3355,7 +3355,24 @@ router.post('/resolve', async (c) => {
           const depEvidenceCleared = isGlobal && !isAdminDep && depEvidenceUsed !== null;
           const after = await executeAsAuth<any>(
             jwtAuth,
-            `UPDATE activity SET deprecated = true, updated_at = time::now() WHERE record::id(id) = $id AND (${accountIdScopedWhere()} OR (scope = 'global' AND ($isAdmin = true OR $evidenceCleared = true))) RETURN AFTER`,
+            // Set `retired` alongside `deprecated`. Deprecation that does not stop SELECTION is
+            // cosmetic: every selection and discovery path filters on `retired` — Thompson
+            // candidate assembly (db/paradigm.ts), shape-based discovery
+            // (services/discover-by-shapes.ts), and the template listing all test
+            // `retired = false OR retired IS NONE`, and only one root-path query anywhere reads
+            // `deprecated`. So an arm deprecated through this impulse stayed fully selectable,
+            // discoverable and listed. Measured 2026-08-05: 18 arms with >=10 executions and a
+            // success rate of exactly 0 were deprecated through this path and every one remained
+            // in the candidate pool. The variant lifecycle documented in CLAUDE.md — mint a
+            // variant, let Thompson allocate, promote the winner and deprecate the losers — was
+            // therefore not removing the losers.
+            //
+            // The two flags are meant to travel together: the failed-out pruning path
+            // (routes/activities.ts) already sets `proposed = false, deprecated = true,
+            // retired = true` in one statement. This impulse setting only `deprecated` was the
+            // anomaly. `deprecated` stays as the lifecycle LABEL (why it left), `retired` as the
+            // operative flag (that it left).
+            `UPDATE activity SET deprecated = true, retired = true, updated_at = time::now() WHERE record::id(id) = $id AND (${accountIdScopedWhere()} OR (scope = 'global' AND ($isAdmin = true OR $evidenceCleared = true))) RETURN AFTER`,
             {
               id: templateId,
               orgId: jwtAuth.orgId,

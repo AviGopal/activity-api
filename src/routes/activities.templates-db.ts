@@ -137,6 +137,12 @@ export interface ActivityTemplate {
   execution_type?: string;
   // Canonical: 'variant_of' (was genealogy)
   variant_of?: Record<string, any>;
+  // Lifecycle. `deprecated` is the LABEL (why the arm left); `retired` is the OPERATIVE flag
+  // that selection, shape-discovery and this listing all filter on. They travel together — an
+  // arm marked deprecated but not retired stays fully selectable, which is what made
+  // evidence-gated deprecation cosmetic until 2026-08-05.
+  deprecated?: boolean;
+  retired?: boolean;
   created_at: string;
   updated_at: string;
   metrics?: {
@@ -407,8 +413,14 @@ export async function enrichTemplatesWithMetrics(
   }
 }
 
+// `deprecated` and `retired` are SELECTED so a caller can see lifecycle state. Their absence
+// made the listing an instrument that could not show what it manages: a consumer sweeping for
+// dead arms saw `deprecated === undefined` on every row, so its "skip the already-retired"
+// guard silently never fired and it re-deprecated the same templates on every pass, logging
+// each one as a fresh retirement. Verifying a retirement against this listing likewise reported
+// that nothing had been retired while a direct read of the same row showed `deprecated: true`.
 export const TEMPLATE_LIST_FIELDS =
-  'id, name, description, tags, tag_prefixes, category, tasks, scope, org_id, project_id, input_shapes, output_shapes, execution_type, variant_of, created_at, updated_at';
+  'id, name, description, tags, tag_prefixes, category, tasks, scope, org_id, project_id, input_shapes, output_shapes, execution_type, variant_of, deprecated, retired, created_at, updated_at';
 
 export async function fetchTemplatesRowTolerant(
   makeQuery: (fields: string) => string,
