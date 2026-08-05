@@ -3873,7 +3873,7 @@ app.post('/reach', async (c) => {
       ? body.missing.map(String)
       : [];
     const res = await surrealDB.query(
-      `UPDATE activity_execution_traces SET reached = $reached, completion_shapes = $completion_shapes, missing = $missing WHERE execution_id = $execution_id`,
+      `UPDATE activity_execution_traces SET reached = $reached, completion_shapes = $completion_shapes, missing = $missing, tags = array::union(tags ?? [], [IF $reached { 'reached:true' } ELSE { 'reached:false' }]) WHERE execution_id = $execution_id`,
       { reached: body.reached, completion_shapes, missing, execution_id: String(execId) },
     );
     const updatedTrace: any = Array.isArray(res) && Array.isArray(res[0]) && res[0].length > 0 ? res[0][0] : null;
