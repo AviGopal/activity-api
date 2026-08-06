@@ -2848,7 +2848,7 @@ app.post('/', async (c) => {
         tags: Array.isArray((trace as any).tags) ? ((trace as any).tags as string[]) : undefined,
       });
       const reachUngraded = reachVerdict === 'ungraded';
-      const reachEffectiveSuccess = reachVerdict === 'reached' || reachVerdict === 'legacy-success';
+      const reachEffectiveSuccess = reachVerdict === 'reached';
 
       applyOutcomeToPosteriors(
         {
@@ -2943,7 +2943,7 @@ app.post('/', async (c) => {
       tags: Array.isArray((trace as any).tags) ? ((trace as any).tags as string[]) : undefined,
     });
     const ctxUngraded = ctxReach === 'ungraded';
-    const ctxEffectiveSuccess = ctxReach === 'reached' || ctxReach === 'legacy-success';
+    const ctxEffectiveSuccess = ctxReach === 'reached';
 
     if (isValidBucket(rawContextBucket) && !ctxUngraded) {
       try {
@@ -3181,7 +3181,7 @@ app.post('/', async (c) => {
       tags: Array.isArray((trace as any).tags) ? ((trace as any).tags as string[]) : undefined,
     });
       const seedUngraded = seedReach === 'ungraded';
-      const seedEffectiveSuccess = seedReach === 'reached' || seedReach === 'legacy-success';
+      const seedEffectiveSuccess = seedReach === 'reached';
       for (const candidateId of metricsCandidateIds) {
         const variantMetricsParams = {
           // Phase E: account-keyed record-id slug; legacy `<variant>` slug

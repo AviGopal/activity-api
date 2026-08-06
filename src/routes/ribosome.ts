@@ -67,7 +67,7 @@ interface ExecutionTrace {
 // prior inline logic across all six input classes (verified by truth table).
 function isHonestlyReached(t: { success: boolean; execution_id?: string; activity_id?: string; tags?: string[] }): boolean {
   const v = classifyReach(t);
-  return v === 'reached' || v === 'legacy-success';
+  return v === 'reached';
 }
 
 interface ExtractedTask {

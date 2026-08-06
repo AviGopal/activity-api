@@ -756,7 +756,7 @@ export async function applyOutcomeToPosteriors(
     tags: trace.tags,
   });
   const ungraded = reachVerdict === 'ungraded';
-  const effectiveSuccess = reachVerdict === 'reached' || reachVerdict === 'legacy-success';
+  const effectiveSuccess = reachVerdict === 'reached';
   const { alphaDelta, betaDelta } = ungraded
     ? { alphaDelta: 0, betaDelta: 0 }
     : computeDeltas(effectiveSuccess, trace.failure_mode, warnings, trace, yieldRefs);
