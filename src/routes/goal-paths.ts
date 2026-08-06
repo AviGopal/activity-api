@@ -794,6 +794,14 @@ app.post('/recommend', async (c) => {
         ? body.endpoint_output_shape
         : undefined;
 
+    // The walk's inferred target shapes, used ONLY as a fallback candidate arm
+    // when exact goal-hash retrieval finds nothing reusable (see below).
+    const targetShapes: string[] = Array.isArray(body?.target_shapes)
+      ? (body.target_shapes as unknown[])
+          .map((s) => String(s))
+          .filter((s) => s.length > 0)
+      : [];
+
     const goalHash = hashGoal(validated.goal_text);
 
     // Optional per-request seed for reproducible recommendations. When
@@ -870,6 +878,7 @@ app.post('/recommend', async (c) => {
       return succ !== null && succ === 0 && execs >= PROVEN_FAILING_MIN_EXECUTIONS;
     };
     const paths = ((allPaths ?? []) as any[]).filter((p) => !isProvenFailing(p));
+    for (const p of paths) p.__match_mode = 'goal_hash';
     const withheld = (allPaths?.length ?? 0) - paths.length;
     if (withheld > 0) {
       logger.info('Withheld proven-failing paths from recommendation', {
@@ -878,6 +887,71 @@ app.post('/recommend', async (c) => {
         remaining: paths.length,
         min_executions: PROVEN_FAILING_MIN_EXECUTIONS,
       });
+    }
+
+    // NEARBY MATCH ON THE SHAPE SIGNATURE — the second candidate arm.
+    //
+    // Retrieval above is keyed on an exact hash of the goal text, so a reworded
+    // or merely similar goal retrieves nothing and the walk re-derives a
+    // composition the system already knows. Measured over the fully-paginated
+    // 4,768-row corpus (2026-08-06): 1,017 of 1,304 fresh goal hashes (78%)
+    // landed on a path_signature that ALREADY EXISTED under a different goal
+    // hash. That is not learning compounding; it is the same composition being
+    // rediscovered from scratch, and it is invisible as waste because each
+    // re-derivation looks like a healthy fresh walk.
+    //
+    // So when the exact arm yields nothing reusable, fall back to candidates
+    // whose recorded ENDPOINT OUTPUT SHAPES overlap the shapes this walk is
+    // trying to produce, ranked by cover fraction |candidate ∩ target| / |target|.
+    // Shapes are the routing key the whole system is built on, so two goals that
+    // terminate in the same shapes are asking for the same thing in different
+    // words — exactly the case the goal-hash key cannot see.
+    //
+    // This is deliberately a FALLBACK, not a merge: an exact goal-hash match is
+    // stronger evidence than a shape overlap, so it is never displaced. And the
+    // same proven-failing bar applies, because a nearby path that never reached
+    // is no more reusable than an exact one that never reached.
+    let shapeMatched = 0;
+    if (paths.length === 0 && targetShapes.length > 0) {
+      const shapeQuery = `
+        SELECT * FROM goal_execution_paths
+        WHERE endpoint_output_shapes CONTAINSANY $target_shapes
+          AND goal_hash != $goal_hash
+        ORDER BY total_executions DESC
+        LIMIT 200
+      `;
+      const shapeRows = await surrealDB.query<GoalExecutionPath[]>(shapeQuery, {
+        target_shapes: targetShapes,
+        goal_hash: goalHash,
+      });
+      const targetSet = new Set(targetShapes);
+      const scored = ((shapeRows ?? []) as any[])
+        .filter((p) => !isProvenFailing(p))
+        .map((p) => {
+          const have: string[] = Array.isArray(p.endpoint_output_shapes) ? p.endpoint_output_shapes.map(String) : [];
+          const covered = have.filter((s) => targetSet.has(s)).length;
+          p.__shape_cover = targetSet.size > 0 ? covered / targetSet.size : 0;
+          p.__match_mode = 'shape_signature';
+          return p;
+        })
+        // A single incidental shape in common is not a nearby match. Require the
+        // candidate to cover at least half of what the walk is trying to produce,
+        // so first/last-mile adaptation has a real body to adapt rather than a
+        // coincidence to chase.
+        .filter((p) => p.__shape_cover >= 0.5)
+        .sort((a, b) => (b.__shape_cover - a.__shape_cover)
+          || ((b.successful_executions ?? 0) - (a.successful_executions ?? 0))
+          || ((b.total_executions ?? 0) - (a.total_executions ?? 0)));
+      if (scored.length > 0) {
+        paths.push(...scored);
+        shapeMatched = scored.length;
+        logger.info('Shape-signature fallback matched candidate paths', {
+          goal_hash: goalHash,
+          target_shapes: targetShapes,
+          candidates: shapeMatched,
+          best_cover: scored[0].__shape_cover,
+        });
+      }
     }
 
     if (paths.length === 0) {
@@ -942,6 +1016,15 @@ app.post('/recommend', async (c) => {
             // @ts-ignore
             avg_cost_usd: p.avg_cost_usd || 0,
             total_executions: totalExec,
+            successful_executions: successExec,
+            // @ts-ignore
+            goal_hash: typeof p.goal_hash === 'string' ? p.goal_hash : undefined,
+            // @ts-ignore
+            path_signature: typeof p.path_signature === 'string' ? p.path_signature : undefined,
+            // @ts-ignore
+            match_mode: p.__match_mode ?? 'goal_hash',
+            // @ts-ignore
+            shape_cover: typeof p.__shape_cover === 'number' ? p.__shape_cover : undefined,
             exploration_bonus: 1.0 / (totalExec + 1),
             thompson_params: { alpha, beta },
           };
@@ -993,6 +1076,15 @@ app.post('/recommend', async (c) => {
             // @ts-ignore
             avg_cost_usd: s.path.avg_cost_usd || 0,
             total_executions: totalExec,
+            successful_executions: successExec,
+            // @ts-ignore
+            goal_hash: typeof s.path.goal_hash === 'string' ? s.path.goal_hash : undefined,
+            // @ts-ignore
+            path_signature: typeof s.path.path_signature === 'string' ? s.path.path_signature : undefined,
+            // @ts-ignore
+            match_mode: s.path.__match_mode ?? 'goal_hash',
+            // @ts-ignore
+            shape_cover: typeof s.path.__shape_cover === 'number' ? s.path.__shape_cover : undefined,
             thompson_params: { alpha, beta },
           };
         })
@@ -1008,6 +1100,8 @@ app.post('/recommend', async (c) => {
       goal_hash: goalHash,
       count: recommendedPaths.length,
       mode: shouldExplore ? 'explore' : 'exploit',
+      shape_matched_candidates: shapeMatched,
+      returned_shape_matches: recommendedPaths.filter((p: any) => p.match_mode === 'shape_signature').length,
     });
     
     return c.json(response);

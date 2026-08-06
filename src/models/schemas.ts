@@ -829,6 +829,35 @@ export const RecommendedPathSchema = z.object({
   avg_duration_ms: z.number(),
   avg_cost_usd: z.number(),
   total_executions: z.number().int(),
+  // ACCEPTANCE COUNTERS — LOAD-BEARING, NOT DECORATIVE.
+  //
+  // goal-host's recommendReachingPath accepts a pathway on the raw counters
+  // (`successful_executions >= minSuccessful && total_executions >= minTotal`),
+  // deliberately NOT on `success_rate`, because the rate is a derived field that
+  // has been observed truncated while the counters are written atomically.
+  //
+  // `successful_executions` was absent from this schema, and z.object() STRIPS
+  // unknown keys — so every recommendation reached the caller with the field
+  // undefined, scored 0, and failed `>= 1`. Measured over 48h on the live spoke:
+  // 5 requests, 15 paths recommended, 0 accepted, and the last genuine reuse was
+  // 2026-08-05T20:42Z. Pathway reuse was not disabled or starved; it was
+  // structurally impossible, and the "no reusable pathway" log line reported it
+  // as an honest absence of candidates.
+  //
+  // Anything the consumer gates on must survive serialization. Adding a field to
+  // the SELECT without adding it here is a silent drop.
+  successful_executions: z.number().int().optional(),
+  // Identity of the recorded path, so a caller can tell an EXACT goal-hash match
+  // from a shape-signature match (the two arms below return the same schema) and
+  // can record which composition it actually reused.
+  goal_hash: z.string().optional(),
+  path_signature: z.string().optional(),
+  // Which candidate arm produced this row: 'goal_hash' (exact goal identity) or
+  // 'shape_signature' (nearby match on endpoint output shapes).
+  match_mode: z.enum(['goal_hash', 'shape_signature']).optional(),
+  // For a shape_signature match: |candidate ∩ target| / |target|, the cover
+  // fraction it was ranked by. Absent on an exact match.
+  shape_cover: z.number().min(0).max(1).optional(),
   exploration_bonus: z.number().optional(), // If recommended for exploration
   thompson_params: z.object({
     alpha: z.number(),
