@@ -3923,15 +3923,28 @@ app.post('/reach', async (c) => {
     }
     // WRITE-FLIP: mirror the reach verdict onto the authoritative `execution`
     // row (the load-bearing learning signal; point update, non-fatal).
+    //
+    // The tag union MUST be written HERE, not only on activity_execution_traces.
+    // Readers fetch traces through v_paradigm_execution_traces, a view over
+    // `execution`, and that view projects `tags` but NOT `reached` — so a verdict
+    // written anywhere else is invisible to classifyReach, which reads tags only.
+    // `missing` is deliberately not set here: it is defined on
+    // activity_execution_traces but on no migration for the SCHEMAFULL `execution`
+    // table, which defines reached and completion_shapes only.
+    let mirrored = 0;
     try {
-      await surrealDB.query(
-        `UPDATE type::thing('execution', $execution_id) SET reached = $reached, completion_shapes = $completion_shapes, missing = $missing`,
-        { reached: body.reached, completion_shapes, missing, execution_id: String(execId) },
+      const mres = await surrealDB.query(
+        `UPDATE type::thing('execution', $execution_id) SET reached = $reached, completion_shapes = $completion_shapes, tags = array::union(tags ?? [], [IF $reached { 'reached:true' } ELSE { 'reached:false' }])`,
+        { reached: body.reached, completion_shapes, execution_id: String(execId) },
       );
+      mirrored = Array.isArray(mres) && Array.isArray(mres[0]) ? (mres[0] as unknown[]).length : (Array.isArray(mres) ? mres.length : 0);
     } catch (e) {
       logger.warn('[reach-patch] execution mirror update failed (non-fatal)', { error: e instanceof Error ? e.message : String(e) });
     }
-    const updated = Array.isArray(res) && Array.isArray(res[0]) ? (res[0] as unknown[]).length : (Array.isArray(res) ? res.length : 0);
+    // `updated` is the caller's persistence signal: goal-host logs MATCHED NO ROW
+    // and abandons the verdict whenever it is 0, so the mirror must be counted.
+    const aetUpdated = Array.isArray(res) && Array.isArray(res[0]) ? (res[0] as unknown[]).length : (Array.isArray(res) ? res.length : 0);
+    const updated = aetUpdated + mirrored;
     return c.json({ success: true, execution_id: String(execId), reached: body.reached, updated }, 200);
   } catch (err) {
     logger.warn('[reach-patch] failed to persist reach verdict on trace', { error: err instanceof Error ? err.message : String(err) });
