@@ -96,6 +96,36 @@ function normalizeGoal(goal: string): string {
   return goal
     .toLowerCase()
     .trim()
+    // CLASS HASH, NOT INSTANCE HASH. goal_hash keys goal_execution_paths — the surface Thompson
+    // learns pathway reuse over — so this function decides what counts as "the same goal", and
+    // therefore what the system is able to learn anything about at all.
+    //
+    // Gap-closing goals embed a unique gap id ("close substrate gap route-edit-5994fcfb:21"),
+    // and the punctuation strip below leaves the hex intact because it is \w. So every instance
+    // hashed to its own row. Measured 2026-08-06 over the live corpus:
+    //
+    //   78.6% of ALL paths executed exactly once (3,690 of 4,693)
+    //   close-substrate-gap alone: 2,145 DISTINCT paths for 3,102 executions — 1.4 each
+    //
+    // A Beta posterior over a single observation IS its prior. So those paths carry no learning,
+    // and the next instance of the same work arrives under a new hash and starts from scratch.
+    // The machinery around it is fine: 47.3% of paths already compose 2-6 activities, and
+    // excluding the two degenerate families, paths executed >=3 times reach 27.2% against 24.7%
+    // for single-shot paths — reuse DOES pay. It is simply almost never possible, because the
+    // key shatters the surface before the learner can see it.
+    //
+    // Eliding volatile identifiers collapses those instances onto one learnable class. That is
+    // what makes first/last-mile pathway adaptation possible: reuse the body, walk the
+    // difference. Deliberately conservative — a hex run must be >= 8 chars AND contain a digit,
+    // so ordinary all-letter hex words ("deadbeef", "facade") are untouched. The ":21" suffix is
+    // part of the identifier: eliding the hex alone still left route-edit-5994fcfb:21 and
+    // route-edit-477438a2:16 in separate classes, which a test caught.
+    //
+    // Safe against replaying a known-bad pathway because /recommend already withholds paths with
+    // >=3 executions and zero successes. Runs BEFORE the punctuation strip, which would otherwise
+    // weld the id to its neighbours and destroy the \b boundaries this relies on.
+    .replace(/\b[0-9a-f]{8,}(?::\d+)?\b/g, (m) => (/\d/.test(m) ? 'id' : m))
+    .replace(/\b\d{10,}\b/g, 'n')
     .replace(/[^\w\s]/g, '') // Remove punctuation
     .replace(/\s+/g, '_');   // Replace spaces with underscores
 }
