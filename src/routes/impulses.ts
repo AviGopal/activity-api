@@ -2854,6 +2854,23 @@ router.post('/resolve', async (c) => {
           asserted_at?: string; source?: string; probe?: string;
           expected?: string; observed?: string; evidence?: string;
         };
+        // SurrealDB option<T> accepts NONE, NOT NULL — they are distinct values, and a bound JS
+        // null arrives as NULL, so a SCHEMAFULL option field rejects the whole CREATE. Measured
+        // 2026-08-06, minutes after the grounding fields first landed: EVERY
+        // goal_verification_label_write returned HTTP 500 with "Found NULL for field
+        // asserted_at, but expected a option<datetime>" — grounded AND ungrounded alike, so the
+        // oracle's own labels died too. goal-host's recordDeterministicLabel is fire-and-forget
+        // and never sees the 500, so the feed dies SILENTLY: the exact mechanism that killed the
+        // 'deterministic' tier for two weeks after migration 101. Migration 192 was deliberately
+        // written option<> with no ASSERT to avoid this, and the BINDING reintroduced it one
+        // layer up. The CREATE below therefore wraps each optional field in
+        // IF ... IS NULL THEN NONE ELSE ... END — the idiom already proven in this repo
+        // (execution-traces.ts:2949, :3032, from the COALESCE-is-not-a-SurrealDB-function
+        // repair). `grounded` is a plain bool and always supplied, so it needs no guard.
+        //
+        // Note the comments live HERE, not inside the CREATE: that template literal is the SQL
+        // string, so a // comment inside it is sent to the database, and a backtick inside it
+        // terminates the literal.
         const gvlNonEmpty = (v: unknown): boolean => typeof v === 'string' && v.trim().length > 0;
         const gvlGrounded =
           gvlNonEmpty(gvlG.source) &&
@@ -2874,12 +2891,12 @@ router.post('/resolve', async (c) => {
               confidence: $confidence,
               notes: $notes,
               labeler: $labeler,
-              asserted_at: $asserted_at,
-              source: $source,
-              probe: $probe,
-              expected: $expected,
-              observed: $observed,
-              evidence: $evidence,
+              asserted_at: IF $asserted_at IS NULL THEN NONE ELSE $asserted_at END,
+              source: IF $source IS NULL THEN NONE ELSE $source END,
+              probe: IF $probe IS NULL THEN NONE ELSE $probe END,
+              expected: IF $expected IS NULL THEN NONE ELSE $expected END,
+              observed: IF $observed IS NULL THEN NONE ELSE $observed END,
+              evidence: IF $evidence IS NULL THEN NONE ELSE $evidence END,
               grounded: $grounded,
               created_at: time::now()
             }`,
