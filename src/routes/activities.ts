@@ -2113,20 +2113,50 @@ app.post('/executions', async (c) => {
     // so the existing query-result shape (driver returns
     // first-statement results) is preserved.
     const accountIdParam = accountIdRecordRef(accountId);
+    // The composite-key SELECT is WIDENED (not duplicated) to carry the counter
+    // and average columns, because the derived fields below are now computed in
+    // JS from this same single read. Law 3: one read, reused.
     const findExistingQuery = `
-      SELECT id FROM variant_performance_metrics
+      SELECT id,
+             total_executions,
+             successful_executions,
+             failed_executions,
+             avg_duration_ms,
+             avg_cost_usd
+        FROM variant_performance_metrics
         WHERE variant_id = $variant_id
           AND (account_id IS $account_id OR (account_id IS NONE AND $account_id IS NULL))
         LIMIT 1
     `;
+    // The derived fields are no longer computed inside the SET clause. Two defects
+    // compounded there:
+    //   1. INTEGER DIVISION. total_executions / successful_executions are declared
+    //      `TYPE int` (sql/001-init-schema.surql:149-159) and SurrealDB 2.3.3
+    //      evaluates int/int as integer division, so the stored `success_rate`
+    //      truncated to exactly 0 or 1 — measured over the full 2445-template
+    //      population the histogram was exactly {0: 805, 1: 619}, ZERO fractional
+    //      values. The truncated 0 is not merely dropped, it is read back and
+    //      amplified: composition-graph.ts:99-100 reconstructs
+    //      alpha = success_rate * total_executions + 1, so a stored 0 forces a
+    //      maximally pessimistic posterior on an arm that may be mostly succeeding;
+    //      health-scoring.ts:446 uses it as successFactor; task-generator.ts:255
+    //      marks every row below 0.3 priority 'critical'.
+    //   2. SEQUENTIAL SET CLAUSES. SurrealDB applies SET assignments in order, so a
+    //      derived field referencing `total_executions` in the same statement that
+    //      increments it read the ALREADY-INCREMENTED value — an off-by-one
+    //      denominator.
+    // The three counters keep their atomic in-statement `+ 1` form: none of them
+    // reads a field another SET clause writes, so they carry no evaluation-order
+    // dependence and stay race-free. Only the derived fields move to bound params
+    // computed from the row the SELECT already returned.
     const updateQuery = `
       UPDATE $id SET
         total_executions = (total_executions ?? 0) + 1,
         successful_executions = (successful_executions ?? 0) + $success_delta,
         failed_executions = (failed_executions ?? 0) + $failure_delta,
-        success_rate = ((successful_executions ?? 0) + $success_delta) / ((total_executions ?? 0) + 1),
-        avg_duration_ms = (((avg_duration_ms ?? 0) * (total_executions ?? 0)) + $duration_ms) / ((total_executions ?? 0) + 1),
-        avg_cost_usd = (((avg_cost_usd ?? 0) * (total_executions ?? 0)) + $cost) / ((total_executions ?? 0) + 1),
+        success_rate = $next_success_rate,
+        avg_duration_ms = $next_avg_duration_ms,
+        avg_cost_usd = $next_avg_cost_usd,
         last_executed_at = time::now(),
         updated_at = time::now()
       RETURN AFTER;
@@ -2160,22 +2190,52 @@ app.post('/executions', async (c) => {
     // first-statement result array (mirrors queryWithAuth). Each of
     // these helper SQLs is single-statement, so the returned value
     // is already the rows array — no further [0] unwrap.
-    const findRows = await surrealDB.query<{ id: string }>(findExistingQuery, {
+    const findRows = await surrealDB.query<{
+      id: string;
+      total_executions?: number;
+      successful_executions?: number;
+      failed_executions?: number;
+      avg_duration_ms?: number;
+      avg_cost_usd?: number;
+    }>(findExistingQuery, {
       variant_id: normalizedVariantId,
       account_id: accountIdParam,
     });
-    const existingId = Array.isArray(findRows) && findRows.length > 0
-      ? (findRows[0] as { id?: string }).id
+    const existingRow = Array.isArray(findRows) && findRows.length > 0
+      ? (findRows[0] as {
+          id?: string;
+          total_executions?: number;
+          successful_executions?: number;
+          failed_executions?: number;
+          avg_duration_ms?: number;
+          avg_cost_usd?: number;
+        })
       : undefined;
+    const existingId = existingRow?.id;
 
     let metricsResult: any[];
     if (existingId) {
+      // A missing or non-numeric stored column reads as 0, never NaN.
+      const counterOf = (value: unknown): number =>
+        typeof value === 'number' && Number.isFinite(value) ? value : 0;
+      const prevTotal = counterOf(existingRow?.total_executions);
+      const prevSuccessful = counterOf(existingRow?.successful_executions);
+      const prevAvgDurationMs = counterOf(existingRow?.avg_duration_ms);
+      const prevAvgCostUsd = counterOf(existingRow?.avg_cost_usd);
+      const nextTotal = prevTotal + 1;
+      const nextSuccessful = prevSuccessful + success_delta;
       metricsResult = (await surrealDB.query<any>(updateQuery, {
         id: existingId,
         success_delta,
         failure_delta,
-        duration_ms: validated.duration_ms,
-        cost: validated.cost,
+        // `* 1.0` forces float arithmetic and a float-valued bound param, so
+        // neither JS nor SurrealDB can re-truncate the assignment. The semantics
+        // of "success" are unchanged — only the arithmetic is.
+        next_success_rate: (nextSuccessful * 1.0) / nextTotal,
+        next_avg_duration_ms:
+          ((prevAvgDurationMs * prevTotal) + validated.duration_ms) * 1.0 / nextTotal,
+        next_avg_cost_usd:
+          ((prevAvgCostUsd * prevTotal) + validated.cost) * 1.0 / nextTotal,
       })) as any[];
     } else {
       metricsResult = (await surrealDB.query<any>(insertQuery, {
