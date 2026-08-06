@@ -3898,10 +3898,124 @@ app.post('/reach', async (c) => {
     const missing: string[] = Array.isArray(body.missing)
       ? body.missing.map(String)
       : [];
+    // AUTHORITATIVE PRE-READ — must precede the UPDATE below. It captures the row
+    // exactly as it stood BEFORE this patch, which is the only way to know what the
+    // INSERT path (app.post('/'), applyOutcomeToPosteriors) already did with this
+    // execution. Re-crediting a row the insert path already graded would double-count
+    // against the same alpha/beta counters. Reusing the ONE honest-reach primitive
+    // (classifyReach) on the PRE-patch tags answers it exactly: only an 'ungraded'
+    // pre-verdict means the insert contributed {0,0}, so this late verdict is the
+    // first and only credit for the row.
+    //
+    // Reads `execution`, NOT activity_execution_traces: AET is the DUAL_WRITE shadow
+    // and isDualWriteEnabled() defaults to FALSE (db/paradigm.ts, "Migration COMPLETE
+    // (2026-07): `execution` is the sole authoritative trace store"). DUAL_WRITE_ENABLED
+    // is set in no script, unit or compose file, so on this deployment AET receives no
+    // new rows at all and a pre-read there would find nothing, forever.
+    let preRow: any = null;
+    let preReadOk = false;
+    try {
+      const preRes = await surrealDB.query<any>(
+        `SELECT variant_id, activity_id, success, tags, cost_usd, org_id, signature, signature_version, composition_chain, failure_mode, trace.tasks AS tasks FROM type::thing('execution', $execution_id) LIMIT 1`,
+        { execution_id: String(execId) },
+      );
+      preRow = Array.isArray(preRes) && preRes.length > 0
+        ? (Array.isArray((preRes as any)[0]) ? (preRes as any)[0][0] : (preRes as any)[0])
+        : null;
+      preReadOk = true;
+    } catch (e) {
+      // Fail CLOSED on grading only: a missed pre-read must never produce an unguarded
+      // (possibly double-counting) posterior write. The verdict patch itself still
+      // proceeds — persisting it is the caller's contract.
+      logger.warn('[reach-patch] pre-read for posterior grading failed (verdict still patched)', { error: e instanceof Error ? e.message : String(e) });
+    }
+    const preTags: string[] = Array.isArray(preRow?.tags) ? (preRow.tags as string[]) : [];
     const res = await surrealDB.query(
       `UPDATE activity_execution_traces SET reached = $reached, completion_shapes = $completion_shapes, missing = $missing, tags = array::union(tags ?? [], [IF $reached { 'reached:true' } ELSE { 'reached:false' }]) WHERE execution_id = $execution_id`,
       { reached: body.reached, completion_shapes, missing, execution_id: String(execId) },
     );
+    // LATE-VERDICT GRADING. The reach gate runs AFTER the trace is inserted, so before
+    // this the walk's honest verdict was persisted and NEVER credited: every posterior
+    // consumer of classifyReach lived in app.post('/'). Measured consequence — two
+    // full-population snapshots 3.5 minutes apart showed ZERO movement in
+    // thompson_alpha/thompson_beta across 2,392 comparable templates while ~400 traces
+    // landed. Reuses the existing producer applyOutcomeToPosteriors with the same
+    // argument shape as the insert-path call site, so 'reached' credits alpha and
+    // 'not-reached' penalizes beta (computeDeltas(false, ...) => beta >= 0.5) exactly
+    // as it would have at insert time. The system learns from failures AND successes.
+    //
+    // SATELLITE EXCLUSION: classifyReach returns 'ungraded' for BOTH a goal-host walk
+    // awaiting a verdict AND a structural satisfier satellite, but only the first is
+    // creditable — a satellite is a walk artifact the honest-reach gate deliberately
+    // never grades, and passing it a 'reached:true' tag would make classifyReach credit
+    // it, because the tag branch is tested BEFORE the satellite branch. Without this
+    // guard the fix would hand full alpha to satisfier: arms, which carry ~37% of all
+    // executions — the precise opposite of the intent.
+    const preActivityId = typeof preRow?.variant_id === 'string'
+      ? (preRow.variant_id as string)
+      : (typeof preRow?.activity_id === 'string' ? (preRow.activity_id as string) : '');
+    const preIsSatellite = String(execId).startsWith('walk-satisfier-') || preActivityId.startsWith('satisfier:');
+    if (preReadOk && preRow && preActivityId && !preIsSatellite && !preTags.includes('reach_graded:true')) {
+      const preVerdict = classifyReach({
+        success: preRow.success === true,
+        execution_id: String(execId),
+        activity_id: preActivityId,
+        tags: preTags,
+      });
+      if (preVerdict === 'ungraded') {
+        // Idempotence marker on the AUTHORITATIVE row, written before the credit so a
+        // retry of this endpoint cannot grade the same execution twice even if the
+        // reach-tag mirror below fails.
+        try {
+          await surrealDB.query(
+            `UPDATE type::thing('execution', $execution_id) SET tags = array::union(tags ?? [], ['reach_graded:true'])`,
+            { execution_id: String(execId) },
+          );
+        } catch (e) {
+          logger.warn('[reach-patch] reach_graded marker write failed (grading proceeds)', { error: e instanceof Error ? e.message : String(e) });
+        }
+        const gradedTags = [...preTags, body.reached ? 'reached:true' : 'reached:false'];
+        applyOutcomeToPosteriors(
+          {
+            activity_id: preActivityId,
+            success: preRow.success === true,
+            failure_mode: (preRow.failure_mode ?? null) as any,
+            tasks: preRow.tasks as any,
+            cost_usd: typeof preRow.cost_usd === 'number' ? (preRow.cost_usd as number) : 0,
+            execution_id: String(execId),
+            tags: gradedTags,
+            ...(Array.isArray(preRow.composition_chain) && preRow.composition_chain.length > 0
+              ? { composition_chain: preRow.composition_chain as string[] }
+              : {}),
+            ...(typeof preRow.signature === 'string' && typeof preRow.signature_version === 'number'
+              ? { signature: preRow.signature as string, signature_version: preRow.signature_version as number }
+              : {}),
+          },
+          surrealDB,
+          typeof preRow.org_id === 'string' ? (preRow.org_id as string) : 'public',
+        ).catch((err) => {
+          logger.warn('[reach-patch] applyOutcomeToPosteriors failed (non-blocking)', {
+            execution_id: String(execId),
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+        logger.info('[reach-patch] late reach verdict graded into posteriors', {
+          execution_id: String(execId),
+          activity_id: preActivityId,
+          reached: body.reached,
+        });
+      } else {
+        logger.info('[reach-patch] posterior grading skipped; insert path already graded this trace', {
+          execution_id: String(execId),
+          pre_verdict: preVerdict,
+        });
+      }
+    } else if (preReadOk && preRow && preIsSatellite) {
+      logger.info('[reach-patch] posterior grading skipped; structural satisfier satellite (never graded by design)', {
+        execution_id: String(execId),
+        activity_id: preActivityId,
+      });
+    }
     const updatedTrace: any = Array.isArray(res) && Array.isArray(res[0]) && res[0].length > 0 ? res[0][0] : null;
     if (updatedTrace && updatedTrace.signature) {
       import('../lib/successor-features').then(({ updateSuccessorFeatures }) => {
