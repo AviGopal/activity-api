@@ -835,12 +835,34 @@ export async function applyOutcomeToPosteriors(
       const newAlpha = decayed.alpha + alphaDelta;
       const newBeta = decayed.beta + betaDelta;
 
+      // SELF-HEALING DERIVED RATE. `success_rate` was written by the executions
+      // endpoint as int/int on two TYPE int columns, so SurrealDB truncated every
+      // value to exactly 0 or 1. Measured over the full template population: 438 of
+      // 1,059 rows carrying counters have MIXED outcomes (0 < successful < total)
+      // and ALL 438 read 0 or 1 — a mathematically impossible value for every one
+      // of them.
+      //
+      // That is not cosmetic, because the value is read back and amplified:
+      // composition-graph.ts reconstructs alpha = success_rate * total_executions + 1
+      // and beta = (1 - success_rate) * total_executions + 1. A row like
+      // development-vessel:trace-store-reconcile (20 successes of 23, genuinely 87%)
+      // stored 0 and therefore reconstructs to alpha=1 / beta=24 — a working arm
+      // handed a maximally pessimistic posterior and suppressed in selection.
+      //
+      // Recomputing it HERE heals it. This statement already runs on every graded
+      // execution, it targets the row that holds the counters, and — unlike the
+      // executions-endpoint UPDATE — it does not increment them, so reading them in
+      // the same statement carries no SET-clause evaluation-order dependence. Each
+      // affected row therefore repairs itself the next time its arm executes, with
+      // no backfill activity, no hand-run SQL, and no separate write path to keep
+      // consistent. math::max([1, ...]) makes the divide safe on a zero-count row.
       await db.query(
         `
         UPDATE variant_performance_metrics
         SET
           thompson_alpha = $new_alpha,
           thompson_beta  = $new_beta,
+          success_rate = (successful_executions ?? 0) * 1.0 / math::max([1, total_executions ?? 0]),
           updated_at = time::now()
         WHERE variant_id = $activity_id AND org_id = $org_id
         `,
