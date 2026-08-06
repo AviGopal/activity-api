@@ -431,6 +431,27 @@ app.post('/', async (c) => {
       // Written as `* 1.0` rather than a cast so it stays correct however the operands
       // happen to be typed at runtime. NOTE: no SQL-level comment here on purpose — this
       // file's queries contain no `--` comments and that parse was not worth risking.
+      // De-sequenced rate arithmetic. SurrealDB applies the SET clauses of one
+      // UPDATE SEQUENTIALLY, so when the success_rate clause below was evaluated the
+      // two counters it referenced had ALREADY been incremented by the clauses above
+      // it: it stored ((S + delta) + delta) / ((T + 1) + 1) instead of the intended
+      // (S + delta) / (T + 1) — numerator double-counted, denominator post-increment.
+      // The counters, posteriors and rolling means stay atomic server-side; only the
+      // DERIVED rate moves here, computed from the pre-update snapshot already read
+      // into `current`, because no SET-clause form can reference pre-update state
+      // once an earlier clause in the same statement has overwritten it.
+      // `current` is `existing[0]` and `existing` is typed GoalExecutionPath[][] by
+      // the query generic (surrealDB.query<T> returns T[]), so `current` is statically
+      // an ARRAY even though at runtime it is the row — the same mismatch the
+      // `@ts-ignore` further down already papers over.
+      const currentRow = current as unknown as {
+        successful_executions?: number;
+        total_executions?: number;
+      };
+      const priorSuccessful = currentRow.successful_executions ?? 0;
+      const priorTotal = currentRow.total_executions ?? 0;
+      const nextSuccessRate = ((priorSuccessful + successDelta) * 1.0) / (priorTotal + 1);
+
       const updateQuery = `
         UPDATE goal_execution_paths
         SET
@@ -441,7 +462,7 @@ app.post('/', async (c) => {
           thompson_alpha = (thompson_alpha ?? 1) + $success_delta,
           thompson_beta = (thompson_beta ?? 1) + $failure_delta,
           last_inference_confidence = $inference_confidence ?? last_inference_confidence,
-          success_rate = (((successful_executions ?? 0) + $success_delta) * 1.0) / ((total_executions ?? 0) + 1),
+          success_rate = $success_rate,
           avg_duration_ms = (((avg_duration_ms ?? 0) * (total_executions ?? 0)) + $duration_ms) / ((total_executions ?? 0) + 1),
           avg_cost_usd = (((avg_cost_usd ?? 0) * (total_executions ?? 0)) + $cost_usd) / ((total_executions ?? 0) + 1),
           avg_token_usage = IF $token_usage IS NULL
@@ -463,6 +484,7 @@ app.post('/', async (c) => {
         path_signature: pathSignature,
         success_delta: successDelta,
         failure_delta: failureDelta,
+        success_rate: nextSuccessRate,
         duration_ms: validated.duration_ms,
         cost_usd: validated.cost_usd,
         token_usage: tokenUsage,
