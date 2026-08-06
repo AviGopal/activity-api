@@ -2818,6 +2818,50 @@ router.post('/resolve', async (c) => {
 
         const jwtAuth = getJwtAuthFromContext(c)!;
 
+        // GROUNDING (migration 192). A label recorded only a conclusion — verdict, confidence,
+        // labeler — never the evidence behind it, so a self-confirming verdict was
+        // indistinguishable from a true one. These fields carry WHAT was checked, against WHICH
+        // external authority, what was EXPECTED, and what was OBSERVED.
+        //
+        // This is also the ONLY grading surface a satisfier reach can use. Measured 2026-08-06:
+        // a walk reached via a 2-step chain and wrote a real memoryNote, then logged
+        // "reach-patch MATCHED NO ROW ... this execution stays ungraded" — satisfier reaches
+        // persist no execution row, so there is nothing for the reach patch to update. The label
+        // corpus is keyed by execution_id and does not need that row, so grounding it is what
+        // lets a correct reach be recorded at all rather than evaporating.
+        //
+        // `grounded` is DERIVED HERE and never read from the caller: a field the actor can set is
+        // a field the actor can assert itself into. It is the aggregate to trust — "fraction of
+        // labels that are grounded" is the honest measure of whether this system can know
+        // anything about itself, and it starts at 0%.
+        //
+        // An authority counts as external only if this substrate does not author it: git (it
+        // pushes but cannot forge the remote), the filesystem, process/systemd state, a
+        // third-party HTTP status, journald, or a human. journald is the sharpest and cheapest —
+        // a log line proves a BRANCH EXECUTED, which is how a drafting floor that had never once
+        // run was finally caught while looking healthy the entire time.
+        //
+        // An UNRECOGNISED source is stored and simply does not count as grounded; it is never
+        // rejected. Migration 101 added ASSERT $value IN ['human','automated'] to labeler,
+        // goal-host emitted 'deterministic', every write 500'd, and because the caller is
+        // fire-and-forget the corpus's most trustworthy tier died silently for two weeks.
+        //
+        // LIMIT, stated so the field is not read as more than it is: asserted_at is caller-
+        // supplied and therefore FORGEABLE until joined against the execution's own start time.
+        // `grounded` currently means "carries external evidence", NOT "was pre-registered".
+        const EXTERNAL_SOURCES = ['git', 'filesystem', 'process', 'http', 'journal', 'human'];
+        const gvlG = gvlPointer as unknown as {
+          asserted_at?: string; source?: string; probe?: string;
+          expected?: string; observed?: string; evidence?: string;
+        };
+        const gvlNonEmpty = (v: unknown): boolean => typeof v === 'string' && v.trim().length > 0;
+        const gvlGrounded =
+          gvlNonEmpty(gvlG.source) &&
+          EXTERNAL_SOURCES.includes(String(gvlG.source)) &&
+          gvlNonEmpty(gvlG.probe) &&
+          gvlNonEmpty(gvlG.expected) &&
+          gvlNonEmpty(gvlG.observed);
+
         try {
           const created = await executeAsAuth<any>(
             jwtAuth,
@@ -2830,6 +2874,13 @@ router.post('/resolve', async (c) => {
               confidence: $confidence,
               notes: $notes,
               labeler: $labeler,
+              asserted_at: $asserted_at,
+              source: $source,
+              probe: $probe,
+              expected: $expected,
+              observed: $observed,
+              evidence: $evidence,
+              grounded: $grounded,
               created_at: time::now()
             }`,
             {
@@ -2841,6 +2892,14 @@ router.post('/resolve', async (c) => {
               confidence: gvlPointer.confidence,
               notes: gvlPointer.notes ?? null,
               labeler: gvlPointer.labeler,
+              asserted_at: gvlNonEmpty(gvlG.asserted_at) ? gvlG.asserted_at : null,
+              source: gvlNonEmpty(gvlG.source) ? gvlG.source : null,
+              probe: gvlNonEmpty(gvlG.probe) ? String(gvlG.probe).slice(0, 2000) : null,
+              expected: gvlNonEmpty(gvlG.expected) ? String(gvlG.expected).slice(0, 2000) : null,
+              observed: gvlNonEmpty(gvlG.observed) ? String(gvlG.observed).slice(0, 2000) : null,
+              // Evidence is raw probe output; cap it so one pathological probe cannot bloat the corpus.
+              evidence: gvlNonEmpty(gvlG.evidence) ? String(gvlG.evidence).slice(0, 4000) : null,
+              grounded: gvlGrounded,
             },
           );
 
