@@ -1775,6 +1775,16 @@ app.post('/', async (c) => {
       }, 400);
     }
 
+    // The posted task array, from EITHER envelope. See the tasks projection below
+    // for why both are accepted and why schema enforcement is deliberately not
+    // bundled with this fallback.
+    const rawPostedTasks: any[] | null =
+      Array.isArray((body as any).execution_trace?.tasks) && (body as any).execution_trace.tasks.length > 0
+        ? (body as any).execution_trace.tasks
+        : Array.isArray((body as any).tasks) && (body as any).tasks.length > 0
+          ? (body as any).tasks
+          : null;
+
     // FIX: Use org_id from request body if provided, otherwise fall back to JWT/session
     // This allows MiniBob to explicitly set org_id when sending traces
     const traceOrgId = body.org_id || jwtAuth?.orgId || session?.org_id || 'public';
@@ -1837,16 +1847,37 @@ app.post('/', async (c) => {
       // `serializeTasksForTrace` (see repos/minibob/src/mcp.ts). The read
       // resolver in `execution-trace-with-signatures.ts` reads these fields
       // to surface task-scoped signal to the co-occurrence extractor.
-      tasks: body.execution_trace?.tasks && body.execution_trace.tasks.length > 0
-        ? body.execution_trace.tasks.map(normalizePersistedTask)
+      // ENVELOPE FALLBACK. Posters disagree about the envelope: ias-executor-ts
+      // wraps (adapters/activity-api-trace-sink.ts:94) so ribosome, validator and
+      // goal-walk traces persist; light-dispatch-vessel POSTs the task array FLAT
+      // (src/index.ts:872, `tasks: taskRecords`) and never constructs an
+      // `execution_trace` wrapper at all. Reading only `body.execution_trace.tasks`
+      // therefore stored NULL for every light-dispatch trace — 10,166 root
+      // executions per 72h, whose metadata.success_count attests to task records
+      // that were computed and then destroyed at the write. The identical fallback
+      // already exists ~1,000 lines below for the successor-features path: the
+      // mismatch was found once, patched for psi, and left unfixed for persistence.
+      //
+      // NOT measurable via `task_count`: that projection is `(metadata.task_count ?? 0)`
+      // sourced from the poster's own tpl.tasks.length, so it reads identically
+      // whether this fallback works or is inert. The honest observable is
+      // content_source moving 'legacy' -> 'split' with a non-empty tasks array.
+      //
+      // Deliberately NOT paired with schema enforcement in this change. Wiring
+      // StoreExecutionTraceRequestSchema (which makes execution_trace required)
+      // into this route would start 400-ing the flat posters that are currently
+      // accepted — i.e. light-dispatch traces would stop persisting entirely.
+      // Fallback first, rejection second, once no poster still needs the fallback.
+      tasks: rawPostedTasks && rawPostedTasks.length > 0
+        ? rawPostedTasks.map(normalizePersistedTask)
         : null,
 
-      // Extract state snapshot from execution_trace
-      state_snapshot: body.execution_trace
+      // Extract state snapshot from whichever envelope carried the tasks.
+      state_snapshot: rawPostedTasks
         ? {
-            input_state: body.execution_trace.tasks?.[0]?.inputState || {},
-            output_state: body.execution_trace.tasks?.[body.execution_trace.tasks?.length - 1]?.outputState || {},
-            stateTransition: body.execution_trace.tasks?.[body.execution_trace.tasks?.length - 1]?.stateTransition || {},
+            input_state: rawPostedTasks[0]?.inputState || {},
+            output_state: rawPostedTasks[rawPostedTasks.length - 1]?.outputState || {},
+            stateTransition: rawPostedTasks[rawPostedTasks.length - 1]?.stateTransition || {},
           }
         : null,
 
