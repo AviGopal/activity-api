@@ -3961,10 +3961,37 @@ app.post('/reach', async (c) => {
       logger.warn('[reach-patch] pre-read for posterior grading failed (verdict still patched)', { error: e instanceof Error ? e.message : String(e) });
     }
     const preTags: string[] = Array.isArray(preRow?.tags) ? (preRow.tags as string[]) : [];
-    const res = await surrealDB.query(
-      `UPDATE activity_execution_traces SET reached = $reached, completion_shapes = $completion_shapes, missing = $missing, tags = array::union(tags ?? [], [IF $reached { 'reached:true' } ELSE { 'reached:false' }]) WHERE execution_id = $execution_id`,
-      { reached: body.reached, completion_shapes, missing, execution_id: String(execId) },
-    );
+    // AET WRITE IS GATED ON THE DUAL-WRITE SWITCH THAT ALREADY GOVERNS IT — this is
+    // the same guard the insert path applies, applied here too.
+    //
+    // This UPDATE has no index to use: every index defined on activity_execution_traces
+    // (migrations 102, 113, 081, 031) covers other columns, and none covers
+    // execution_id. So it is a full unindexed scan of the trace store. Measured against
+    // the hub: an unindexed scan costs 12-16s (a `limit=1` list is 11.9s, proving the
+    // cost is the scan and not the row count), while every indexed or point access on
+    // the same store is 0.2-0.4s. It consumed the ENTIRE client deadline by itself.
+    //
+    // And it can never match. DUAL_WRITE_ENABLED is set in no unit file, so
+    // isDualWriteEnabled() is false and AET has received no rows since decommission;
+    // a reach patch is always for a current execution. Confirmed in the journal:
+    // across 143/143 successful patches `rows=1`, and since rows = aetUpdated +
+    // mirrored with the mirror being a point update returning exactly 1, aetUpdated
+    // was structurally 0 every single time.
+    //
+    // So the one query that spent the whole budget contributed zero persistence, and
+    // 165 of 377 "timeouts" were verdicts the server had already persisted after the
+    // client gave up — false failures on a path whose real work costs ~0.2s.
+    //
+    // Gated rather than deleted because `res` still feeds updatedTrace ->
+    // updateSuccessorFeatures below. That call is already unreachable while AET is
+    // frozen (an empty result yields updatedTrace = null), so gating changes no
+    // behaviour today and keeps the psi path correct if dual-write is ever re-enabled.
+    const res = isDualWriteEnabled()
+      ? await surrealDB.query(
+        `UPDATE activity_execution_traces SET reached = $reached, completion_shapes = $completion_shapes, missing = $missing, tags = array::union(tags ?? [], [IF $reached { 'reached:true' } ELSE { 'reached:false' }]) WHERE execution_id = $execution_id`,
+        { reached: body.reached, completion_shapes, missing, execution_id: String(execId) },
+      )
+      : [];
     // LATE-VERDICT GRADING. The reach gate runs AFTER the trace is inserted, so before
     // this the walk's honest verdict was persisted and NEVER credited: every posterior
     // consumer of classifyReach lived in app.post('/'). Measured consequence — two
