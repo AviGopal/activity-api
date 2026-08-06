@@ -5278,20 +5278,37 @@ app.post('/feedback', async (c) => {
       // Negative feedback is specific - don't penalize adjacent activities
     }
 
-    // Also credit the activity's variant_performance_metrics posteriors.
-    applyOutcomeToPosteriors(
-      {
-        activity_id: validated.activity_id,
-        success: validated.direction === 'positive',
-        failure_mode: null,
-      },
-      surrealDB,
-      orgId,
-    ).catch((err) => {
-      logger.warn('applyOutcomeToPosteriors failed (non-blocking, /feedback)', {
-        activity_id: validated.activity_id,
-        error: err instanceof Error ? err.message : String(err),
-      });
+    // SINGLE-WRITER SEAM for variant_performance_metrics. This handler used to also
+    // call applyOutcomeToPosteriors. 2b4e18b gave POST /reach a pre-read that grades a
+    // goal-host trace (tags carry dispatcher_used:goal-host and no reach tag =>
+    // classifyReach 'ungraded' => GRADE), so both seams wrote the same VPM row. Measured
+    // over 72h of live traffic before this change: 72 executions took a beta penalty from
+    // BOTH, across 100 distinct template rows — a non-uniform ~2x beta inflation gated on
+    // reach-patch delivery, which is uncorrelated with arm quality.
+    //
+    // /reach is kept and this call is dropped, not the reverse, for three measured reasons:
+    //   1. ORDERING IS NOT A RACE. goal-host awaits this POST inline during the walk
+    //      (index.ts :6453/:6514/:8122/:8126) and fires the reach-patch afterwards
+    //      (:10032). Over 24 paired samples the lag was 11-161s, median 41s, with ZERO
+    //      inversions. Any first-writer-wins scheme hands 100% of grades to this seam.
+    //   2. THIS SEAM CANNOT MOVE ALPHA ANYWAY. Every alpha credit goal-host sends names
+    //      the walk's lastPick, and 57/57 over 72h were `satisfier:*` ids, which
+    //      classifyReach routes to isHollowSatellite => {0,0} => the VPM UPDATE is skipped.
+    //      Removing this call loses 0% of alpha, not the 62.5% a delivery-rate argument
+    //      suggests.
+    //   3. THIS SEAM'S BETA IS WRONG, not merely poorer. It passes failure_mode: null, so
+    //      computeDeltas charges beta = 1.0 unconditionally — defeating the 'cascading' /
+    //      'user_abort' victim exemption (beta = 0.0, "upstream cause carries the
+    //      penalty"). /reach reads the real failure_mode and honours it. /reach also
+    //      carries tasks + cost_usd (graded yield), signature (context_thompson_scores),
+    //      and composition_chain (ancestor blame propagation) — none of which exist here.
+    //
+    // The impulse_shape_activity_score increments above are deliberately KEPT: /reach
+    // never writes that table, so the routing score is single-counted and must keep
+    // flowing. This deletion is scoped to variant_performance_metrics only.
+    logger.info('posterior grading delegated to POST /reach (sole VPM grader)', {
+      activity_id: validated.activity_id,
+      direction: validated.direction,
     });
 
     // Invalidate Redis cache for template recommendations
