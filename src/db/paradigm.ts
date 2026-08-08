@@ -512,6 +512,58 @@ export async function insertExecution(
  * match via the org_id branch so callers without an accountId — and all
  * pre-Phase-B rows — keep returning data.
  */
+/**
+ * Read the graded (alpha, beta) pairs from the canonical posterior store.
+ *
+ * `variant_performance_metrics.thompson_alpha/_beta` is what applyOutcomeToPosteriors
+ * writes after classifyReach grades an execution, so it — and only it — carries the
+ * honest-reach signal. Returns a map keyed by the same normalized activity_id the view
+ * uses (the `activity:` wrapper stripped), so the two can be joined directly.
+ *
+ * Failure is NOT silent-degrade-to-status: an empty map means every caller falls back
+ * to the uninformative prior, which is the honest reading of "we could not observe the
+ * evidence". Degrading to exit status here would quietly reinstate the defect this
+ * exists to fix.
+ */
+async function getCanonicalPosteriors(
+  orgId: string,
+  activityIds: string[],
+  accountId: string | null,
+): Promise<Map<string, { alpha: number; beta: number }>> {
+  const out = new Map<string, { alpha: number; beta: number }>();
+  if (activityIds.length === 0) return out;
+  try {
+    const rows = await surrealDB.query<{
+      variant_id: string;
+      thompson_alpha: number | null;
+      thompson_beta: number | null;
+    }>(
+      `SELECT variant_id, thompson_alpha, thompson_beta FROM variant_performance_metrics
+       WHERE ((account_id = $account_id) OR (account_id IS NONE AND org_id = $org_id))
+         AND variant_id IN $activity_ids`,
+      {
+        // Same dual-tenant scoping and the same plain-string org form the legacy
+        // fallback below uses — this reads the identical rows it would have read.
+        org_id: orgId.startsWith('organizations:') ? orgId.replace('organizations:', '') : orgId,
+        account_id: accountId,
+        activity_ids: activityIds,
+      },
+    );
+    for (const r of rows ?? []) {
+      const id = String(r.variant_id).replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
+      out.set(id, {
+        alpha: typeof r.thompson_alpha === 'number' ? r.thompson_alpha : 1,
+        beta: typeof r.thompson_beta === 'number' ? r.thompson_beta : 1,
+      });
+    }
+  } catch (error) {
+    logger.warn('[paradigm] canonical posterior read failed; selection falls back to the prior, NOT to exit status', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  return out;
+}
+
 export async function getActivityScores(
   orgId: string,
   activityIds?: string[],
@@ -551,14 +603,52 @@ export async function getActivityScores(
         : await surrealDB.query<ActivityScore>(query, params);
 
       if (result && result.length > 0) {
+        // THE POSTERIOR COMES FROM THE POSTERIOR STORE, NOT FROM EXIT STATUS.
+        //
+        // v_activity_score defines `alpha = count(success = true) + 1`. `success` is
+        // the template's exit status, which is the signal `reached` exists to replace:
+        // on a 24h exhaustive census of the hub (n=41,600) status was 92.4% green
+        // while honest reach was 1.67%. Selecting on it is selecting on ~90% noise.
+        //
+        // The honest posterior already exists. classifyReach grades every execution,
+        // applyOutcomeToPosteriors writes the (alpha, beta) deltas, and they land in
+        // variant_performance_metrics — which posterior-update.ts calls, in its own
+        // words, "the canonical posterior store". It was simply never read here: the
+        // view returns rows for every activity that has ever executed, so the
+        // `result.length > 0` branch always won and the canonical store was reached
+        // only when the view returned NOTHING. Populated, never consumed — the reach
+        // grading the whole learning loop is built on could not steer one selection.
+        //
+        // So overlay it. The view still supplies the descriptive columns it computes
+        // honestly (total_executions, successes/failures, durations, costs); only the
+        // two columns that STEER — alpha and beta — are taken from the graded store.
+        //
+        // An activity with no canonical row falls back to the uninformative prior
+        // (1, 1) rather than to its exit-status count. That is the deliberate part: an
+        // ungraded activity has no evidence, and Thompson must be told that rather
+        // than handed a green exit record. Expect a mass collapse toward (1,1) and
+        // near-uniform selection on first deploy. That is not the fleet forgetting —
+        // it is the fleet no longer claiming to know things it never measured, and the
+        // posterior rebuilds from graded outcomes at the rate reach verdicts land.
+        const graded = await getCanonicalPosteriors(
+          orgId,
+          result.map((r) => r.activity_id),
+          accountId,
+        );
+        const data = result.map((r) => {
+          const g = graded.get(r.activity_id);
+          return { ...r, alpha: g?.alpha ?? 1, beta: g?.beta ?? 1 };
+        });
+
         logger.debug('[paradigm] Activity scores fetched from new view', {
-          count: result.length,
+          count: data.length,
+          graded_posteriors: graded.size,
           path: 'new',
           latency_ms: Date.now() - startTime,
         });
 
         return {
-          data: result,
+          data,
           path: 'new',
           latency_ms: Date.now() - startTime,
         };
@@ -2061,6 +2151,18 @@ export async function getVariantScores(
     let result = jwtToken
       ? await queryWithAuth<VariantScore>(jwtToken, query, params)
       : await surrealDB.query<VariantScore>(query, params);
+
+    // Same overlay as getActivityScores, for the same reason: the view's alpha/beta
+    // are exit-status counts, and variant selection must be steered by the graded
+    // posterior. success_rate and the descriptive columns stay as the view computes
+    // them. See the long note at the getActivityScores call site.
+    if (result && result.length > 0) {
+      const graded = await getCanonicalPosteriors(orgId, result.map((r) => r.activity_id), accountId);
+      result = result.map((r) => {
+        const g = graded.get(r.activity_id);
+        return { ...r, alpha: g?.alpha ?? 1, beta: g?.beta ?? 1 };
+      });
+    }
 
     // If v_activity_score doesn't have data, fall back to variant_performance_metrics
     if (!result || result.length === 0) {
