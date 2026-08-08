@@ -205,8 +205,56 @@ export async function runTraceRetentionSweep(
   // bounded by autoDiscoverMax so a cycle's work stays bounded. Per-stratum
   // caps below still come from policyFor (overrides respected). Best-effort:
   // on failure we fall back to the configured list alone.
+  // ── PRESSURE CHECK: when the store is over the global ceiling, the cheap valve
+  // runs FIRST and discovery is skipped for this cycle. ────────────────────────
+  //
+  // Measured on the hub at 267,731 rows against a 150,000 ceiling: every sweep
+  // cycle for hours ended in "sweep cycle failed: The operation timed out", so
+  // `execution` was never pruned to cap and kept growing. The cycle spends its
+  // budget before it reaches the valve:
+  //
+  //   SELECT activity_id, count() AS n FROM execution GROUP BY activity_id
+  //     -> Iterate Table (FULL SCAN), 15,160ms measured
+  //
+  // and then sweeps up to autoDiscoverMax (60) discovered strata with several
+  // queries each — all before the global-ceiling valve, which is the ONLY step
+  // that bounds total size. The valve itself is cheap and index-backed:
+  //
+  //   SELECT id, executed_at FROM execution ORDER BY executed_at ASC LIMIT 1000
+  //     -> Iterate Index (idx_execution_executed_at), 237ms measured
+  //
+  // Note this is NOT an unindexed-field problem: idx_execution_activity ON
+  // execution FIELDS activity_id already exists and the GROUP BY full-scans
+  // anyway, so it cannot be indexed away — the only fix is to not pay for it
+  // while the store is over its hard bound.
+  //
+  // Ordering is the whole change. Stratified balance is the better policy and
+  // keeps running normally; it is simply not the policy to spend a timing-out
+  // budget on while the store is 1.8x over the bound it is supposed to enforce.
+  // Once the valve brings the store back under the ceiling, the next cycle
+  // discovers and sweeps strata as before — over a smaller table, so the scan
+  // is cheaper too.
+  let overCeiling = false;
+  if (cfg.globalCeilingEnabled && cfg.globalCeiling > 0) {
+    try {
+      const rows = await surrealDB.query<{ count: number }>(`SELECT count() FROM ${TABLE} GROUP ALL`);
+      const total = Array.isArray(rows) && rows.length > 0 ? Number(rows[0]?.count ?? 0) : 0;
+      overCeiling = total > cfg.globalCeiling;
+      if (overCeiling) {
+        logger.warn('[trace-retention] over global ceiling — skipping stratum auto-discovery this cycle so the indexed valve is reached', {
+          total, ceiling: cfg.globalCeiling, surplus: total - cfg.globalCeiling,
+        });
+      }
+    } catch (err) {
+      // Cannot tell: behave exactly as before rather than skipping work on a guess.
+      logger.warn('[trace-retention] pressure check failed; proceeding with the normal cycle order', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   let sweepActivities = cfg.activities;
-  if (cfg.autoDiscover) {
+  if (cfg.autoDiscover && !overCeiling) {
     try {
       const groups = await surrealDB.query<{ activity_id: unknown; n: unknown }>(
         `SELECT activity_id, count() AS n FROM ${TABLE} GROUP BY activity_id`,
