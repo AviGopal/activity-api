@@ -9,31 +9,6 @@ export function isHollowSatellite(t: { execution_id?: string; activity_id?: stri
 }
 
 /**
- * Drop a reach verdict from a structural satellite's tag set, at the INSERT boundary.
- *
- * `classifyReach` tests the tag branch BEFORE the satellite branch, deliberately, so
- * that POST /reach can grade a row by appending a tag (see reach-classify.test.ts:58,
- * which pins that ordering). Both late paths guard satellites themselves. Nothing
- * guarded the insert: a walk hands the same tag set to every satisfier sub-trace it
- * emits, so satellites arrive already carrying the parent walk's verdict and are then
- * classified 'reached' on their own account.
- *
- * Measured, 24h exhaustive census (n=41,600): 475 of 694 'reached' rows — 68.4% — were
- * satellites; genuine reach 219 (0.53%). Their `reached` COLUMN is null, which is how
- * you tell a tag that rode along from a verdict the gate actually issued.
- *
- * Non-reach tags survive: attribution, state signature and dispatcher are still the
- * satellite's own.
- */
-export function stripSatelliteReachTags(
-  tags: string[],
-  t: { execution_id?: string; activity_id?: string },
-): string[] {
-  if (!isHollowSatellite(t)) return tags;
-  return tags.filter((tag) => tag !== 'reached:true' && tag !== 'reached:false');
-}
-
-/**
  * The ONE honest-reach primitive shared by the ribosome (extract-or-not) and the
  * posterior (credit / penalize / skip).
  *

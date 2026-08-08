@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { classifyReach, isHollowSatellite, stripSatelliteReachTags } from './reach-classify';
+import { classifyReach, isHollowSatellite } from './reach-classify';
 
 /**
  * This primitive decides whether an execution moves a Thompson posterior and whether the
@@ -59,32 +59,6 @@ describe('classifyReach', () => {
     // /reach guards satellites itself, BEFORE appending a tag, precisely because the tag
     // branch is tested first here. Pin that ordering so the guard stays necessary.
     expect(classifyReach({ success: true, activity_id: 'satisfier:x', tags: ['reached:true'] })).toBe('reached');
-  });
-
-  it('STRIPS a rode-along verdict from a satellite at the insert boundary', () => {
-    // The complement of the test above. That ordering is only safe while the ONLY way a
-    // satellite acquires a reach tag is POST /reach, which guards them. It wasn't: a
-    // walk hands its own tag set to every satisfier sub-trace it emits, so satellites
-    // arrived pre-tagged and classified 'reached' on their own account — 475 of 694
-    // 'reached' rows in a 24h exhaustive census (n=41,600), 68.4%, with a null `reached`
-    // COLUMN proving no gate ever issued the verdict.
-    const walkTags = ['state_signature:b728569f', 'dispatcher_used:goal-host', 'reached:true'];
-    expect(stripSatelliteReachTags(walkTags, { execution_id: 'walk-satisfier-1-1786182238304' }))
-      .toEqual(['state_signature:b728569f', 'dispatcher_used:goal-host']);
-    expect(stripSatelliteReachTags(walkTags, { activity_id: 'satisfier:shellResult' }))
-      .toEqual(['state_signature:b728569f', 'dispatcher_used:goal-host']);
-    // reached:false rides along the same way and is equally not the satellite's own.
-    expect(stripSatelliteReachTags(['reached:false', 'operator:human-surface'], { activity_id: 'satisfier:llm_completion' }))
-      .toEqual(['operator:human-surface']);
-    // A real execution keeps its verdict untouched.
-    expect(stripSatelliteReachTags(walkTags, { execution_id: 'exec_002cxza0', activity_id: 'feature_compose' }))
-      .toEqual(walkTags);
-    // And the stripped satellite now classifies as the gate always intended.
-    expect(classifyReach({
-      success: true,
-      execution_id: 'walk-satisfier-1-1786182238304',
-      tags: stripSatelliteReachTags(walkTags, { execution_id: 'walk-satisfier-1-1786182238304' }),
-    })).toBe('ungraded');
   });
 
   it('treats a goal-host walk with no verdict yet as ungraded, not as a success', () => {
