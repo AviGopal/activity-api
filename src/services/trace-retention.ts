@@ -192,10 +192,106 @@ export interface StratumResult {
   deletedActual: number | null; // null in dry-run
 }
 
+/**
+ * REACH HISTORY ROLLUP — so the substrate can observe its own trajectory.
+ *
+ * The system records reach twice and NEITHER supports a time-series:
+ *   - execution.reached  — per execution, timestamped, but the store is pruned to
+ *                          TRACE_STORE_CAP oldest-first. Measured on the hub: the whole
+ *                          table spans 2026-07-24..2026-08-08 (~15 days) and every one of
+ *                          the 5,341 reach-graded rows fell inside a SINGLE week.
+ *   - goal_execution_paths — full history, but only cumulative counters plus a
+ *                          `last_executed_at`, so a row that accrued 50 attempts over three
+ *                          weeks buckets entirely into its final week.
+ *
+ * So "are we reaching more over time?" — the question the whole learning loop exists to
+ * answer — cannot be asked. The raw evidence is deleted faster than the signal accumulates,
+ * and the surviving summary has no time resolution. Note the trap: the retention sweep this
+ * file implements is what deletes it, so making retention work (which it now does) actively
+ * destroys the trajectory unless something captures it first.
+ *
+ * This is that capture. Before any deletion, fold newly-graded executions into a tiny
+ * per-ISO-week counter table that retention never touches.
+ *
+ * INCREMENTAL, NOT RECOMPUTED. Counts advance from a stored watermark and only ever add
+ * rows newer than it. Recomputing a week from surviving rows would make its totals SHRINK as
+ * pruning caught up — a monotonically-decreasing history, which is worse than none because it
+ * looks plausible. The watermark is why this survives its own garbage collector.
+ */
+const REACH_HISTORY_WATERMARK = 'reach_history:__watermark__';
+
+export async function rollupReachHistory(): Promise<{ scanned: number; weeks: number } | null> {
+  try {
+    const wmRows = await surrealDB.query<{ last_executed_at?: string }>(
+      `SELECT last_executed_at FROM ${REACH_HISTORY_WATERMARK}`,
+    );
+    // First run has no watermark: start from the oldest row the store still holds rather
+    // than from epoch, so the first bucket is honest about what it could actually see.
+    const since = (Array.isArray(wmRows) && wmRows[0]?.last_executed_at)
+      ? String(wmRows[0].last_executed_at)
+      : new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
+
+    const rows = await surrealDB.query<{ executed_at?: string; reached?: boolean }>(
+      `SELECT executed_at, reached FROM ${TABLE}
+         WHERE reached != NONE AND executed_at > type::datetime($since)
+         ORDER BY executed_at ASC LIMIT 20000`,
+      { since },
+    );
+    const list = Array.isArray(rows) ? rows : [];
+    if (list.length === 0) return { scanned: 0, weeks: 0 };
+
+    const buckets = new Map<string, { reached: number; total: number }>();
+    let maxTs = since;
+    for (const r of list) {
+      const ts = r?.executed_at;
+      if (!ts) continue;
+      const d = new Date(String(ts));
+      if (Number.isNaN(d.getTime())) continue;
+      // ISO week start (Monday), UTC.
+      const day = (d.getUTCDay() + 6) % 7;
+      const wk = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - day))
+        .toISOString().slice(0, 10);
+      const b = buckets.get(wk) ?? { reached: 0, total: 0 };
+      b.total += 1;
+      if (r.reached === true) b.reached += 1;
+      buckets.set(wk, b);
+      if (String(ts) > maxTs) maxTs = String(ts);
+    }
+
+    for (const [wk, b] of buckets) {
+      await surrealDB.query(
+        `UPSERT reach_history:['${wk}'] SET
+           week = $wk,
+           reached = (reached ?? 0) + $reached,
+           total = (total ?? 0) + $total,
+           updated_at = time::now()`,
+        { wk, reached: b.reached, total: b.total },
+      );
+    }
+    await surrealDB.query(
+      `UPSERT ${REACH_HISTORY_WATERMARK} SET last_executed_at = $ts, updated_at = time::now()`,
+      { ts: maxTs },
+    );
+    logger.info('[trace-retention] reach-history rollup', {
+      scanned: list.length, weeks: buckets.size, watermark: maxTs,
+    });
+    return { scanned: list.length, weeks: buckets.size };
+  } catch (err) {
+    // Never block the sweep on the observability write.
+    logger.warn('[trace-retention] reach-history rollup failed (non-fatal)', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
 export async function runTraceRetentionSweep(
   cfg: TraceRetentionConfig = loadTraceRetentionConfig(),
 ): Promise<{ results: StratumResult[]; durationMs: number; orphanReaped: number }> {
   const startedAt = Date.now();
+  // CAPTURE BEFORE DELETE. The rollup must precede every prune below, or the sweep
+  // destroys the only timestamped record of whether reach is improving.
+  await rollupReachHistory();
   const coldCutoffIso = new Date(startedAt - cfg.hotWindowMs).toISOString();
   const statuses = ['success', 'failure'] as const;
   const results: StratumResult[] = [];
