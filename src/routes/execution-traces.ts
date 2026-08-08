@@ -486,7 +486,36 @@ async function insertTraceContent(trace: any, jwtToken?: string): Promise<void> 
   `;
   // Root path: execution_trace_content FOR create uses $auth.org_id (JWT only
   // populates $token). Auth validated at HTTP layer; root path is safe.
-  await surrealDB.query(q, p);
+  //
+  // IDEMPOTENT ON THE UNIQUE INDEX. execution_trace_content carries a UNIQUE index on
+  // execution_id, and this content row is written from more than one path (the dual-write
+  // sink and trace re-posts), so a second write for an execution whose content is already
+  // stored throws:
+  //
+  //   Database index `idx_etc_execution_id` already contains 'exec_6ye6gde7',
+  //   with record `execution_trace_content:7f1ptdw6kjw1lcdhl25c`
+  //
+  // Measured on the hub: 556 of these in 90 minutes, ~6/min, and the SAME execution ids
+  // recur seconds apart — so the caller treats the throw as retryable and comes back. Each
+  // attempt is a write transaction the store has to open and roll back, and each one logs a
+  // multi-kilobyte error carrying the full task array, against a DB already under pressure.
+  //
+  // The row existing IS the desired end state, so a duplicate is success, not failure.
+  // Swallowing it here stops the retry at its source. Any OTHER error still throws: a
+  // blanket catch would hide real write failures, which is how a trace store silently stops
+  // recording.
+  try {
+    await surrealDB.query(q, p);
+  } catch (err: any) {
+    const msg = String(err?.message ?? err);
+    if (msg.includes('idx_etc_execution_id') && msg.includes('already contains')) {
+      logger.debug('[trace-content] content row already stored for this execution — treating duplicate as success', {
+        execution_id: trace.execution_id,
+      });
+      return;
+    }
+    throw err;
+  }
 }
 
 /**
