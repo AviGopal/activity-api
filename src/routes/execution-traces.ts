@@ -27,7 +27,7 @@ import { resolveLearningTrack, type LearningTrack } from '../lib/learning-track'
 import { incrementExemplarBurstCounter } from '../services/exemplar-selector';
 import { incrementTraceStoreCounter } from '../lib/trace-store-counters';
 import { applyOutcomeToPosteriors } from '../lib/posterior-update';
-import { classifyReach } from '../lib/reach-classify';
+import { classifyReach, stripSatelliteReachTags } from '../lib/reach-classify';
 import { updateSuccessorFeatures } from '../lib/successor-features';
 import { applyClusterPosterior } from '../lib/cluster-posterior';
 
@@ -1955,7 +1955,39 @@ app.post('/', async (c) => {
       ...(Array.isArray(body.impulse_resolutions) && body.impulse_resolutions.length > 0
         ? { impulse_resolutions: body.impulse_resolutions } : {}),
       // Classification tags (e.g. "intent:topology_discovery", "intent:boredom_source").
-      ...(Array.isArray(body.tags) && body.tags.length > 0 ? { tags: body.tags } : {}),
+      //
+      // A STRUCTURAL SATELLITE MAY NOT CARRY A REACH VERDICT. `walk-satisfier-*` /
+      // `satisfier:*` rows are walk artifacts, and the honest-reach gate deliberately
+      // never grades one: POST /reach guards them before appending a tag, and the
+      // posterior path guards them again (preIsSatellite) before crediting. Both
+      // guards live on the LATE path — nothing guarded the INSERT, and a walk writes
+      // its own verdict into the tag set it hands to every satellite sub-trace it
+      // emits. So satellites arrive pre-tagged `reached:true` and classifyReach, whose
+      // tag branch is tested before the satellite branch (pinned by
+      // reach-classify.test.ts:58 because /reach relies on that ordering), returns
+      // 'reached' for them.
+      //
+      // Measured on a 24h exhaustive census of the hub (n=41,600): 694 executions
+      // classify as reached and 475 of them — 68.4% — are satellites. Genuine reach is
+      // 219, i.e. 0.53%. The `reached` COLUMN on those rows is null, which is the tell:
+      // the verdict never came from the gate, only the tag rode along. Posteriors were
+      // never corrupted (the late guards held); every REPORTED number was — the
+      // harness, the dashboards, the human surface, and the reach figure this system
+      // is measured against.
+      //
+      // Stripped here rather than at each producer because this is the one place every
+      // producer passes through, and a guard the writers must remember is a guard that
+      // will be forgotten by the next writer. Non-reach tags are preserved: a satellite
+      // still carries its state_signature, dispatcher and operator attribution.
+      ...(() => {
+        const raw = Array.isArray(body.tags) ? body.tags : [];
+        if (raw.length === 0) return {};
+        const kept = stripSatelliteReachTags(raw, {
+          execution_id: body.execution_id,
+          activity_id: body.activity_id || body.template_id,
+        });
+        return kept.length > 0 ? { tags: kept } : {};
+      })(),
     };
 
     // ========================================================================
