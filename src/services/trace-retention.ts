@@ -92,6 +92,18 @@ export interface TraceRetentionConfig {
   /** Toggle just the global-ceiling valve (still overall-gated by enabled + dryRun). */
   globalCeilingEnabled: boolean;
   /**
+   * Bound on rows the ceiling valve deletes in ONE sweep, and a wall-clock budget for
+   * the attempt. Without these the valve drains the entire surplus in a single cycle:
+   * at 156k surplus and a 25-row batch that is ~6,250 SELECT+DELETE round trips
+   * against a 30-minute interval, on a memory-pressured box, with a real chance of
+   * overrunning the interval and overlapping the next sweep. The orphan reap below
+   * already solved this and its comment records why; the valve gets the same shape
+   * rather than a second answer to the same question. Surplus that survives a cycle
+   * is picked up by the next one — the valve is a steady drain, not a one-shot.
+   */
+  ceilingPerSweepCap: number;
+  ceilingBudgetMs: number;
+  /**
    * Reap ORPHANED execution_trace_content rows — content whose parent `execution`
    * was already pruned by the sweeps above. Bounded per sweep + time-budgeted +
    * age-windowed. On by default once the sweep is enabled and not dry-run.
@@ -171,6 +183,12 @@ export function loadTraceRetentionConfig(env = process.env): TraceRetentionConfi
     // policy primary); 0 disables. Still overall-gated by enabled + dryRun.
     globalCeiling: parseInt(env.TRACE_RETENTION_GLOBAL_CEILING ?? env.TRACE_STORE_CAP ?? '50000', 10),
     globalCeilingEnabled: env.TRACE_RETENTION_GLOBAL_CEILING_ENABLED !== 'false', // on by default
+    // 20000/sweep at a 30-min interval is ~40k/hr of drain capacity against a measured
+    // intake of ~275 rows/hr, so a 156k surplus clears in ~8 sweeps while leaving the
+    // valve able to absorb a large burst. The time budget is the real guard: it caps
+    // the attempt regardless of how slow individual deletes turn out to be under load.
+    ceilingPerSweepCap: parseInt(env.TRACE_RETENTION_CEILING_PER_SWEEP_CAP ?? '20000', 10),
+    ceilingBudgetMs: parseInt(env.TRACE_RETENTION_CEILING_BUDGET_MS ?? String(5 * 60 * 1000), 10),
     orphanReapEnabled: env.TRACE_RETENTION_ORPHAN_REAP_ENABLED !== 'false', // on by default
     orphanReapPerSweepCap: parseInt(env.TRACE_RETENTION_ORPHAN_MAX ?? '20000', 10),
     orphanReapBudgetMs: parseInt(env.TRACE_RETENTION_ORPHAN_BUDGET_MS ?? '120000', 10),
@@ -545,10 +563,15 @@ export async function runTraceRetentionSweep(
       let removed: number | null = null;
       if (!cfg.dryRun) {
         const batchSize = cfg.deleteBatchSize;
-        const maxIters = Math.ceil(surplus / batchSize) + 10; // generous guard
+        // Target this sweep's work, not the whole surplus (see ceilingPerSweepCap).
+        const target = Math.min(surplus, cfg.ceilingPerSweepCap);
+        const budgetUntil = Date.now() + cfg.ceilingBudgetMs;
+        const maxIters = Math.ceil(target / batchSize) + 10; // generous guard
         let done = 0;
-        for (let iter = 0; iter < maxIters && done < surplus; iter++) {
-          const thisBatch = Math.min(batchSize, surplus - done);
+        let stoppedBy: 'target' | 'budget' | 'empty' | 'iters' = 'iters';
+        for (let iter = 0; iter < maxIters && done < target; iter++) {
+          if (Date.now() >= budgetUntil) { stoppedBy = 'budget'; break; }
+          const thisBatch = Math.min(batchSize, target - done);
           // NO `ORDER BY` — that is the whole fix, and this file already proved it.
           //
           // The previous comment here claimed executed_at ORDER BY was index-backed and
@@ -599,6 +622,7 @@ export async function runTraceRetentionSweep(
               requested: thisBatch,
               returned: ids.length,
               surplus,
+              target,
             });
           }
           if (ids.length === 0) {
@@ -614,13 +638,26 @@ export async function runTraceRetentionSweep(
               surplus,
               note: 'over ceiling but no rows older than the hot window — ceiling and cold cutoff disagree',
             });
+            stoppedBy = 'empty';
             break;
           }
           await surrealDB.query('DELETE $ids RETURN NONE', { ids });
           done += ids.length;
+          if (done >= target) stoppedBy = 'target';
         }
         removed = done;
-        logger.info('[trace-retention] global-ceiling valve: done', { removed, surplus, batchSize });
+        // `remaining` is what this sweep deliberately left for the next one. It is the
+        // number to watch: a healthy valve shows it falling sweep over sweep. If it
+        // holds steady while removed>0, intake matches drain and the cap needs raising.
+        logger.info('[trace-retention] global-ceiling valve: done', {
+          removed,
+          target,
+          surplus,
+          remaining: Math.max(0, surplus - done),
+          stoppedBy,
+          batchSize,
+          elapsedMs: Date.now() - (budgetUntil - cfg.ceilingBudgetMs),
+        });
       }
       // Synthetic stratum so the counter-decrement below and the reconcile route's
       // `deleted` reduce both include the valve's deletions.
