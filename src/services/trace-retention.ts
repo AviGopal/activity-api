@@ -501,11 +501,37 @@ export async function runTraceRetentionSweep(
   // double-count). Default ceiling == TRACE_STORE_CAP so the enforced number is the
   // sensed number; TRACE_RETENTION_GLOBAL_CEILING decouples, and
   // TRACE_RETENTION_GLOBAL_CEILING_ENABLED=false disables just this valve.
+  // ENTRY LOGGING, BECAUSE THIS BRANCH IS SILENTLY SKIPPED (2026-08-09).
+  //
+  // Measured on the live hub: the store sits at 2x its cap, the sensor alarms, the
+  // sweep completes without error, and the full sweep log is exactly three lines —
+  // reach-history rollup, the "over global ceiling ... so the indexed valve is
+  // reached" warning, and the aux-table reap. This valve's delete never runs and
+  // logs nothing. Net rate measured +436 rows/hr across 22 samples / 27 min with
+  // ZERO negative deltas, which is consistent with nothing deleting from `execution`
+  // at all.
+  //
+  // Its three gates all pass when checked by hand (globalCeilingEnabled default true,
+  // globalCeiling 150000, dryRun false), and the count query returns correctly —
+  // `SELECT count() FROM execution GROUP ALL` yields {"count":306191}, exactly the
+  // shape the code reads. So the skip is not the gate and not the count, and there is
+  // no return/throw between the aux reap and here.
+  //
+  // Log the entry rather than infer it from surrounding lines. Every diagnosis today
+  // that reasoned from adjacent evidence instead of instrumenting the branch itself
+  // was wrong; this makes the next cycle answer the question directly.
+  logger.info('[trace-retention] global-ceiling valve: entering', {
+    enabled: cfg.globalCeilingEnabled,
+    ceiling: cfg.globalCeiling,
+    dryRun: cfg.dryRun,
+    deleteBatchSize: cfg.deleteBatchSize,
+  });
   if (cfg.globalCeilingEnabled && cfg.globalCeiling > 0) {
     let total = 0;
     try {
       const rows = await surrealDB.query<{ count: number }>(`SELECT count() FROM ${TABLE} GROUP ALL`);
       total = Array.isArray(rows) && rows.length > 0 ? Number(rows[0]?.count ?? 0) : 0;
+      logger.info('[trace-retention] global-ceiling valve: counted', { total, ceiling: cfg.globalCeiling, willPrune: total > cfg.globalCeiling });
     } catch (err) {
       logger.warn('[trace-retention] global-ceiling count failed; skipping valve this cycle', {
         error: err instanceof Error ? err.message : String(err),
