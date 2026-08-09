@@ -501,14 +501,34 @@ export async function runTraceRetentionSweep(
         let done = 0;
         for (let iter = 0; iter < maxIters && done < surplus; iter++) {
           const thisBatch = Math.min(batchSize, surplus - done);
-          // Oldest-first paging: executed_at is index-backed (idx_execution_executed_at
-          // → Iterate Index, bounded range scan) and MUST appear in the projection —
-          // SurrealDB 2.3.x requires any ORDER BY field to be selected. Delete that id
-          // list with RETURN NONE so no row bodies are hauled back. Re-querying from the
-          // head each iteration converges because the prior batch is already deleted.
+          // NO `ORDER BY` — that is the whole fix, and this file already proved it.
+          //
+          // The previous comment here claimed executed_at ORDER BY was index-backed and
+          // bounded. It is not: the orphan-reap block below records the measured truth
+          // for the same table — ORDER BY triggers SurrealDB 2.3.3 MemoryOrderedLimit, a
+          // full-table materialize+sort, and "with ORDER BY even LIMIT 1 times out >30s;
+          // without it, LIMIT 1000 returns in ~1s". That fix was found once, for the
+          // orphan reap, and never applied here.
+          //
+          // Measured 2026-08-09: every sweep died on this statement —
+          //   [trace-retention] over global ceiling {"total":302376,"surplus":152376}
+          //   [trace-retention] sweep cycle failed {"error":"...The operation timed out."}
+          // and because the loop re-queries from the head each iteration, a timeout on
+          // iteration 1 means ZERO rows deleted, forever. The valve that exists to shrink
+          // the table could not run at the table size that made it necessary — the store
+          // grew ~1000 rows/hr against a cap it was already 2x over.
+          //
+          // A cutoff bound gives us oldest-first without a sort: executed_at is
+          // index-backed, so `WHERE executed_at < $cut` is a bounded range scan. The
+          // cutoff is the hot-window edge, which is exactly the retention contract
+          // (keep everything newer than the hot window) — so this deletes only what the
+          // policy already designates as cold, and never touches recent traces.
           const rows = await surrealDB.query<{ id: unknown }>(
-            `SELECT id, executed_at FROM ${TABLE} ORDER BY executed_at ASC LIMIT $batch`,
-            { batch: thisBatch },
+            `SELECT id FROM ${TABLE} WHERE executed_at < type::datetime($cut) LIMIT $batch`,
+            // Reuse the sweep's own cold cutoff (line ~295) rather than recomputing it,
+            // so the valve and the per-activity strata can never disagree about what
+            // "cold" means.
+            { batch: thisBatch, cut: coldCutoffIso },
           );
           const ids = (Array.isArray(rows) ? rows : [])
             .map((r) => (r as { id?: unknown })?.id)
