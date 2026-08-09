@@ -38,6 +38,7 @@
  */
 
 import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { logger } from '../utils/logger';
 import { config } from '../config';
 import { normalizeRecordId } from '../utils/surrealdb-types';
@@ -71,7 +72,29 @@ const AET_INDEX_DEFS = [
   `DEFINE INDEX OVERWRITE idx_aet_composition_chain ON ${AET_TABLE} FIELDS composition_chain`,
 ];
 
-const DEFAULT_LEASE_PATH = '/workspace/leases/maintenance.json';
+// THE WRITER AND THE VALIDATOR MUST DERIVE THIS THE SAME WAY (2026-08-09).
+//
+// This constant was a bare '/workspace/leases/maintenance.json' while the only
+// writer — development-vessel's maintenanceLease_write — derives its path as
+// `join(WORKSPACE_ROOT, 'leases', 'maintenance.json')`. Both processes run with
+// WORKSPACE_ROOT=/workspace/git/super-repo, so the writer wrote
+//   /workspace/git/super-repo/leases/maintenance.json
+// and this gate read
+//   /workspace/leases/maintenance.json
+// which has never existed on any host. Measured: ENOENT, and therefore
+// `reconcile_trace_store refused` on EVERY call that got this far — the lease
+// gate could not pass, so the reconcile could not run, so the trace store grew
+// unbounded (300k against a 150k cap) while its reconciler held the global
+// change_window lease and blocked all self-editing.
+//
+// Two components documented as sharing a file, each computing its location from
+// a different rule, with no test covering the pair. Matching fallbacks are not
+// agreement — derive from the same variable so they cannot drift apart again.
+const DEFAULT_LEASE_PATH = join(
+  process.env['WORKSPACE_ROOT'] ?? '/workspace',
+  'leases',
+  'maintenance.json',
+);
 
 // ---------------------------------------------------------------------------
 // Maintenance lease gate — pure, independently testable.
