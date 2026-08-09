@@ -136,7 +136,29 @@ export function loadTraceRetentionConfig(env = process.env): TraceRetentionConfi
     hotWindowMs: parseInt(env.TRACE_RETENTION_HOT_WINDOW_MS ?? String(2 * 60 * 60 * 1000), 10),
     defaultSuccessCap: parseInt(env.TRACE_RETENTION_DEFAULT_SUCCESS_CAP ?? '2000', 10),
     defaultFailureCap: parseInt(env.TRACE_RETENTION_DEFAULT_FAILURE_CAP ?? '2000', 10),
-    deleteBatchSize: parseInt(env.TRACE_RETENTION_DELETE_BATCH ?? '1000', 10),
+    // DELETE COST ON `execution` SCALES WITH STATEMENT WIDTH, NOT ROW COUNT (2026-08-09).
+    //
+    // Measured against the live 300k-row store:
+    //   DELETE <1 id>    0.0s  (row verified gone)
+    //   DELETE <2 ids>   10.7s
+    //   DELETE <50 ids>  TIMEOUT at 60s
+    //   SELECT 1000 ids   0.1s  (reads are fine; only mutation is pathological)
+    // Cause: `execution` carries 16 indexes, several low-cardinality (success, tier,
+    // org), so a delete rewrites all sixteen B-trees per row and the cost compounds
+    // across a wide id list. The aux tables reap happily at the same batch size —
+    // trace_digest and concept_usage log removed:29/76/16 in the same sweeps that
+    // fail on `execution` — which is what makes this table-specific rather than a
+    // general DB problem.
+    //
+    // At 1000 the valve's `DELETE $ids RETURN NONE` times out every cycle, so the
+    // loop dies at iteration 1 and commits NOTHING. Lowering it trades throughput for
+    // completion: many small statements that finish beat one wide statement that
+    // never does. 25 is deliberately well under the measured 50-id failure point,
+    // since the timeout is load-dependent and the margin matters more than the count.
+    //
+    // Kept as an env override so a deployment on a healthier table (fewer indexes, or
+    // post-partition) can raise it without a code change.
+    deleteBatchSize: parseInt(env.TRACE_RETENTION_DELETE_BATCH ?? '25', 10),
     activities,
     overrides,
     autoDiscover: env.TRACE_RETENTION_AUTO !== 'false', // on by default; ENABLED already gates the job
