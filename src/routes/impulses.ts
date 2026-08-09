@@ -5252,6 +5252,94 @@ router.post('/resolve', async (c) => {
         return c.json(result.body as ImpulseResolveResponse, result.status as any);
       }
 
+      case 'edge_liveness_report': {
+        // ADVERTISED IS A CLAIM; DEMONSTRATED IS A FACT (2026-08-09).
+        //
+        // Coverage was counted by whether a shape is ADVERTISED, so an activity could
+        // be dispatched 36 times, never once succeed, and still be counted as covered.
+        // That is exactly how trace-store-reconcile — broken five independent ways —
+        // went unnoticed for weeks while its target metric never moved.
+        //
+        // This reads the fact out of history instead. Everything needed is already in
+        // `execution`: activity_id, output_impulse_shapes, success, executed_at. No new
+        // instrumentation, just a projection nobody had written.
+        //
+        // Three states, because each names a DIFFERENT repair:
+        //   never_succeeded — a BUILD defect. The producer has never worked; this names
+        //                     a file to go read. (The reconcile's state for weeks.)
+        //   regressed       — succeeded once and no longer does; bisect against deploys.
+        //   healthy         — most recent attempt succeeded.
+        // A shape with no attempts at all simply does not appear: that is a coverage
+        // hole, answerable from the advertised set, not from history.
+        const limit = Math.min(Number((pointer as any).limit ?? 200), 1000);
+        const activityFilter = (pointer as any).activity_id as string | undefined;
+        const sinceDays = Number((pointer as any).since_days ?? 30);
+        const sinceIso = new Date(Date.now() - sinceDays * 86400_000).toISOString();
+
+        // Bounded by executed_at (index-backed) and by LIMIT so this can never become
+        // the kind of unbounded scan that times out on a 300k-row table.
+        let elQuery =
+          'SELECT activity_id, output_impulse_shapes, success, executed_at FROM execution ' +
+          'WHERE executed_at > type::datetime($since)';
+        const elParams: Record<string, unknown> = { since: sinceIso, limit };
+        if (activityFilter) {
+          elQuery += ' AND activity_id = $activity_id';
+          elParams['activity_id'] = activityFilter;
+        }
+        elQuery += ' LIMIT $limit';
+        const elRows = await surrealDB.query<Record<string, unknown>[]>(elQuery, elParams);
+        const rows = Array.isArray(elRows[0]) ? elRows[0] : (elRows as unknown as Record<string, unknown>[]);
+
+        interface EdgeAcc { attempts: number; successes: number; last_success_at: string | null; last_attempt_at: string | null }
+        const acc = new Map<string, EdgeAcc>();
+        for (const r of Array.isArray(rows) ? rows : []) {
+          const actId = String((r as any)?.activity_id ?? '').trim();
+          if (!actId) continue;
+          const shapes = Array.isArray((r as any)?.output_impulse_shapes) ? (r as any).output_impulse_shapes as unknown[] : [];
+          const ok = (r as any)?.success === true;
+          const at = typeof (r as any)?.executed_at === 'string' ? (r as any).executed_at as string : null;
+          // An execution that produced NO shape still counts as an attempt against the
+          // activity itself — a producer that never emits anything is the loudest case
+          // of never_succeeded, and keying only on emitted shapes would hide it.
+          const keys = shapes.length ? shapes.map((s) => `${actId} ${String(s)}`) : [`${actId} (no-output-shape)`];
+          for (const k of keys) {
+            const cur = acc.get(k) ?? { attempts: 0, successes: 0, last_success_at: null, last_attempt_at: null };
+            cur.attempts += 1;
+            if (at && (!cur.last_attempt_at || at > cur.last_attempt_at)) cur.last_attempt_at = at;
+            if (ok) {
+              cur.successes += 1;
+              if (at && (!cur.last_success_at || at > cur.last_success_at)) cur.last_success_at = at;
+            }
+            acc.set(k, cur);
+          }
+        }
+
+        const edges = [...acc.entries()].map(([k, v]) => {
+          const [activity_id, produced_shape] = k.split(' ');
+          // attempts_since_success is the actionable number: how many times this edge
+          // has been tried since it last worked. For never_succeeded it is every attempt.
+          const attempts_since_success = v.last_success_at
+            ? v.attempts - v.successes
+            : v.attempts;
+          const state = v.successes === 0
+            ? 'never_succeeded'
+            : (v.last_attempt_at && v.last_success_at && v.last_attempt_at > v.last_success_at)
+              ? 'regressed'
+              : 'healthy';
+          return { activity_id, produced_shape, state, attempts: v.attempts, successes: v.successes, attempts_since_success, last_success_at: v.last_success_at, last_attempt_at: v.last_attempt_at };
+        });
+        // Worst first: never_succeeded, then regressed, then by how long they have been
+        // failing — so the head of the list is the worklist.
+        const rank: Record<string, number> = { never_succeeded: 0, regressed: 1, healthy: 2 };
+        edges.sort((a, b) => (rank[a.state]! - rank[b.state]!) || (b.attempts_since_success - a.attempts_since_success));
+        const summary = {
+          never_succeeded: edges.filter((e) => e.state === 'never_succeeded').length,
+          regressed: edges.filter((e) => e.state === 'regressed').length,
+          healthy: edges.filter((e) => e.state === 'healthy').length,
+        };
+        return c.json({ shape: 'edge_liveness_report', edges, count: edges.length, summary, window_days: sinceDays, sampled_executions: Array.isArray(rows) ? rows.length : 0 });
+      }
+
       case 'compositionGraph': {
         const limit = (pointer as any).limit ?? 100;
         const activityId = (pointer as any).activity_id as string | undefined;
