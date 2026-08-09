@@ -170,7 +170,36 @@ export function loadTraceRetentionConfig(env = process.env): TraceRetentionConfi
     //
     // Kept as an env override so a deployment on a healthier table (fewer indexes, or
     // post-partition) can raise it without a code change.
-    deleteBatchSize: parseInt(env.TRACE_RETENTION_DELETE_BATCH ?? '25', 10),
+    // 25 -> 1, BECAUSE THE COST IS PER-STATEMENT, NOT PER-ROW (2026-08-09).
+    //
+    // The measurements above say 1000 was fatal and 25 survives. They do not say 25 is
+    // good, and the valve's own instrumentation now shows it is not:
+    //
+    //   batch 25, 16 indexes      100 rows / 352s   ->  ~88s PER DELETE STATEMENT
+    //   batch 25, index dropped    50 rows / 860s   -> ~430s per statement
+    //   batch 25, index dropped    50 rows / 570s   -> ~285s per statement
+    //
+    // Against the earlier direct probe of the same table:
+    //
+    //   DELETE <1 id>    0.0s      DELETE <2 ids>   10.7s      DELETE <50 ids>  timeout
+    //
+    // One id is effectively free and two cost eleven seconds. That is not a per-row cost
+    // curve — it is a threshold: the moment a DELETE carries more than one id, something
+    // (16 index B-trees, several low-cardinality) turns pathological, and the penalty then
+    // scales with statement width. 25 ids inherits the whole penalty and amortises nothing.
+    //
+    // So the batch size was tuned against the wrong model. At ~0.2s per single delete the
+    // valve sheds ~5 rows/sec against a measured intake of ~325 rows/HOUR — the first
+    // configuration in this file that can actually outpace arrivals. Many cheap statements
+    // beat one expensive statement, and the extra round trips are irrelevant next to a
+    // 285s stall.
+    //
+    // REVERSIBLE AND MEASURED THE SAME WAY: the valve's `done` line reports removed and
+    // elapsedMs under an unchanged budget, so the next sweep compares directly against the
+    // 3.52 s/row baseline. If singles are not faster, this goes back — the previous
+    // hypothesis (index count) was reverted on exactly that evidence, not on argument.
+    // Env override retained so a deployment on a healthier table can raise it.
+    deleteBatchSize: parseInt(env.TRACE_RETENTION_DELETE_BATCH ?? '1', 10),
     activities,
     overrides,
     autoDiscover: env.TRACE_RETENTION_AUTO !== 'false', // on by default; ENABLED already gates the job
