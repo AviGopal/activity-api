@@ -15,6 +15,7 @@ import { validRepairSignature, repairBoostFromRows } from '../lib/repair-signatu
 import { Hono } from 'hono';
 import beta from '@stdlib/random-base-beta';
 import { surrealDB, queryWithAuth } from '../db/surreal';
+import { config } from '../config';
 import { RedisClient } from '../db/redis';
 import { invalidateTemplateCache, invalidateTemplateCacheMany } from '../utils/template-cache';
 import { logger } from '../utils/logger';
@@ -1992,6 +1993,46 @@ app.post('/executions', async (c) => {
     // trace_store_counters bookkeeping (migration 156) — fire-and-forget,
     // never blocks the trace insert's critical path.
     void incrementTraceStoreCounter();
+
+    // SUCCESS-SAMPLING FOR HIGH-VOLUME BOOKKEEPING FAMILIES (2026-08-09).
+    //
+    // The trace store reached 303k rows against a 150k cap and CANNOT be drained:
+    // `execution` carries 16 indexes, so every delete rewrites all of them. Measured
+    // on the live hub — SELECT of 1000 ids 0.1s, DELETE of 1 row 0.0s, DELETE of 2
+    // rows 10.7s, DELETE of 50 rows times out at 60s, and sequential single deletes
+    // sustain 0.2 rows/sec. Against ~1000 inserts/hr that is a NEGATIVE net drain:
+    // retention cannot win, so the only lever is not writing the rows.
+    //
+    // Measured composition of the inflow: two lifecycle meta-templates,
+    // validator-dispatch (55%) and slot-binding (10%), are ~65% of all inserts and
+    // 83-97% of them are status=success. These are bookkeeping about the dispatch
+    // machinery itself, not records of work. The retention policy already names
+    // exactly these two families (TRACE_RETENTION_ACTIVITIES) — the policy was
+    // right, only its delete mechanism was impossible.
+    //
+    // FAILURES ARE NEVER SAMPLED. A failure is the signal the learning loop is for:
+    // Thompson needs the beta side, the ribosome extracts from reached executions,
+    // and every diagnosis in this repo starts from a failed trace. Successes in a
+    // family that succeeds 97% of the time are near-duplicates; the counter
+    // (incrementTraceStoreCounter above) still records every one, so rate and volume
+    // stay observable even where the row does not.
+    //
+    // Shaped, not hardcoded: both the family list and the keep-rate are read from
+    // config at use time, so the behaviour is steerable without a deploy and a
+    // deployment that wants full fidelity sets the rate to 1.
+    const sampledFamilies = config.traceStore.successSampleActivities;
+    const keepRate = config.traceStore.successSampleRate;
+    if (
+      validated.success === true &&
+      keepRate < 1 &&
+      sampledFamilies.some((f: string) => String(activityIdFromRequest ?? '').includes(f)) &&
+      Math.random() >= keepRate
+    ) {
+      logger.debug('Execution trace success-sampled out (counter still incremented)', {
+        executionId, activityId: activityIdFromRequest, keepRate,
+      });
+      return c.json({ success: true, data: { execution_id: executionId, sampled_out: true } }, 201);
+    }
 
     // WRITE-FLIP: `execution` is ALWAYS written (authoritative store).
     {

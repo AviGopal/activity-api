@@ -104,6 +104,10 @@ export interface Config {
     cap: number;                // TRACE_STORE_CAP, default 50_000
     hotWindowDays: number;      // TRACE_STORE_HOT_WINDOW_DAYS, default 14
     reservoirPerActivity: number; // TRACE_STORE_RESERVOIR_PER_ACTIVITY, default 25
+    /** Activity-id substrings whose SUCCESSFUL traces are sampled. TRACE_STORE_SUCCESS_SAMPLE_ACTIVITIES. */
+    successSampleActivities: string[];
+    /** Fraction of successes to keep for those families, 0..1. TRACE_STORE_SUCCESS_SAMPLE_RATE, default 1 (= keep all). */
+    successSampleRate: number;
   };
 }
 
@@ -434,6 +438,15 @@ export function loadConfig(): Config {
       cap: parseEnvInt('TRACE_STORE_CAP', 50_000),
       hotWindowDays: parseEnvInt('TRACE_STORE_HOT_WINDOW_DAYS', 14),
       reservoirPerActivity: parseEnvInt('TRACE_STORE_RESERVOIR_PER_ACTIVITY', 25),
+      // DEFAULTS ARE A NO-OP. rate 1 keeps every success, so a deployment that says
+      // nothing behaves exactly as before and this can only reduce writes where an
+      // operator has deliberately turned it on.
+      successSampleActivities: (process.env['TRACE_STORE_SUCCESS_SAMPLE_ACTIVITIES'] ?? '')
+        .split(',').map((s) => s.trim()).filter(Boolean),
+      successSampleRate: (() => {
+        const raw = Number(process.env['TRACE_STORE_SUCCESS_SAMPLE_RATE'] ?? '1');
+        return Number.isFinite(raw) && raw >= 0 && raw <= 1 ? raw : 1;
+      })(),
     },
   };
 }
