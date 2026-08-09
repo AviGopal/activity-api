@@ -35,6 +35,25 @@
 -- idx_execution_success and the other low-cardinality indexes — are real query filters and
 -- each needs its own migration AND its own measurement; do not batch them.
 --
--- No data is touched. Rebuilding a unique index over ~306k rows costs one pass.
+-- CONCURRENTLY IS LOAD-BEARING, NOT DECORATION.
+--
+-- The first version of this migration omitted it and FAILED on the live hub:
+--
+--   [Migration] ✗ 194-restore-execution-id-index.surql error: TimeoutError
+--   [Init] ⚠ Migration ... had errors but continuing...
+--
+-- A blocking unique-index build over ~306k rows cannot finish inside applySQLFile's 45s
+-- window, and that window must NOT be widened. The comment on that timeout records why:
+-- it was raised to 300s on 2026-08-03 and reverted, because init-database is an
+-- ExecStartPre — a slow DDL turned a fast failure into a restart loop that took the trace
+-- store offline and blinded the ribosome (10 PIDs, 9 re-runs in 25 minutes). Its
+-- conclusion is the rule this migration follows: work too expensive for the startup
+-- window must be built OUT OF BAND, not by extending the gate.
+--
+-- CONCURRENTLY makes the build asynchronous and non-blocking, so the statement returns
+-- immediately and startup is never held hostage to index construction. This is the same
+-- form db_admin's create_index operation emits for exactly this reason.
+--
+-- No data is touched.
 
-DEFINE INDEX IF NOT EXISTS idx_execution_id ON execution FIELDS id UNIQUE;
+DEFINE INDEX IF NOT EXISTS idx_execution_id ON execution FIELDS id UNIQUE CONCURRENTLY;
