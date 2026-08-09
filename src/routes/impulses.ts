@@ -5297,7 +5297,20 @@ router.post('/resolve', async (c) => {
           if (!actId) continue;
           const shapes = Array.isArray((r as any)?.output_impulse_shapes) ? (r as any).output_impulse_shapes as unknown[] : [];
           const ok = (r as any)?.success === true;
-          const at = typeof (r as any)?.executed_at === 'string' ? (r as any).executed_at as string : null;
+          // executed_at is a SurrealDB datetime, not a string — a typeof==='string'
+          // test rejects every value and leaves last_success_at/last_attempt_at null
+          // while attempts counts up, which is what the first live query returned
+          // (attempts:10, last_attempt_at:null). Same family as the TimestampSchema
+          // defect where timestamps serialize as {}. Normalise via Date so a datetime,
+          // an ISO string, or an epoch number all compare correctly as ISO.
+          const rawAt = (r as any)?.executed_at;
+          let at: string | null = null;
+          if (typeof rawAt === 'string') at = rawAt;
+          else if (rawAt instanceof Date) at = rawAt.toISOString();
+          else if (rawAt != null) {
+            const d = new Date(rawAt as string | number);
+            at = Number.isNaN(d.getTime()) ? null : d.toISOString();
+          }
           // An execution that produced NO shape still counts as an attempt against the
           // activity itself — a producer that never emits anything is the loudest case
           // of never_succeeded, and keying only on emitted shapes would hide it.
