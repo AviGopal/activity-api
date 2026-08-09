@@ -194,12 +194,31 @@ export function loadTraceRetentionConfig(env = process.env): TraceRetentionConfi
     // beat one expensive statement, and the extra round trips are irrelevant next to a
     // 285s stall.
     //
-    // REVERSIBLE AND MEASURED THE SAME WAY: the valve's `done` line reports removed and
-    // elapsedMs under an unchanged budget, so the next sweep compares directly against the
-    // 3.52 s/row baseline. If singles are not faster, this goes back — the previous
-    // hypothesis (index count) was reverted on exactly that evidence, not on argument.
-    // Env override retained so a deployment on a healthier table can raise it.
-    deleteBatchSize: parseInt(env.TRACE_RETENTION_DELETE_BATCH ?? '1', 10),
+    // MEASURED AND REVERTED TO 25. Singles were not faster:
+    //
+    //   batch 25, 16 indexes, quiet      100 rows / 352s  ->  3.52 s/row   <- best observed
+    //   batch  1, index rebuilding        33 rows / 303s  ->  9.19 s/row
+    //
+    // So the statement-width theory is not supported either. A single-id DELETE still
+    // costs seconds, nothing like the 0.0s the earlier direct probe recorded — which now
+    // looks like it was taken against a much quieter table rather than being a property of
+    // single deletes.
+    //
+    // THE BATCH=1 SAMPLE IS CONTAMINATED AND I CAUSED IT: the unique index restored by
+    // migration 194 was rebuilding CONCURRENTLY in the background during that sweep —
+    // sustained write load on this exact table. It is not comparable to the 3.52 baseline,
+    // so it neither confirms nor refutes cleanly; it only fails to show the large win the
+    // change was made to capture. Reverting to the best MEASURED value rather than keeping
+    // an unvalidated one is the conservative call, and 25 also carries the documented
+    // margin below the 50-id failure point.
+    //
+    // WHAT THIS LEAVES: two hypotheses tested and neither supported — index count (drop
+    // measured WORSE, reverted in 0da9c16) and statement width (this). The remaining
+    // explanation is that the per-delete cost is in the storage engine's delete path for
+    // this table, which is a design question (partitioning, a different retention
+    // substrate, or not storing this volume at all) rather than anything tunable here.
+    // Re-test batch=1 on a QUIET table before drawing a conclusion from that sample.
+    deleteBatchSize: parseInt(env.TRACE_RETENTION_DELETE_BATCH ?? '25', 10),
     activities,
     overrides,
     autoDiscover: env.TRACE_RETENTION_AUTO !== 'false', // on by default; ENABLED already gates the job
