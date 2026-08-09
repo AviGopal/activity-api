@@ -1,0 +1,58 @@
+-- 193: drop idx_execution_id — a UNIQUE index on the record id
+--
+-- WHY THIS EXISTS
+--
+-- Deletes on `execution` cost ~3.5 SECONDS PER ROW. Measured on the live hub
+-- 2026-08-09, by the retention valve's own instrumentation over a full 5-minute
+-- budget with no other sweep overlapping it:
+--
+--   global-ceiling valve: done {"removed":100,"elapsedMs":352069,"stoppedBy":"budget"}
+--
+-- That is the whole trace-store problem. The store sits at 306k against a 150k
+-- ceiling; intake is ~325 rows/hr; the valve drains ~200 rows/hr at a 30-minute
+-- sweep interval. A correct, running, bounded valve still LOSES GROUND. No batch
+-- size and no budget fixes a 3.5 s/row delete — every one of them is a different
+-- way to schedule the same cost. The cost itself is the target.
+--
+-- The cause is index count: `execution` carries ~16 indexes, so a single row delete
+-- rewrites sixteen B-trees. Reads are unaffected (SELECT 1000 ids returns in 0.1s);
+-- only mutation is pathological, which is what makes this structural rather than a
+-- general database problem.
+--
+-- WHY THIS INDEX FIRST
+--
+-- `idx_execution_id ON execution FIELDS id UNIQUE` indexes the RECORD ID. SurrealDB
+-- already keys every table by record id and already enforces its uniqueness — that is
+-- what a record id is. So this index buys nothing on reads and cannot change any query
+-- plan, while costing a uniqueness probe on every insert and a tree maintenance on
+-- every delete. It is the one index that can be removed with no read-path risk at all.
+--
+-- ONE CHANGE, MEASURED (law 12 — causal discipline)
+--
+-- Deliberately drops exactly ONE index so the effect is attributable. The valve's own
+-- `done` line is the instrument and needs no credentials: same 5-minute budget, same
+-- 25-row batch, so `removed` and `elapsedMs` are directly comparable across the change.
+--
+--   BASELINE  removed=100  elapsedMs=352069  ->  3.52 s/row
+--
+-- If s/row drops materially, the index-count hypothesis is confirmed and the remaining
+-- candidates are worth their individual risk assessments. If it does not move, the
+-- hypothesis is wrong and the next suspect is the storage engine's delete path, not the
+-- schema — either way the next step is decided by a measurement rather than an argument.
+--
+-- NOT INCLUDED HERE, ON PURPOSE
+--
+--   - idx_execution_success (2 distinct values over 306k rows) and the other
+--     low-cardinality indexes are the likeliest big wins, but `success` is a real query
+--     filter and dropping it can regress read plans. It needs its own migration and its
+--     own measurement.
+--   - idx_execution_vessel is DEFINEd twice under one name on two different fields
+--     (resolved_by_vessel_id, and vessel_id), both with IF NOT EXISTS — so one of the
+--     two silently never existed. That is a definition bug to repair, but repairing it
+--     ADDS an index, which is the wrong direction to move while deletes cost seconds.
+--     Filed, not fixed here.
+--
+-- REVERSIBLE: re-adding is one DEFINE INDEX. Nothing depends on this index's presence,
+-- and no data is touched — only the index structure is dropped.
+
+REMOVE INDEX IF EXISTS idx_execution_id ON execution;
