@@ -581,11 +581,46 @@ export async function runTraceRetentionSweep(
           const ids = (Array.isArray(rows) ? rows : [])
             .map((r) => (r as { id?: unknown })?.id)
             .filter((id) => id != null);
-          if (ids.length === 0) break; // table drained
+          if (iter === 0) {
+            // WHY THE FIRST ITERATION IS LOGGED (2026-08-09).
+            //
+            // The valve enters, counts 306326 against a 150000 ceiling, sets
+            // willPrune:true — and then emits nothing at all. The only silent exit in
+            // this loop is the `break` below, so a valve that "does not run" and a
+            // valve that runs and finds zero cold rows are indistinguishable from the
+            // outside. They have opposite fixes: the first is a control-flow bug, the
+            // second means the ceiling and the cold cutoff disagree about what should
+            // be deleted, and the valve is correctly declining to touch hot traces.
+            //
+            // Log what the first SELECT actually returned so the next cycle says which
+            // one it is instead of leaving it to be inferred.
+            logger.info('[trace-retention] global-ceiling valve: first batch', {
+              cut: coldCutoffIso,
+              requested: thisBatch,
+              returned: ids.length,
+              surplus,
+            });
+          }
+          if (ids.length === 0) {
+            // Not necessarily "table drained" — the original comment assumed the only
+            // reason for an empty page is exhaustion. With a cutoff-bounded WHERE it
+            // also means nothing is older than the hot window, which is a policy
+            // disagreement rather than success. Say which, and say it at warn level
+            // when the table is over its ceiling and still cannot shed anything.
+            logger.warn('[trace-retention] global-ceiling valve: nothing cold to delete', {
+              cut: coldCutoffIso,
+              iter,
+              deletedSoFar: done,
+              surplus,
+              note: 'over ceiling but no rows older than the hot window — ceiling and cold cutoff disagree',
+            });
+            break;
+          }
           await surrealDB.query('DELETE $ids RETURN NONE', { ids });
           done += ids.length;
         }
         removed = done;
+        logger.info('[trace-retention] global-ceiling valve: done', { removed, surplus, batchSize });
       }
       // Synthetic stratum so the counter-decrement below and the reconcile route's
       // `deleted` reduce both include the valve's deletions.
