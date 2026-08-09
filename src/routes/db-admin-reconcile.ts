@@ -335,7 +335,17 @@ export async function resolveReconcileTraceStore(pointer: any, actor: string | n
       try {
         const sweep = await runTraceRetentionSweep(rcfg);
         const deleted = sweep.results.reduce((n, r) => n + (r.deletedActual ?? 0), 0);
-        retention = { deleted, dry_run: rcfg.dryRun, strata: sweep.results.length, duration_ms: sweep.durationMs };
+        // A sweep skipped for re-entrancy returns zeros across the board, which is
+        // indistinguishable from a sweep that ran and legitimately found nothing to
+        // delete. Say which — reporting "deleted: 0" for work that never started is
+        // the hollow-success pattern this store has been bitten by repeatedly.
+        retention = sweep.skipped
+          ? {
+              skipped: true,
+              reason: 'another sweep was already in flight (timer tick or a concurrent reconcile)',
+              deleted: 0,
+            }
+          : { deleted, dry_run: rcfg.dryRun, strata: sweep.results.length, duration_ms: sweep.durationMs };
       } catch (err: any) {
         retention = { error: err?.message ?? String(err) };
       }

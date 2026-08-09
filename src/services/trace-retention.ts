@@ -325,8 +325,47 @@ export async function rollupReachHistory(): Promise<{ scanned: number; weeks: nu
   }
 }
 
+/**
+ * Re-entrancy guard. The sweep has TWO independent callers — the interval timer in
+ * startTraceRetentionSweep, and the db-admin reconcile route, which the substrate's
+ * `trace-store-reconcile` activity drives on a ~5-minute lease. Neither knew about the
+ * other, so they interleaved freely: observed 2026-08-09 in one process, sweeps at
+ * 18:01:53 and 18:05:26 with a 30-minute configured interval.
+ *
+ * Concurrent sweeps are not merely redundant here, they are actively harmful. The
+ * ceiling valve pages cold rows with a cutoff-bounded WHERE and no cursor, so two
+ * sweeps select THE SAME rows and both issue DELETEs for them — duplicated work and
+ * write contention on the one table where deletes already cost seconds per row
+ * (16 indexes rewritten per delete). The overlap makes the exact bottleneck worse.
+ *
+ * A module-level boolean is the right scope: both callers live in this process, and a
+ * cross-process lease already exists for the reconcile path. Second caller returns the
+ * skip marker rather than throwing — a skipped sweep is normal, not an error, and the
+ * next tick picks the work up.
+ */
+let sweepInFlight = false;
+
 export async function runTraceRetentionSweep(
   cfg: TraceRetentionConfig = loadTraceRetentionConfig(),
+): Promise<{ results: StratumResult[]; durationMs: number; orphanReaped: number; skipped?: true }> {
+  if (sweepInFlight) {
+    logger.info('[trace-retention] sweep already in flight — skipping this invocation', {
+      note: 'timer tick and reconcile route both drive this sweep; overlapping runs would delete the same rows twice',
+    });
+    return { results: [], durationMs: 0, orphanReaped: 0, skipped: true };
+  }
+  sweepInFlight = true;
+  try {
+    return await runTraceRetentionSweepInner(cfg);
+  } finally {
+    // finally, not a trailing assignment: an exception anywhere in the sweep must not
+    // leave the guard stuck true and disable retention for the life of the process.
+    sweepInFlight = false;
+  }
+}
+
+async function runTraceRetentionSweepInner(
+  cfg: TraceRetentionConfig,
 ): Promise<{ results: StratumResult[]; durationMs: number; orphanReaped: number }> {
   const startedAt = Date.now();
   // CAPTURE BEFORE DELETE. The rollup must precede every prune below, or the sweep
