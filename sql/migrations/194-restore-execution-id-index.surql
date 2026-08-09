@@ -1,0 +1,40 @@
+-- 194: restore idx_execution_id — 193 was measured and it made deletes WORSE
+--
+-- 193 dropped `idx_execution_id ON execution FIELDS id UNIQUE` on the argument that it
+-- indexes the record id, which SurrealDB already keys and already enforces unique, so it
+-- could only cost writes and could not change a query plan. That argument was wrong, or
+-- at least not supported by what happened.
+--
+-- MEASURED, same instrument both sides — the retention valve's own `done` line, identical
+-- 5-minute budget and 25-row batch, so `removed` and `elapsedMs` compare directly:
+--
+--   BEFORE (16 indexes)   removed=100  elapsedMs=352069   ->   3.52 s/row
+--   AFTER  (index gone)   removed=50   elapsedMs=859907   ->  17.20 s/row
+--   AFTER  (index gone)   removed=50   elapsedMs=570422   ->  11.41 s/row
+--
+-- Two samples, both several times worse than baseline, and the surplus kept growing
+-- across them (156803 -> 156938). Whatever the mechanism, the change did not do what it
+-- was supposed to do.
+--
+-- WHY THE ORIGINAL REASONING WAS PROBABLY WRONG: the valve deletes via `DELETE $ids`,
+-- which resolves a list of record ids. A UNIQUE index on `id` is plausibly what the
+-- engine uses to locate those rows. Removing it may force a costlier lookup per id — the
+-- exact opposite of the "pure write overhead" story. That is a hypothesis too; it is NOT
+-- what this migration rests on. This migration rests on the measurement.
+--
+-- CAUSALITY IS NOT PROVEN. Both post-drop samples ran on a box that had just applied ~190
+-- migrations and was throwing embedding-backfill errors, so sustained load is a live
+-- alternative explanation. The responsible default when a deliberate change measures
+-- worse twice is to put it back, not to keep it and argue. If a later, quieter experiment
+-- shows the drop is neutral or good, it can be re-applied — cheaply, because this is one
+-- statement either way.
+--
+-- WHAT THIS DOES NOT CHANGE: the trace store's real problem stands. Deletes cost seconds
+-- per row, intake is ~325 rows/hr, and the valve cannot keep up. The index-count theory is
+-- now the LEAST supported of the candidates, not the most. The remaining ones —
+-- idx_execution_success and the other low-cardinality indexes — are real query filters and
+-- each needs its own migration AND its own measurement; do not batch them.
+--
+-- No data is touched. Rebuilding a unique index over ~306k rows costs one pass.
+
+DEFINE INDEX IF NOT EXISTS idx_execution_id ON execution FIELDS id UNIQUE;
