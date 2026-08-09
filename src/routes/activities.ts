@@ -3434,7 +3434,26 @@ app.post('/templates/auto-promote', async (c) => {
       // row UNDER-counts real executions. The `tr.total > empirical_samples`
       // guard only lets traces win when they carry MORE observations than vpm,
       // so a well-sampled stochastic posterior is never overridden by raw counts.
-      if (empirical_samples < min_samples) {
+      // GATING THE FALLBACK ON `min_samples` MADE A LOWER THRESHOLD PROMOTE FEWER.
+      //
+      // The trace-store fallback only ran when `empirical_samples < min_samples`, so a
+      // caller asking for a LOOSER bar (min_samples=3) skipped the better evidence and
+      // judged the proposal on a thin vpm posterior, while the default (20) reached the
+      // trace store and saw the real execution count. Reproduced against the live hub:
+      //
+      //   default        -> promoted 2  (73 and 72 samples, evidence_source=trace_store)
+      //   min_samples=3  -> promoted 0
+      //
+      // and min_samples=3 is exactly what boredom-vessel's auto-promote tick sends
+      // (index.ts:1423), which is why the live loop has logged
+      // `considered=1176 promoted=0` on every tick while the endpoint would promote.
+      // 214 proposals across 33 classes have been waiting behind an inverted threshold.
+      //
+      // The guard that matters is `tr.total > empirical_samples` — traces win only when
+      // they carry MORE observations than vpm — and it is unchanged. Consulting the trace
+      // store unconditionally cannot lower the evidence, it can only raise it, so a
+      // well-sampled stochastic posterior is still never overridden by raw counts.
+      {
         const tr = traceStatsMap.get(p.template_id);
         if (tr && tr.total > empirical_samples) {
           empirical_samples = tr.total;
