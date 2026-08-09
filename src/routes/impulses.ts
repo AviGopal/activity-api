@@ -3264,6 +3264,97 @@ router.post('/resolve', async (c) => {
           } as ImpulseResolveResponse, 400);
         }
 
+        // A TEMPLATE IS THE ONLY CODE HERE THAT SHIPS WITH NO COMPILE STEP (2026-08-09).
+        //
+        // Two defects that ran for weeks were structurally checkable before storage:
+        //   - trace-store-reconcile's http_fetch named POST /v2/db/admin/reconcile-trace-store,
+        //     a route that exists nowhere in this codebase. Every dispatch 404'd, and because
+        //     it died before release_lease it parked the global change_window lease and blocked
+        //     fleet-wide self-editing.
+        //   - a later correction shipped a mustache variable no dispatcher binds, so the URL
+        //     rendered with no host, the fetch died in-process, and the run still reported
+        //     success:true with task_count:5.
+        //
+        // The goal plane already refuses exactly this class (goal-host index.ts:11419 rejects a
+        // dispatch whose text still contains an unrendered placeholder, because an unanswerable
+        // goal collapses every attempt onto one goal_hash and feeds the learner beta updates it
+        // cannot distinguish from a bad pathway). Same reasoning, one plane over: a template
+        // stored broken is re-dispatched forever and every failure is charged to the drafter.
+        //
+        // Checked against the MERGED view, not the update payload: `variables` is not an
+        // updatable field, so a placeholder's declaration lives only in the stored template and
+        // validating the payload alone would false-positive on every legitimate task update.
+        {
+          const _tasks = (updatePointer.updates as Record<string, unknown>)['tasks'];
+          if (Array.isArray(_tasks)) {
+            const stored = await surrealDB.query<Record<string, unknown>[]>(
+              'SELECT variables FROM activity_template WHERE variant_id = $vid LIMIT 1',
+              { vid: updatePointer.templateId },
+            ).catch(() => [] as Record<string, unknown>[][]);
+            const storedRow = (Array.isArray(stored?.[0]) ? stored[0]![0] : undefined) as { variables?: unknown } | undefined;
+            const declared = new Set<string>();
+            const mergedVars = (updatePointer.updates as Record<string, unknown>)['variables'] ?? storedRow?.variables;
+            if (Array.isArray(mergedVars)) {
+              for (const v of mergedVars) {
+                const n = (v as { name?: unknown })?.name;
+                if (typeof n === 'string' && n) declared.add(n);
+              }
+            }
+            const problems: string[] = [];
+            const blob = JSON.stringify(_tasks);
+            // 1. Unbound placeholder. `{{taskId_text}}` is the engine's own cross-task data-flow
+            //    binding and is always satisfied at run time, so it is exempt.
+            const taskIds = new Set<string>();
+            for (const t of _tasks) {
+              const id = (t as { id?: unknown })?.id;
+              if (typeof id === 'string' && id) taskIds.add(id);
+            }
+            for (const m of blob.matchAll(/\{\{\s*([\w.]+)\s*\}\}/g)) {
+              const name = m[1]!;
+              if (declared.has(name)) continue;
+              const base = name.replace(/_text$/, '');
+              if (name.endsWith('_text') && taskIds.has(base)) continue;
+              if (name.includes('.')) continue; // {{shape.field}} addressing, resolved elsewhere
+              problems.push(`task placeholder {{${name}}} has no declared variable and no producing task — it will render empty`);
+            }
+            // 2. A substrate-local URL naming a path no fleet vessel mounts. Only
+            //    loopback/localhost is judged — a remote host's routes are not ours to know.
+            //
+            //    Matched against ACTUAL MOUNT PREFIXES, not a namespace. A `/v2/` test would
+            //    have accepted `/v2/db/admin/reconcile-trace-store` — the exact dead route that
+            //    ran for weeks — because it is well-formed and in the right namespace while
+            //    naming nothing. Checking the namespace is how the defect passed review in the
+            //    first place; the mounted set is the fact.
+            //
+            //    Kept deliberately generous across the fleet (goal-host, discovery, concept-db,
+            //    dev-vessel and the federation egress all answer on loopback in-container), so
+            //    this rejects paths that match NO vessel rather than paths that are not ours.
+            //    Under-blocking is the right failure direction for a publish gate.
+            const MOUNTED_PREFIXES = [
+              '/v2/activities', '/v2/auth', '/v2/cluster', '/v2/connections', '/v2/events',
+              '/v2/goal-paths', '/v2/impulses', '/v2/llm-router', '/v2/ribosome', '/v2/shapes',
+              '/v2/tuning-params', '/v2/vessels',
+              '/v1/', '/metrics', '/health', '/resolve', '/run-goal', '/concepts', '/egress',
+              '/dispatch', '/shapes', '/active-dispatches', '/ws',
+            ];
+            for (const m of blob.matchAll(/"(https?:\/\/(?:127\.0\.0\.1|localhost)(?::\d+)?)(\/[^"']*)"/g)) {
+              const path = m[2]!.split('?')[0]!;
+              if (!MOUNTED_PREFIXES.some((p) => path === p || path.startsWith(p))) {
+                problems.push(`task URL path ${path} matches no route mounted by any fleet vessel — it will 404 on every dispatch`);
+              }
+            }
+            if (problems.length > 0) {
+              return c.json({
+                success: false,
+                error: `template rejected: ${problems.join('; ')}`,
+                refused: true,
+                why_this_is_refused_rather_than_stored:
+                  'a template stored broken is re-dispatched forever, and every failure is charged to the drafter rather than to the template',
+              } as unknown as ImpulseResolveResponse, 400);
+            }
+          }
+        }
+
         const jwtAuth = getJwtAuthFromContext(c)!;
         const templateId = updatePointer.templateId;
         const updates = updatePointer.updates;
