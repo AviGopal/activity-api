@@ -30,6 +30,20 @@ mock.module('../db/surreal', () => ({
 }));
 
 mock.module('../db/redis', () => ({
+  // `src/db/redis.ts` also exports a `redis` singleton. Omitting it made this
+  // whole file fail at IMPORT time ("Export named 'redis' not found"), so this
+  // tenancy suite was INERT -- it reported an error, never a verdict, and the
+  // scoping regressions it exists to catch went unguarded.
+  redis: {
+    del: async () => 0,
+    get: async () => null,
+    set: async () => 'OK',
+    sadd: async () => 0,
+    smembers: async () => [],
+    srem: async () => 0,
+    withLock: async (_l: unknown, _c: unknown, fn: () => Promise<unknown>) => fn(),
+    getClient: () => null,
+  },
   RedisClient: {
     getInstance: () => ({
       del: async () => 0,
@@ -62,6 +76,21 @@ mock.module('../db/paradigm', () => ({
   normalizeActivityId: (id: string) =>
     id.replace(/^activity:/, '').replace(/[⟨⟩`]/g, ''),
   updateShapeActivityScores: async () => null,
+
+  // Filled from the real module's export list, MATCHING each signature.
+  // A mock missing any export fails at import time (what made this suite inert);
+  // and stubbing a SYNC predicate as `async () => null` returns a truthy Promise,
+  // which silently flips branches like shouldSkipLegacyFallback() and fabricates
+  // failures that look like product defects.
+  computeShapeSignature: (s: string[]) => s,
+  getActivityShapePatterns: async () => ({ data: [], path: 'legacy' as const }),
+  getParadigmReadPercentage: () => 0,
+  isParadigmReadEnabled: () => false,
+  logDualWriteConfig: () => undefined,
+  queryActivitiesByEmbeddingDense: async () => ({ data: [], path: 'legacy' as const }),
+  shouldSkipLegacyFallback: () => false,
+  shouldUseParadigmRead: () => false,
+  transformLegacyTemplate: (t: any) => t,
 }));
 
 mock.module('../services/variant-creator', () => ({
@@ -221,9 +250,15 @@ describe('Phase B2: reads dual-scope impulse + activity-shape queries', () => {
     expect(newTbl.sql).toContain('account_id = $account_id');
     expect(newTbl.params.account_id).toBe('acc-acme-001');
 
+    // The legacy fallback now reads the VIEW `v_paradigm_execution_traces`
+    // rather than the `activity_execution_traces` table it was written against.
+    // The assertion drifted unnoticed because this suite could not import at all
+    // (see the redis/paradigm mocks above) — an inert test cannot report its own
+    // staleness. Accept either name so the tenancy guarantee stays asserted
+    // across that rename.
     const legacy = surrealQueries.find((q) =>
-      /SELECT\s+\*\s+FROM\s+activity_execution_traces/i.test(q.sql) &&
-      /WHERE\s+execution_id/i.test(q.sql),
+      /SELECT\s+\*\s+FROM\s+(?:activity_execution_traces|v_paradigm_execution_traces)/i.test(q.sql) &&
+      /WHERE\s+\(?execution_id/i.test(q.sql),
     )!;
     expect(legacy).toBeDefined();
     expect(legacy.sql).toContain('account_id IS NONE');

@@ -4193,8 +4193,30 @@ router.post('/resolve', async (c) => {
         // and threw HTTP 500). Mirrors the proven goal_execution_paths query in
         // routes/goal-paths.ts (migration 092) — surrealDB.query returns rows directly.
         const gepAuth = getJwtAuthFromContext(c)!;
+        // Tenancy on this table is OPTIONAL, and every historical row omits it.
+        // `goal_execution_paths` rows written by the upsert path carry no
+        // `org_id` (nor `account_id`/`project_id`) at all -- 200/200 sampled rows
+        // had the fields ABSENT, not null. The previous predicate was a bare
+        // `org_id = $org`, so it matched zero rows for every caller and every
+        // shape: this handler returned `{paths: []}` unconditionally while the
+        // sibling `GET /v2/goal-paths` route -- which has no org term -- read the
+        // same rows fine. A reader that demands a field the writer never sets is
+        // not isolation, it is a blind spot.
+        //
+        // This mirrors the `accountIdScopedWhere()` idiom already used 24x in
+        // this file (prefer the scoped column, fall back for legacy rows), with
+        // one necessary difference: that helper's legacy branch still requires
+        // `org_id = $org_id`, which cannot match a row whose org_id is NONE.
+        // So untenanted rows are admitted explicitly.
+        //
+        // Isolation is PRESERVED for any row that does carry tenancy: a row with
+        // an org_id still only matches its own org. Only rows that belong to
+        // nobody are shared. The durable fix is upstream -- the write path must
+        // stamp org_id so new rows are tenanted -- and until it does, dropping
+        // the tolerance here would re-blind the reader.
         const gepRows = await surrealDB.query<Record<string, unknown>[]>(
-          'SELECT * FROM goal_execution_paths WHERE $shape IN endpoint_output_shapes AND org_id = $org',
+          'SELECT * FROM goal_execution_paths WHERE $shape IN endpoint_output_shapes '
+            + 'AND (org_id = $org OR org_id IS NONE)',
           { shape: targetShape, org: gepAuth.orgId }
         );
         const paths = Array.isArray(gepRows) ? gepRows : [];
