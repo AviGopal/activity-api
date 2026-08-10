@@ -63,6 +63,39 @@ const app = new Hono();
  *
  * Exported for tests — see `execution-traces.test.ts`.
  */
+/**
+ * Failure modes that mean the execution did NOT run to completion.
+ *
+ * Deliberately narrow. `budget_exhausted` is excluded: a walk can legitimately
+ * reach its goal and then exceed a budget on the way out, and treating that as
+ * unreached would erase real successes — the opposite failure from the one this
+ * guards. Only add a type here when "this ran to completion" is false BY
+ * DEFINITION of the type.
+ */
+const NON_COMPLETING_FAILURE_MODES = new Set(['execution_error']);
+
+/**
+ * Reconcile a claimed reach verdict against the execution's own failure mode.
+ *
+ * Task #55, 2026-08-10: `reached: true` was persisted on executions whose trace
+ * reported `failure_mode.type = 'execution_error'` and produced zero shapes. The
+ * two fields were written side by side and never compared, so the store recorded
+ * a self-contradicting row that every downstream reader — reach rate, Thompson
+ * credit, the ribosome's extraction filter — then trusted.
+ *
+ * The execution's testimony wins over the claim: a throw is mechanical, whereas
+ * the verdict may come from a grader that never saw it. An undefined verdict
+ * stays undefined (ungraded is not a negative), and a `false` claim stays false.
+ */
+export function reachedVerdict(
+  claimed: boolean | undefined,
+  failureModeType: string | undefined,
+): boolean | undefined {
+  if (claimed !== true) return claimed;
+  if (failureModeType != null && NON_COMPLETING_FAILURE_MODES.has(failureModeType)) return false;
+  return true;
+}
+
 export function extractTaskImpulseIds(task: any): {
   input_impulse_ids: string[];
   output_impulse_ids: string[];
@@ -2588,12 +2621,32 @@ app.post('/', async (c) => {
         // carries an explicit verdict — ungraded/legacy traces leave the column
         // NONE rather than fabricating a boolean (mirrors classifyReach's tag
         // authority). A later reach write-back can still set it.
-        reached:
+        // CONTRADICTION GUARD (task #55, 2026-08-10). The verdict below is a pure
+        // pass-through of whatever the writer claimed, and the SAME record carries
+        // failure_mode. Nothing compared them, so `reached: true` was persisted on
+        // executions whose own trace said the walk THREW
+        // (failure_mode.type = 'execution_error') and produced no shapes.
+        //
+        // A reach verdict is a claim about the goal; a hard failure mode is the
+        // execution's own testimony that it did not complete. When they disagree,
+        // the execution's testimony wins: it is mechanical, while the verdict may
+        // come from a grader that never saw the throw. Downgrading to `false`
+        // rather than `undefined` is deliberate — this is graded evidence, not an
+        // ungraded row, and leaving it NONE would hide a real negative from the
+        // learner exactly like the `0 introduced` gate did.
+        //
+        // Narrow ON PURPOSE: only failure modes that mean "did not run to
+        // completion". `budget_exhausted` is NOT included — a walk can legitimately
+        // reach its goal and then exceed a budget on the way out, and treating that
+        // as unreached would erase real successes.
+        reached: reachedVerdict(
           typeof (body as any).reached === 'boolean' ? (body as any).reached
           : typeof (trace as any).reached === 'boolean' ? (trace as any).reached
           : Array.isArray((trace as any).tags) && (trace as any).tags.includes('reached:true') ? true
           : Array.isArray((trace as any).tags) && (trace as any).tags.includes('reached:false') ? false
           : undefined,
+          body.failure_mode?.type,
+        ),
         version: 0,
       };
 
