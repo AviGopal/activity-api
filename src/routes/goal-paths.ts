@@ -42,6 +42,9 @@ const app = new Hono();
  * `predictEndpointState` — empty input returns `[]`, missing rows are
  * skipped, and duplicates are collapsed via Set.
  */
+/** How the walk denotes a satisfier pseudo-activity; the suffix IS the shape. */
+export const SATISFIER_PREFIX = 'satisfier:';
+
 export async function accumulateEndpointShapes(
   pathActivities: string[]
 ): Promise<string[]> {
@@ -76,6 +79,25 @@ export async function accumulateEndpointShapes(
     );
 
     for (const activityId of pathActivities) {
+      // A `satisfier:<shape>` step NAMES ITS OWN OUTPUT SHAPE and is not a row in
+      // `activity`, so the lookup above can never resolve it.
+      //
+      // That is not an edge case: ~40% of recorded path steps are satisfier
+      // pseudo-ids and 63.5% of accepted pathways are satisfier-ONLY, so for the
+      // majority of pathways this function returned [] and the row was written
+      // with an EMPTY endpoint_output_shapes. Measured on a live store: 0 of 200
+      // rows had a non-empty value, which makes every shape-keyed lookup
+      // (`WHERE $shape IN endpoint_output_shapes`) return nothing — the
+      // denormalisation migration 092 exists for is silently a no-op.
+      //
+      // Parsing the suffix is exactly what the walk already does when it reads
+      // these ids back (goal-host-vessel `shapeOf`), so this makes the writer
+      // agree with the reader rather than inventing a convention.
+      if (activityId.startsWith(SATISFIER_PREFIX)) {
+        const shape = activityId.slice(SATISFIER_PREFIX.length);
+        if (shape) shapeSet.add(shape);
+        continue;
+      }
       const activity = activityMap.get(activityId);
       if (activity?.output_shapes) {
         activity.output_shapes.forEach((shape: string) => shapeSet.add(shape));
