@@ -76,7 +76,6 @@ async function main() {
       const execId = `fx_cleanup_${days}d_${i}_${Date.now()}`;
       await runSql(
         `CREATE activity_execution_traces CONTENT {
-          org: $test_org_id,
            execution_id: $eid,
            activity_id: 'cleanup-test-activity',
            variant_id: 'cleanup-test-activity',
