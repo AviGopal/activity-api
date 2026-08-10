@@ -383,7 +383,7 @@ app.post('/', async (c) => {
             });
             return c.json({
               error: 'Scope-narrowing violation (CC1)',
-              message: `Child path produces shapes [${violations.join(', ')}] not in parent's endpoint_output_shapes [${parentShapes.join(', ')}]. Sub-goals MUST narrow scope, never expand it.`,
+              message: `Child path produces shapes [${violations.join(', ')}] not in parent's endpoint_output_shapes [${parentShapes.join(', ')}]. Sub-goals MUST narrow scope, never expand it.` as const,
               parent_path_signature: validated.parent_path_signature,
               parent_endpoint_output_shapes: parentShapes,
               child_endpoint_output_shapes: endpointOutputShapes,
