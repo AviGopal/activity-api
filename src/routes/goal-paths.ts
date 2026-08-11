@@ -570,6 +570,7 @@ app.post('/', async (c) => {
           goal_hash: $goal_hash,
           org_id: $org_id,
           goal_text: $goal_text,
+          tenant_id: $tenant_id,
           goal_category: $goal_category,
           path_activities: $path_activities,
           path_signature: $path_signature,
