@@ -17,6 +17,34 @@ import * as jose from 'jose';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 
+/**
+ * Is an identity-vessel failure transient (network/availability) rather than a
+ * definitive credential rejection?
+ *
+ * `AbortSignal.timeout()` rejects with the message "The operation timed out." —
+ * which does NOT contain the substring "timeout". Matching only on "timeout"
+ * therefore sent every aborted request down the revoked-key branch, so a slow
+ * identity vessel read as a fleet-wide credential revocation and the negative
+ * result was cached for its full TTL instead of ~2s.
+ *
+ * The identical `"timed out"` vs `"timeout"` confusion was already found and
+ * fixed once in llm-resolver-vessel/src/provider-errors.ts. This file carried
+ * TWO copies of the predicate and neither received that lesson, so both call
+ * sites now share this one definition rather than repeating the list.
+ */
+export function isTransientIdentityFailure(reason: string | undefined): boolean {
+  if (!reason) return false;
+  return (
+    reason.includes('Network error') ||
+    reason.includes('fetch') ||
+    reason.includes('timeout') ||
+    reason.includes('timed out') ||
+    reason.includes('ECONNREFUSED') ||
+    reason.includes('returned 5') ||
+    reason.includes('getaddrinfo')
+  );
+}
+
 export interface JwtPayload {
   NS: string;
   DB: string;
@@ -228,13 +256,7 @@ export async function validateApiKeyViaIdentityVessel(
   }
 
   // If primary failed due to network error, try external fallback
-  const isNetworkError =
-    primaryResult.reason?.includes('Network error') ||
-    primaryResult.reason?.includes('fetch') ||
-    primaryResult.reason?.includes('timeout') ||
-    primaryResult.reason?.includes('ECONNREFUSED') ||
-    primaryResult.reason?.includes('returned 5') ||
-    primaryResult.reason?.includes('getaddrinfo');
+  const isNetworkError = isTransientIdentityFailure(primaryResult.reason);
 
   if (isNetworkError && primaryUrl !== fallbackUrl) {
     logger.info('[auth] Primary identity-vessel unavailable, trying external URL', {
@@ -389,12 +411,7 @@ export async function validateApiKeyWithFallback(
   }
 
   // Check if identity-vessel returned a specific error (vs network failure)
-  const isNetworkError =
-    identityResult.reason?.includes('Network error') ||
-    identityResult.reason?.includes('fetch') ||
-    identityResult.reason?.includes('timeout') ||
-    identityResult.reason?.includes('ECONNREFUSED') ||
-    identityResult.reason?.includes('returned 5');
+  const isNetworkError = isTransientIdentityFailure(identityResult.reason);
 
   if (isNetworkError) {
     // Try discovery-vessel to find identity-vessel
