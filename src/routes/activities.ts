@@ -141,6 +141,43 @@ import { classifyTemplateTiers } from '../services/tier-classifier';
 import { lookupAssignment, readClusterPosterior } from '../lib/cluster-posterior';
 import { getTuningParam } from '../lib/tuning-params';
 
+/** Normalised trailing `-<timestamp>` suffix on a re-minted template name/id. */
+export const TS_SUFFIX_RE = /-\d{10,}$/;
+
+/** Order-insensitive signature of a shape list, for comparing two templates. */
+export function shapeSignature(arr: unknown): string {
+  return Array.isArray(arr) ? arr.map(String).slice().sort().join(',') : '';
+}
+
+/**
+ * Pick the existing template an incoming mint should be UPSERTed onto, or undefined.
+ *
+ * This is the SAFETY BOUNDARY of mint dedup, extracted so it can be asserted
+ * directly. A candidate qualifies only when ALL of these hold:
+ *   (a) its name, with any timestamp suffix stripped, equals the incoming
+ *       normalized name — a near-miss name is NOT a match;
+ *   (b) its consumed/produced shape signature is IDENTICAL — two templates that
+ *       share a name but differ in shapes are different capabilities and merging
+ *       them would destroy a distinct posterior;
+ *   (c) it is not the incoming row itself.
+ * Exact normalized-name matches are preferred over timestamp-suffixed siblings.
+ */
+export function selectDedupTarget(
+  candidates: Array<{ id_str?: unknown; name?: unknown; input_shapes?: unknown; output_shapes?: unknown }> | null | undefined,
+  opts: { normalizedName: string; incomingSig: string; activityId: string },
+): { id_str?: unknown; name?: unknown } | undefined {
+  const matches = (candidates || []).filter((cand) => {
+    const candName = String(cand?.name ?? '');
+    if (candName.replace(TS_SUFFIX_RE, '') !== opts.normalizedName) return false;
+    const candId = String(cand?.id_str ?? '');
+    if (!candId || candId === opts.activityId) return false;
+    return `${shapeSignature(cand?.input_shapes)}|${shapeSignature(cand?.output_shapes)}` === opts.incomingSig;
+  });
+  matches.sort((a, b) =>
+    Number(String(b?.name ?? '') === opts.normalizedName) - Number(String(a?.name ?? '') === opts.normalizedName));
+  return matches[0];
+}
+
 const app = new Hono();
 
 // D5.2 — partial-pooling minimum-sample threshold for the leaf signature posterior.
@@ -658,15 +695,28 @@ app.post('/templates', async (c) => {
     // existing template with the same NORMALIZED name AND the same consumed/produced
     // shape signature; if found, UPSERT onto that record — its accumulated posterior
     // is preserved (the metrics UPSERT below uses `??` defaults), body fields update.
-    const TS_SUFFIX_RE = /-\d{10,}$/;
+    // ENTRY GATE. Only a timestamp-suffixed re-mint enters the dedup path; an
+    // un-suffixed name deliberately issues NO candidate query, a contract pinned by
+    // `activities-mint-dedup.test.ts` ("un-suffixed names never trigger the dedup
+    // candidate query").
+    //
+    // MEASURED 2026-08-11 and NOT acted on here: this pattern matched 1,623 historical
+    // rows and **0 of the 95 templates minted in the last week** — the compose loop
+    // stopped emitting timestamp-suffixed names, so the matcher is now aimed at a
+    // population that moved, while 162 exact-duplicate-NAME families (1,293 rows)
+    // accumulate unmerged. Widening this gate was tried and REVERTED: it is safe with
+    // respect to the match predicate (see `selectDedupTarget`, which still demands an
+    // identical shape signature) but it breaks the un-suffixed contract above and adds
+    // a SELECT to every mint. That is a design decision with a real cost, not a bug
+    // fix, so it is filed rather than taken unilaterally — see gap
+    // `the-mint-dedup-gate-requires-a-timestamp-suffix-that-no-new-mint-carries`.
     const hadTimestampSuffix =
       TS_SUFFIX_RE.test(String(activityName)) || TS_SUFFIX_RE.test(String(activityId));
     let dedupedOntoExisting = false;
     if (hadTimestampSuffix) {
       try {
         const normalizedName = String(activityName).replace(TS_SUFFIX_RE, '');
-        const shapeSig = (arr: unknown): string =>
-          Array.isArray(arr) ? arr.map(String).slice().sort().join(',') : '';
+        const shapeSig = shapeSignature;
         const incomingSig = `${shapeSig(activityRecord.input_shapes)}|${shapeSig(activityRecord.output_shapes)}`;
         const dedupWhere = activityRecord.org_id
           ? `(name = $norm_name OR string::starts_with(name, $norm_prefix)) AND org_id = $dedup_org`
@@ -685,17 +735,13 @@ app.post('/templates', async (c) => {
           ? await queryWithAuth<any>(jwtAuth.jwtToken, dedupQuery, dedupParams)
           : await surrealDB.query<any>(dedupQuery, dedupParams);
         // Prefer an exact normalized-name match; fall back to the first
-        // timestamp-suffixed sibling with the same shape signature.
-        const matches = (dedupCandidates || []).filter((cand: any) => {
-          const candName = String(cand?.name ?? '');
-          if (candName.replace(TS_SUFFIX_RE, '') !== normalizedName) return false;
-          const candId = String(cand?.id_str ?? '');
-          if (!candId || candId === activityId) return false;
-          return `${shapeSig(cand?.input_shapes)}|${shapeSig(cand?.output_shapes)}` === incomingSig;
-        });
-        matches.sort((a: any, b: any) =>
-          Number(String(b?.name ?? '') === normalizedName) - Number(String(a?.name ?? '') === normalizedName));
-        const dedupTarget = matches[0];
+        // timestamp-suffixed sibling with the same shape signature. The predicate
+        // lives in `selectDedupTarget` so the safety boundary is directly testable.
+        const dedupTarget = selectDedupTarget(dedupCandidates as any, {
+          normalizedName,
+          incomingSig,
+          activityId: String(activityId),
+        }) as any;
         if (dedupTarget) {
           logger.info('Template mint dedup: UPSERT onto existing capability (posterior preserved)', {
             incoming_id: activityId,
