@@ -1,0 +1,20 @@
+-- Migration 195: work_signature on goal_execution_paths.
+--
+-- The table is SCHEMAFULL (003-goal-execution-paths.surql:15), so a field with no
+-- DEFINE FIELD is silently DROPPED on write — the write succeeds, the column is
+-- absent, and nothing errors. b78ceac added work_signature to both the CREATE and
+-- the UPDATE branch and shipped without this definition, so it persisted nothing
+-- while reading as landed. Migration 181 exists for exactly the same reason:
+-- walk_tier was null for every row until it was defined.
+--
+-- work_signature is md5(path_activities | sorted unique tools_used), a signature
+-- over the effect surface a walk actually touched rather than the shapes it
+-- declared. path_signature hashes path_activities, which on a satisfier walk is
+-- only [satisfier:<shape>] — measured, a one-operation goal and a
+-- three-operation goal recorded the IDENTICAL path_signature 4502429f465d532f
+-- while the journal shows one contacted the registry and the other contacted the
+-- registry AND the gap store and compared them.
+--
+-- option<string>: absent tools_used yields null, so a walk reporting no effects
+-- records no work signature and pre-existing rows stay valid.
+DEFINE FIELD IF NOT EXISTS work_signature ON goal_execution_paths TYPE option<string>;
