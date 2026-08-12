@@ -187,6 +187,41 @@ function hashPath(activities: string[]): string {
 }
 
 /**
+ * A signature over the WORK a walk did, not the shapes it declared.
+ *
+ * `path_signature` hashes `path_activities`, which on a satisfier walk is just
+ * `[satisfier:<shape>]` — a function of the target shape and nothing else.
+ * Measured 2026-08-12 on four goals demanding 1, 2, 3 and 4 external operations:
+ * the one-operation and the three-operation goal recorded the IDENTICAL
+ * signature `4502429f465d532f`, twice, including once under a fully healthy LLM
+ * plane. They had not done the same work — the journal shows one contacted the
+ * registry and the other contacted the registry AND the gap store and compared
+ * them. The collision is a RECORDING defect, not honest sameness.
+ *
+ * `tools_used` carries the effect surface: which vessel was contacted, what kind
+ * of effect it was, and which external endpoints the step actually reached,
+ * canonicalized to host:port plus the first path segment.
+ *
+ * WHY THE CANONICALIZATION, AND WHY THAT COARSE. The command a satisfier runs is
+ * LLM-drafted, so two phrasings of the SAME request can pick different routes to
+ * the same fact. Measured with 2 phrasings x 3 repetitions of one goal: three
+ * distinct raw paths appeared — `/registry/shapes`, `/registry/stats`,
+ * `/registry/stats.totalShapes` — and the split fell along the phrasing boundary.
+ * Under host:port + first segment all six collapse to `127.0.0.1:8100/registry`.
+ * A finer key would SPLIT IDENTICAL GOALS, which is the mirror of the defect
+ * being repaired and strictly worse than leaving it alone.
+ *
+ * Absent `tools_used` returns null, so a walk that reports no effects records no
+ * work signature and today's behaviour is unchanged byte for byte.
+ */
+function hashWork(activities: string[], toolsUsed: unknown): string | null {
+  if (!Array.isArray(toolsUsed) || toolsUsed.length === 0) return null;
+  const effects = [...new Set(toolsUsed.map((t) => String(t)))].sort();
+  const signature = `${activities.join('->')}|${effects.join(',')}`;
+  return crypto.createHash('md5').update(signature).digest('hex').substring(0, 16);
+}
+
+/**
  * Deterministic 32-bit PRNG (mulberry32). Given the same seed it yields the
  * same [0,1) stream, so a recommendation can be reproduced on a held-out
  * re-run. Only used when a per-request seed is supplied; otherwise the
@@ -522,6 +557,11 @@ app.post('/', async (c) => {
       const priorTotal = currentRow.total_executions ?? 0;
       const nextSuccessRate = ((priorSuccessful + successDelta) * 1.0) / (priorTotal + 1);
 
+      // typical_tools_used was written on CREATE and ABSENT from this SET clause,
+      // so a repeat execution silently dropped it — the column could only ever
+      // hold what the FIRST run reported. Measured: 0/100 recent rows populated.
+      // `$x ?? x` keeps a sender-less caller from erasing what an earlier run
+      // recorded, matching how walk_tier and expected_output_shapes behave here.
       const updateQuery = `
         UPDATE goal_execution_paths
         SET
@@ -543,6 +583,8 @@ app.post('/', async (c) => {
           last_executed_at = time::now(),
           walk_tier = $walk_tier ?? walk_tier,
           expected_output_shapes = $expected_output_shapes ?? expected_output_shapes,
+          typical_tools_used = $typical_tools_used ?? typical_tools_used,
+          work_signature = $work_signature ?? work_signature,
           updated_at = time::now()
         WHERE goal_hash = $goal_hash
           AND path_signature = $path_signature
@@ -562,6 +604,8 @@ app.post('/', async (c) => {
         endpoint_output_shapes: endpointOutputShapes,
         expected_output_shapes: validated.expected_output_shapes ?? null,
         walk_tier: validated.walk_tier ?? 'fresh_derivation',
+        typical_tools_used: validated.tools_used ?? undefined,
+        work_signature: hashWork(validated.path_activities, validated.tools_used) ?? undefined,
       });
       
       // @ts-ignore - SurrealDB query typing
@@ -607,6 +651,7 @@ app.post('/', async (c) => {
           last_inference_confidence: $inference_confidence,
           typical_files_modified: $typical_files_modified,
           typical_tools_used: $typical_tools_used,
+          work_signature: $work_signature,
           last_executed_at: time::now(),
           walk_tier: $walk_tier,
           created_at: time::now(),
@@ -637,6 +682,7 @@ app.post('/', async (c) => {
         inference_confidence: validated.inference_confidence ?? 0,
         typical_files_modified: validated.files_modified ?? undefined,
         typical_tools_used: validated.tools_used ?? undefined,
+        work_signature: hashWork(validated.path_activities, validated.tools_used) ?? undefined,
         walk_tier: validated.walk_tier ?? 'fresh_derivation',
       });
       
