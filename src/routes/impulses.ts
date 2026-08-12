@@ -4215,8 +4215,15 @@ router.post('/resolve', async (c) => {
         // stamp org_id so new rows are tenanted -- and until it does, dropping
         // the tolerance here would re-blind the reader.
         const gepRows = await surrealDB.query<Record<string, unknown>[]>(
+          // 'public' (and its record form) is this codebase's NO-TENANT sentinel,
+          // not a tenant: paradigm.ts writes `org_id ?? 'public'`, exemplar-selector
+          // inserts `org_id: 'public'` outright, execution-traces falls back to it,
+          // and its own comment notes the store may hold either "public" or
+          // "organizations:public". The goal-path WRITER uses the same default, so
+          // tolerating NONE alone still missed every row it creates -- measured:
+          // the shape-keyed GET returned the new row while this resolve returned [].
           'SELECT * FROM goal_execution_paths WHERE $shape IN endpoint_output_shapes '
-            + 'AND (org_id = $org OR org_id IS NONE)',
+            + "AND (org_id = $org OR org_id IS NONE OR org_id = 'public' OR org_id = 'organizations:public')",
           { shape: targetShape, org: gepAuth.orgId }
         );
         const paths = Array.isArray(gepRows) ? gepRows : [];
