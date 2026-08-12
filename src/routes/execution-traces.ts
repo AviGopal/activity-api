@@ -1663,6 +1663,77 @@ export async function backfillChildCompositionChains(
 }
 
 /**
+ * Derive the parent→child composition edge from the LIVE `execution` table.
+ *
+ * The compose resolver (ias-executor-ts activity.ts) stamps
+ * `parent_execution_id` on every nested child trace, but nothing turned those
+ * parent→child pairs into `activity_composition_graph` edges — the sole edge
+ * writer (POST /composition / activityComposition_write) has no caller, so the
+ * graph froze. This derives the edge at ingest by reading the parent's
+ * `activity_id` from the AUTHORITATIVE `execution` table (NOT the frozen
+ * `activity_execution_traces`) and upserting the producer→consumer edge.
+ * Best-effort: never fails the just-succeeded insert.
+ *
+ * Exported for tests.
+ */
+export async function deriveCompositionEdgeFromParent(
+  childActivityId: string | undefined,
+  parentExecutionId: string | undefined,
+  success: boolean,
+  jwtToken?: string,
+): Promise<void> {
+  if (!childActivityId || !parentExecutionId) return;
+  // parent_execution_id may arrive bare or record-prefixed; reduce to the bare
+  // id so type::thing('execution', $pid) resolves the live row.
+  const bareParent = parentExecutionId.includes(':')
+    ? parentExecutionId.split(':').pop()!.replace(/[⟨⟩]/g, '')
+    : parentExecutionId;
+  try {
+    const parentRows = await surrealDB.query<{ activity_id?: string }[]>(
+      `SELECT activity_id FROM type::thing('execution', $pid) LIMIT 1`,
+      { pid: bareParent },
+    );
+    const parentActivityId = Array.isArray(parentRows)
+      ? (parentRows.flat()[0] as { activity_id?: string } | undefined)?.activity_id
+      : undefined;
+    if (!parentActivityId || parentActivityId === childActivityId) return;
+    const upsertSql = `
+        LET $existing = (SELECT * FROM activity_composition_graph
+          WHERE parent_activity_id = $parent AND child_activity_id = $child LIMIT 1);
+        IF array::len($existing) > 0 THEN (
+          UPDATE activity_composition_graph SET
+            execution_count = execution_count + 1,
+            success_count = IF($success, success_count + 1, success_count),
+            weight = (IF($success, success_count + 1, success_count)) / (execution_count + 1),
+            updated_at = time::now()
+          WHERE parent_activity_id = $parent AND child_activity_id = $child
+        ) ELSE (
+          CREATE activity_composition_graph SET
+            parent_activity_id = $parent,
+            child_activity_id = $child,
+            execution_count = 1,
+            success_count = IF($success, 1, 0),
+            weight = IF($success, 1.0, 0.0),
+            created_at = time::now(),
+            updated_at = time::now()
+        ) END;
+      `;
+    const params = { parent: parentActivityId, child: childActivityId, success };
+    if (jwtToken) {
+      await queryWithAuth(jwtToken, upsertSql, params);
+    } else {
+      await surrealDB.query(upsertSql, params);
+    }
+  } catch (err) {
+    logger.warn('[composition-edge] derive-from-parent failed (non-blocking)', {
+      child_activity_id: childActivityId,
+      parent_execution_id: parentExecutionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
  * Read-time fallback: walk `parent_execution_id` chain on the fly when the
  * stored `composition_chain` is empty. The insert-time helper and child
  * backfill above are write-time fixes; traces inserted before they landed can
@@ -2355,6 +2426,19 @@ app.post('/', async (c) => {
       execution_id: trace.execution_id,
       error: e instanceof Error ? e.message : String(e),
     }));
+
+    // Derive the parent→child composition edge from the LIVE `execution` table.
+    // The compose resolver stamps parent_execution_id on nested child traces,
+    // but nothing turned those pairs into activity_composition_graph edges —
+    // the graph had frozen. Best-effort + detached, like the chain backfill.
+    if (body.parent_execution_id) {
+      void deriveCompositionEdgeFromParent(
+        trace.activity_id as string | undefined,
+        body.parent_execution_id as string | undefined,
+        trace.success === true,
+        jwtAuth?.jwtToken,
+      ).catch(() => {});
+    }
 
     // Emit fine-grained WebSocket events for real-time execution visualization
     if (body.execution_trace?.tasks && Array.isArray(body.execution_trace.tasks)) {
