@@ -53,6 +53,29 @@ export async function accumulateEndpointShapes(
   }
 
   try {
+    // Satisfier shapes are resolved WITHOUT the database and BEFORE it, because
+    // the lookup below short-circuits on an empty result. A satisfier-only
+    // pathway matches no `activity` row, the query comes back empty, the early
+    // return fires, and every shape the pathway genuinely produces is discarded.
+    // That early return is why the naive fix (adding a branch inside the loop)
+    // silently did nothing live while passing a test whose mock returned a
+    // non-empty envelope.
+    const shapeSet = new Set<string>();
+    const realActivityIds: string[] = [];
+    for (const activityId of pathActivities) {
+      if (activityId.startsWith(SATISFIER_PREFIX)) {
+        const shape = activityId.slice(SATISFIER_PREFIX.length);
+        if (shape) shapeSet.add(shape);
+      } else {
+        realActivityIds.push(activityId);
+      }
+    }
+    // Nothing left to look up: a satisfier-only pathway is fully resolved, and
+    // querying for an empty id list would only risk the empty-result path again.
+    if (realActivityIds.length === 0) {
+      return Array.from(shapeSet);
+    }
+
     const activitiesQuery = `
       SELECT id, output_shapes FROM activity
       WHERE id INSIDE $activity_ids
@@ -60,11 +83,12 @@ export async function accumulateEndpointShapes(
 
     const activitiesResult = await surrealDB.query(
       activitiesQuery,
-      { activity_ids: pathActivities }
+      { activity_ids: realActivityIds }
     );
 
     if (!activitiesResult || activitiesResult.length === 0) {
-      return [];
+      // Satisfier shapes already gathered above must survive this path.
+      return Array.from(shapeSet);
     }
 
     // Flatten the result (SurrealDB returns nested arrays).
@@ -73,12 +97,11 @@ export async function accumulateEndpointShapes(
       ? rawActivities
       : [];
 
-    const shapeSet = new Set<string>();
     const activityMap = new Map<string, { id: string; output_shapes: string[] }>(
       activities.map(a => [a.id, a])
     );
 
-    for (const activityId of pathActivities) {
+    for (const activityId of realActivityIds) {
       // A `satisfier:<shape>` step NAMES ITS OWN OUTPUT SHAPE and is not a row in
       // `activity`, so the lookup above can never resolve it.
       //
@@ -93,11 +116,6 @@ export async function accumulateEndpointShapes(
       // Parsing the suffix is exactly what the walk already does when it reads
       // these ids back (goal-host-vessel `shapeOf`), so this makes the writer
       // agree with the reader rather than inventing a convention.
-      if (activityId.startsWith(SATISFIER_PREFIX)) {
-        const shape = activityId.slice(SATISFIER_PREFIX.length);
-        if (shape) shapeSet.add(shape);
-        continue;
-      }
       const activity = activityMap.get(activityId);
       if (activity?.output_shapes) {
         activity.output_shapes.forEach((shape: string) => shapeSet.add(shape));
@@ -570,7 +588,6 @@ app.post('/', async (c) => {
           goal_hash: $goal_hash,
           org_id: $org_id,
           goal_text: $goal_text,
-          tenant: (body as any).tenant_id ?? 'public',
           goal_category: $goal_category,
           path_activities: $path_activities,
           path_signature: $path_signature,

@@ -9,10 +9,15 @@
 // lookup return nothing and silently voids migration 092's denormalisation.
 import { describe, test, expect, mock } from 'bun:test';
 
+// FIXTURE FIDELITY. The first version of this test mocked `query` as `[[]]` — a
+// length-1 envelope wrapping an empty row set. Live, a query matching nothing
+// returns an EMPTY envelope, which trips the function's
+// `activitiesResult.length === 0` early return. The naive fix passed this test
+// and did nothing in production, because the mock skipped the branch that
+// actually fires. Mock the empty envelope.
 mock.module('../db/surreal', () => ({
-  // No activity rows exist for satisfier ids — mirror that faithfully.
-  surrealDB: { query: async () => [[]], getInstance: async () => ({}) },
-  queryWithAuth: async () => [[]],
+  surrealDB: { query: async () => [], getInstance: async () => ({}) },
+  queryWithAuth: async () => [],
   createAuthenticatedClient: async () => ({}),
 }));
 mock.module('../db/redis', () => ({
@@ -46,6 +51,13 @@ describe('accumulateEndpointShapes — satisfier pseudo-ids', () => {
 
   test('an empty pathway is still []', async () => {
     expect(await accumulateEndpointShapes([])).toEqual([]);
+  });
+
+  test('satisfier shapes survive an EMPTY activity-query result', async () => {
+    // The live failure: the query short-circuits on an empty envelope, and a
+    // fix that only ran inside the loop was discarded before it executed.
+    expect(await accumulateEndpointShapes(['satisfier:shellResult', 'activity:⟨unknown⟩']))
+      .toEqual(['shellResult']);
   });
 
   test('a real template id with no activity row still contributes nothing', async () => {
