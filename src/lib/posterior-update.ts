@@ -578,7 +578,7 @@ export async function propagateCreditAlongChain(
   const siblingDivisor = Math.max(1, execution.sibling_group_size ?? 1);
 
   // Batch-resolve execution IDs to variant IDs.
-  type AncestorMeta = { variant_id: string };
+  type AncestorMeta = { variant_id: string; signature?: string; signature_version?: number };
   let ancestorMetaByExecId: Map<string, AncestorMeta> = new Map();
   try {
     const limited = ancestors.slice(0, CREDIT_PROPAGATION_MAX_DEPTH);
@@ -588,14 +588,18 @@ export async function propagateCreditAlongChain(
     // scans the entire org partition (~2s on 160K rows vs ~27ms point lookup —
     // EXPLAIN-verified 2026-06-21). The $ids come from THIS execution's own
     // composition_chain, so they are already org-scoped by provenance.
-    const rows = await db.query<{ execution_id: string; variant_id: string }>(
-      `SELECT execution_id, variant_id FROM v_paradigm_execution_traces
+    const rows = await db.query<{ execution_id: string; variant_id: string; signature?: string; signature_version?: number }>(
+      `SELECT execution_id, variant_id, signature, signature_version FROM v_paradigm_execution_traces
        WHERE execution_id IN $ids`,
       { ids: limited },
     );
     for (const row of Array.isArray(rows) ? rows : []) {
       if (row.execution_id && row.variant_id) {
-        ancestorMetaByExecId.set(row.execution_id, { variant_id: row.variant_id });
+        ancestorMetaByExecId.set(row.execution_id, {
+          variant_id: row.variant_id,
+          signature: typeof row.signature === 'string' ? row.signature : undefined,
+          signature_version: typeof row.signature_version === 'number' ? row.signature_version : undefined,
+        });
       }
     }
   } catch (err) {
@@ -619,8 +623,14 @@ export async function propagateCreditAlongChain(
     // Use per-ancestor v1 signature when available.
     // When absent (transition period), skip the conditional write for this ancestor.
     const sigEntry = execution.ancestor_signatures?.[ancestorExecId];
-    const ancestorSig = sigEntry?.signature ?? null;
-    const ancestorSigVersion = sigEntry?.signature_version ?? 1;
+    // Fall back to the ancestor's OWN recorded v1 signature (from its trace row, exposed
+    // on v_paradigm_execution_traces by migration 158) when the caller did not thread an
+    // explicit ancestor_signatures override. ancestor_signatures has NO populating caller,
+    // so WITHOUT this fallback the signature-conditioned chain-credit write in
+    // writeAncestorDelta was dead for every composition — composed pathways could never
+    // out-rank single-shot ones on the conditioned posterior the selector reads.
+    const ancestorSig = sigEntry?.signature ?? meta?.signature ?? null;
+    const ancestorSigVersion = sigEntry?.signature_version ?? meta?.signature_version ?? 1;
     if (ancestorSig === null) noSigCount++;
 
     let alphaDelta = 0;
