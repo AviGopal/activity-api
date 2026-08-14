@@ -751,6 +751,36 @@ export async function runExecutionTraceWithSignatures(
     }
 
     const tasks = extractTasks(row);
+    // SYNTHETIC-REACH SIGNATURE FALLBACK (2026-08-14): satisfier/composite reaches never
+    // persist their impulses as `impulse` rows, AND for an exact-execution lookup
+    // skipSignatures short-circuits the DB fetch — so impulses_by_id was `{}` for a
+    // walk-composite trace and the ribosome had NO per-impulse signature to synthesize a
+    // recipe from. This is why the walk-composite mint has never produced a learned-*
+    // template even after the shapes were fixed. The trace ALREADY carries the mapping:
+    // each task's {input,output}_impulse_ids ↔ {input,output}_shapes. Hydrate
+    // impulses_by_id from the tasks so a synthetic composite is extractable BY SHAPE
+    // (shape-only signature; pointer_type null is exactly what a shape-routed step is).
+    // Non-destructive: only fills ids not already resolved from the impulse table.
+    for (const t of tasks) {
+      const pairs: Array<[string[], Array<string | undefined>]> = [
+        [t.output_impulse_ids ?? [], t.output_shapes ?? []],
+        [t.input_impulse_ids ?? [], t.input_shapes ?? []],
+      ];
+      for (const [ids, shapes] of pairs) {
+        for (let i = 0; i < ids.length; i++) {
+          const id = ids[i];
+          if (id && !(id in impulses_by_id)) {
+            impulses_by_id[id] = { pointer_type: null, shape: shapes[i] ?? shapes[0] ?? null };
+          }
+        }
+      }
+    }
+    // Surface the task-derived impulse ids at the trace level too, so a consumer that
+    // reads input_impulses/output_impulses (not just impulses_by_id) also sees them.
+    const taskOutputIds = [...new Set(tasks.flatMap((t) => t.output_impulse_ids ?? []))];
+    const taskInputIds = [...new Set(tasks.flatMap((t) => t.input_impulse_ids ?? []))];
+    const mergedInputImpulses = [...new Set([...input_impulses, ...taskInputIds])];
+    const mergedOutputImpulses = [...new Set([...output_impulses, ...taskOutputIds])];
     const execId = primaryIdString(row.id);
 
     return {
@@ -770,8 +800,8 @@ export async function runExecutionTraceWithSignatures(
       impulse_resolutions: Array.isArray(row.impulse_resolutions)
         ? (row.impulse_resolutions as unknown[])
         : [],
-      input_impulses,
-      output_impulses,
+      input_impulses: mergedInputImpulses,
+      output_impulses: mergedOutputImpulses,
       impulses_by_id,
       tasks,
     };
