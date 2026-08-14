@@ -180,6 +180,8 @@ export function normalizePersistedTask(task: any): {
   cost_usd?: number;
   consumed_from_task_ids?: string[];
   child_activity_id?: string;
+  input_shapes?: string[];
+  output_shapes?: string[];
 } {
   const { input_impulse_ids: inputImpulseIds, output_impulse_ids: outputImpulseIds } =
     extractTaskImpulseIds(task);
@@ -224,6 +226,15 @@ export function normalizePersistedTask(task: any): {
   if (typeof task?.child_activity_id === 'string' && task.child_activity_id.length > 0) {
     out.child_activity_id = task.child_activity_id;
   }
+  // Per-task SHAPES (2026-08-13): preserve the shape sequence into the stored task
+  // so a composite trace does NOT read ∅ → ∅ back — the ribosome's
+  // acquire_trace_signature needs the shape→shape sequence to extract a recipe, and
+  // dropping it here made every walk-composite mint synthesize nothing (hub 404).
+  // Accept the sink's snake_case or a raw trace's camelCase.
+  const _inShapes = Array.isArray(task?.input_shapes) ? task.input_shapes : Array.isArray(task?.inputShapes) ? task.inputShapes : null;
+  if (_inShapes) out.input_shapes = _inShapes.filter((x: unknown) => typeof x === 'string');
+  const _outShapes = Array.isArray(task?.output_shapes) ? task.output_shapes : Array.isArray(task?.outputShapes) ? task.outputShapes : null;
+  if (_outShapes) out.output_shapes = _outShapes.filter((x: unknown) => typeof x === 'string');
 
   return out;
 }
