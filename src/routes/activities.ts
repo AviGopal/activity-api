@@ -3310,8 +3310,20 @@ app.get('/topology-coverage', async (c) => {
     let totalObs = 0;
     let oldestTs: string | null = null;
     let newestTs: string | null = null;
+    // B2 instrumentation (§12.6, 2026-08-14): the selection-posterior write-back health signal.
+    // A cell at Beta(1,1) (alpha==1 && beta==1) that HAS been observed (n_observations>0) is the
+    // "walk grades into a table nothing reads" symptom — the observation did not move the posterior,
+    // so Thompson selection over that cell is still blind despite real traffic. This is the readout
+    // the operator surface lacked (making the 24%-Beta(1,1) concern un-measurable); expose it here.
+    let cellsWithObs = 0;
+    let ungradedDespiteObs = 0;
 
     for (const row of rows) {
+      const nObs = row.n_observations ?? 0;
+      if (nObs > 0) {
+        cellsWithObs += 1;
+        if ((row.alpha ?? 1) === 1 && (row.beta ?? 1) === 1) ungradedDespiteObs += 1;
+      }
       const sig = row.context_bucket;
       let entry = sigMap.get(sig);
       if (!entry) {
@@ -3376,6 +3388,16 @@ app.get('/topology-coverage', async (c) => {
       dark_signature_count: darkSignatureCount,
       oldest_observation: oldestTs,
       newest_observation: newestTs,
+      // B2 write-back health (selection posteriors): total (template×signature) cells, how many have
+      // been observed, and how many of THOSE are still Beta(1,1) — observed but ungraded. A nonzero
+      // ungraded_despite_observation_fraction is the write-back leak the 24% concern named; 0 means
+      // the selection write-back reaches the cell (as goal-path write-back was measured to).
+      total_cells: rows.length,
+      cells_with_observation: cellsWithObs,
+      ungraded_despite_observation: ungradedDespiteObs,
+      ungraded_despite_observation_fraction: cellsWithObs > 0
+        ? Math.round((ungradedDespiteObs / cellsWithObs) * 10000) / 10000
+        : 0,
     });
   } catch (err) {
     logger.error('GET /v2/activities/topology-coverage failed', {
