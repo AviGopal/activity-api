@@ -222,6 +222,18 @@ function hashWork(activities: string[], toolsUsed: unknown): string | null {
 }
 
 /**
+ * The per-goal-path posterior CELL key (§12.6 step 5, 2026-08-14). Bucket by the WORK a walk did —
+ * hashWork over the effect surface — when it reported effects, else fall back to the path signature.
+ * So identical work lands in ONE cell (concentrated evidence) and different work in DIFFERENT cells
+ * (no 1-op/3-op merge), instead of scattering/merging by surface-form path signatures. Computable at
+ * record time because tools_used is a POST-execution fact. path_signature is an opaque, round-tripped
+ * cell key, so keying it by work is safe; the path stays recoverable from path_activities.
+ */
+export function bucketSignature(activities: string[], toolsUsed: unknown): string {
+  return hashWork(activities, toolsUsed) ?? hashPath(activities);
+}
+
+/**
  * Deterministic 32-bit PRNG (mulberry32). Given the same seed it yields the
  * same [0,1) stream, so a recommendation can be reproduced on a held-out
  * re-run. Only used when a per-request seed is supplied; otherwise the
@@ -398,7 +410,16 @@ app.post('/', async (c) => {
     const validated = PathRecordRequestSchema.parse(body);
 
     const goalHash = hashGoal(validated.goal_text);
-    const pathSignature = hashPath(validated.path_activities);
+    // §12.6 step 5 (hub bucketing, 2026-08-14): key the per-goal-path posterior CELL on the WORK the
+    // walk actually did — hashWork over the effect surface (tools_used), computable HERE because this
+    // is the POST-execution record — falling back to hashPath (path activities) when no effects were
+    // reported. This is the "evidence lands on the right cell" fix: two executions that did the SAME
+    // work now share ONE posterior cell instead of scattering across surface-form path signatures,
+    // and two that did DIFFERENT work no longer merge (the 1-op/3-op collision the hashWork docstring
+    // measured). path_signature is an OPAQUE, round-tripped cell key (goal-host echoes it back as
+    // lineage; the actual path is recoverable from path_activities), so bucketing it by work is safe.
+    // Forward-only + self-healing: legacy path-keyed cells age out as work-keyed evidence accrues.
+    const pathSignature = bucketSignature(validated.path_activities, validated.tools_used);
 
     // Denormalise terminal output shapes so shape-keyed lookup
     // (`WHERE endpoint_output_shapes CONTAINS $shape`) doesn't need the
