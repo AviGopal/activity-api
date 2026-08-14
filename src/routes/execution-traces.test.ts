@@ -192,6 +192,27 @@ describe('normalizePersistedTask field precedence', () => {
     expect(p.input_impulse_ids).toEqual(['camel']);
   });
 
+  test('per-task input_shapes/output_shapes survive the reader (was dropped → composite ∅→∅)', () => {
+    // Regression for the mint-inertness root cause: normalizePersistedTask emitted
+    // NO shape fields, so a walk-composite trace read back ∅ → ∅ on the hub and the
+    // ribosome's acquire_trace_signature had no shape sequence to extract → no
+    // learned-* template. The reader must now preserve them (snake_case from the
+    // sink, camelCase from a raw trace).
+    const step1 = normalizePersistedTask({
+      task_id: 'compose-step-1', resolver_id: 'vessel_health_report', success: true,
+      input_shapes: [], output_shapes: ['vessel_health_report'],
+    });
+    const step2 = normalizePersistedTask({
+      task_id: 'compose-step-2', resolver_id: 'memoryNote_write', success: true,
+      inputShapes: ['vessel_health_report'], outputShapes: ['memoryNote_write'],
+    });
+    expect(step1.output_shapes).toEqual(['vessel_health_report']);
+    expect(step2.input_shapes).toEqual(['vessel_health_report']);
+    expect(step2.output_shapes).toEqual(['memoryNote_write']);
+    // A task with no shapes stays undefined (not an empty stored array of noise).
+    expect(normalizePersistedTask({ task_id: 'x' }).output_shapes).toBeUndefined();
+  });
+
   test('tool_calls accepts both toolCalls and tool_calls', () => {
     expect(
       normalizePersistedTask({
