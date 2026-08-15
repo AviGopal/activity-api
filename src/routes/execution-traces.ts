@@ -3323,11 +3323,7 @@ app.post('/', async (c) => {
         RETURN AFTER;
       `;
       const variantMetricsInsert = `
-        INSERT INTO activity_composition_graph {
-  execution_id = 'derive-from-parent',
-  org_id = 'organizations:substrate',
-  success = $success,
-  created_at = time::now(),
+        INSERT INTO variant_performance_metrics {
           id: type::thing('variant_performance_metrics', $record_id_slug),
           variant_id: $variant_id,
           activity_id: $variant_id,
