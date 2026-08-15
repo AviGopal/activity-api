@@ -296,7 +296,7 @@ export async function createVariant(
     // option<string>; null is valid when caller has no accountId claim.
     // account_id_version=1 marks this row as Phase B dual-written.
     await surrealDB.query(`
-      CREATE activity:⟨$variant_id⟩ SET
+      CREATE type::thing("activity", $variant_id) SET
         name = $name,
         description = $description,
         tags = $tags,
@@ -396,10 +396,27 @@ export async function checkAndRetireTemplate(
     const successes = executions.filter((e: any) => e.success === true).length;
     const successRate = successes / executions.length;
 
+    // BIND THE RECORD ID, DO NOT INTERPOLATE IT INTO THE BRACKETS.
+    //
+    // This UPDATE read `activity:⟨$template_id⟩`. SurrealQL parameters bind VALUES, not
+    // IDENTIFIERS, so that targets a record whose id is the literal text "$template_id" — it
+    // matches nothing, changes nothing, and returns success. Proven against the live store:
+    //
+    //   LET $tid = "testrec"; UPDATE zz_probe:⟨$tid⟩        SET retired = true;  -> [] , unchanged
+    //   LET $tid = "testrec"; UPDATE type::thing("zz_probe2", $tid) SET retired = true;  -> retired: true
+    //
+    // And the consequence, measured: across 3,849 activities (1,210 of them retired by other
+    // paths) the count of `retired_reason = "poor_performance"` is ZERO. This sweep has never
+    // once retired anything. `retired` is the OPERATIVE flag selection filters on, so every arm
+    // that earned retirement stayed fully selectable — including one observed at 202 executions
+    // and 0 successes, still winning the last pick and failing every goal it won.
+    //
+    // That is the missing half of law 3: minting is cheap and retirement was inert, so bad arms
+    // only ever accumulate. Same defect at the CREATE above, which is why it is fixed too.
     // Retire if success rate < 30%
     if (successRate < 0.3) {
       await surrealDB.query(`
-        UPDATE activity:⟨$template_id⟩ SET
+        UPDATE type::thing("activity", $template_id) SET
           retired = true,
           retired_at = time::now(),
           retired_reason = "poor_performance"
