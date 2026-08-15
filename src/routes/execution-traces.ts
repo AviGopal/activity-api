@@ -1701,7 +1701,7 @@ export async function deriveCompositionEdgeFromParent(
     : parentExecutionId;
   try {
     const parentRows = await surrealDB.query<{ activity_id?: string }[]>(
-      `SELECT activity_id FROM type::thing('execution', $pid) LIMIT 1`,
+      `SELECT activity_id FROM activity_execution_traces WHERE execution_id = $pid LIMIT 1`,
       { pid: bareParent },
     );
     const parentActivityId = Array.isArray(parentRows)
