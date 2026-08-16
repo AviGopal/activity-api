@@ -697,6 +697,11 @@ async function runTraceRetentionSweepInner(
         const budgetUntil = Date.now() + cfg.ceilingBudgetMs;
         const maxIters = Math.ceil(target / batchSize) + 10; // generous guard
         let done = 0;
+        // Ids this sweep has already failed to delete. Sweep-scoped deliberately: a lock or a
+        // transient contention should get a fresh chance next cycle, while a genuinely
+        // undeletable row costs one failed batch per sweep instead of the entire sweep.
+        const quarantined = new Set<string>();
+        let quarantineFailures = 0;
         let stoppedBy: 'target' | 'budget' | 'empty' | 'iters' = 'iters';
         for (let iter = 0; iter < maxIters && done < target; iter++) {
           if (Date.now() >= budgetUntil) { stoppedBy = 'budget'; break; }
@@ -723,12 +728,25 @@ async function runTraceRetentionSweepInner(
           // cutoff is the hot-window edge, which is exactly the retention contract
           // (keep everything newer than the hot window) — so this deletes only what the
           // policy already designates as cold, and never touches recent traces.
+          // SKIP ROWS THIS SWEEP HAS ALREADY FAILED TO DELETE (2026-08-16).
+          //
+          // The SELECT is oldest-first and re-queries FROM THE HEAD every iteration, so a row
+          // that cannot be deleted is returned again, and again, forever. Measured: the ids
+          // ["execution:exec_4o2fxn66","execution:exec_rc76dipc","execution:exec_jvblm7lg",
+          // "execution:exec_tj30in95"] led the failing DELETE of EVERY failed sweep on
+          // 2026-08-16 — 20:19, 20:56, 21:09 and 23:16 — across two process lifetimes and three
+          // different batch sizes (1, 5, 25). That is why batch tuning could never work: 1, 5
+          // and 25 all begin with the same head row, so the batch dimension was never the
+          // variable. Excluding the known-bad ids is what lets the scan ADVANCE to the other
+          // ~308,000 rows instead of dying on the first page.
           const rows = await surrealDB.query<{ id: unknown }>(
-            `SELECT id FROM ${TABLE} WHERE executed_at < type::datetime($cut) LIMIT $batch`,
+            quarantined.size > 0
+              ? `SELECT id FROM ${TABLE} WHERE executed_at < type::datetime($cut) AND id NOT IN $skip LIMIT $batch`
+              : `SELECT id FROM ${TABLE} WHERE executed_at < type::datetime($cut) LIMIT $batch`,
             // Reuse the sweep's own cold cutoff (line ~295) rather than recomputing it,
             // so the valve and the per-activity strata can never disagree about what
             // "cold" means.
-            { batch: thisBatch, cut: coldCutoffIso },
+            { batch: thisBatch, cut: coldCutoffIso, ...(quarantined.size > 0 ? { skip: [...quarantined] } : {}) },
           );
           const ids = (Array.isArray(rows) ? rows : [])
             .map((r) => (r as { id?: unknown })?.id)
@@ -770,9 +788,43 @@ async function runTraceRetentionSweepInner(
             stoppedBy = 'empty';
             break;
           }
-          await surrealDB.query('DELETE $ids RETURN NONE', { ids });
-          done += ids.length;
-          if (done >= target) stoppedBy = 'target';
+          // A FAILING BATCH MUST NOT KILL THE SWEEP.
+          //
+          // This DELETE was unguarded, so one throw propagated out of the loop, aborted the whole
+          // cycle, and left `removed` at zero — and because the next cycle re-selects from the
+          // head, the very same rows were retried on every sweep forever. The store grew from
+          // ~294k surplus to ~308k while this ran every 30 minutes and committed nothing.
+          //
+          // On failure: quarantine these ids for the rest of this sweep and CONTINUE. A batch
+          // that fails is evidence about those rows, not about the other 308,000. Retrying an
+          // identical statement and expecting a different result is the failure mode this whole
+          // report keeps documenting — a retry that does not widen is not a retry.
+          try {
+            await surrealDB.query('DELETE $ids RETURN NONE', { ids });
+            done += ids.length;
+            if (done >= target) stoppedBy = 'target';
+          } catch (err) {
+            for (const id of ids) quarantined.add(id as string);
+            quarantineFailures++;
+            logger.warn('[trace-retention] global-ceiling valve: batch FAILED — quarantining and advancing', {
+              iter,
+              batchSize: ids.length,
+              quarantinedTotal: quarantined.size,
+              firstId: String(ids[0]),
+              error: err instanceof Error ? err.message : String(err),
+              note: 'these ids are skipped for the remainder of this sweep so the scan can reach rows behind them; they are NOT deleted and NOT lost',
+            });
+            // If nearly everything is failing, the fault is the store, not these rows — stop
+            // rather than grinding a saturated DB for the rest of the budget.
+            if (quarantineFailures >= 20 && done === 0) {
+              logger.error('[trace-retention] global-ceiling valve: aborting — 20 consecutive batches failed with nothing deleted', {
+                quarantinedTotal: quarantined.size,
+                note: 'not a poison-row problem: the store itself is refusing deletes. Investigate DB health before tuning retention.',
+              });
+              stoppedBy = 'budget';
+              break;
+            }
+          }
         }
         removed = done;
         // `remaining` is what this sweep deliberately left for the next one. It is the
@@ -780,6 +832,8 @@ async function runTraceRetentionSweepInner(
         // holds steady while removed>0, intake matches drain and the cap needs raising.
         logger.info('[trace-retention] global-ceiling valve: done', {
           removed,
+          quarantined: quarantined.size,
+          quarantineFailures,
           target,
           surplus,
           remaining: Math.max(0, surplus - done),
