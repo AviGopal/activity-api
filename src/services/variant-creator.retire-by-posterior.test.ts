@@ -15,6 +15,14 @@
 
 import { describe, test, expect, mock, beforeEach } from 'bun:test';
 
+// config.ts runs validateNamespace() at import time and THROWS without this, which takes the
+// whole file down before a single test runs. Set it before the dynamic import below, exactly as
+// config.account-id.test.ts does. Compensating by exporting the variable in the shell instead
+// hides the defect locally and fails wherever the runner is clean — which is precisely how this
+// file passed here and regressed the hub's convergence gate (180 -> 182 fail).
+process.env.SURREALDB_NAMESPACE ??= 'activity-system';
+process.env.SURREALDB_DATABASE ??= 'learning_loop';
+
 const surrealQueries: { sql: string; params: any }[] = [];
 let metricsRow: Record<string, unknown> | null = null;
 let updateReturns: unknown[] = [{ id: 'x' }];
