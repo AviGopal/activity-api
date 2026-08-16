@@ -9,6 +9,7 @@
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
 import { accountIdScopedWhere } from '../routes/activities';
+import { getTuningParam } from '../lib/tuning-params';
 
 export interface VariantCreationResult {
   variantId: string;
@@ -436,6 +437,116 @@ export async function checkAndRetireTemplate(
     return false;
   } catch (error) {
     logger.error('Error checking template retirement', {
+      templateId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
+/**
+ * Retire an arm on the evidence the learning loop actually maintains.
+ *
+ * WHY THIS EXISTS ALONGSIDE checkAndRetireTemplate (2026-08-16). That function cannot retire
+ * anything, for four independent reasons — each sufficient on its own, all four measured:
+ *
+ *  1. Its only call site is `POST /v2/activities/executions` (routes/activities.ts). Nothing in
+ *     the fleet posts there; the walk's traces go to `POST /v2/activities/execution-traces`
+ *     (ias-executor-ts adapters/activity-api-trace-sink.ts). Commit f2857fc repaired its UPDATE
+ *     binding correctly, and the repair was inert because no caller reaches it.
+ *  2. It reads `FROM execution`. The trace-ingest handler writes `activity_execution_traces`.
+ *     Different tables — so the walk's outcomes never appear in the rows it counts.
+ *  3. Measured on the live hub: `learned-auto-bridge-shellresult` carries 407 executions in
+ *     variant_performance_metrics and ZERO rows in `execution`. Its `< 20 → return false` guard
+ *     therefore refuses precisely the arms that earned retirement. That same filtered read took
+ *     43.5s against the live store (unindexed on activity_id) and must never sit on a hot path.
+ *  4. `surrealDB.query<T>` returns a FLAT `T[]`, but it does `recentExecutions[0] || []` and then
+ *     `.filter(...)` on it — i.e. `.filter` on a single row object, which throws, is swallowed by
+ *     its own catch, and returns false. It has never once completed its own body.
+ *
+ * This function reads variant_performance_metrics instead: the table `applyOutcomeToPosteriors`
+ * already maintains, keyed by variant, indexed, O(1). Tenancy scoping and the variant_id spellings
+ * mirror the working reader in db/paradigm.ts (`activity:⟨…⟩` and bare ids both occur).
+ *
+ * IT DELIBERATELY DOES NOT SWEEP. It is called only when a trace has just added blame to this arm,
+ * so arms retire one fresh failure at a time. A retroactive pass over the same predicate would
+ * retire most of the live corpus at once — measured, the highest posterior mean in a 91-arm sample
+ * is 0.604 and most sit far below 0.3 — which would strip the walk of its candidates in one write.
+ */
+export async function checkAndRetireByPosterior(
+  templateId: string,
+  orgId: string,
+  accountId?: string | null,
+): Promise<boolean> {
+  try {
+    const bareId = String(templateId).replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
+    if (!bareId) return false;
+
+    const rows = await surrealDB.query<{
+      total_executions?: number | null;
+      thompson_alpha?: number | null;
+      thompson_beta?: number | null;
+    }>(
+      `SELECT total_executions, thompson_alpha, thompson_beta
+       FROM variant_performance_metrics
+       WHERE ((account_id = $account_id) OR (account_id IS NONE AND org_id = $org_id))
+         AND (variant_id = $bare_id OR variant_id = $bracketed_id OR activity_id = $bare_id)
+       LIMIT 1`,
+      {
+        org_id: orgId.startsWith('organizations:') ? orgId.replace('organizations:', '') : orgId,
+        account_id: accountId ?? null,
+        bare_id: bareId,
+        bracketed_id: `activity:⟨${bareId}⟩`,
+      },
+    );
+
+    const row = rows?.[0];
+    if (!row) return false;
+
+    // Thresholds are read at use time from substrate_tuning_param (falling back to the 20 / 0.3
+    // this replaces), NOT frozen into constants — a retirement threshold is behaviour, and
+    // behaviour the system cannot observe or adjust is behaviour it cannot learn.
+    const minExecutions = await getTuningParam('RETIREMENT_MIN_EXECUTIONS', undefined, 20);
+    const successFloor = await getTuningParam('RETIREMENT_SUCCESS_FLOOR', undefined, 0.3);
+
+    const totalExecutions = typeof row.total_executions === 'number' ? row.total_executions : 0;
+    if (totalExecutions < minExecutions) return false;
+
+    // Posterior mean, not the stored success_rate: success_rate was written as int/int on two
+    // TYPE int columns and truncates to exactly 0 or 1 (see the self-healing note in
+    // lib/posterior-update.ts — 438 of 1,059 mixed-outcome rows carry an impossible value).
+    const alpha = typeof row.thompson_alpha === 'number' ? row.thompson_alpha : 1;
+    const beta = typeof row.thompson_beta === 'number' ? row.thompson_beta : 1;
+    if (alpha <= 0 || beta <= 0) return false;
+    const posteriorMean = alpha / (alpha + beta);
+    if (posteriorMean >= successFloor) return false;
+
+    // Match on the id PART, not on bracket spelling. `activity:⟨x⟩` and `activity:x` are the same
+    // record and both spellings occur in this store; meta::id(id) is what the other working retire
+    // path (routes/activities.ts) uses, and 1,210 activities carry a retired flag set that way.
+    const updated = await surrealDB.query(
+      `UPDATE activity SET
+         retired = true,
+         retired_at = time::now(),
+         retired_reason = "poor_performance"
+       WHERE meta::id(id) = $bare_id AND (retired = false OR retired IS NONE)
+       RETURN meta::id(id)`,
+      { bare_id: bareId },
+    );
+
+    const didRetire = Array.isArray(updated) && updated.length > 0;
+    if (didRetire) {
+      logger.info('Retired arm on posterior evidence', {
+        templateId: bareId,
+        totalExecutions,
+        posteriorMean,
+        alpha,
+        beta,
+      });
+    }
+    return didRetire;
+  } catch (error) {
+    logger.error('Error checking posterior retirement', {
       templateId,
       error: error instanceof Error ? error.message : String(error),
     });

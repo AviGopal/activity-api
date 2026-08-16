@@ -3059,6 +3059,50 @@ app.post('/', async (c) => {
         });
       });
 
+      // RETIREMENT, on the route the fleet actually posts to (2026-08-16).
+      //
+      // The pre-existing trigger sits in `POST /v2/activities/executions` (routes/activities.ts),
+      // which nothing in the fleet calls, and reads `FROM execution`, which this handler does not
+      // write — so no walk outcome has ever reached it. Measured consequence on the live hub:
+      // `retired_reason = "poor_performance"` appears on ZERO rows, while an arm at posterior mean
+      // 0.0087 with 395 executions stayed fully selectable. See checkAndRetireByPosterior for the
+      // other two reasons that trigger could not have fired even if it were called.
+      //
+      // Gated on a GRADED FAILURE — the same reach boundary the posterior write above uses. That is
+      // deliberate rate-limiting, not caution for its own sake: an arm can only retire on the tick
+      // where it freshly earns blame, so retirement trickles instead of sweeping. Fire-and-forget,
+      // like every other side effect in this cluster; it must never delay trace ingest.
+      if (!reachUngraded && !reachEffectiveSuccess) {
+        void import('../services/variant-creator')
+          .then(({ checkAndRetireByPosterior }) =>
+            checkAndRetireByPosterior(trace.variant_id as string, trace.org_id as string, traceAccountId),
+          )
+          .then(async (wasRetired) => {
+            if (!wasRetired) return;
+            logger.info('[retirement] arm retired on posterior evidence', {
+              activity_id: trace.variant_id,
+              execution_id: trace.execution_id,
+            });
+            const { broadcaster: retireBroadcaster } = await import('../websocket/broadcaster');
+            retireBroadcaster.emit({
+              type: 'template_retired',
+              timestamp: new Date().toISOString(),
+              data: {
+                activity_id: trace.variant_id as string,
+                reason: 'poor_performance',
+                org_id: (trace.org_id as string) ?? null,
+                account_id: traceAccountId ?? null,
+              },
+            });
+          })
+          .catch((err) => {
+            logger.warn('[retirement] posterior retirement check failed (non-blocking)', {
+              activity_id: trace.variant_id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+      }
+
       // Successor features ψ(s,a) — learning-rate mechanism #7. Accumulate this
       // trace's discounted shape-occupancy into the (signature, template) cell.
       // ADDITIVE, env-flagged (SUCCESSOR_FEATURES, default ON), fire-and-forget —
