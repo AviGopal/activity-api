@@ -395,12 +395,54 @@ let sweepInFlight = false;
 
 export async function runTraceRetentionSweep(
   cfg: TraceRetentionConfig = loadTraceRetentionConfig(),
-): Promise<{ results: StratumResult[]; durationMs: number; orphanReaped: number; skipped?: true }> {
+): Promise<{
+  results: StratumResult[];
+  durationMs: number;
+  orphanReaped: number;
+  skipped?: true;
+  skippedReason?: 'in_flight' | 'fts_rebuilding';
+}> {
   if (sweepInFlight) {
     logger.info('[trace-retention] sweep already in flight — skipping this invocation', {
       note: 'timer tick and reconcile route both drive this sweep; overlapping runs would delete the same rows twice',
     });
-    return { results: [], durationMs: 0, orphanReaped: 0, skipped: true };
+    return { results: [], durationMs: 0, orphanReaped: 0, skipped: true, skippedReason: 'in_flight' };
+  }
+
+  // DO NOT DELETE WHILE `REBUILD INDEX` HOLDS THE STORE (2026-08-16).
+  //
+  // Measured on the live hub: the ceiling valve selected 25 ids, issued its DELETE, and failed
+  // with "The operation timed out" on EVERY cycle — deleting zero while the surplus grew
+  // monotonically (294,970 -> 295,625 -> 296,430 across three sweeps against a 150,000 ceiling).
+  //
+  // The cause is a phase lock, not a batch size. Both jobs are `setInterval(30 min)` armed at the
+  // same process boot — the FTS scorer rebuild (index.ts, ~350s of sequential REBUILD INDEX on
+  // `activity`) and this sweep — so they fire together on every period, forever. The signature is
+  // two unrelated subsystems failing at the SAME MILLISECOND, exactly 30 minutes apart:
+  //
+  //   12:16:59.611Z  [trace-retention] sweep cycle failed   "The operation timed out."
+  //   12:16:59.611Z  [FTS] Periodic FTS scorer rebuild failed "The operation timed out."
+  //   12:46:59.611Z  ...both again, to the millisecond
+  //
+  // Identical timestamps mean both statements were issued together and both hit the same 300s
+  // timeout. This is why the source comment above could measure 3.52 s/row historically and the
+  // valve now achieves 0 rows/cycle: nothing about DELETE changed, the contention did.
+  //
+  // Deferring is only half the fix — a guard alone would skip EVERY cycle, since the collision is
+  // by construction. `startTraceRetentionSweep` re-arms a short retry on this reason, which lands
+  // the sweep in a rebuild-free window and breaks the phase lock. Rebuild occupies ~350s of every
+  // 1800s, so ~80% of the period is available.
+  try {
+    const { isFtsRebuildInProgress } = await import('../jobs/fts-rebuild');
+    if (isFtsRebuildInProgress()) {
+      logger.info('[trace-retention] deferring sweep — FTS REBUILD INDEX is in flight', {
+        note: 'a DELETE issued against this table while REBUILD holds it times out at 300s and commits nothing; retrying shortly to land outside the rebuild window',
+      });
+      return { results: [], durationMs: 0, orphanReaped: 0, skipped: true, skippedReason: 'fts_rebuilding' };
+    }
+  } catch {
+    // Job module unavailable: proceed. Losing the guard degrades to today's behaviour, which is
+    // strictly better than refusing to sweep because a probe could not be loaded.
   }
   sweepInFlight = true;
   try {
@@ -892,13 +934,37 @@ export function startTraceRetentionSweep(cfg: TraceRetentionConfig = loadTraceRe
     overrides: cfg.overrides,
   });
 
-  const tick = () =>
-    void runTraceRetentionSweep(cfg).catch((err) =>
-      logger.warn('[trace-retention] sweep cycle failed', {
-        error: err instanceof Error ? err.message : String(err),
-      }),
-    );
+  // RETRY ON DEFERRAL, OR THE GUARD BECOMES A PERMANENT SKIP.
+  //
+  // This sweep and the FTS rebuild are both armed at boot on the same 30-minute period, so they
+  // collide on every cycle by construction (see the note in runTraceRetentionSweep). Deferring
+  // without re-arming would simply move the failure from "DELETE times out" to "sweep never runs".
+  // Re-arming a short retry walks the sweep out of the rebuild window and breaks the phase lock;
+  // the attempt cap keeps a permanently-rebuilding store from spinning this forever.
+  const FTS_DEFER_RETRY_MS = 90_000;
+  const FTS_DEFER_MAX_ATTEMPTS = 6; // 9 min of retries; rebuild occupies ~350s of every 1800s
 
-  setTimeout(tick, 30_000); // 30s warmup, matches sibling jobs
-  setInterval(tick, cfg.intervalMs);
+  const tick = (attempt = 0): void =>
+    void runTraceRetentionSweep(cfg)
+      .then((r) => {
+        if (r.skipped && r.skippedReason === 'fts_rebuilding') {
+          if (attempt + 1 < FTS_DEFER_MAX_ATTEMPTS) {
+            setTimeout(() => tick(attempt + 1), FTS_DEFER_RETRY_MS);
+          } else {
+            logger.warn('[trace-retention] gave up this cycle — FTS rebuild held the store for every retry', {
+              attempts: FTS_DEFER_MAX_ATTEMPTS,
+              windowMs: FTS_DEFER_RETRY_MS * FTS_DEFER_MAX_ATTEMPTS,
+              note: 'if this repeats, the rebuild is not completing and the store is saturated — that is the blocker, not the batch size',
+            });
+          }
+        }
+      })
+      .catch((err) =>
+        logger.warn('[trace-retention] sweep cycle failed', {
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+
+  setTimeout(() => tick(), 30_000); // 30s warmup, matches sibling jobs
+  setInterval(() => tick(), cfg.intervalMs);
 }
