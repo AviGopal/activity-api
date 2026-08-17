@@ -114,6 +114,11 @@ app.use('/v2/*', async (c, next) => {
 // Health check endpoint (no auth required)
 // Deep health check: verifies Redis and SurrealDB connectivity
 let healthCache: { at: number; body: any; code: number } | null = null;
+/** A local SurrealDB query is single-digit milliseconds when healthy. Past this the store
+ *  is degraded even though the query still returns — the distinction the old boolean
+ *  verdict could not express. Not a restart trigger; see the health handler. */
+const SURREAL_DEGRADED_MS = 2_000;
+
 app.get('/health', async (c) => {
   if (healthCache && Date.now() - healthCache.at < 10_000) { return c.json({ ...healthCache.body, cached: true }, healthCache.code as 200 | 503); }
   const healthStatus: any = {
@@ -169,9 +174,21 @@ app.get('/health', async (c) => {
     const surrealStart = Date.now();
     const { surrealDB } = await import('./db/surreal');
     await surrealDB.query('SELECT * FROM activity LIMIT 1');
+    const surrealLatency = Date.now() - surrealStart;
+    // THRESHOLD THE LATENCY WE ALREADY MEASURE. Until 2026-08-17 this recorded
+    // `latency_ms` and then set `status: 'healthy'` on query success alone — a boolean that
+    // ignored the number beside it. Measured consequence: the probe read `healthy` at 16.5s
+    // and only flipped when the query timed out completely, so every watchdog above it saw a
+    // green service while the store was effectively unusable.
+    //
+    // DELIBERATELY does not fail the endpoint. A 503 here would let watchdogs restart
+    // activity-api under exactly the load that made it slow, turning a degradation into an
+    // outage — and restart-under-load is a failure mode this substrate has already paid for.
+    // `degraded` makes the condition visible to anything that reads the body while leaving
+    // the restart decision to a human or a policy that can see more than one probe.
     healthStatus.checks.surrealdb = {
-      status: 'healthy',
-      latency_ms: Date.now() - surrealStart
+      status: surrealLatency > SURREAL_DEGRADED_MS ? 'degraded' : 'healthy',
+      latency_ms: surrealLatency
     };
   } catch (error: any) {
     logger.error('SurrealDB health check failed', { error: error.message });
