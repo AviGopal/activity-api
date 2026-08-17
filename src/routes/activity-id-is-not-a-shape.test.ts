@@ -71,3 +71,64 @@ describe('an activity id is not a shape', () => {
     expect(badShapeTask([{ outputShapes: ['activity_template', 'activityVariant_write'] }])).toBeNull();
   });
 });
+
+// A COMPOSITION MAY NOT REQUIRE WHAT IT PRODUCES (2026-08-17).
+//
+// Measured across 26 learned compositions: 21 declare input_shapes [] and 5 declare something —
+// and ALL FIVE list a shape produced by their own tasks. The clearest case:
+//
+//   learned-composition-vessel-health-report-to-json-path-extract-to-shellresult-to-memo
+//     input_shapes: ['vessel_health_report']
+//     task 0:       vessel_health_report  in=[]  out=['vessel_health_report']
+//
+// Read as a precondition, that composition can only run when a shape it produces itself is
+// already in the pool — unsatisfiable on a cold walk.
+//
+// Worth recording as method: an earlier pass this session found ALL compositions carrying
+// input_shapes [], added a ribosome rule to compute them, then RETRACTED the concern on
+// measuring that 37 of 38 were genuinely self-contained so [] was correct. That retraction was
+// right about the empty majority and never examined the non-empty minority, where the defect
+// actually lived. Both halves of a population need checking before a question is closed.
+
+/** Mirrors the precondition guard in routes/activities.ts. */
+function selfSatisfied(inputShapes: unknown[], tasks: Array<{ outputShapes?: unknown[] }>): string[] {
+  const produced = new Set<string>();
+  for (const t of tasks ?? []) {
+    for (const o of (t?.outputShapes ?? []) as unknown[]) if (typeof o === 'string') produced.add(o);
+  }
+  return (inputShapes ?? []).filter((i): i is string => typeof i === 'string').filter((i) => produced.has(i));
+}
+
+describe('a composition may not require what it produces', () => {
+  test('THE REGRESSION: the real self-satisfied composition is rejected', () => {
+    const tasks = [
+      { outputShapes: ['vessel_health_report'] },
+      { outputShapes: ['json_path_extract'] },
+      { outputShapes: ['shellResult'] },
+      { outputShapes: ['memoryNote_write'] },
+    ];
+    expect(selfSatisfied(['vessel_health_report'], tasks)).toEqual(['vessel_health_report']);
+  });
+
+  test('reports every self-satisfied entry, not just the first', () => {
+    const tasks = [
+      { outputShapes: ['vessel_health_report'] },
+      { outputShapes: ['discovery_vessel_registry_observer'] },
+      { outputShapes: ['shellResult'] },
+    ];
+    expect(selfSatisfied(['discovery_vessel_registry_observer', 'shellResult', 'vessel_health_report'], tasks))
+      .toEqual(['discovery_vessel_registry_observer', 'shellResult', 'vessel_health_report']);
+  });
+
+  test('a GENUINE external requirement is allowed through', () => {
+    // The whole point of input_shapes is to express what a composition needs from outside. A
+    // guard that rejected every non-empty value would make first/last-mile adaptation
+    // impossible, which is the opposite of the intent.
+    const tasks = [{ outputShapes: ['memoryNote_write'] }];
+    expect(selfSatisfied(['text'], tasks)).toEqual([]);
+  });
+
+  test('the self-contained majority (input_shapes []) is untouched', () => {
+    expect(selfSatisfied([], [{ outputShapes: ['shellResult'] }])).toEqual([]);
+  });
+});

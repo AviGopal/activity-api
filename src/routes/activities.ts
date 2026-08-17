@@ -411,6 +411,45 @@ app.post('/templates', async (c) => {
       }, 400);
     }
 
+    // A COMPOSITION MAY NOT REQUIRE WHAT IT PRODUCES.
+    //
+    // Measured 2026-08-17 across 26 learned compositions: 21 declare input_shapes [] and 5
+    // declare something — and ALL FIVE list at least one shape produced by their own tasks.
+    // learned-composition-vessel-health-report-to-json-path-extract-to-shellresult-to-memo
+    // declares input_shapes ['vessel_health_report'] while its task 0 IS vessel_health_report
+    // with in=[] out=[vessel_health_report]. Read as a precondition, that composition can only
+    // run when a shape it produces itself is already in the pool — unsatisfiable on a cold
+    // walk, and a candidate cause of the residual concept-free composition failures.
+    //
+    // The correct value is the union of every task's inputShapes MINUS every shape produced by
+    // an EARLIER task in the same chain, which for these chains is []. Rejecting here is the
+    // same chokepoint and the same reasoning as the activity-id guard above: both are
+    // extraction defects fully detectable from the template alone, so neither needs to reach a
+    // walk to be caught.
+    const _declaredInputs = ((validated as { input_shapes?: unknown[] }).input_shapes ?? []) as unknown[];
+    if (_declaredInputs.length > 0) {
+      const _producedByOwnTasks = new Set<string>();
+      for (const t of (activityTasks ?? []) as Array<{ outputShapes?: unknown[] }>) {
+        for (const o of (t?.outputShapes ?? []) as unknown[]) {
+          if (typeof o === 'string') _producedByOwnTasks.add(o);
+        }
+      }
+      const _selfSatisfied = _declaredInputs
+        .filter((i): i is string => typeof i === 'string')
+        .filter((i) => _producedByOwnTasks.has(i));
+      if (_selfSatisfied.length > 0) {
+        return c.json({
+          error: 'Invalid input_shapes: the composition declares a precondition it produces itself',
+          detail:
+            'input_shapes must be the union of every task\'s inputShapes MINUS every shape produced by an ' +
+            'earlier task in the same chain. A shape the composition produces is not an external requirement, ' +
+            'and declaring it as one makes the composition unselectable on a walk that has not already produced it.',
+          self_satisfied: _selfSatisfied,
+          activity_id: activityId,
+        }, 400);
+      }
+    }
+
     // Convert category to tags if needed (backward compatibility)
     const tags = ensureTags({ tags: validated.tags, category: validated.category });
     const tagPrefixes = computeTagPrefixes(tags);
