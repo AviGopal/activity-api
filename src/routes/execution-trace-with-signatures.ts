@@ -87,11 +87,15 @@ export interface ExecutionTraceTaskEntry {
    *  populated when the source row carries them (notably the execution_trace_content
    *  tasks read on an execution_id point-lookup). */
   resolver?: string;
-  /** Per-task resolver config. The store strips config (normalizePersistedTask
-   *  whitelists a fixed field set), so for a SHAPE-ROUTED step this is synthesized
-   *  as the executable shape-routing form { type: <resolver> } (the mintResolverWrapper
-   *  body the engine pre-registers a VesselResolver for), letting the ribosome emit a
-   *  re-executable composite instead of a config:{} hollow shell. */
+  /** Per-task resolver config. Since 2026-08-17 the executor records the arguments a
+   *  resolver was actually called with and normalizePersistedTask persists them as
+   *  `resolved_config`; when present they are surfaced here (merged under the shape-routing
+   *  `type` key) so the ribosome can emit a RE-BINDABLE composite.
+   *  When absent — historical traces, and meta-resolvers whose config is not executable —
+   *  this falls back to the synthesized shape-routing form { type: <resolver> } (the
+   *  mintResolverWrapper body the engine pre-registers a VesselResolver for). That shim
+   *  makes a composite dispatchable but carries no arguments, which is why replaying
+   *  pre-2026-08-17 compositions fails with "…got undefined". */
   config?: Record<string, unknown>;
   description?: string;
   input_shapes?: string[];
@@ -343,11 +347,25 @@ function extractTasks(row: RawExecutionRow): ExecutionTraceTaskEntry[] {
       'llm_completion_dispatch', 'http_fetch', 'bash', 'file', 'git', 'noop',
       'impulse-resolve', 'impulse_resolve', 'validation', 'iteration',
     ]);
-    const persistedCfg = tt.config && typeof tt.config === 'object' && !Array.isArray(tt.config)
-      ? (tt.config as Record<string, unknown>) : undefined;
-    const config = (persistedCfg && Object.keys(persistedCfg).length > 0)
-      ? persistedCfg
-      : (resolverName && !META_RESOLVERS.has(resolverName) ? { type: resolverName } : undefined);
+    // The "future write" the note above anticipates landed 2026-08-17: the executor now
+    // records post-interpolation arguments and normalizePersistedTask persists them under
+    // `resolved_config`. Read BOTH keys — reading only `tt.config` would leave the whole
+    // record → persist → extract chain inert at its last seam, which is precisely how the
+    // three preceding layers each looked correct in isolation while nothing changed.
+    const asObj = (v: unknown): Record<string, unknown> | undefined =>
+      v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
+    const resolvedCfg = asObj(tt.resolved_config ?? tt.resolvedConfig);
+    const persistedCfg = asObj(tt.config);
+    // Real arguments beat the synthesized {type} shim, which carries no arguments and only
+    // ever made a composite dispatchable, never re-runnable. Merge so the shape-routing key
+    // survives alongside them; the real config wins on any key collision.
+    const config = (resolvedCfg && Object.keys(resolvedCfg).length > 0)
+      ? (resolverName && !META_RESOLVERS.has(resolverName)
+          ? { type: resolverName, ...resolvedCfg }
+          : resolvedCfg)
+      : (persistedCfg && Object.keys(persistedCfg).length > 0)
+        ? persistedCfg
+        : (resolverName && !META_RESOLVERS.has(resolverName) ? { type: resolverName } : undefined);
     const outShapes = toStringArray(tt.outputShapes ?? tt.output_shapes);
     out.push({
       task_id,

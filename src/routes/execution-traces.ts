@@ -166,6 +166,12 @@ export function deriveSignatureShapes(trace: any): string[] {
   return dedupe(produced);
 }
 
+/** Trust-boundary cap on a single task's stored resolved_config, in serialized chars.
+ *  Sized to admit real resolver arguments (paths, urls, jq expressions, small bodies)
+ *  while refusing a blob that would bloat the FLEXIBLE tasks column — traces are already
+ *  under retention pressure from the ceiling valve. */
+const RESOLVED_CONFIG_MAX_CHARS = 4000;
+
 export function normalizePersistedTask(task: any): {
   task_id: string;
   description?: string;
@@ -182,6 +188,7 @@ export function normalizePersistedTask(task: any): {
   child_activity_id?: string;
   input_shapes?: string[];
   output_shapes?: string[];
+  resolved_config?: Record<string, unknown>;
 } {
   const { input_impulse_ids: inputImpulseIds, output_impulse_ids: outputImpulseIds } =
     extractTaskImpulseIds(task);
@@ -235,6 +242,35 @@ export function normalizePersistedTask(task: any): {
   if (_inShapes) out.input_shapes = _inShapes.filter((x: unknown) => typeof x === 'string');
   const _outShapes = Array.isArray(task?.output_shapes) ? task.output_shapes : Array.isArray(task?.outputShapes) ? task.outputShapes : null;
   if (_outShapes) out.output_shapes = _outShapes.filter((x: unknown) => typeof x === 'string');
+
+  // Per-task RESOLVED CONFIG (2026-08-17): the arguments the resolver was actually
+  // called with, post-interpolation. This is the same defect class as the shapes fix
+  // directly above — a per-task field dropped by this whitelist starves the ribosome —
+  // but with a sharper consequence: without it every extracted composition carries
+  // config:{} and CANNOT BE REPLAYED. Measured: 98 of 98 tasks across the 26 stored
+  // learned compositions had no arguments, and replaying them produced
+  // "paths[0] … got undefined" (fs_read, 18x), "invalid URL: undefined" (http_fetch, 8x)
+  // and "undefined is not an object (path.split)" (json_path_extract). Those
+  // compositions completed 6 of 61 runs.
+  //
+  // The producer (ias-executor's redactResolvedConfig) already redacts secrets by key
+  // name and bounds value length. The cap here is a SECOND, independent bound at the
+  // trust boundary: this endpoint accepts writes from any vessel, and a per-task blob
+  // rides the FLEXIBLE tasks column straight into the row. Oversize configs are dropped
+  // whole rather than truncated — a half-serialized config would replay as a subtly
+  // WRONG call, which is worse than an honestly absent one.
+  const _rc = task?.resolvedConfig ?? task?.resolved_config;
+  if (_rc && typeof _rc === 'object' && !Array.isArray(_rc)) {
+    try {
+      const encoded = JSON.stringify(_rc);
+      if (encoded !== undefined && encoded.length <= RESOLVED_CONFIG_MAX_CHARS) {
+        out.resolved_config = _rc as Record<string, unknown>;
+      }
+    } catch {
+      // Cyclic or non-serializable config: store nothing. An absent config is a
+      // recoverable gap; a config that breaks the row's write is not.
+    }
+  }
 
   return out;
 }
