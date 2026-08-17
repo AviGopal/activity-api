@@ -371,6 +371,46 @@ app.post('/templates', async (c) => {
       return c.json({ error: 'Missing required field: name or variant_name' }, 400);
     }
 
+    // AN ACTIVITY ID IS NOT A SHAPE.
+    //
+    // Root-caused 2026-08-17. The only five-hop learned composition on this fleet,
+    // activity:<learned-composition-vessel-health-report-to-fs-read-to-concept-to-memorynote-to-acti>,
+    // had four tasks whose outputShapes entry was an ACTIVITY IDENTIFIER — task 4 declared
+    // out=[activity:<learned-composition-...>] and task 5 then required that same string as
+    // its input shape. No resolver advertises a shape named after an activity, so those tasks
+    // can only be satisfied by the bogus output of the task before them: the composition is
+    // unexecutable the moment it is written. Measured across the population, 6 of 26 learned
+    // compositions (23%) carried at least one such entry, and five-hop executions completed
+    // 0 times in 12 runs.
+    //
+    // The cost is not a dead row. A malformed composition is still SELECTED, consumes a walk
+    // step, returns new_shapes=0, and then has its posterior updated by an outcome that says
+    // nothing about whether the composition was right — the loop learns from noise it
+    // generated. Rejecting at the write boundary is the cheapest place to stop that, and the
+    // malformed entries are identifiable by prefix.
+    //
+    // Rejects rather than strips: a composition whose intermediate shapes are wrong is not
+    // repairable by deleting them, and a caller that gets a 400 with the offending value can
+    // be fixed, where a silently-corrected row cannot.
+    const _shapeLike = (v: unknown): string => (typeof v === 'string' ? v : '');
+    const _badShapeTask = (activityTasks ?? []).find((t: unknown) => {
+      const outs = ((t as { outputShapes?: unknown[] })?.outputShapes ?? []) as unknown[];
+      return outs.some((o) => _shapeLike(o).startsWith('activity:'));
+    });
+    if (_badShapeTask) {
+      const offending = (((_badShapeTask as { outputShapes?: unknown[] }).outputShapes ?? []) as unknown[])
+        .map(_shapeLike).filter((o) => o.startsWith('activity:'));
+      return c.json({
+        error: 'Invalid outputShapes: an activity identifier is not a shape',
+        detail:
+          'A task declared an output shape beginning with "activity:". The shape a composed step produces is ' +
+          'the OUTPUT SHAPE of the activity it calls, not that activity\'s id. A downstream task requiring ' +
+          'this value as an input shape can never be satisfied, so the composition would be unexecutable.',
+        offending,
+        activity_id: activityId,
+      }, 400);
+    }
+
     // Convert category to tags if needed (backward compatibility)
     const tags = ensureTags({ tags: validated.tags, category: validated.category });
     const tagPrefixes = computeTagPrefixes(tags);
