@@ -3508,6 +3508,66 @@ app.get('/topology-coverage', async (c) => {
  * Designed to be called periodically by the substrate itself (boredom-vessel
  * goal rotation, systemd timer, etc.). The operator never invokes this.
  */
+/**
+ * Sweep learned compositions that the write boundary would now REJECT.
+ *
+ * The two guards above stop malformed compositions being written from now on. They do nothing
+ * about the ones already stored, and those keep being SELECTED: measured 2026-08-17, learned
+ * compositions completed 6 of 61 runs, five-hop ones 0 of 12, most returning new_shapes=0. A
+ * stored composition that cannot execute is not inert — it wins a walk step, returns nothing,
+ * and has its posterior updated by an outcome that says nothing about whether it was right.
+ *
+ * Same predicates as the write guards, deliberately: a template the store would refuse today
+ * should not survive because it arrived yesterday. Defaults to dry_run so the sweep can be
+ * inspected before it retires anything.
+ */
+app.post('/templates/retire-malformed', async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const dry_run = body.dry_run !== false;   // default DRY: retiring rows is not a thing to do by accident
+    // PERMISSIONS on `activity` need $auth populated, so prefer the JWT path and fall back
+    // to root only when no token is present — the same rule the template upsert above follows.
+    const _jwt = getJwtAuthFromContext(c);
+    const _sel = 'SELECT id, tasks, input_shapes FROM activity WHERE retired != true LIMIT 500';
+    const rows = _jwt?.jwtToken
+      ? await queryWithAuth<Record<string, unknown>>(_jwt.jwtToken, _sel, {})
+      : await surrealDB.query<Record<string, unknown>>(_sel, {});
+    const list = Array.isArray(rows) ? (rows[0] as unknown as Record<string, unknown>[]) ?? [] : [];
+    const offenders: Array<{ id: string; reason: string; detail: string[] }> = [];
+    for (const t of list) {
+      const tasks = (t.tasks ?? []) as Array<{ outputShapes?: unknown[] }>;
+      const produced = new Set<string>();
+      for (const tk of tasks) for (const o of (tk?.outputShapes ?? []) as unknown[]) if (typeof o === 'string') produced.add(o);
+      const actShapes = tasks
+        .flatMap((tk) => ((tk?.outputShapes ?? []) as unknown[]))
+        .filter((o): o is string => typeof o === 'string' && o.startsWith('activity:'));
+      if (actShapes.length > 0) {
+        offenders.push({ id: String(t.id), reason: 'activity-id-as-output-shape', detail: actShapes.slice(0, 4) });
+        continue;
+      }
+      const selfSat = ((t.input_shapes ?? []) as unknown[])
+        .filter((i): i is string => typeof i === 'string')
+        .filter((i) => produced.has(i));
+      if (selfSat.length > 0) offenders.push({ id: String(t.id), reason: 'self-satisfied-precondition', detail: selfSat });
+    }
+    let retired = 0;
+    if (!dry_run) {
+      for (const o of offenders) {
+        try {
+          const _upd = 'UPDATE type::thing($tid) SET retired = true, deprecated = true, updated_at = time::now()';
+          if (_jwt?.jwtToken) await queryWithAuth(_jwt.jwtToken, _upd, { tid: o.id });
+          else await surrealDB.query(_upd, { tid: o.id });
+          retired++;
+        } catch { /* one failed row must not abort the sweep; the rest are still worth retiring */ }
+      }
+    }
+    console.log(`[retire-malformed] scanned=${list.length} offenders=${offenders.length} retired=${retired} dry_run=${dry_run}`);
+    return c.json({ scanned: list.length, offenders, retired, dry_run });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : 'retire-malformed failed' }, 500);
+  }
+});
+
 app.post('/templates/auto-promote', async (c) => {
   try {
     const body = await c.req.json().catch(() => ({}));
