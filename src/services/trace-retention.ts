@@ -800,7 +800,21 @@ async function runTraceRetentionSweepInner(
           // identical statement and expecting a different result is the failure mode this whole
           // report keeps documenting — a retry that does not widen is not a retry.
           try {
-            await surrealDB.query('DELETE $ids RETURN NONE', { ids });
+            // FAIL FAST SO QUARANTINE IS CHEAP (2026-08-16).
+            //
+            // Quarantine made the sweep survive a poison batch; it did not make DISCOVERING one
+            // cheap. Measured on the first completed sweep: the failing DELETE took 245s of a
+            // 300s budget — 82% of the cycle spent waiting for one statement to time out — while
+            // the successful batch after it deleted 25 rows in 74s. The sweep then ended on
+            // `stoppedBy: budget` having removed 25.
+            //
+            // A DELETE that is going to succeed on this table returns in ~1-3s; one that is going
+            // to fail consumes the server-side default. Bounding it at 20s turns a poison batch
+            // from 82% of the budget into under 7%, so the remaining time goes to rows that
+            // actually delete. The clause is SurrealQL's own (paradigm.ts already uses TIMEOUT 8s
+            // on a hot SELECT), so the server abandons the statement rather than the client
+            // hanging up on work that continues underneath.
+            await surrealDB.query('DELETE $ids RETURN NONE TIMEOUT 20s', { ids });
             done += ids.length;
             if (done >= target) stoppedBy = 'target';
           } catch (err) {

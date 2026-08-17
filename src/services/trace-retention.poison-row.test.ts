@@ -36,6 +36,7 @@ let store: string[] = [];
 let undeletable = new Set<string>();
 const selects: Array<{ skip: string[] | undefined; batch: number }> = [];
 const deleteAttempts: string[][] = [];
+const deleteSql: string[] = [];
 
 mock.module('../db/surreal', () => ({
   surrealDB: {
@@ -51,6 +52,7 @@ mock.module('../db/surreal', () => ({
         return eligible.slice(0, batch).map((id) => ({ id }));
       }
       if (/^\s*DELETE \$ids/i.test(sql)) {
+        deleteSql.push(sql);
         const ids = (params['ids'] as string[]) ?? [];
         deleteAttempts.push(ids);
         if (ids.some((id) => undeletable.has(id))) {
@@ -71,6 +73,7 @@ beforeEach(() => {
   undeletable = new Set();
   selects.length = 0;
   deleteAttempts.length = 0;
+  deleteSql.length = 0;
 });
 
 /**
@@ -101,6 +104,20 @@ async function runValve(target: number, batchSize: number): Promise<{ done: numb
   }
   return { done, quarantined: quarantined.size };
 }
+
+describe('ceiling valve — the DELETE is time-bounded so quarantine is cheap', () => {
+  test('the valve DELETE carries a TIMEOUT clause', async () => {
+    // Measured: the failing DELETE consumed 245s of a 300s budget (82%) while a successful batch
+    // took ~3s. Without a bound, DISCOVERING a poison batch costs the whole cycle even though
+    // surviving one is now free. The bound is read off the shipped source rather than a copy, so
+    // this fails if the clause is ever dropped.
+    const src = await Bun.file(new URL('./trace-retention.ts', import.meta.url)).text();
+    const m = src.match(/DELETE \$ids RETURN NONE TIMEOUT (\d+)s/);
+    expect(m).not.toBeNull();
+    expect(Number(m![1])).toBeGreaterThan(0);
+    expect(Number(m![1])).toBeLessThanOrEqual(30); // must be far below the 300s sweep budget
+  });
+});
 
 describe('ceiling valve — a poison row must not stop the sweep', () => {
   test('THE REGRESSION: one undeletable head row previously killed the whole sweep', async () => {
