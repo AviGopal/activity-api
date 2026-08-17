@@ -57,6 +57,19 @@ export interface DiscoverByShapesInput {
   output_shapes?: string[];
   predecessor_activity_id?: string;
   /**
+   * Attach composition_score / successor_value WITHOUT changing the query direction.
+   *
+   * `mode: "candidates_with_scores"` conflates two orthogonal things: it augments the
+   * results AND forces queryMode to 'forward'. A caller running a BACKWARD query who wants
+   * scores cannot say so — switching the mode silently inverts their query and returns the
+   * wrong candidates. That trap is why the walk (which runs both directions) receives no
+   * chain-aware signal at all: composition evidence and psi are computed only in a mode it
+   * cannot safely request.
+   *
+   * This flag separates them. Direction stays whatever `mode` says; scoring is opt-in.
+   */
+  include_scores?: boolean;
+  /**
    * Successor-features readout (mechanism #7). When `signature` (the state s)
    * and `completion_shapes` (the goal direction R) are supplied in
    * candidates_with_scores mode, each candidate is augmented with
@@ -129,10 +142,13 @@ export async function runDiscoverByShapes(
     signature,
     completion_shapes = [],
     sf_scope = 'org',
+    include_scores = false,
   } = input;
 
-  // candidates_with_scores treats the query as forward mode (find producers)
-  // and augments each result with composition_score from activity_composition_graph.
+  // candidates_with_scores treats the query as forward mode (find producers) and augments
+  // each result with composition_score. `include_scores` requests the augmentation ALONE,
+  // leaving the direction as `mode` states — so a backward query can carry scores without
+  // being silently turned into a forward one.
   const queryMode = mode === 'candidates_with_scores' ? 'forward' : mode;
 
   logger.info('Discovering activities by shapes', {
@@ -148,7 +164,7 @@ export async function runDiscoverByShapes(
   // using `$parent.id` to scope each correlated lookup. Composition score
   // augmentation is folded in via a conditional subquery — empty predecessor
   // path uses GROUP ALL to roll up edges across all parents of the candidate.
-  const isCandidatesMode = mode === 'candidates_with_scores';
+  const isCandidatesMode = mode === 'candidates_with_scores' || include_scores === true;
   const compositionSubquery = isCandidatesMode
     ? predecessor_activity_id
       ? `, (SELECT success_count, execution_count FROM activity_composition_graph

@@ -5688,6 +5688,10 @@ app.post('/discover-by-shapes', async (c) => {
       current_shapes: body.current_shapes ?? [],
       output_shapes: body.output_shapes ?? [],
       predecessor_activity_id: body.predecessor_activity_id,
+      // Scores WITHOUT changing direction. A backward-mode caller can now ask for
+      // composition_score/successor_value; switching it to candidates_with_scores to get them
+      // would silently turn the query forward and return the wrong candidates.
+      include_scores: body.include_scores === true,
       // Successor-features readout (mechanism #7): goal direction (s, R).
       signature: body.signature,
       completion_shapes: body.completion_shapes,
