@@ -42,6 +42,11 @@ mock.module('../db/surreal', () => ({
 // against a missing local Redis (the test environment has no Redis
 // container; we only care about the SurrealDB upsert SQL anyway).
 mock.module('../db/redis', () => ({
+  // `redis` must be exported too: mock.module replaces the module GLOBALLY and the
+  // replacement outlives this file, so a factory that omits a real export breaks every
+  // later test file importing it. Measured 2026-08-17: 53 files died at import with
+  // "Export named 'redis' not found" and never ran their assertions.
+  get redis() { return this.RedisClient.getInstance(); },
   RedisClient: {
     getInstance: () => ({
       del: async () => 0,
