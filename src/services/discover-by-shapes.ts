@@ -319,11 +319,32 @@ export async function runDiscoverByShapes(
   // the dot product is the TRANSFER value — non-zero even for cells the Beta
   // never rewarded on this R, because ψ encodes transition structure, not reward.
   // Additive: attaches `successor_value` alongside the unchanged Thompson scores.
+  // A SIGNATURE FROM THE WRONG NAMESPACE MUST NOT PRODUCE A ZERO.
+  //
+  // This gate was `signature.length > 0`. A caller sending an 8-hex host-load hash (a real
+  // incident, 2026-08-17) passed it, every psi cell lookup missed, and every candidate was
+  // annotated `successor_value: {value: 0}` — which reads downstream as "psi measured zero
+  // occupancy toward this goal", not as "the key was never in this namespace". A lookup that
+  // could not be performed was reported as a measurement.
+  //
+  // psi cells are keyed by `computeStateSignature` = sha256(...).digest().slice(0,8) -> 16 hex
+  // chars. POST /recommend already validates exactly `^[0-9a-f]{16}$` before using a
+  // caller-supplied signature as a cts key; this reuses that rule rather than inventing a
+  // second one that can drift from it.
+  const sigUsable = typeof signature === 'string' && /^[0-9a-f]{16}$/.test(signature);
+  if (isCandidatesMode && successorFeaturesEnabled() && typeof signature === 'string' && signature.length > 0 && !sigUsable) {
+    // Loud, because the silent version of this cost a full wiring cycle: the chain looked
+    // closed at every hop and moved no information.
+    logger.warn('successor-features: signature is not a shape-space signature — psi NOT attached', {
+      event: 'sf_signature_namespace_mismatch',
+      received_length: signature.length,
+      expected: '16 hex chars (sha256 digest slice)',
+    });
+  }
   if (
     isCandidatesMode &&
     successorFeaturesEnabled() &&
-    typeof signature === 'string' &&
-    signature.length > 0 &&
+    sigUsable &&
     completion_shapes.length > 0
   ) {
     try {
