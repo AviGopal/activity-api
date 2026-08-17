@@ -10752,18 +10752,18 @@ app.post('/shape-scores', async (c) => {
             org_id: $org_id,
             account_id: $account_id,
             account_id_version: $account_id_version,
-            success_count: (
+            success_count: ((
               SELECT VALUE success_count FROM ONLY impulse_shape_activity_score:[$org_id, $shape, $activity_id]
-            ) ?? 0 + $success_increment,
-            failure_count: (
+            ) ?? 0) + $success_increment,
+            failure_count: ((
               SELECT VALUE failure_count FROM ONLY impulse_shape_activity_score:[$org_id, $shape, $activity_id]
-            ) ?? 0 + $failure_increment,
-            alpha: (
+            ) ?? 0) + $failure_increment,
+            alpha: ((
               SELECT VALUE success_count FROM ONLY impulse_shape_activity_score:[$org_id, $shape, $activity_id]
-            ) ?? 0 + $success_increment + 1,
-            beta: (
+            ) ?? 0) + $success_increment + 1,
+            beta: ((
               SELECT VALUE failure_count FROM ONLY impulse_shape_activity_score:[$org_id, $shape, $activity_id]
-            ) ?? 0 + $failure_increment + 1,
+            ) ?? 0) + $failure_increment + 1,
             updated_at: time::now()
           };
         `;
