@@ -170,6 +170,13 @@ export function deriveSignatureShapes(trace: any): string[] {
  *  Sized to admit real resolver arguments (paths, urls, jq expressions, small bodies)
  *  while refusing a blob that would bloat the FLEXIBLE tasks column — traces are already
  *  under retention pressure from the ceiling valve. */
+/** Short-TTL page cache for the trace list. See the cache-read block in the list handler for
+ *  why this exists and why the key must carry the tenant. Keyed org-first so a missing org
+ *  identity cannot collide with a real one. */
+const TRACE_LIST_CACHE_TTL_MS = 10_000;
+const TRACE_LIST_CACHE_MAX = 200;
+const traceListCache = new Map<string, { body: unknown; expiresAt: number }>();
+
 const RESOLVED_CONFIG_MAX_CHARS = 4000;
 
 export function normalizePersistedTask(task: any): {
@@ -860,6 +867,43 @@ app.get('/', async (c) => {
       authMethod: useJwtAuth ? 'jwt' : 'session',
     });
 
+    // COLLAPSE IDENTICAL POLLS INTO ONE QUERY. Measured on the hub 2026-08-18: this route
+    // received 50 requests in 3 minutes from a browser dashboard whose global 5s
+    // refetchInterval reached it, and SurrealDB 2.3.3 answers each one by materialising all
+    // 473,176 rows of v_paradigm_execution_traces into a sort BEFORE applying the LIMIT.
+    // ~40 such sorts ran concurrently and pinned all 8 DB workers at ~96% with 0.0% iowait,
+    // taking the whole fleet to 30s query latency — including the substrate's own learning
+    // writes, which timed out and were lost.
+    //
+    // The client-side fix (dashboard 3f5e35e) is correct and cannot help a browser already
+    // running the old bundle, so the server has to be able to defend itself. A 10s TTL turns
+    // a 5s poll into one query per 10s per distinct page — the cost stops scaling with the
+    // number of open tabs, which is the property that was missing.
+    //
+    // ★ THE KEY MUST CARRY THE TENANT, OR THIS IS A DATA LEAK RATHER THAN A CACHE. The JWT
+    //   path calls queryWithAuth, where row visibility is enforced by the DATABASE against
+    //   the caller's token — so two orgs can issue a byte-identical query+params and are
+    //   entitled to different rows. Keying on the SQL alone would serve one org's page to
+    //   another. effectiveOrgId (line ~725) is the explicit discriminator, and when it is
+    //   absent this refuses to cache at all rather than guessing a key.
+    //
+    // Deliberately in-memory and tiny: this is one process, the entries are one page each,
+    // and a 10s TTL bounds staleness well under the human perception the dashboard wanted.
+    const cacheKey = effectiveOrgId
+      ? `${effectiveOrgId}|${useJwtAuth ? 'jwt' : 'session'}|${query}|${JSON.stringify(params)}`
+      : null;
+    if (cacheKey) {
+      const hit = traceListCache.get(cacheKey);
+      if (hit && hit.expiresAt > Date.now()) {
+        logger.info('execution traces served from cache', {
+          event: 'trace_list_cache_hit',
+          org_id: effectiveOrgId,
+          age_ms: TRACE_LIST_CACHE_TTL_MS - (hit.expiresAt - Date.now()),
+        });
+        return c.json(hit.body);
+      }
+    }
+
     // Execute query with appropriate auth method
     let executions: ExecutionTrace[];
     let countResult: { total: number }[];
@@ -1127,6 +1171,25 @@ app.get('/', async (c) => {
       limit,
       offset,
     };
+
+    // Only a SUCCESSFUL page is cached. An error path must never be memoised — a transient
+    // DB failure would otherwise be served to every caller for the whole TTL, converting one
+    // bad second into ten.
+    if (cacheKey) {
+      traceListCache.set(cacheKey, { body: response, expiresAt: Date.now() + TRACE_LIST_CACHE_TTL_MS });
+      if (traceListCache.size > TRACE_LIST_CACHE_MAX) {
+        // Bounded, and pruned by expiry first so a burst of distinct pages cannot grow this
+        // without limit. An unbounded cache on a request-shaped key is a slow memory leak,
+        // which on this fleet means an OOM kill.
+        const now = Date.now();
+        for (const [k, v] of traceListCache) if (v.expiresAt <= now) traceListCache.delete(k);
+        while (traceListCache.size > TRACE_LIST_CACHE_MAX) {
+          const oldest = traceListCache.keys().next().value;
+          if (oldest === undefined) break;
+          traceListCache.delete(oldest);
+        }
+      }
+    }
 
     return c.json(response);
 
