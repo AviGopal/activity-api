@@ -235,7 +235,12 @@ export function getEmbeddingProvider(): EmbeddingProvider | null {
   const config = getEmbeddingConfig();
   if (!config) return null;
 
-  embeddingProvider = createEmbeddingProvider(config);
+  try {
+    embeddingProvider = createEmbeddingProvider(config);
+  } catch (error) {
+    logger.error('Failed to initialize embedding provider', { error: (error as Error).message, provider: config.provider });
+    return null;
+  }
   logger.info('Embedding provider initialized', {
     provider: config.provider,
     model: config.model,
