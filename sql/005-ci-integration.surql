@@ -98,6 +98,27 @@
 -- Index for efficient CI result queries
 -- ============================================================================
 
+-- THE FIELD MUST EXIST BEFORE IT CAN BE INDEXED. `execution_traces` is SCHEMAFULL
+-- (004-execution-traces.surql:13), and `ci_status` was described only in a COMMENT at the
+-- top of this file — never DEFINEd. So every index below failed with "The field 'ci_status'
+-- does not exist", the migration was never marked applied, and it re-ran on EVERY boot of
+-- activity-api. Observed on the hub 2026-08-18: 3 identical failures per start, ~7 starts an
+-- hour, indefinitely.
+--
+-- The same omission silently broke the feature itself: on a SCHEMAFULL table a write to an
+-- undefined field is rejected, so POST /ci (routes/ci.ts) could never have persisted a
+-- ci_status either. The indexes were the loud symptom of a defect that also had a quiet half.
+--
+-- Shape taken from the response contract in src/models/schemas.ts:1402 (success, branch,
+-- commit, provider, completed_at; `.passthrough()`), so FLEXIBLE is correct — the writer is
+-- allowed to add keys the schema does not enumerate.
+DEFINE FIELD IF NOT EXISTS ci_status ON TABLE execution_traces FLEXIBLE TYPE option<object>;
+DEFINE FIELD IF NOT EXISTS ci_status.success ON TABLE execution_traces TYPE option<bool>;
+DEFINE FIELD IF NOT EXISTS ci_status.branch ON TABLE execution_traces TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS ci_status.commit ON TABLE execution_traces TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS ci_status.provider ON TABLE execution_traces TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS ci_status.completed_at ON TABLE execution_traces TYPE option<string>;
+
 -- Index on ci_status.success for filtering by CI pass/fail
 DEFINE INDEX ci_status_success_idx ON TABLE execution_traces COLUMNS ci_status.success;
 

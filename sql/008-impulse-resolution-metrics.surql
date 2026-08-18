@@ -48,4 +48,15 @@ DEFINE INDEX idx_resolution_execution ON impulse_resolution_metrics COLUMNS exec
 DEFINE INDEX idx_resolution_type_resolver ON impulse_resolution_metrics COLUMNS impulse_type, resolver_id, success;
 
 -- Composite index for shape discovery failures
-DEFINE INDEX idx_resolution_shape_failures ON impulse_resolution_metrics COLUMNS requested_shape, discovery_failure WHERE discovery_failure = true;
+-- NO PARTIAL INDEXES IN SURREALDB. `DEFINE INDEX ... WHERE <pred>` is a PostgreSQL partial
+-- index; SurrealDB's parser stops at the WHERE:
+--     Parse error: Unexpected token `WHERE`, expected Eof
+--       --> [51:117]
+-- So this statement failed on every run, the migration was never marked applied, and it
+-- re-ran on EVERY boot of activity-api (~7 starts/hour on the hub, observed 2026-08-18).
+--
+-- Dropping the predicate loses nothing: the index already leads with `requested_shape` and
+-- includes `discovery_failure`, so a query filtering `discovery_failure = true` uses it. A
+-- partial index would only have made it smaller, and SurrealDB has no such feature to fall
+-- back to.
+DEFINE INDEX idx_resolution_shape_failures ON impulse_resolution_metrics COLUMNS requested_shape, discovery_failure;
