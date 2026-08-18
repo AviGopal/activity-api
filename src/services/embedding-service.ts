@@ -39,7 +39,9 @@ export interface EmbeddingConfig {
 export function getEmbeddingConfig(): EmbeddingConfig | null {
   const provider = process.env.EMBEDDING_PROVIDER;
   if (!provider) {
-    logger.warn('EMBEDDING_PROVIDER is not set in the environment');
+    // No action taken as EMBEDDING_PROVIDER is not set
+    return null;
+
     return null;
   }
 
