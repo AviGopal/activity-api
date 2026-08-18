@@ -38,7 +38,10 @@ export interface EmbeddingConfig {
 // Get config from environment
 export function getEmbeddingConfig(): EmbeddingConfig | null {
   const provider = process.env.EMBEDDING_PROVIDER;
-  if (!provider) return null;
+  if (!provider) {
+    logger.warn('EMBEDDING_PROVIDER is not set in the environment');
+    return null;
+  }
 
   const apiKey =
     process.env.EMBEDDING_API_KEY ||
