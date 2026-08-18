@@ -115,7 +115,7 @@ class OpenAIEmbeddingProvider implements EmbeddingProvider {
 
     if (!response.ok) {
       const error = await response.text();
-      throw new Error(`OpenAI embedding error: ${error}`);
+      throw new Error(`OpenAI embedding error: ${error}. Check your API key and permissions.`);
     }
 
     const data = (await response.json()) as {
