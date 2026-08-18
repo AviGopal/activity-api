@@ -22,8 +22,8 @@ import { readFileSync } from 'node:fs';
  * what `=== 'true'` returned.
  *
  * SCOPE, STATED: EMBEDDING_PRIOR_ENABLED and POSTERIOR_COALESCE are closed here.
- * `POSTERIOR_FLUSH_MS` is NOT — it is a CADENCE, and law 5 puts cadence in the pool as a
- * rhythm impulse rather than a tuning row. See the final test, which pins it as known-open.
+ * `POSTERIOR_FLUSH_MS` is CLASSIFIED as plumbing rather than ported — see the final test for
+ * the evidence, which corrects an earlier claim of mine that it was a law-5 item.
  */
 
 const SRC = new URL('../src/', import.meta.url).pathname;
@@ -91,13 +91,40 @@ describe('law 1 — EMBEDDING_PRIOR_ENABLED is read as data', () => {
     expect(s.slice(i, i + 700)).toMatch(/catch \{[\s\S]*keep the last known value/);
   });
 
-  it('KNOWN-OPEN: POSTERIOR_FLUSH_MS is a CADENCE and needs a different seam', () => {
-    // Law 5: "Cadence lives in the pool as time-shaped rhythm impulses the selector reads,
-    // not in static intervals, timers, or concurrency clamps." Porting FLUSH_MS to a tuning
-    // row would satisfy law 1 while violating law 5 — a worse outcome than leaving it
-    // visible. Pinned so the next reader sees it named rather than inferring from this
-    // file's existence that the whole class is closed.
+  it('POSTERIOR_FLUSH_MS is PLUMBING, not a behavioural switch — classified, not ported', () => {
+    /**
+     * I twice called this a law-5 item ("cadence belongs in the pool as a rhythm impulse")
+     * and declined to touch it. Reading both the rhythm mechanism and this constant refutes
+     * that, in the direction of it being NEITHER violation:
+     *
+     *  - Law 5's cadence is what the SELECTOR reads. `rhythm_conductor_tick` scores each
+     *    rhythm's due-ness, credit, staleness and affordability, and enqueues the winning
+     *    family's goal — it decides WHAT THE SUBSTRATE SPENDS TIME ON. FLUSH_MS is read by
+     *    no selector.
+     *  - Law 1 forbids BEHAVIOUR in a frozen constant. FLUSH_MS is the setInterval period of
+     *    a write buffer whose deltas are additive and commutative — the module's own header
+     *    states N concurrent +δ "collapse losslessly into a single +Σδ". Changing it changes
+     *    write LATENCY and batch size; it changes neither which arm is selected nor what
+     *    value is written.
+     *
+     * So it is process plumbing, the category law 1 explicitly permits alongside ports and
+     * identity. The audit swept it into a list of "env-frozen behavioral switches" next to
+     * EMBEDDING_PRIOR_ENABLED (which chooses a prior) and POSTERIOR_COALESCE (which decides
+     * whether the conflict-storm defence runs) — both genuinely behavioural, and both now
+     * closed. Grouping a buffer interval with them was over-broad.
+     *
+     * Pinned as a CLASSIFICATION so the next reader inherits the reasoning rather than the
+     * verdict. If someone later makes FLUSH_MS affect a written value — say by decaying
+     * per-flush instead of per-delta — this test's premise breaks and it should fail.
+     */
     const s = readFileSync(SRC + 'lib/posterior-aggregator.ts', 'utf8');
-    expect(s).toMatch(/process\.env\.POSTERIOR_FLUSH_MS/);
+    // The premise: it is consumed ONLY as a timer period.
+    expect(s).toMatch(/const FLUSH_MS = Math\.max\(50, parseInt\(process\.env\.POSTERIOR_FLUSH_MS/);
+    const uses = (s.match(/\bFLUSH_MS\b/g) ?? []).filter(Boolean);
+    expect(uses.length).toBeGreaterThanOrEqual(2);
+    expect(s).toMatch(/\}, FLUSH_MS\);/);
+    // And the property that makes the period value-neutral: coalescing is lossless, so the
+    // same deltas produce the same Σδ regardless of how often the buffer drains.
+    expect(s).toMatch(/collapse losslessly into a single/);
   });
 });
