@@ -94,3 +94,37 @@ describe('SurrealDB coalesce precedence in accumulator UPSERTs', () => {
     }
   });
 });
+
+describe('impulse_shape_activity_score — the orphan is pinned, not assumed', () => {
+  /**
+   * The `/feedback` handler keeps incrementing this table and its comment called it "the
+   * routing score" that "must keep flowing". Verified 2026-08-17 across every file type in
+   * every repo: it has NO READER. Every reference is a write, a schema DEFINE, a test, or a
+   * SELECT nested inside its own UPSERT (read-modify-write). Selection reads
+   * v_shape_conditioned_score and v_activity_score — both computed views over `execution` —
+   * plus variant_performance_metrics via getCanonicalPosteriors.
+   *
+   * Pinned rather than deleted: removing a write is a data-retention decision, and the
+   * surrounding three-reason analysis was established over 72h of measured traffic. What
+   * this asserts is that the CLAIM stays honest. If someone later adds a genuine reader,
+   * this test fails and the comment must be updated to say so — which is the direction that
+   * costs nothing. If nobody does, the orphan stays visible instead of being re-defended by
+   * a stale sentence.
+   */
+  it('the stale-claim correction is present and specific', () => {
+    const src = readFileSync(join(SRC, 'routes/activities.ts'), 'utf8');
+    expect(src).toContain('STALE AS OF 2026-08-17');
+    // The correction must name the actual readers, or the next reader has to redo the work.
+    expect(src).toContain('v_shape_conditioned_score');
+    expect(src).toContain('getCanonicalPosteriors');
+  });
+
+  it('it also records what was NOT wrong — /reach remains the live grader', () => {
+    // The audit that found the orphan overstated it as "the walk's ENTIRE credit channel".
+    // Recording the refutation next to the finding is what stops the overstatement being
+    // re-derived by the next person who greps this table.
+    const src = readFileSync(join(SRC, 'routes/activities.ts'), 'utf8');
+    expect(src).toContain('sole VPM grader');
+    expect(src).toMatch(/the other one is live/);
+  });
+});

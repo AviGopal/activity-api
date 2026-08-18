@@ -5573,6 +5573,29 @@ app.post('/feedback', async (c) => {
     // The impulse_shape_activity_score increments above are deliberately KEPT: /reach
     // never writes that table, so the routing score is single-counted and must keep
     // flowing. This deletion is scoped to variant_performance_metrics only.
+    //
+    // ⚠ STALE AS OF 2026-08-17: "the routing score" HAS NO READER. Audited, then verified
+    // by hand across every file type in every repo. Every reference to
+    // impulse_shape_activity_score is a write, a schema DEFINE, a test, or a SELECT nested
+    // INSIDE its own UPSERT (paradigm.ts:1774-1783 — read-modify-write, not a read). No
+    // selector consults it: shape-conditioned selection reads v_shape_conditioned_score
+    // (a computed view over `execution`), and global selection reads v_activity_score
+    // (likewise) overlaid with variant_performance_metrics via getCanonicalPosteriors.
+    //
+    // So this sentence asserts a consumer that does not exist, and that is the load-bearing
+    // problem — a comment describing an intent the system no longer implements is what
+    // stops the next reader from checking. The write itself is cheap; the claim is not.
+    //
+    // WHAT IS NOT WRONG, and was misdiagnosed as such: the walk's credit is NOT severed by
+    // this. /reach is the sole VPM grader (see the three measured reasons above) and VPM is
+    // read at selection time. An audit that found this orphan concluded "the walk's ENTIRE
+    // alpha/beta credit channel writes to a table no selector reads" — that is one of TWO
+    // channels, and the other one is live. Finding a real orphan is not the same as finding
+    // the orphan on the critical path.
+    //
+    // DELIBERATELY NOT DELETED HERE. Removing a write is a data-retention decision (the
+    // table has history, an ev computed column and an index), and the three reasons above
+    // were established over 72h of measured traffic. What is corrected is the false claim.
     logger.info('posterior grading delegated to POST /reach (sole VPM grader)', {
       activity_id: validated.activity_id,
       direction: validated.direction,
