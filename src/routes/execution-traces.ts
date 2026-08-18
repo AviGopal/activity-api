@@ -778,13 +778,42 @@ app.get('/', async (c) => {
       whereConditions.push('executed_at >= type::datetime($start_date)');
       params.start_date = startDate;
     } else {
-      // Default to the last 30 days when no start_date is provided.
-      // This bounds the ORDER BY executed_at DESC scan to a manageable window
-      // instead of scanning all 25k+ historical rows (OOMKill prevention).
-      // Clients needing older data can pass ?start_date=<iso> explicitly.
-      const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+      // ★ THIS GUARD DID NOT FAIL — IT ERODED. It was written as "last 30 days ... instead of
+      //   scanning all 25k+ historical rows (OOMKill prevention)", and at 25k rows spanning
+      //   more than a month that genuinely bounded the scan.
+      //
+      //   Measured on the hub 2026-08-18: the table holds 473,176 rows spanning TWENTY-FIVE
+      //   DAYS. The oldest row is 2026-07-24; the default asked for >= 2026-07-19. The
+      //   predicate therefore excluded ZERO rows, and every request sorted the entire view.
+      //   SurrealDB 2.3.3 answers `ORDER BY ... LIMIT n` with a MemoryOrderedLimit collector —
+      //   it materialises every matching row into a sort BEFORE applying the LIMIT — so a
+      //   filter that excludes nothing means an O(table) sort per request. ~40 of those ran
+      //   concurrently and pinned all 8 DB workers at ~96% with 0.0% iowait, taking the whole
+      //   fleet to 30s query latency.
+      //
+      // ★ A CALENDAR WINDOW IS THE WRONG SHAPE OF GUARD FOR A GROWING TABLE. It bounds the
+      //   scan only while ingest stays slow enough that 30 days is less than all of history.
+      //   Cross that line — as this fleet did somewhere between 111k and 473k rows — and the
+      //   bound silently becomes a no-op while still LOOKING like a bound. Nothing errors, and
+      //   the comment above it keeps asserting protection it no longer provides.
+      //
+      //   The durable answer is an index-satisfiable ordering (migration 172 gets exactly that
+      //   on the UNSCOPED branch: `Iterate Index` + `ReverseOrder`, 129ms) so the engine walks
+      //   the index and stops at LIMIT without sorting anything. The org-scoped branch the
+      //   dashboard uses does not get that plan from this engine version, so until it does,
+      //   the window has to genuinely narrow.
+      //
+      //   24 hours is chosen against the measured ingest rate (473k rows / 25 days ~= 19k per
+      //   day), which puts a default page over ~19k rows instead of 473k — a ~25x smaller
+      //   sort — while still covering what a "recent traces" view is for. It is deliberately
+      //   expressed in hours so the next person who has to shrink it does not have to
+      //   re-derive why. Clients needing history pass ?start_date=<iso> explicitly and get the
+      //   old behaviour on demand rather than by default.
+      const windowHours = Number(process.env.TRACE_LIST_DEFAULT_WINDOW_HOURS ?? '24');
+      const hours = Number.isFinite(windowHours) && windowHours > 0 ? windowHours : 24;
+      const windowStart = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
       whereConditions.push('executed_at >= type::datetime($start_date)');
-      params.start_date = thirtyDaysAgo;
+      params.start_date = windowStart;
     }
 
     if (endDate) {
