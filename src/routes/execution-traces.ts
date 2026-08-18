@@ -1268,237 +1268,6 @@ app.get('/exemplars', async (c) => {
 });
 
 /**
- * GET /v2/activities/execution-traces/:executionId
- *
- * Get detailed information about a specific execution trace
- * Enhanced with Thompson Sampling selection data for explainability (M4.2)
- */
-app.get('/:executionId', async (c) => {
-  try {
-    const executionId = c.req.param('executionId');
-
-    // Fetch execution trace
-    const traceQuery = `
-      SELECT * FROM v_paradigm_execution_traces
-      WHERE execution_id = $execution_id
-      LIMIT 1
-    `;
-
-    const result = await surrealDB.query<ExecutionTrace>(traceQuery, {
-      execution_id: executionId,
-    });
-
-    logger.info('GET execution trace query result', {
-      executionId,
-      resultLength: result?.length || 0,
-      result: result,
-    });
-
-    // UNION-GAP FIX (2026-07-02, reason plane): the single-trace GET only
-    // consulted activity_execution_traces (wrappers keyed by the execution_id
-    // FIELD). ias-executor paradigm-walk executions land in the `execution`
-    // table keyed by RECORD ID (execution:<id>) with the execution_id field
-    // NULL — so `WHERE execution_id = $id` never matched them and template-walk
-    // traces 404'd here, leaving goal_reasoning with no per-task detail. Mirror
-    // the LIST path's paradigm union: fall back to the `execution` table by
-    // record id before declaring not-found. (Satisfier-only reaches persist no
-    // execution row at all — their reasoning lives in the goal-host walkLog.)
-    let traceRow: ExecutionTrace | undefined = result?.[0];
-    if (!traceRow) {
-      try {
-        const paradigmRows = await surrealDB.query<any>(
-          `SELECT * FROM type::thing('execution', $eid) LIMIT 1`,
-          { eid: executionId },
-        );
-        const p = paradigmRows?.[0];
-        if (p) {
-          const rowId = typeof p.id === 'string'
-            ? (p.id.includes(':') ? p.id.split(':').pop()!.replace(/[⟨⟩]/g, '') : p.id)
-            : String(p.id ?? '');
-          traceRow = {
-            ...p,
-            execution_id: p.execution_id || rowId || executionId,
-            activity_id: p.activity_id,
-            status: p.status,
-            created_at: p.created_at || p.executed_at,
-            error_message: p.error?.message ?? p.error_message,
-            tasks: p.trace?.tasks ?? p.tasks ?? [],
-          } as ExecutionTrace;
-          logger.info('[paradigm-union] single-GET fell back to paradigm execution table', { executionId });
-        }
-      } catch (paradigmError) {
-        logger.warn('[paradigm-union] single-GET paradigm fallback failed', {
-          executionId,
-          error: paradigmError instanceof Error ? paradigmError.message : String(paradigmError),
-        });
-      }
-    }
-
-    if (!traceRow) {
-      logger.warn('Execution trace not found in database', {
-        executionId,
-        params: { execution_id: executionId },
-      });
-      return c.json({
-        error: 'Execution trace not found',
-        execution_id: executionId,
-      }, 404);
-    }
-
-    const trace = traceRow;
-
-    // M4.2: Fetch Thompson Sampling selection data for explainability
-    // Priority: 1) correlation_id (exact match), 2) activity_id (approximate/most recent)
-    let selectionData = null;
-    try {
-      let selectionResult: {
-        thompson_sample: number;
-        alpha: number;
-        beta: number;
-        selection_method: string;
-        candidates_count: number | null;
-        selected_at: string;
-        correlation_id?: string;
-      }[] = [];
-
-      // First try exact match by correlation_id if the trace has one
-      if ((trace as any).correlation_id) {
-        const correlationQuery = `
-          SELECT
-            thompson_sample,
-            alpha,
-            beta,
-            selection_method,
-            candidates_count,
-            selected_at,
-            correlation_id
-          FROM thompson_selection_log
-          WHERE correlation_id = $correlation_id
-          LIMIT 1
-        `;
-        selectionResult = await surrealDB.query(correlationQuery, {
-          correlation_id: (trace as any).correlation_id,
-        });
-      }
-
-      // Fall back to activity_id match (most recent selection for this activity)
-      if (!selectionResult || selectionResult.length === 0) {
-        const activityQuery = `
-          SELECT
-            thompson_sample,
-            alpha,
-            beta,
-            selection_method,
-            candidates_count,
-            selected_at,
-            correlation_id
-          FROM thompson_selection_log
-          WHERE activity_id = $activity_id
-          ORDER BY selected_at DESC
-          LIMIT 1
-        `;
-        selectionResult = await surrealDB.query(activityQuery, {
-          activity_id: trace.activity_id || trace.variant_id,
-        });
-      }
-
-      if (selectionResult && selectionResult.length > 0) {
-        const sel = selectionResult[0];
-        selectionData = {
-          selection_probability: sel.thompson_sample,
-          selection_method: sel.selection_method,
-          alpha_at_selection: sel.alpha,
-          beta_at_selection: sel.beta,
-          candidates_count: sel.candidates_count,
-          selected_at: sel.selected_at,
-          // Include match type for debugging
-          match_type: (trace as any).correlation_id && sel.correlation_id === (trace as any).correlation_id
-            ? 'exact' : 'activity_fallback',
-        };
-      }
-    } catch (selectionError) {
-      // Don't fail the request if selection data fetch fails
-      logger.warn('Failed to fetch selection data', {
-        executionId,
-        error: selectionError instanceof Error ? selectionError.message : String(selectionError),
-      });
-    }
-
-    // Phase C: consult execution_trace_content first (split-write path).
-    // If absent, the inline AET fields carry the full payload (legacy path).
-    let contentSource: 'split' | 'legacy' = 'legacy';
-    let contentOverride: Record<string, unknown> = {};
-    try {
-      const contentRows = await surrealDB.query<{
-        tasks: unknown; state_snapshot: unknown; impulse_resolutions: unknown; output_impulses: unknown;
-      }>(`SELECT tasks, state_snapshot, impulse_resolutions, output_impulses FROM execution_trace_content WHERE execution_id = $eid LIMIT 1`, { eid: executionId });
-      if (contentRows && contentRows.length > 0) {
-        contentSource = 'split';
-        const cr = contentRows[0];
-        contentOverride = {
-          tasks: cr.tasks,
-          state_snapshot: cr.state_snapshot,
-          impulse_resolutions: cr.impulse_resolutions,
-          output_impulses: cr.output_impulses,
-        };
-      }
-    } catch (contentErr) {
-      logger.warn('execution_trace_content read failed; falling back to legacy AET fields', { executionId, err: contentErr instanceof Error ? contentErr.message : String(contentErr) });
-    }
-    if (contentSource === 'legacy') {
-      logger.info('trace content source: legacy (Phase D gate)', { executionId, content_source: contentSource });
-    } else {
-      logger.debug('trace content source', { executionId, content_source: contentSource });
-    }
-
-    // The v_paradigm compat view no longer carries `trace AS execution_trace` or
-    // `trace.tasks AS tasks` (migration-167). Hydrate the trace blob (and tasks
-    // for the legacy, non-split path) from the canonical `execution` row so the
-    // response shape is unchanged. Single point-lookup by record id.
-    try {
-      const blobRows = await surrealDB.query<any>(
-        `SELECT trace, trace.tasks AS tasks FROM type::thing('execution', $eid) LIMIT 1`,
-        { eid: (trace as any).execution_id || executionId },
-      );
-      const b = Array.isArray(blobRows) ? blobRows[0] : undefined;
-      if (b) {
-        (trace as any).execution_trace = b.trace ?? (trace as any).execution_trace ?? null;
-        if (contentSource !== 'split' && !(Array.isArray((trace as any).tasks) && (trace as any).tasks.length > 0)) {
-          (trace as any).tasks = Array.isArray(b.tasks) ? b.tasks : [];
-        }
-      }
-    } catch (blobErr) {
-      logger.warn('trace blob hydrate failed', { executionId, err: blobErr instanceof Error ? blobErr.message : String(blobErr) });
-    }
-
-    // Return trace with optional selection data
-    // Ensure execution_id is populated (use SurrealDB id as fallback for legacy data)
-    const traceNormalized: any = {
-      ...trace,
-      ...(contentSource === 'split' ? contentOverride : {}),
-      execution_id: trace.execution_id || (trace as any).id?.toString().split(':')[1] || (trace as any).id,
-      selection_attribution: selectionData,
-      content_source: contentSource,
-    };
-
-    // Read-time fallback: same contract as list handler.
-    const traceWithChain = await applyChainFallback(traceNormalized);
-
-    return c.json(traceWithChain);
-
-  } catch (error) {
-    logger.error('Failed to get execution trace', {
-      error: error instanceof Error ? error.message : String(error),
-    });
-
-    return c.json({
-      error: 'Failed to get execution trace',
-      message: error instanceof Error ? error.message : 'Unknown error',
-    }, 500);
-  }
-});
-
-/**
  * GET /v2/activities/execution-traces/selection-events
  *
  * List Thompson Sampling selection events for explainability dashboard (M4.1)
@@ -4184,6 +3953,246 @@ app.get('/calibration-summary', async (c) => {
 
     return c.json({
       error: 'Failed to fetch calibration summary',
+      message: error instanceof Error ? error.message : 'Unknown error',
+    }, 500);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Param route LAST. hono 4.x matches in registration order, so `/:executionId`
+// swallows every literal sibling registered after it — that is how
+// /selection-events, /selection-outcomes, /selection-calibration and
+// /calibration-summary all came to 404 with this handler's own
+// {"error":"Execution trace not found"} body. `/exemplars` escaped only
+// because it happens to be registered above. Keep this block below every
+// literal GET on this router.
+// ---------------------------------------------------------------------------
+/**
+ * GET /v2/activities/execution-traces/:executionId
+ *
+ * Get detailed information about a specific execution trace
+ * Enhanced with Thompson Sampling selection data for explainability (M4.2)
+ */
+app.get('/:executionId', async (c) => {
+  try {
+    const executionId = c.req.param('executionId');
+
+    // Fetch execution trace
+    const traceQuery = `
+      SELECT * FROM v_paradigm_execution_traces
+      WHERE execution_id = $execution_id
+      LIMIT 1
+    `;
+
+    const result = await surrealDB.query<ExecutionTrace>(traceQuery, {
+      execution_id: executionId,
+    });
+
+    logger.info('GET execution trace query result', {
+      executionId,
+      resultLength: result?.length || 0,
+      result: result,
+    });
+
+    // UNION-GAP FIX (2026-07-02, reason plane): the single-trace GET only
+    // consulted activity_execution_traces (wrappers keyed by the execution_id
+    // FIELD). ias-executor paradigm-walk executions land in the `execution`
+    // table keyed by RECORD ID (execution:<id>) with the execution_id field
+    // NULL — so `WHERE execution_id = $id` never matched them and template-walk
+    // traces 404'd here, leaving goal_reasoning with no per-task detail. Mirror
+    // the LIST path's paradigm union: fall back to the `execution` table by
+    // record id before declaring not-found. (Satisfier-only reaches persist no
+    // execution row at all — their reasoning lives in the goal-host walkLog.)
+    let traceRow: ExecutionTrace | undefined = result?.[0];
+    if (!traceRow) {
+      try {
+        const paradigmRows = await surrealDB.query<any>(
+          `SELECT * FROM type::thing('execution', $eid) LIMIT 1`,
+          { eid: executionId },
+        );
+        const p = paradigmRows?.[0];
+        if (p) {
+          const rowId = typeof p.id === 'string'
+            ? (p.id.includes(':') ? p.id.split(':').pop()!.replace(/[⟨⟩]/g, '') : p.id)
+            : String(p.id ?? '');
+          traceRow = {
+            ...p,
+            execution_id: p.execution_id || rowId || executionId,
+            activity_id: p.activity_id,
+            status: p.status,
+            created_at: p.created_at || p.executed_at,
+            error_message: p.error?.message ?? p.error_message,
+            tasks: p.trace?.tasks ?? p.tasks ?? [],
+          } as ExecutionTrace;
+          logger.info('[paradigm-union] single-GET fell back to paradigm execution table', { executionId });
+        }
+      } catch (paradigmError) {
+        logger.warn('[paradigm-union] single-GET paradigm fallback failed', {
+          executionId,
+          error: paradigmError instanceof Error ? paradigmError.message : String(paradigmError),
+        });
+      }
+    }
+
+    if (!traceRow) {
+      logger.warn('Execution trace not found in database', {
+        executionId,
+        params: { execution_id: executionId },
+      });
+      return c.json({
+        error: 'Execution trace not found',
+        execution_id: executionId,
+      }, 404);
+    }
+
+    const trace = traceRow;
+
+    // M4.2: Fetch Thompson Sampling selection data for explainability
+    // Priority: 1) correlation_id (exact match), 2) activity_id (approximate/most recent)
+    let selectionData = null;
+    try {
+      let selectionResult: {
+        thompson_sample: number;
+        alpha: number;
+        beta: number;
+        selection_method: string;
+        candidates_count: number | null;
+        selected_at: string;
+        correlation_id?: string;
+      }[] = [];
+
+      // First try exact match by correlation_id if the trace has one
+      if ((trace as any).correlation_id) {
+        const correlationQuery = `
+          SELECT
+            thompson_sample,
+            alpha,
+            beta,
+            selection_method,
+            candidates_count,
+            selected_at,
+            correlation_id
+          FROM thompson_selection_log
+          WHERE correlation_id = $correlation_id
+          LIMIT 1
+        `;
+        selectionResult = await surrealDB.query(correlationQuery, {
+          correlation_id: (trace as any).correlation_id,
+        });
+      }
+
+      // Fall back to activity_id match (most recent selection for this activity)
+      if (!selectionResult || selectionResult.length === 0) {
+        const activityQuery = `
+          SELECT
+            thompson_sample,
+            alpha,
+            beta,
+            selection_method,
+            candidates_count,
+            selected_at,
+            correlation_id
+          FROM thompson_selection_log
+          WHERE activity_id = $activity_id
+          ORDER BY selected_at DESC
+          LIMIT 1
+        `;
+        selectionResult = await surrealDB.query(activityQuery, {
+          activity_id: trace.activity_id || trace.variant_id,
+        });
+      }
+
+      if (selectionResult && selectionResult.length > 0) {
+        const sel = selectionResult[0];
+        selectionData = {
+          selection_probability: sel.thompson_sample,
+          selection_method: sel.selection_method,
+          alpha_at_selection: sel.alpha,
+          beta_at_selection: sel.beta,
+          candidates_count: sel.candidates_count,
+          selected_at: sel.selected_at,
+          // Include match type for debugging
+          match_type: (trace as any).correlation_id && sel.correlation_id === (trace as any).correlation_id
+            ? 'exact' : 'activity_fallback',
+        };
+      }
+    } catch (selectionError) {
+      // Don't fail the request if selection data fetch fails
+      logger.warn('Failed to fetch selection data', {
+        executionId,
+        error: selectionError instanceof Error ? selectionError.message : String(selectionError),
+      });
+    }
+
+    // Phase C: consult execution_trace_content first (split-write path).
+    // If absent, the inline AET fields carry the full payload (legacy path).
+    let contentSource: 'split' | 'legacy' = 'legacy';
+    let contentOverride: Record<string, unknown> = {};
+    try {
+      const contentRows = await surrealDB.query<{
+        tasks: unknown; state_snapshot: unknown; impulse_resolutions: unknown; output_impulses: unknown;
+      }>(`SELECT tasks, state_snapshot, impulse_resolutions, output_impulses FROM execution_trace_content WHERE execution_id = $eid LIMIT 1`, { eid: executionId });
+      if (contentRows && contentRows.length > 0) {
+        contentSource = 'split';
+        const cr = contentRows[0];
+        contentOverride = {
+          tasks: cr.tasks,
+          state_snapshot: cr.state_snapshot,
+          impulse_resolutions: cr.impulse_resolutions,
+          output_impulses: cr.output_impulses,
+        };
+      }
+    } catch (contentErr) {
+      logger.warn('execution_trace_content read failed; falling back to legacy AET fields', { executionId, err: contentErr instanceof Error ? contentErr.message : String(contentErr) });
+    }
+    if (contentSource === 'legacy') {
+      logger.info('trace content source: legacy (Phase D gate)', { executionId, content_source: contentSource });
+    } else {
+      logger.debug('trace content source', { executionId, content_source: contentSource });
+    }
+
+    // The v_paradigm compat view no longer carries `trace AS execution_trace` or
+    // `trace.tasks AS tasks` (migration-167). Hydrate the trace blob (and tasks
+    // for the legacy, non-split path) from the canonical `execution` row so the
+    // response shape is unchanged. Single point-lookup by record id.
+    try {
+      const blobRows = await surrealDB.query<any>(
+        `SELECT trace, trace.tasks AS tasks FROM type::thing('execution', $eid) LIMIT 1`,
+        { eid: (trace as any).execution_id || executionId },
+      );
+      const b = Array.isArray(blobRows) ? blobRows[0] : undefined;
+      if (b) {
+        (trace as any).execution_trace = b.trace ?? (trace as any).execution_trace ?? null;
+        if (contentSource !== 'split' && !(Array.isArray((trace as any).tasks) && (trace as any).tasks.length > 0)) {
+          (trace as any).tasks = Array.isArray(b.tasks) ? b.tasks : [];
+        }
+      }
+    } catch (blobErr) {
+      logger.warn('trace blob hydrate failed', { executionId, err: blobErr instanceof Error ? blobErr.message : String(blobErr) });
+    }
+
+    // Return trace with optional selection data
+    // Ensure execution_id is populated (use SurrealDB id as fallback for legacy data)
+    const traceNormalized: any = {
+      ...trace,
+      ...(contentSource === 'split' ? contentOverride : {}),
+      execution_id: trace.execution_id || (trace as any).id?.toString().split(':')[1] || (trace as any).id,
+      selection_attribution: selectionData,
+      content_source: contentSource,
+    };
+
+    // Read-time fallback: same contract as list handler.
+    const traceWithChain = await applyChainFallback(traceNormalized);
+
+    return c.json(traceWithChain);
+
+  } catch (error) {
+    logger.error('Failed to get execution trace', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+
+    return c.json({
+      error: 'Failed to get execution trace',
       message: error instanceof Error ? error.message : 'Unknown error',
     }, 500);
   }
