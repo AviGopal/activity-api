@@ -92,6 +92,41 @@ describe('trace-list cache — tenant isolation', () => {
     expect(ttl).toBeLessThanOrEqual(30_000);
   });
 
+  it('THE MEASURED FAILURE: a per-request timestamp must not poison the key', () => {
+    const s = source();
+    // The first version keyed on JSON.stringify(params) and hit ZERO times in three minutes
+    // against 60 queries, on a process that definitely had the code. `start_date` defaults to
+    // now-30d computed per request to the millisecond — 73 distinct values in 4 minutes — so
+    // every poll minted a fresh key and the cache was pure overhead.
+    expect(s).toContain('const keyParams =');
+    expect(s).toMatch(/Math\.floor\(t \/ TRACE_LIST_CACHE_TTL_MS\) \* TRACE_LIST_CACHE_TTL_MS/);
+    // And the key must be built from the bucketed copy, not the raw params.
+    expect(s).toMatch(/JSON\.stringify\(keyParams\)/);
+    expect(s).not.toMatch(/\|\$\{JSON\.stringify\(params\)\}`/);
+  });
+
+  it('the QUERY still receives the exact timestamp — bucketing is key-only', () => {
+    // If the quantised value ever reached `params`, the cache would silently change which
+    // rows the query returns. Only the key copy is rounded.
+    const s = source();
+    const i = s.indexOf('const keyParams =');
+    const block = s.slice(i, i + 600);
+    expect(block).toMatch(/keyParams\.start_date =/);
+    expect(block).not.toMatch(/[^y]params\.start_date =/);
+  });
+
+  it('BUCKETING PRESERVES A REAL RANGE DIFFERENCE', () => {
+    // A user picking a different window must not share a cache entry. 10s granularity is far
+    // finer than any range a human selects, so this only ever collapses machine-generated
+    // near-identical timestamps.
+    const TTL = 10_000;
+    const bucket = (iso: string) => Math.floor(Date.parse(iso) / TTL) * TTL;
+    // two polls ~5s apart -> same or adjacent bucket, and identical within a bucket
+    expect(bucket('2026-07-19T02:43:30.542Z')).toBe(bucket('2026-07-19T02:43:35.152Z'));
+    // a genuinely different range stays distinct
+    expect(bucket('2026-07-19T02:43:30.542Z')).not.toBe(bucket('2026-07-18T02:43:30.542Z'));
+  });
+
   it('NEGATIVE CONTROL: the key regex rejects a tenant-less key', () => {
     // Before trusting the assertion above, prove it would catch the dangerous form.
     const dangerous = 'const cacheKey = `${query}|${JSON.stringify(params)}`;';

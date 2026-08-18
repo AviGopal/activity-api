@@ -889,8 +889,26 @@ app.get('/', async (c) => {
     //
     // Deliberately in-memory and tiny: this is one process, the entries are one page each,
     // and a 10s TTL bounds staleness well under the human perception the dashboard wanted.
+    // ★ THE KEY MUST NOT CONTAIN A VALUE THAT CHANGES EVERY REQUEST. The first version of
+    //   this keyed on JSON.stringify(params) directly and NEVER HIT ONCE — measured 0 hits
+    //   against 60 queries in three minutes on a process that definitely had the code.
+    //   `start_date` defaults to now-30d computed per request, to the millisecond:
+    //       2026-07-19T02:43:30.542Z / :35.152Z / :40.350Z  — 73 distinct values in 4 minutes.
+    //   So every poll minted a fresh key and the cache was pure overhead.
+    //
+    //   Quantising it to the TTL boundary makes consecutive polls share a key while keeping
+    //   any genuinely different range (a user picking a window) distinct — 10s granularity is
+    //   far finer than any range a human selects. The QUERY still receives the exact
+    //   timestamp; only the key is bucketed, so this cannot change which rows are returned.
+    const keyParams = { ...params } as Record<string, unknown>;
+    if (typeof keyParams.start_date === 'string') {
+      const t = Date.parse(keyParams.start_date);
+      keyParams.start_date = Number.isNaN(t)
+        ? keyParams.start_date
+        : Math.floor(t / TRACE_LIST_CACHE_TTL_MS) * TRACE_LIST_CACHE_TTL_MS;
+    }
     const cacheKey = effectiveOrgId
-      ? `${effectiveOrgId}|${useJwtAuth ? 'jwt' : 'session'}|${query}|${JSON.stringify(params)}`
+      ? `${effectiveOrgId}|${useJwtAuth ? 'jwt' : 'session'}|${query}|${JSON.stringify(keyParams)}`
       : null;
     if (cacheKey) {
       const hit = traceListCache.get(cacheKey);
