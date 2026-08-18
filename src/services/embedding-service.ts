@@ -144,7 +144,7 @@ class VoyageEmbeddingProvider implements EmbeddingProvider {
   }
 
   async generateEmbeddings(texts: string[]): Promise<number[][]> {
-    const response = await fetch('https://api.voyageai.com/v1/embeddings', {
+    const response = await fetch(`${process.env.EMBEDDING_BASE_URL}/v1/embeddings`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${this.apiKey}`,
