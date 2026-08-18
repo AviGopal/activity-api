@@ -233,7 +233,10 @@ export function getEmbeddingProvider(): EmbeddingProvider | null {
   if (embeddingProvider) return embeddingProvider;
 
   const config = getEmbeddingConfig();
-  if (!config) return null;
+  if (!config) {
+    logger.warn('Embedding provider disabled: EMBEDDING_PROVIDER environment variable is not set or misconfigured.');
+    return null;
+  }
 
   try {
     embeddingProvider = createEmbeddingProvider(config);
