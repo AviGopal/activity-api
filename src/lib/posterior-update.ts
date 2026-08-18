@@ -425,6 +425,31 @@ export async function writeImpulseRelevancePenalty(
  *
  * All writes are best-effort — errors are logged at WARN and swallowed.
  */
+/**
+ * EMBEDDING_PRIOR_ENABLED, read as data rather than frozen at process start.
+ *
+ * Audit finding 3.8 (law 1). This flag selects WHICH PRIOR seeds a new cell — the θ-scored
+ * embedding prior or the concept-neighbour query — so it decides where every uninformed arm
+ * starts, which is squarely selection behaviour and squarely what law 1 says may not live in
+ * a constant the system cannot observe.
+ *
+ * Mirrors `successorBlendEnabled` in routes/activities.scoring.ts exactly (law 3 — the repo's
+ * established boolean-through-getTuningParam idiom, not a second one): env wins when set to a
+ * truthy literal, otherwise an authored `substrate_tuning_param` row decides, otherwise the
+ * documented default. With no row and no env — the shipped state — this returns false, which
+ * is byte-for-byte what `process.env.EMBEDDING_PRIOR_ENABLED === 'true'` returned.
+ *
+ * The env tier is deliberately kept: dropping it would be a behaviour change disguised as a
+ * law-1 fix, silently disabling the prior on every deployment that sets the var.
+ */
+async function embeddingPriorEnabled(): Promise<boolean> {
+  const raw = process.env.EMBEDDING_PRIOR_ENABLED;
+  if (raw === 'true' || raw === '1') return true;
+  // Number('true') is NaN, so a non-numeric env value cannot be misread as a tuning value —
+  // getTuningParam falls through to the default, which is the off state.
+  return (await getTuningParam('EMBEDDING_PRIOR_ENABLED', raw, 0)) >= 1;
+}
+
 async function writeAncestorDelta(
   ancestorId: string,
   alphaDelta: number,
@@ -478,7 +503,7 @@ async function writeAncestorDelta(
       // it through so seedPriorFromConcepts routes to the θ-scored prior
       // instead of the concept-neighbor query. Falls back gracefully on miss.
       let embedding: number[] | undefined;
-      if (process.env.EMBEDDING_PRIOR_ENABLED === 'true') {
+      if (await embeddingPriorEnabled()) {
         const e = await lookupEmbeddingForSignature(signature, orgId);
         if (e) embedding = e;
       }
@@ -909,7 +934,7 @@ export async function applyOutcomeToPosteriors(
       const CARDINALITY_CAP = parseInt(process.env.SIGNATURE_CARDINALITY_CAP ?? '200', 10);
       // M1 hook (concept_vugylIHzIMvk): same pattern as the chain-credit path.
       let embedding: number[] | undefined;
-      if (process.env.EMBEDDING_PRIOR_ENABLED === 'true' && trace.signature) {
+      if ((await embeddingPriorEnabled()) && trace.signature) {
         const e = await lookupEmbeddingForSignature(trace.signature, orgId);
         if (e) embedding = e;
       }
