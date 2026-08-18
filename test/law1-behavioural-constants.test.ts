@@ -48,7 +48,11 @@ describe('law 1 — EMBEDDING_PRIOR_ENABLED is read as data', () => {
 
   it('both consumers call the resolver', () => {
     const s = read('lib/posterior-update.ts');
-    const calls = (s.match(/await embeddingPriorEnabled\(\)/g) ?? []).length;
+    // NOT the awaited form. The resolver is SYNCHRONOUS on purpose: it reads a cache and
+    // refreshes out of band, because an awaited lookup can stall a CREDIT WRITE against an
+    // unreachable store. Asserting `await embeddingPriorEnabled()` would pin that defect back
+    // in — the test would enforce the very blocking call the fix removed.
+    const calls = (s.match(/if \(embeddingPriorEnabled\(\)/g) ?? []).length;
     // Fixing one of two sites is this repo's most-repeated failure; assert the count.
     expect(calls).toBe(2);
   });
@@ -84,11 +88,17 @@ describe('law 1 — EMBEDDING_PRIOR_ENABLED is read as data', () => {
 
   it('a lookup failure keeps the last value — it must not silently disable coalescing', () => {
     const s = readFileSync(SRC + 'lib/posterior-aggregator.ts', 'utf8');
+    // Single-flight + deadline: an unbounded lookup issued once per flush tick accumulates
+    // pending work forever against a store that hangs rather than refuses.
+    expect(s).toMatch(/coalesceRefreshInFlight/);
     // Coalescing matters MOST under load, which is also when a DB blip is likeliest. Flipping
     // it off on a failed read would reintroduce the conflict storm exactly when it hurts.
     const i = s.indexOf('async function refreshCoalesceSetting');
     expect(i).toBeGreaterThan(-1);
-    expect(s.slice(i, i + 700)).toMatch(/catch \{[\s\S]*keep the last known value/);
+    // 2200, not 700: the third time tonight a source-window assertion failed because the
+    // comment it was reading grew past the slice. An instrument that truncates its subject
+    // reports on the truncation.
+    expect(s.slice(i, i + 2200)).toMatch(/catch \{[\s\S]*keep the last known value/);
   });
 
   it('POSTERIOR_FLUSH_MS is PLUMBING, not a behavioural switch — classified, not ported', () => {

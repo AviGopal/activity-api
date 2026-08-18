@@ -442,13 +442,62 @@ export async function writeImpulseRelevancePenalty(
  * The env tier is deliberately kept: dropping it would be a behaviour change disguised as a
  * law-1 fix, silently disabling the prior on every deployment that sets the var.
  */
-async function embeddingPriorEnabled(): Promise<boolean> {
+let embeddingPriorCache: { value: boolean; expiresAt: number } | null = null;
+let embeddingPriorRefreshing = false;
+const EMBEDDING_PRIOR_TTL_MS = 30_000;
+
+/**
+ * Is the embedding prior enabled? NEVER BLOCKS, NEVER THROWS, NEVER TOUCHES THE DB INLINE.
+ *
+ * Two defects produced this shape, both mine, both caught by the convergence gate refusing to
+ * deploy the commit that carried them:
+ *
+ *  1. INJECTION. `getTuningParam` uses the module-level `surrealDB` singleton, while both call
+ *     sites sit in functions that receive an INJECTED `db`. Consulting it reached past the
+ *     dependency the caller had deliberately mocked.
+ *
+ *  2. BLOCKING — the one that actually mattered. With no reachable store the lookup did not
+ *     fail fast, it HUNG: `applyOutcomeToPosteriors` timed out after 5000ms. A policy flag had
+ *     acquired the power to stall a credit write, so the same store saturation that already
+ *     loses reach verdicts would now also stall the code path that records them. That is a
+ *     strictly worse failure than the one this flag was made configurable to help with.
+ *
+ * ★ A TUNING FLAG IS NOT DATA THE CALLER NEEDS TO BE CORRECT. It selects which prior seeds a
+ *   new cell; being one refresh window stale is harmless, and being unavailable must mean
+ *   "keep the last answer", never "wait" and never "fail". So the read is synchronous against
+ *   a cache, and the refresh happens OUT OF BAND with its own deadline, fire-and-forget.
+ *
+ * The env value remains the immediate answer when set, so the shipped configuration path never
+ * depends on the store at all.
+ */
+function embeddingPriorEnabled(): boolean {
   const raw = process.env.EMBEDDING_PRIOR_ENABLED;
   if (raw === 'true' || raw === '1') return true;
-  // Number('true') is NaN, so a non-numeric env value cannot be misread as a tuning value —
-  // getTuningParam falls through to the default, which is the off state.
-  return (await getTuningParam('EMBEDDING_PRIOR_ENABLED', raw, 0)) >= 1;
+
+  const now = Date.now();
+  if (!embeddingPriorCache || embeddingPriorCache.expiresAt <= now) {
+    // Kick a refresh and DO NOT await it. The current answer is returned either way.
+    if (!embeddingPriorRefreshing) {
+      embeddingPriorRefreshing = true;
+      void (async () => {
+        let value = embeddingPriorCache?.value ?? false;
+        try {
+          value = (await getTuningParam('EMBEDDING_PRIOR_ENABLED', raw, 0)) >= 1;
+        } catch {
+          // Keep the last known answer. An unreachable store must not silently switch which
+          // prior seeds every new cell.
+        } finally {
+          embeddingPriorCache = { value, expiresAt: Date.now() + EMBEDDING_PRIOR_TTL_MS };
+          embeddingPriorRefreshing = false;
+        }
+      })();
+    }
+  }
+  return embeddingPriorCache?.value ?? false;
 }
+
+/** Tests only — drop the cached verdict so a case can set the env and observe the change. */
+export function _resetEmbeddingPriorCache(): void { embeddingPriorCache = null; }
 
 async function writeAncestorDelta(
   ancestorId: string,
@@ -503,7 +552,7 @@ async function writeAncestorDelta(
       // it through so seedPriorFromConcepts routes to the θ-scored prior
       // instead of the concept-neighbor query. Falls back gracefully on miss.
       let embedding: number[] | undefined;
-      if (await embeddingPriorEnabled()) {
+      if (embeddingPriorEnabled()) {
         const e = await lookupEmbeddingForSignature(signature, orgId);
         if (e) embedding = e;
       }
@@ -934,7 +983,7 @@ export async function applyOutcomeToPosteriors(
       const CARDINALITY_CAP = parseInt(process.env.SIGNATURE_CARDINALITY_CAP ?? '200', 10);
       // M1 hook (concept_vugylIHzIMvk): same pattern as the chain-credit path.
       let embedding: number[] | undefined;
-      if ((await embeddingPriorEnabled()) && trace.signature) {
+      if (embeddingPriorEnabled() && trace.signature) {
         const e = await lookupEmbeddingForSignature(trace.signature, orgId);
         if (e) embedding = e;
       }

@@ -64,10 +64,27 @@ export async function getTuningParam(
     // NOTE: `value` is a reserved word in SurrealDB's SELECT grammar (it collides
     // with the VALUE projection clause), so it must be backtick-quoted and aliased
     // to a non-reserved name before it can be read as a plain column.
-    const rows = await surrealDB.query<{ param_value: number | null }>(
-      'SELECT `value` AS param_value FROM substrate_tuning_param WHERE name = $name LIMIT 1',
-      { name },
-    );
+    // ★ A TUNING LOOKUP NEEDS ITS OWN DEADLINE. `surrealDB.query` carries none, and against an
+    //   unreachable or saturated store it does not fail fast — it hangs. Every caller here is
+    //   asking for a POLICY VALUE with a documented fallback, so waiting is never the right
+    //   behaviour: the fallback is a correct answer and the cache already tolerates staleness.
+    //
+    //   Measured 2026-08-18: a refresh of POSTERIOR_COALESCE issued from the flush timer hung
+    //   on this query and stalled `applyOutcomeToPosteriors` past 5s — a policy read blocking
+    //   a CREDIT WRITE. The same store saturation that already loses reach verdicts would then
+    //   also stall the code path that records them.
+    //
+    //   1.5s is far above a healthy lookup (this table holds a handful of rows and answers in
+    //   single-digit ms) and far below any caller's tolerance for delay.
+    const rows = await Promise.race([
+      surrealDB.query<{ param_value: number | null }>(
+        'SELECT `value` AS param_value FROM substrate_tuning_param WHERE name = $name LIMIT 1',
+        { name },
+      ),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`tuning-param lookup exceeded deadline for '${name}'`)), 1_500),
+      ),
+    ]);
     if (rows && rows.length > 0 && typeof rows[0].param_value === 'number' && Number.isFinite(rows[0].param_value)) {
       tableValue = rows[0].param_value;
     }
