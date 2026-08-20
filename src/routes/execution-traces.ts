@@ -3274,7 +3274,18 @@ app.post('/', async (c) => {
           total_executions = (total_executions ?? 0) + 1,
           successful_executions = (successful_executions ?? 0) + $success_delta,
           failed_executions = (failed_executions ?? 0) + $failure_delta,
-          success_rate = ((successful_executions ?? 0) + $success_delta) / ((total_executions ?? 0) + 1),
+          -- <float> CAST IS LOAD-BEARING. successful_executions and total_executions are
+          -- both TYPE int, and SurrealQL int/int truncates — so this expression could only
+          -- ever yield 0 or 1. Measured on the live hub: every sampled success_rate is
+          -- exactly 0.0 or 1.0, with ZERO fractional values anywhere in the column.
+          --
+          -- It is not a cosmetic reporting error. services/task-generator.ts selects
+          -- a WHERE success_rate < threshold filter (:209), writes the number into goal text as
+          -- 'has N% success rate' (:254), and sets priority = critical when the rate is under 0.3 (:255). So an arm running at 98.6% truncates to 0 and the
+          -- substrate mints itself a CRITICAL goal asserting it has a 0% success rate —
+          -- false work, at top priority, continuously, about a healthy arm.
+          -- The same cast is already used correctly at :3598.
+          success_rate = (<float> ((successful_executions ?? 0) + $success_delta)) / (<float> ((total_executions ?? 0) + 1)),
           avg_duration_ms = (((avg_duration_ms ?? 0) * (total_executions ?? 0)) + $duration_ms) / ((total_executions ?? 0) + 1),
           avg_cost_usd = (((avg_cost_usd ?? 0) * (total_executions ?? 0)) + $cost) / ((total_executions ?? 0) + 1),
           last_executed_at = time::now(),
@@ -3292,7 +3303,9 @@ app.post('/', async (c) => {
           total_executions: 1,
           successful_executions: $success_delta,
           failed_executions: $failure_delta,
-          success_rate: $success_delta,
+          -- Seed as a float for the same reason: an INSERT of the int 1 or 0 starts the
+          -- row off in the binary regime even before the UPDATE above ever runs.
+          success_rate: <float> $success_delta,
           avg_duration_ms: $duration_ms,
           avg_cost_usd: $cost,
           thompson_alpha: $seed_alpha,
