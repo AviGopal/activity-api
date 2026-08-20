@@ -185,19 +185,45 @@ export async function runDiscoverByShapes(
   // sample-then-truncate, the correct order. The CONTAINSANY shape filter scans
   // every matching row regardless of LIMIT, so widening the cap barely changes
   // query cost.
-  const ADMISSION_CAP = 200;
+  //
+  // 2026-08-19: 200 was not a bounded superset for every shape. `patch_proposal`
+  // has 522 producers on the live hub — 2.6x the cap — so ~322 of them, including
+  // any learned high-posterior arm that is not recent, never reached the draw at
+  // all. That is precisely the recency truncation this comment says the cap exists
+  // to prevent, still happening for the one shape over cap. Raised to 1000, which
+  // covers the widest live family with headroom; the CONTAINSANY scan is unchanged
+  // by the LIMIT, so the cost argument above still holds.
+  const ADMISSION_CAP = 1000;
   const admissionLimit = Math.max(limit, ADMISSION_CAP);
   const params: Record<string, unknown> = { required_shapes, admission_limit: admissionLimit };
   if (predecessor_activity_id) params.predecessor_activity_id = predecessor_activity_id;
 
+  // ρ_sample: KEEP UNEXERCISED DRAFTS OUT OF THE DRAW.
+  //
+  // The filter admitted anything not `retired`, so `proposed = true` drafts — which
+  // activities.ts:508-513 and schemas.ts:250-253 both document as the quarantine flag
+  // for substrate-authored templates — competed at full rank against earned arms.
+  // Measured on the live hub: for the `patch` family, 26 of 28 candidates are untried
+  // and 14 draw at the uniform prior; the median max of 14 uniform draws is ~0.95, so a
+  // learned arm essentially never wins its own family. That is a sampling-drive defect,
+  // not an exploration policy: the draws are spent on arms nothing has ever graded.
+  //
+  // Exploration is NOT removed — proposed arms already have a first-run route via the
+  // `proposed-for-exercise` backlog, which is where a draft is supposed to earn its
+  // first observations. This only stops them diluting the ordinary draw.
+  //
+  // `proposed IS NONE` must be admitted: the flag is unset on the vast majority of rows
+  // (the ribosome write path never sets it), and excluding NONE would empty the pool.
+  const PROPOSED_EXCLUSION = ' AND (proposed = false OR proposed IS NONE)';
+
   let whereClause: string;
   if (queryMode === 'forward') {
-    whereClause = 'output_shapes CONTAINSANY $required_shapes AND (retired = false OR retired IS NONE)';
+    whereClause = 'output_shapes CONTAINSANY $required_shapes AND (retired = false OR retired IS NONE)' + PROPOSED_EXCLUSION;
   } else {
     const outputFilterClause = output_shapes.length > 0
       ? ' AND output_shapes CONTAINSANY $output_shapes_filter'
       : '';
-    whereClause = `input_shapes CONTAINSANY $required_shapes${outputFilterClause} AND (retired = false OR retired IS NONE)`;
+    whereClause = `input_shapes CONTAINSANY $required_shapes${outputFilterClause} AND (retired = false OR retired IS NONE)${PROPOSED_EXCLUSION}`;
     if (current_shapes.length > 0) params.current_shapes = current_shapes;
     if (output_shapes.length > 0) params.output_shapes_filter = output_shapes;
   }
