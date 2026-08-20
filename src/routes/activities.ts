@@ -6085,6 +6085,12 @@ app.post('/recommend', async (c) => {
     // < MIN_RATE) from being SELECTED TO RUN, regardless of chain-credit-inflated alpha or
     // declared output-shape coverage. Reversible: EMPIRICAL_BADNESS_FLOOR=0 restores prior.
     const EMPIRICAL_BADNESS_FLOOR_ENABLED = (await getTuningParam("EMPIRICAL_BADNESS_FLOOR", process.env.EMPIRICAL_BADNESS_FLOOR, 1)) >= 1;
+    // Shaped, not env-frozen (law 1) — this one IS a behaviour knob the system should be
+    // able to steer and roll back, unlike a one-shot interlock. Default ON: exit-status
+    // ranking is the measured defect, and leaving the fix dark by default would repeat
+    // the failure this whole tier is about — a correct mechanism that never runs.
+    // Set UCB_GRADED_MEAN=0 to fall back to the exit-status mean and compare reach rates.
+    const UCB_GRADED_MEAN = (await getTuningParam("UCB_GRADED_MEAN", process.env.UCB_GRADED_MEAN, 1)) >= 1;
     const EMPIRICAL_BADNESS_MIN_OBS = parseInt(process.env.EMPIRICAL_BADNESS_MIN_OBS ?? '20', 10);
     const EMPIRICAL_BADNESS_MIN_RATE = parseFloat(process.env.EMPIRICAL_BADNESS_MIN_RATE ?? '0.02');
     // The floor's GLOBAL honest counts come from `template.metrics`
@@ -6302,10 +6308,47 @@ app.post('/recommend', async (c) => {
     // UCB: total org executions derived from already-fetched scoresMap — no extra DB query
     const total_org_executions = Math.max(1, [...scoresMap.values()].reduce((sum, s) => sum + (s.total_executions ?? 0), 0));
 
-    function ucbScore(totalExecs: number, successes: number): number {
+    // THE MEAN COMES FROM THE GRADED POSTERIOR, NOT FROM EXIT STATUS.
+    //
+    // This took `successes` straight from v_activity_score — the count of executions
+    // that exited zero (021-paradigm-computed-views-v3.surql:29). The paradigm overlay
+    // (db/paradigm.ts:600-641) exists precisely to replace that signal with the honest
+    // reach grading and carries its own measurement in-comment: exit status is 92.4%
+    // green against 1.67% honest reach at n=41,600. But the overlay only replaces α and
+    // β, and UCB never read those — so the column the overlay exists to neutralize was
+    // the column ranking the exploitation pool, while the trace still labelled the pick
+    // `method: 'thompson_sampling'`.
+    //
+    // The exploration bonus keeps using the OBSERVATION count. n is "how much have we
+    // seen", which exit status reports correctly; only the value estimate was wrong.
+    function ucbScore(totalExecs: number, mean: number): number {
       const n = totalExecs;
-      const mean = n === 0 ? 0 : successes / n;
       return mean + Math.sqrt(2 * Math.log(total_org_executions) / Math.max(n, 1));
+    }
+    /**
+     * The value estimate for UCB, graded where a real posterior exists.
+     *
+     * COLD-ARM HAZARD, handled deliberately. α and β default to 1.0 when a template has
+     * no posterior row, so a naive α/(α+β) hands every untried arm a mean of 0.5 — where
+     * today it gets 0.0 (n === 0 → mean 0). That single line would promote the entire
+     * cold population above every arm with a measured sub-50% record, which on this
+     * fleet is most of them. So a graded mean is used ONLY when the posterior is real;
+     * otherwise the previous exit-status expression is preserved exactly, including its
+     * n === 0 → 0 behaviour.
+     *
+     * `hasPosterior` tests the SCORES row, not the defaulted locals, because the locals
+     * are indistinguishable from a genuine Beta(1,1).
+     */
+    function ucbMean(
+      s: { alpha?: number | null; beta?: number | null; total_executions?: number; successes?: number } | undefined,
+      graded: boolean,
+    ): number {
+      const n = s?.total_executions ?? 0;
+      const legacy = n === 0 ? 0 : (s?.successes ?? 0) / n;
+      if (!graded) return legacy;
+      const a = s?.alpha, b = s?.beta;
+      const hasPosterior = typeof a === 'number' && typeof b === 'number' && a + b > 0;
+      return hasPosterior ? a / (a + b) : legacy;
     }
 
     // Apply Thompson Sampling with heuristic prior boosting
@@ -6609,8 +6652,7 @@ app.post('/recommend', async (c) => {
         }
 
         const rawTotalExecs = scores?.total_executions ?? 0;
-        const rawSuccesses = scores?.successes ?? 0;
-        const computed_ucb_score = ucbScore(rawTotalExecs, rawSuccesses);
+        const computed_ucb_score = ucbScore(rawTotalExecs, ucbMean(scores, UCB_GRADED_MEAN));
 
         return {
           template_id: activityId,
@@ -6636,6 +6678,25 @@ app.post('/recommend', async (c) => {
           exploration: false, // patched after pool partitioning
           pool_signature: stateSpaceSig ?? null,
           signature_observations: sigRow?.n_observations ?? 0,
+          // TOP-LEVEL POSTERIOR — the consumer cannot see selection_metadata.
+          //
+          // goal-host's readCandidateShapes reads `x.alpha ?? x.thompson_alpha ??
+          // x.metrics?.thompson_alpha` and `x.sampled_score ?? x.sampledScore ??
+          // x.thompson_score ?? x.score`. It does not read `selection_metadata` — zero
+          // occurrences of that key across its entire src. So every recommend-sourced
+          // WalkCandidate arrived with alpha/beta/sampledScore undefined and two gates
+          // could not fire: the proven-bad-composite rejection, and scaffoldRank's -1
+          // learned-pathway reuse promotion. The posterior was computed, serialized,
+          // shipped, and annihilated in transit — which is the mechanism by which
+          // learning is supposed to COMPOUND, so this is a λ₁ defect, not a cosmetic one.
+          //
+          // Mirrors discover-by-shapes.ts:288-299, whose comment already names
+          // readCandidateShapes as the consumer and does exactly this. selection_metadata
+          // is left untouched: it is the observability record, and the SF-blend re-sort
+          // below reads `rec.selection_metadata.score`.
+          alpha: alphaBlended,
+          beta: betaBlended,
+          sampled_score: sample,
           selection_metadata: {
             method: 'thompson_sampling',
             score_source: posteriorSource,
