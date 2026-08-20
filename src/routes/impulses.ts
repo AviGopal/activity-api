@@ -32,6 +32,9 @@ import {
 } from '../services/impulse-formatters';
 import { getJwtAuthFromContext, type JwtAuthContext } from '../middleware/jwtAuth';
 import { normalizeRecordId } from '../utils/surrealdb-types';
+// The SAME normalizer the posterior WRITE path uses (posterior-update.ts:825).
+// Reads were not normalizing, so `activity:foo` and `foo` were different keys.
+import { normalizeActivityId } from '../db/paradigm';
 import activitiesRouter, { accountIdScopedWhere } from './activities';
 import executionTracesRouter from './execution-traces';
 import { runTemplateAuditReport, type TemplateAuditInput } from './template-audit';
@@ -1460,8 +1463,18 @@ router.post('/resolve', async (c) => {
         // Confidence interval is left to the caller (workbench computes it
         // from α/β client-side); the resolver returns the raw posterior so
         // selection-resolvers downstream can apply their own decision rule.
-        const variantId =
+        // NORMALIZE THE ID ON THE WAY IN. The write path has always normalized
+        // (posterior-update.ts:825 -> normalizeActivityId); this read did not, and
+        // goal-host publishes `selectedTemplateId` in the `activity:<name>` form.
+        // So the id printed on a dispatch record could not be used to read that
+        // dispatch's own posterior: measured live, same session, both HTTP 200 —
+        //   activity:proposed_pattern_authored_http_llm_file_chain -> a=1 b=1 n=0
+        //   proposed_pattern_authored_http_llm_file_chain          -> a=8.98 b=30.03 n=342
+        // A 342-execution arm and a never-tried arm returned as the same object.
+        const rawVariantId =
           (pointer as any).activity_variant_id || (pointer as any).activity_id;
+        const variantId =
+          typeof rawVariantId === 'string' ? normalizeActivityId(rawVariantId) : rawVariantId;
         if (!variantId || typeof variantId !== 'string') {
           return c.json(
             {
@@ -1549,6 +1562,43 @@ router.post('/resolve', async (c) => {
             if ((gr[0]?.total_executions ?? 0) > 0) { rows = gr; resolvedScope = 'global'; }
           }
         }
+        // A MISS MUST BE LOUD. This used to substitute {alpha:1, beta:1, n:0} and
+        // still answer `loaded: true`, so THREE distinct states shared one
+        // indistinguishable response: no such activity at all / a registered arm
+        // that has never run / a real global baseline that happens to be uniform.
+        // `scope` does not discriminate them — both scope branches above are gated
+        // on total_executions > 0, so a miss always reports scope:"global".
+        //
+        // That silence is load-bearing, not cosmetic: a fabricated Beta(1,1) is the
+        // MAXIMALLY EXPLORABLE posterior, so a key miss does not read as an error —
+        // it reads as an enticing untried arm. This shape is the canonical
+        // credit-flow read in the operator access recipes, and an audit of the
+        // learning loop performed through it would score a typo as a virgin arm.
+        //
+        // The sibling shapes over the same table already answer loudly for an
+        // unknown id (activityMetrics -> 404, activityTemplate -> 404). We keep 200
+        // here on purpose — workbench's useVariantScores renders posteriors for
+        // arbitrary activities including legitimately untried ones, and a 404 there
+        // would turn "never run yet" into an error banner — but the response now
+        // says which of the three states it is, and `loaded` is false when the
+        // numbers are a prior rather than a measurement.
+        const rowFound = rows.length > 0;
+        let posteriorSource: 'stored' | 'untried' | 'unknown' = 'stored';
+        if (!rowFound) {
+          // Distinguish "registered but never graded" from "no such arm". One
+          // cheap existence probe; failure to answer is reported as unknown
+          // rather than guessed.
+          try {
+            const existsRows = await executeAsAuth<any>(
+              jwtAuthCtx,
+              `SELECT count() AS n FROM activity WHERE id = $variant_id OR name = $variant_id GROUP ALL`,
+              params,
+            );
+            posteriorSource = (existsRows[0]?.n ?? 0) > 0 ? 'untried' : 'unknown';
+          } catch {
+            posteriorSource = 'unknown';
+          }
+        }
         const row = rows[0] || {
           total_executions: 0,
           success_count: 0,
@@ -1582,9 +1632,13 @@ router.post('/resolve', async (c) => {
 
         content = JSON.stringify(
           {
-            loaded: true,
+            // false when the numbers below are a PRIOR, not a measurement.
+            loaded: rowFound,
             metadata: {
               activity_variant_id: variantId,
+              ...(typeof rawVariantId === 'string' && rawVariantId !== variantId
+                ? { requested_id: rawVariantId }
+                : {}),
               ...(shapeSig ? { shape_signature: shapeSig } : {}),
               ...(contextBucket ? { context_bucket: contextBucket } : {}),
             },
@@ -1604,6 +1658,12 @@ router.post('/resolve', async (c) => {
               signatures_aggregated: signaturesAggregated,
               signature_version: signatureVersion,
               scope: resolvedScope,
+              //   posterior_source: "stored"  = these are measured numbers
+              //                     "untried" = arm exists, has never been graded
+              //                     "unknown" = no such arm; you probably mis-keyed
+              // Read this BEFORE trusting alpha/beta. scope cannot tell you.
+              posterior_source: posteriorSource,
+              row_found: rowFound,
             },
           },
           null,
