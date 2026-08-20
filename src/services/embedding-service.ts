@@ -39,9 +39,7 @@ export interface EmbeddingConfig {
 export function getEmbeddingConfig(): EmbeddingConfig | null {
   const provider = process.env.EMBEDDING_PROVIDER;
   if (!provider) {
-    // No action taken as EMBEDDING_PROVIDER is not set
-    return null;
-
+    logger.warn('EMBEDDING_PROVIDER environment variable not set. Embedding service disabled.');
     return null;
   }
 
