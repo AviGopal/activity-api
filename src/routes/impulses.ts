@@ -1589,9 +1589,16 @@ router.post('/resolve', async (c) => {
           // cheap existence probe; failure to answer is reported as unknown
           // rather than guessed.
           try {
+            // `meta::id(id)`, NOT a bare `id = $variant_id`. SurrealDB compares a full
+            // record id (`activity:⟨feature_compose⟩`) against a plain string and never
+            // matches — the same silent-empty defect getVariantFamily documents at
+            // paradigm.ts:1958-1964, which is why every variant-family query once
+            // returned []. Writing this probe the bare way would have made it report
+            // "unknown" for every arm that exists, i.e. a new lying instrument inside
+            // the commit that exists to remove one.
             const existsRows = await executeAsAuth<any>(
               jwtAuthCtx,
-              `SELECT count() AS n FROM activity WHERE id = $variant_id OR name = $variant_id GROUP ALL`,
+              `SELECT count() AS n FROM activity WHERE meta::id(id) = $variant_id OR name = $variant_id GROUP ALL`,
               params,
             );
             posteriorSource = (existsRows[0]?.n ?? 0) > 0 ? 'untried' : 'unknown';
