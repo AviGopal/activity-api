@@ -1437,6 +1437,51 @@ router.post('/resolve', async (c) => {
         }
       }
 
+      // Latest shaped observation(s) about the substrate's own dynamics — the
+      // stability inequality (kind='stability') and the learning-liveness probe
+      // (kind='learning_liveness'). Written by POST /v2/activities/observable.
+      //
+      // Read-only and deliberately dumb: this shape does not RECOMPUTE anything. The
+      // producers own their arithmetic; making the reader re-derive λ₁ would create a
+      // second definition of the inequality, and there are already two disagreeing
+      // ones in the fleet. One writer, one number, one name.
+      case 'substrateObservable': {
+        const kind = typeof (pointer as any).kind === 'string' ? (pointer as any).kind : null;
+        const rawLimit = Number((pointer as any).limit);
+        const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 200) : 1;
+        let obsRows: any[] = [];
+        try {
+          obsRows = await executeAsAuth<any>(
+            jwtAuthCtx,
+            `SELECT kind, observed_at, body FROM substrate_observable
+             ${kind ? 'WHERE kind = $kind' : ''}
+             ORDER BY observed_at DESC LIMIT $limit`,
+            { kind, limit },
+          );
+        } catch {
+          // Table absent until the first write — an empty answer with `available:false`
+          // is the honest response, and is NOT the same as "the inequality does not hold".
+          obsRows = [];
+        }
+        content = JSON.stringify(
+          {
+            loaded: obsRows.length > 0,
+            metadata: { kind: kind ?? 'all', returned: obsRows.length },
+            content: {
+              // available:false means NOBODY HAS WRITTEN ONE YET. Distinguishing this
+              // from a real reading is the whole lesson of thompson_posterior's
+              // fabricated Beta(1,1): an absent measurement must never be dressed as a
+              // measurement.
+              available: obsRows.length > 0,
+              observations: obsRows,
+            },
+          },
+          null,
+          2,
+        );
+        break;
+      }
+
       case 'thompson_posterior': {
         // Phase 9: routable shape for per-variant Thompson posteriors. Lifts
         // the implicit Thompson vessel inside activity-api into the standard

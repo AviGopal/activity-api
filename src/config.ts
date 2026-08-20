@@ -268,6 +268,17 @@ export function loadConfig(): Config {
         // Summary aggregates across variants; thompson_posterior is per-
         // variant precise). See docs/impulse-types/thompson_posterior.md.
         'thompson_posterior',
+        // LAW 1 FOR THE ARCHITECTURE'S OWN NUMBERS (2026-08-19).
+        // λ₁, ρ_grow and the stability headroom of SUBSTRATE_AS_DYNAMICS.md §3 were
+        // computed correctly by scripts/substrate/spectral-gap.ts and written only to
+        // /workspace/metrics/spectral-gap.jsonl — a file on one host, with no shape, no
+        // federation, and (grep-verified) no programmatic consumer anywhere. Meanwhile
+        // two live governors that call themselves "λ₁ ≥ ρ_grow" compute two DIFFERENT
+        // quantities. Until the real observables are readable through discovery, no
+        // claim about the convergence rate λ₁·ρ_sample·κ⁻¹ is falsifiable and "is it
+        // learning?" can only be answered anecdotally.
+        // Pointer: { type: 'substrateObservable', kind?: string, limit?: number }.
+        'substrateObservable',
         // Shaped-stream stage 1 (2026-07): poll-floor read over the WS
         // broadcaster's sequence-numbered event buffer.
         'eventStream',

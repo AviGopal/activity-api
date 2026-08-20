@@ -5237,6 +5237,46 @@ app.get('/family/:baseId', async (c) => {
  *
  * Updates impulse_shape_activity_score table for all shapes the activity handles.
  */
+/**
+ * POST /v2/activities/observable — publish one shaped observation about the
+ * substrate's own dynamics. Read back via the `substrateObservable` shape.
+ *
+ * Two producers today: scripts/substrate/spectral-gap.ts (kind='stability' — λ₁,
+ * ρ_grow, headroom, inequality_holds) and scripts/substrate/learning-liveness-probe.ts
+ * (kind='learning_liveness'). Both previously wrote to host-local files with no
+ * reader, which is why the architecture's own stability condition could not be
+ * queried and two governors could disagree about what it even meant.
+ *
+ * Deliberately generic and deliberately dumb: it stores what the producer computed.
+ * Re-deriving anything here would create a second definition of a number that
+ * already suffers from having two.
+ */
+app.post('/observable', async (c) => {
+  try {
+    const jwtAuth = getJwtAuthFromContext(c);
+    const session = (c.get as any)('session') as SessionData | undefined;
+    const orgId = jwtAuth?.orgId || session?.org_id || null;
+    if (!orgId) return c.json({ error: 'Unauthorized', message: 'Missing organization context' }, 401);
+
+    const body = await c.req.json().catch(() => null) as { kind?: unknown; body?: unknown } | null;
+    const kind = typeof body?.kind === 'string' && body.kind.trim().length > 0 ? body.kind.trim() : null;
+    if (!kind) return c.json({ error: 'kind is required' }, 400);
+    if (body?.body === undefined) return c.json({ error: 'body is required' }, 400);
+
+    await surrealDB.query(
+      `CREATE substrate_observable CONTENT {
+         kind: $kind, body: $obs, observed_at: time::now(),
+         org_id: $org_id, account_id: $account_id
+       }`,
+      { kind, obs: body.body, org_id: orgId, account_id: jwtAuth?.accountId ?? null },
+    );
+    return c.json({ stored: true, kind }, 201);
+  } catch (error: any) {
+    logger.error('POST /v2/activities/observable failed', { error: error.message });
+    return c.json({ error: 'Failed to store observation', message: error.message }, 500);
+  }
+});
+
 app.post('/feedback', async (c) => {
   c.header('x-complexity-probe-feedback', '1');
   try {
