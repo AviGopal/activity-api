@@ -1664,7 +1664,16 @@ export async function deriveCompositionEdgeFromParent(
       //   so it will miss forever and must not be read as ill health. An
       //   undifferentiated parent_miss cannot serve as a health signal while
       //   that population is mixed in.
-      const parentNotPersisted = /^walk-(satisfier|[a-z]+)-/.test(bareParent);
+      //   Two id NAMESPACES reach here and only one can ever resolve. A real
+      //   `execution` row's key is `exec_` + 8 chars (`exec_2p6n42ss`, sampled
+      //   live). Walk-internal ids — `walk-satisfier-*`, and the longer
+      //   hyphenated `exec_<uuid-ish>` form goal-host mints for steps that never
+      //   persist a row — are not execution keys at all, and looking them up
+      //   MUST miss. Counting those as lookup failures would make the counter
+      //   permanently non-zero and useless as a health signal, which is exactly
+      //   the trap the split exists to avoid.
+      const parentNotPersisted =
+        /^walk-/.test(bareParent) || !/^exec_[a-z0-9]{8}$/.test(bareParent);
       logger.warn('[composition-edge] parent_miss', {
         outcome: parentNotPersisted ? 'parent_not_persisted' : 'parent_lookup_miss',
         child_activity_id: childActivityId,
