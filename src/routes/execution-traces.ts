@@ -1628,27 +1628,45 @@ export async function deriveCompositionEdgeFromParent(
     ? parentExecutionId.split(':').pop()!.replace(/[⟨⟩]/g, '')
     : parentExecutionId;
   try {
-    // ★ READ THE LIVE TABLE, NOT THE SHADOW. This selected from
-    //   `activity_execution_traces`, which is a partial mirror: measured
-    //   18,135 rows against `execution`'s 150,003 (12%). The overwhelming
-    //   majority of parent lookups therefore missed, took the silent early
-    //   return below, and no edge was ever minted — every row in
-    //   activity_composition_graph came from the batch reconciler instead.
-    //   `execution` is the authoritative table the ingest path writes.
+    // ★ READ THE LIVE TABLE, BY ITS ACTUAL KEY. Two corrections in series here,
+    //   and the second was caught by the counter added alongside the first.
+    //
+    //   (1) This originally selected from `activity_execution_traces`, a partial
+    //       mirror: measured 18,135 rows against `execution`'s 150,003 (12%), so
+    //       ~88% of parent lookups missed and no edge was ever minted.
+    //   (2) Retargeting to `execution` with `WHERE execution_id = $pid` made it
+    //       WORSE — 100% miss, 186 parent_miss in 25 minutes with nothing else.
+    //       There is no `execution_id` FIELD on `execution`: the table keys by
+    //       RECORD ID, and the compat view synthesizes the column with
+    //       `meta::id(id) AS execution_id` (sql/schemas/022-paradigm-compat-views.surql:63)
+    //       precisely because it does not exist on the base table. A predicate on
+    //       an absent column matches nothing, silently.
+    //
+    //   `type::thing('execution', $pid)` addresses the row by the key the table
+    //   actually uses — which is what the `bareParent` normalization above was
+    //   always preparing for.
     const parentRows = await surrealDB.query<{ activity_id?: string }[]>(
-      `SELECT activity_id FROM execution WHERE execution_id = $pid LIMIT 1`,
+      `SELECT activity_id FROM type::thing('execution', $pid) LIMIT 1`,
       { pid: bareParent },
     );
     const parentActivityId = Array.isArray(parentRows)
       ? (parentRows.flat()[0] as { activity_id?: string } | undefined)?.activity_id
       : undefined;
     if (!parentActivityId) {
-      // ★ COUNT THE MISS. This was a bare `return`, so a lookup failure and a
-      //   successful mint were indistinguishable from outside — the journal
-      //   showed neither derive activity NOR errors, which read as "never
-      //   invoked" when in fact this fired on 66% of ingests and gave up here.
+      // ★ COUNT THE MISS, AND SPLIT IT BY CAUSE. This was a bare `return`, so a
+      //   lookup failure and a successful mint were indistinguishable from
+      //   outside — the journal showed neither derive activity NOR errors, which
+      //   read as "never invoked" when in fact this fired on ~66% of ingests and
+      //   gave up here.
+      //
+      //   The split matters because ONE cause is permanent and correct: a walk
+      //   satisfier parent (`walk-satisfier-*`) never persists an execution row,
+      //   so it will miss forever and must not be read as ill health. An
+      //   undifferentiated parent_miss cannot serve as a health signal while
+      //   that population is mixed in.
+      const parentNotPersisted = /^walk-(satisfier|[a-z]+)-/.test(bareParent);
       logger.warn('[composition-edge] parent_miss', {
-        outcome: 'parent_miss',
+        outcome: parentNotPersisted ? 'parent_not_persisted' : 'parent_lookup_miss',
         child_activity_id: childActivityId,
         parent_execution_id: parentExecutionId,
       });
@@ -1692,9 +1710,20 @@ export async function deriveCompositionEdgeFromParent(
     //   lookup that found its parent could not have written a row. `success` is
     //   the one easily missed: it was referenced inside IF() for the counters
     //   but never SET as a field in its own right.
+    // ★ MATCH THE DEDUPE KEY THE TABLE ALREADY USES. All 1,998 existing edges
+    //   carry the PREFIXED form on BOTH endpoints (`activity:⟨…⟩`, sampled from
+    //   the live graph). `parent_activity_id` comes off the execution row, which
+    //   is normalized bare at write; `child_activity_id` arrives prefixed. Left
+    //   as-is, a minted edge would land under a different (parent, child) key
+    //   than every reconciler edge for the same pair — splitting the family and
+    //   double-counting the posterior instead of sharpening it (law 3).
+    const asPrefixed = (id: string): string => {
+      const bare = id.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
+      return `activity:⟨${bare}⟩`;
+    };
     const params = {
-      parent: parentActivityId,
-      child: childActivityId,
+      parent: asPrefixed(parentActivityId),
+      child: asPrefixed(childActivityId),
       success,
       execution_id: childExecutionId ?? bareParent,
       org_id: orgId,
