@@ -6080,6 +6080,23 @@ app.post('/recommend', async (c) => {
     let contextScoresMap = new Map<string, { alpha: number; beta: number; n_observations: number }>();
     if (contextBucket && activityIds.length > 0) {
       try {
+        // ★ THE WRITE KEY AND THE READ KEY WERE DIFFERENT STRINGS. Credit writes
+        //   `template_id` through `normalizeActivityId`
+        //   (db/paradigm.ts:1932), which strips the `activity:` prefix AND the
+        //   ⟨⟩ brackets — so rows are stored BARE. `activityIds` comes from
+        //   `normalizeRecordId`, a string passthrough, so the ids bound here are
+        //   PREFIXED (`activity:⟨…⟩`, verified against live templates). `IN`
+        //   never matched, so every conditional posterior the learning loop
+        //   wrote — 4,545 rows on the probe stack — was addressable by nobody
+        //   and this map was always empty.
+        //
+        //   Query BOTH forms and key the map under both, so a caller holding
+        //   either form resolves. Normalizing only one side would silently
+        //   orphan whichever rows the other side wrote.
+        const bareIds = activityIds.map((id: string) =>
+          id.replace(/^activity:/, '').replace(/[⟨⟩`]/g, ''),
+        );
+        const idVariants = [...new Set([...activityIds, ...bareIds])];
         const ctxResult = await surrealDB.query<any>(`
           SELECT template_id, alpha, beta, n_observations, last_updated_at
           FROM context_thompson_scores
@@ -6088,17 +6105,29 @@ app.post('/recommend', async (c) => {
           org_id: orgId,
           account_id: jwtAuth?.accountId ?? null,
           bucket: contextBucket,
-          ids: activityIds,
+          ids: idVariants,
         });
 
         for (const row of (ctxResult || [])) {
           const decayedCtx = decayRow(row.alpha ?? 1, row.beta ?? 1, row.last_updated_at);
-          contextScoresMap.set(row.template_id, {
+          const entry = {
             alpha: decayedCtx.alpha,
             beta: decayedCtx.beta,
             n_observations: row.n_observations ?? 0,
-          });
+          };
+          const stored = String(row.template_id ?? '');
+          contextScoresMap.set(stored, entry);
+          const bare = stored.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
+          if (bare !== stored) contextScoresMap.set(bare, entry);
+          const prefixed = `activity:⟨${bare}⟩`;
+          if (prefixed !== stored) contextScoresMap.set(prefixed, entry);
         }
+        logger.info('context_thompson_scores lookup', {
+          event: 'cts_lookup',
+          requested: activityIds.length,
+          matched: contextScoresMap.size,
+          bucket: contextBucket,
+        });
       } catch (ctxErr: any) {
         logger.warn('context_thompson_scores lookup failed (non-blocking)', {
           error: ctxErr.message,
