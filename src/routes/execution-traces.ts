@@ -1607,22 +1607,60 @@ export async function deriveCompositionEdgeFromParent(
   parentExecutionId: string | undefined,
   success: boolean,
   jwtToken?: string,
+  /** The child's own execution id — becomes the edge's `execution_id` witness
+   *  ("last execution where this composition occurred"), so a fresh pair is
+   *  attributable to the run that earned it rather than to a batch job. */
+  childExecutionId?: string,
+  /** Tenant. `org_id` is a required, non-NONE column on this SCHEMAFULL table. */
+  orgId?: string,
 ): Promise<void> {
   if (!childActivityId || !parentExecutionId) return;
+  if (!orgId) {
+    logger.warn('[composition-edge] missing_org_id', {
+      outcome: 'missing_org_id',
+      child_activity_id: childActivityId,
+    });
+    return;
+  }
   // parent_execution_id may arrive bare or record-prefixed; reduce to the bare
   // id so type::thing('execution', $pid) resolves the live row.
   const bareParent = parentExecutionId.includes(':')
     ? parentExecutionId.split(':').pop()!.replace(/[⟨⟩]/g, '')
     : parentExecutionId;
   try {
+    // ★ READ THE LIVE TABLE, NOT THE SHADOW. This selected from
+    //   `activity_execution_traces`, which is a partial mirror: measured
+    //   18,135 rows against `execution`'s 150,003 (12%). The overwhelming
+    //   majority of parent lookups therefore missed, took the silent early
+    //   return below, and no edge was ever minted — every row in
+    //   activity_composition_graph came from the batch reconciler instead.
+    //   `execution` is the authoritative table the ingest path writes.
     const parentRows = await surrealDB.query<{ activity_id?: string }[]>(
-      `SELECT activity_id FROM activity_execution_traces WHERE execution_id = $pid LIMIT 1`,
+      `SELECT activity_id FROM execution WHERE execution_id = $pid LIMIT 1`,
       { pid: bareParent },
     );
     const parentActivityId = Array.isArray(parentRows)
       ? (parentRows.flat()[0] as { activity_id?: string } | undefined)?.activity_id
       : undefined;
-    if (!parentActivityId || parentActivityId === childActivityId) return;
+    if (!parentActivityId) {
+      // ★ COUNT THE MISS. This was a bare `return`, so a lookup failure and a
+      //   successful mint were indistinguishable from outside — the journal
+      //   showed neither derive activity NOR errors, which read as "never
+      //   invoked" when in fact this fired on 66% of ingests and gave up here.
+      logger.warn('[composition-edge] parent_miss', {
+        outcome: 'parent_miss',
+        child_activity_id: childActivityId,
+        parent_execution_id: parentExecutionId,
+      });
+      return;
+    }
+    if (parentActivityId === childActivityId) {
+      logger.info('[composition-edge] self_edge_skipped', {
+        outcome: 'self_edge_skipped',
+        activity_id: childActivityId,
+      });
+      return;
+    }
     const upsertSql = `
         LET $existing = (SELECT * FROM activity_composition_graph
           WHERE parent_activity_id = $parent AND child_activity_id = $child LIMIT 1);
@@ -1637,6 +1675,9 @@ export async function deriveCompositionEdgeFromParent(
           CREATE activity_composition_graph SET
             parent_activity_id = $parent,
             child_activity_id = $child,
+            execution_id = $execution_id,
+            org_id = $org_id,
+            success = $success,
             execution_count = 1,
             success_count = IF($success, 1, 0),
             weight = IF($success, 1.0, 0.0),
@@ -1644,12 +1685,30 @@ export async function deriveCompositionEdgeFromParent(
             updated_at = time::now()
         ) END;
       `;
-    const params = { parent: parentActivityId, child: childActivityId, success };
+    // ★ BIND EVERY REQUIRED COLUMN. activity_composition_graph is SCHEMAFULL and
+    //   `execution_id`, `success` (sql/002-learning-system-phase1.surql:29,36)
+    //   and `org_id` (migrations/031:45) all carry `ASSERT $value != NONE` with
+    //   no VALUE/DEFAULT clause. The CREATE bound none of them, so even a
+    //   lookup that found its parent could not have written a row. `success` is
+    //   the one easily missed: it was referenced inside IF() for the counters
+    //   but never SET as a field in its own right.
+    const params = {
+      parent: parentActivityId,
+      child: childActivityId,
+      success,
+      execution_id: childExecutionId ?? bareParent,
+      org_id: orgId,
+    };
     if (jwtToken) {
       await queryWithAuth(jwtToken, upsertSql, params);
     } else {
       await surrealDB.query(upsertSql, params);
     }
+    logger.info('[composition-edge] derive_ok', {
+      outcome: 'derive_ok',
+      parent_activity_id: parentActivityId,
+      child_activity_id: childActivityId,
+    });
   } catch (err) {
     logger.warn('[composition-edge] derive-from-parent failed (non-blocking)', {
       child_activity_id: childActivityId,
@@ -2363,7 +2422,18 @@ app.post('/', async (c) => {
         body.parent_execution_id as string | undefined,
         trace.success === true,
         jwtAuth?.jwtToken,
-      ).catch(() => {});
+        trace.execution_id as string | undefined,
+        (trace.org_id as string | null | undefined) ?? undefined,
+        // ★ `.catch(() => {})` swallowed every failure here. Combined with the
+        //   bare early-return inside, the journal showed neither derive activity
+        //   NOR errors — which reads as "never invoked" when in fact this fires
+        //   on ~66% of ingests (measured) and was giving up on a parent lookup
+        //   against a 12%-populated shadow table. Log it.
+      ).catch((e) => logger.warn('[composition-edge] derive dispatch failed', {
+        outcome: 'dispatch_failed',
+        execution_id: trace.execution_id,
+        error: e instanceof Error ? e.message : String(e),
+      }));
     }
 
     // Emit fine-grained WebSocket events for real-time execution visualization
