@@ -6218,6 +6218,17 @@ app.post('/recommend', async (c) => {
           missing: [],  // blocking_shapes computed later; signature uses present pool
         });
 
+        // ★ SAME ID-FORM MISMATCH AS THE LEGACY BUCKET LOOKUP ABOVE. This is the
+        //   reader whose KEY is correct — a 16-hex state-space signature derived
+        //   server-side "byte-identical to the write path" — but it binds
+        //   `activityIds` (PREFIXED `activity:⟨…⟩`) against rows whose
+        //   `template_id` the writer stored BARE via normalizeActivityId
+        //   (db/paradigm.ts:1932). Right key, wrong id form, so `IN` matched
+        //   nothing and the conditional posterior never overrode the global.
+        const sigBareIds = activityIds.map((id: string) =>
+          id.replace(/^activity:/, '').replace(/[⟨⟩`]/g, ''),
+        );
+        const sigIdVariants = [...new Set([...activityIds, ...sigBareIds])];
         const sigResult = await surrealDB.query<any>(`
           SELECT template_id, alpha, beta, n_observations, last_updated_at
           FROM context_thompson_scores
@@ -6225,12 +6236,22 @@ app.post('/recommend', async (c) => {
         `, {
           org_id: orgId,
           sig: stateSpaceSig,
-          ids: activityIds,
+          ids: sigIdVariants,
         });
 
         for (const row of (sigResult || [])) {
           if (row.template_id) {
             const decayedSig = decayRow(row.alpha ?? 1, row.beta ?? 1, row.last_updated_at);
+            // Key under both forms so a caller holding either resolves.
+            const storedSigId = String(row.template_id);
+            const bareSigId = storedSigId.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
+            for (const k of new Set([storedSigId, bareSigId, `activity:⟨${bareSigId}⟩`])) {
+              sigScoresMap.set(k, {
+                alpha: decayedSig.alpha,
+                beta: decayedSig.beta,
+                n_observations: row.n_observations ?? 0,
+              });
+            }
             sigScoresMap.set(row.template_id, {
               alpha: decayedSig.alpha,
               beta: decayedSig.beta,
