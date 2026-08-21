@@ -697,17 +697,10 @@ const SIGNATURE_CLUSTER_INTERVAL_MS = parseInt(
   process.env.SIGNATURE_CLUSTER_INTERVAL_MS ?? String(6 * 60 * 60 * 1000), 10, // 6h
 );
 
-import('./jobs/accelerator-flag-tick').then(({ runAcceleratorFlagTick }) => {
-  setTimeout(() => {
-    void runAcceleratorFlagTick().catch(err => logger.warn('[FlagPolicy] initial tick failed', { error: String(err) }));
-  }, 10 * 60 * 1000);
-  setInterval(() => {
-    void runAcceleratorFlagTick().catch(err => logger.warn('[FlagPolicy] periodic tick failed', { error: String(err) }));
-  }, parseInt(process.env.ACCELERATOR_FLAG_INTERVAL_MS ?? String(60 * 60 * 1000), 10));
-}).catch(err => {
-  logger.error('[FlagPolicy] Failed to load accelerator-flag-tick job', { error: String(err) });
-});
-
+// Scheduled ONCE. This block was present verbatim twice, so every flag decision
+// ran and logged twice per tick — which is why the SF_BLEND evidence line always
+// appeared in pairs. Harmless while the write was a silent no-op; a race on the
+// UPSERT now that writes actually land.
 import('./jobs/accelerator-flag-tick').then(({ runAcceleratorFlagTick }) => {
   setTimeout(() => {
     void runAcceleratorFlagTick().catch(err => logger.warn('[FlagPolicy] initial tick failed', { error: String(err) }));

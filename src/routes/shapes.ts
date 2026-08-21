@@ -254,6 +254,45 @@ app.post('/', async (c) => {
     // Phase B3: dual-write account_id alongside org_id. Public shapes leave
     // both null (visible to all tenants); private shapes carry both.
     // account_id_version=1 marks this row as Phase B dual-written.
+    // ★ NULL IS NOT NONE. org_id, account_id, changelog, migration_from and
+    //   created_by are all `option<string>` (migration 056). SurrealDB accepts
+    //   NONE and REJECTS NULL, so binding `null` for a PUBLIC shape — which is
+    //   exactly what "public shapes carry neither org nor account" means here —
+    //   made every public registration fail with
+    //   `Found NULL for field \`org_id\` ... but expected a option<string>`.
+    //   Measured 35 occurrences in 48h on the hub.
+    //
+    //   NONE is also the value the tenancy PERMISSIONS clauses test for
+    //   (`org_id IS NONE`, :17/:22/:26), so a NULL row would not be visible as
+    //   a public shape even if it were written.
+    //
+    //   Omit the key entirely rather than coalescing to null: an unbound field
+    //   in CONTENT is NONE.
+    const optionalFields: string[] = [];
+    const params: Record<string, unknown> = {
+      name: body.name,
+      version: body.version,
+      schema: body.schema,
+      description: body.description,
+      example: body.example,
+      tags: body.tags || [],
+      public: body.public !== undefined ? body.public : false,
+      account_id_version: 1,
+      breaking_changes: body.breaking_changes || [],
+    };
+    const addOptional = (field: string, value: unknown): void => {
+      if (typeof value !== 'string' || value.length === 0) return;
+      optionalFields.push(`${field}: $${field}`);
+      params[field] = value;
+    };
+    if (!body.public) {
+      addOptional('org_id', auth.orgId);
+      addOptional('account_id', auth.accountId);
+    }
+    addOptional('changelog', body.changelog);
+    addOptional('migration_from', body.migration_from);
+    addOptional('created_by', (auth as { userId?: string }).userId);
+
     const createQuery = `
       CREATE shape_definition CONTENT {
         name: $name,
@@ -263,35 +302,15 @@ app.post('/', async (c) => {
         example: $example,
         tags: $tags,
         public: $public,
-        org_id: $orgId,
-        account_id: $account_id,
         account_id_version: $account_id_version,
         deprecated: false,
         breaking_changes: $breaking_changes,
-        changelog: $changelog,
-        migration_from: $migration_from,
-        created_at: time::now(),
-        created_by: $userId
+        created_at: time::now()${optionalFields.length ? ',\n        ' + optionalFields.join(',\n        ') : ''}
       }
       RETURN id, name, version, created_at;
     `;
 
-    const results = await surrealDB.query<ShapeDefinition[]>(createQuery, {
-      name: body.name,
-      version: body.version,
-      schema: body.schema,
-      description: body.description,
-      example: body.example,
-      tags: body.tags || [],
-      public: body.public !== undefined ? body.public : false,
-      orgId: body.public ? null : auth.orgId,
-      account_id: body.public ? null : (auth.accountId ?? null),
-      account_id_version: 1,
-      breaking_changes: body.breaking_changes || [],
-      changelog: body.changelog || null,
-      migration_from: body.migration_from || null,
-      userId: (auth as any).userId || null,
-    });
+    const results = await surrealDB.query<ShapeDefinition[]>(createQuery, params);
 
     const result = results[0]?.[0];
     if (!result) {

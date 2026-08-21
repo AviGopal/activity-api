@@ -130,17 +130,52 @@ export async function writeTuningParam(
   }
   // UPSERT by the UNIQUE `name` key. `value` is backtick-quoted because it is a
   // reserved word in SurrealDB's statement grammar.
+  //
+  // ★ NULL IS NOT NONE. `updated_by` and `evidence` are `option<string>`
+  //   (migration 152). SurrealDB accepts NONE for those and REJECTS NULL — and
+  //   the two UPSERT branches diverge catastrophically on that rejection: the
+  //   UPDATE branch raises loudly, but the CREATE branch WRITES NOTHING AND
+  //   RAISES NOTHING, returning an empty result set. The awaited promise
+  //   resolves and the caller logs success over a row that does not exist.
+  //
+  //   Measured: accelerator-flag-tick calls this with no meta at all, so
+  //   SF_BLEND took the silent create branch on every hourly tick — logging
+  //   `flipped=true` forever while every reader resolved null -> default 0 and
+  //   psi blending stayed off. Reproduced on two independent deployments.
+  //
+  //   Fix: omit the keys entirely when absent (an unbound param is NONE) rather
+  //   than coalescing to null.
+  const params: Record<string, unknown> = { name, value };
+  const assignments = ['name = $name', '`value` = $value', 'updated_at = time::now()'];
+  if (typeof meta.updated_by === 'string') {
+    assignments.push('updated_by = $updated_by');
+    params.updated_by = meta.updated_by;
+  }
+  if (typeof meta.evidence === 'string') {
+    assignments.push('evidence = $evidence');
+    params.evidence = meta.evidence;
+  }
   await surrealDB.query(
-    'UPSERT substrate_tuning_param SET name = $name, `value` = $value, updated_at = time::now(), updated_by = $updated_by, evidence = $evidence WHERE name = $name',
-    {
-      name,
-      value,
-      updated_by: meta.updated_by ?? null,
-      evidence: meta.evidence ?? null,
-    },
+    `UPSERT substrate_tuning_param SET ${assignments.join(', ')} WHERE name = $name`,
+    params,
   );
   // Drop just this param's cache entry so the next getTuningParam observes it.
   cache.delete(name);
+
+  // ★ READ BACK AND THROW ON MISMATCH. A write path that can silently no-op is
+  //   exactly how this defect survived: the only honest way to report success
+  //   is to observe the row. This is one extra indexed lookup on a table that
+  //   holds a handful of rows, on a path that runs hourly at most.
+  const check = await surrealDB.query<{ param_value: number | null }>(
+    'SELECT `value` AS param_value FROM substrate_tuning_param WHERE name = $name LIMIT 1',
+    { name },
+  );
+  const stored = check?.[0]?.param_value;
+  if (typeof stored !== 'number' || stored !== value) {
+    throw new Error(
+      `writeTuningParam: '${name}' did not persist (wrote ${value}, read back ${JSON.stringify(stored)})`,
+    );
+  }
 }
 
 /** Test hook — drop the cache so a freshly-authored row is observed immediately. */
