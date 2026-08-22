@@ -1769,14 +1769,16 @@ export async function deriveCompositionEdgeFromParent(
     }
     const upsertSql = `
         LET $existing = (SELECT * FROM activity_composition_graph
-          WHERE parent_activity_id = $parent AND child_activity_id = $child LIMIT 1);
+          WHERE (parent_activity_id = $parent OR parent_activity_id = $parent_bare)
+            AND (child_activity_id = $child OR child_activity_id = $child_bare) LIMIT 1);
         IF array::len($existing) > 0 THEN (
           UPDATE activity_composition_graph SET
             execution_count = execution_count + 1,
             success_count = (IF $success THEN success_count + 1 ELSE success_count END),
             weight = (IF $success THEN success_count + 1 ELSE success_count END) / (execution_count + 1),
             updated_at = time::now()
-          WHERE parent_activity_id = $parent AND child_activity_id = $child
+          WHERE (parent_activity_id = $parent OR parent_activity_id = $parent_bare)
+            AND (child_activity_id = $child OR child_activity_id = $child_bare)
         ) ELSE (
           CREATE activity_composition_graph SET
             parent_activity_id = $parent,
@@ -1812,6 +1814,8 @@ export async function deriveCompositionEdgeFromParent(
     const params = {
       parent: asPrefixed(parentActivityId),
       child: asPrefixed(childActivityId),
+      parent_bare: parentActivityId,
+      child_bare: childActivityId,
       success,
       execution_id: childExecutionId ?? bareParent,
       org_id: orgId,
@@ -1820,6 +1824,36 @@ export async function deriveCompositionEdgeFromParent(
       await queryWithAuth(jwtToken, upsertSql, params);
     } else {
       await surrealDB.query(upsertSql, params);
+    }
+    // ★ VERIFY THE ROW, DO NOT TRUST THE CALL. `derive_ok` was logged
+    //   unconditionally after the statement returned — which reports that the
+    //   call did not throw, not that an edge exists. Measured: 13 derive_ok with
+    //   the row count unmoved at 1999. That is this investigation's own defect
+    //   class reproduced inside its own instrument.
+    //
+    //   Read the pair back and report what actually happened. The stored data
+    //   mixes id forms (a live row carries parent `activity:⟨slot-binding⟩` with
+    //   child `validator-dispatch`), so an existence check on one form alone
+    //   both misses the UPDATE and cannot confirm the CREATE.
+    const verifyRows = await surrealDB.query<{ execution_count?: number }>(
+      `SELECT execution_count FROM activity_composition_graph
+         WHERE (parent_activity_id = $parent OR parent_activity_id = $parent_bare)
+           AND (child_activity_id = $child OR child_activity_id = $child_bare) LIMIT 1`,
+      {
+        parent: params.parent,
+        child: params.child,
+        parent_bare: parentActivityId,
+        child_bare: childActivityId,
+      },
+    );
+    const landed = Array.isArray(verifyRows) && (verifyRows as unknown[]).flat().length > 0;
+    if (!landed) {
+      logger.warn('[composition-edge] derive_wrote_nothing', {
+        outcome: 'derive_wrote_nothing',
+        parent_activity_id: params.parent,
+        child_activity_id: params.child,
+      });
+      return;
     }
     logger.info('[composition-edge] derive_ok', {
       outcome: 'derive_ok',
