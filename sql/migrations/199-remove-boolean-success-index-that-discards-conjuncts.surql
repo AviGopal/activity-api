@@ -1,0 +1,71 @@
+-- 199: REMOVE idx_execution_success — with it, `X AND success = true` DISCARDS `X`
+--
+-- URGENT CLASS: this is a latent data-loss risk, not a performance question.
+--
+-- Migration 198 removed the two composite `success` indexes because they returned ZERO for
+-- rows that existed. That was correct and it is not being reverted. But it exposed a worse
+-- behaviour underneath: with only the single-field `idx_execution_success` left to serve
+-- the boolean, the planner uses it and DROPS the conjoined filter entirely.
+--
+-- MEASURED 2026-08-22, immediately after 198 applied, on two unrelated activities:
+--
+--   global                                                      success = true   -> 8,167
+--
+--   activity_id='ribosome-extract'                              (total rows)     ->   123
+--   activity_id='ribosome-extract'  AND success = true                           -> 8,167   << global count
+--   activity_id='ribosome-extract'  AND success                                  ->   122   << correct
+--
+--   activity_id='validator-dispatch'                            (total rows)     -> 5,547
+--   activity_id='validator-dispatch' AND success = true                          -> 8,442   << exceeds the arm's OWN total
+--   activity_id='validator-dispatch' AND success                                 -> 5,547   << correct
+--
+-- A filtered count LARGER than the unfiltered count for the same activity is proof on its
+-- own. The equality predicate is answering a different question than the one asked: it
+-- returns the GLOBAL success count and ignores `activity_id` completely.
+--
+-- WHY THIS IS MORE DANGEROUS THAN WHAT 198 FIXED. Before 198 these call sites got 0 — wrong,
+-- but inert: a sweep that selects nothing deletes nothing. Now they get a large, plausible,
+-- GLOBAL row set. `src/lib/trace-retention.ts` filters strata with exactly this predicate
+-- (configured strata: validator-dispatch, slot-binding; defaultSuccessCap 600,
+-- defaultFailureCap 2000). A per-stratum delete driven by a global selection deletes across
+-- every stratum. Roughly 49 call sites in this repo use `AND success = <bool>`.
+--
+-- NOT CURRENTLY FIRING, and that is luck rather than design — verified in the live journal
+-- at 09:13:40, minutes after 198 applied:
+--
+--   WARN [trace-retention] over global ceiling — skipping stratum auto-discovery this
+--   cycle so the indexed valve is reached {"total":150086,"ceiling":150000,"surplus":86}
+--
+-- The table is above its ceiling, so the sweep takes the global time-ordered valve and
+-- never reaches the stratum path. The moment row_count drops below 150,000 the stratum
+-- deletes engage on a predicate that ignores which stratum it is in. Fixing it before that
+-- happens, not after.
+--
+-- THE HYPOTHESIS THIS RESTS ON, stated as one: the truthiness form `AND success` returns
+-- correct results *because it cannot be served from a boolean equality index* and therefore
+-- scans. Remove the last index over that column and `AND success = true` must scan too.
+-- That is an inference from the measurements above, not something this migration has
+-- observed — the observation requires the index to be gone.
+--
+-- VERIFY IMMEDIATELY AFTER APPLYING. All four must agree:
+--
+--   SELECT count() FROM execution WHERE activity_id='ribosome-extract';
+--   SELECT count() FROM execution WHERE activity_id='ribosome-extract' AND success = true;
+--   SELECT count() FROM execution WHERE activity_id='ribosome-extract' AND success;
+--   SELECT count() FROM execution WHERE activity_id='ribosome-extract' AND success != false;
+--
+-- The second must be <= the first, and must equal the third and fourth.
+--
+-- IF IT STILL DISAGREES, the defect is not indexable at all and the repair moves to the
+-- CALL SITES: every `AND success = true` becomes `AND success`, and every
+-- `AND success = false` becomes `AND success = false` verified against a scan first. Do NOT
+-- reinstate any index over `success` to make it fast again — every configuration tried so
+-- far has been fast and wrong, in two different directions.
+--
+-- COST: counting by success now scans. Global `success = true` measured 5.5 ms indexed; a
+-- scan of 150k rows measured ~226 ms elsewhere in this table. The time-ordered indexes the
+-- retention valve actually depends on are untouched.
+--
+-- No data is touched.
+
+REMOVE INDEX IF EXISTS idx_execution_success ON execution;
