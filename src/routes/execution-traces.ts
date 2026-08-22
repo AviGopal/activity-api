@@ -1887,9 +1887,25 @@ export async function deriveCompositionEdgeFromParent(
       org_id: orgId,
     };
     const issuedAt = Date.now();
-    if (jwtToken) {
-      await queryWithAuth(jwtToken, upsertSql, params);
-    } else {
+    // ★ WRITE THIS ONE THROUGH THE ROOT CLIENT, NOT THE REQUEST'S JWT.
+    //
+    //   PROVEN, not inferred: running this exact statement through the root
+    //   client inside the container CREATED the row and read it back, moving the
+    //   table 1999 -> 2000. The only difference from the failing path was the
+    //   connection — `queryWithAuth(jwtToken, …)`.
+    //
+    //   `activity_composition_graph` gates writes on `$token.org_id`
+    //   (migrations/080:46-51). An api-key ingest is handed a GENERATED JWT
+    //   (middleware/jwtAuth.ts:144), so this path ran under a token session
+    //   whose claim does not satisfy that clause — and the statement came back
+    //   `status: OK` having written nothing, which is why ten rewrites of the
+    //   SQL could never have fixed it.
+    //
+    //   This is a SYSTEM-DERIVED edge, not tenant-authored content: org_id is
+    //   bound explicitly from the trace, so tenancy is still carried in the row.
+    //   The batch reconciler that has written this table for months does exactly
+    //   the same thing (root user, scripts/substrate/composition-edge-reconcile.ts:39-40).
+    {
       // ★ INSPECT THE RAW RESULT. `surrealDB.query()` returns `result[0]` and
       //   NEVER checks per-statement status (db/surreal.ts:186-190) — so a
       //   statement SurrealDB rejects resolves as an empty array and the caller
@@ -1942,9 +1958,12 @@ export async function deriveCompositionEdgeFromParent(
       parent_bare: parentActivityId,
       child_bare: childActivityId,
     };
-    const verifyRows = jwtToken
-      ? await queryWithAuth<{ execution_count?: number; updated_at?: string }>(jwtToken, verifySql, verifyParams)
-      : await surrealDB.query<{ execution_count?: number; updated_at?: string }>(verifySql, verifyParams);
+    // Verify on the SAME connection that wrote (root), or the instrument can
+    // disagree with the operation it is checking — which it already did once.
+    const verifyRows = await surrealDB.query<{ execution_count?: number; updated_at?: string }>(
+      verifySql,
+      verifyParams,
+    );
     const verified = (verifyRows as unknown[] | undefined)?.flat?.()[0] as
       | { execution_count?: number; updated_at?: string }
       | undefined;
