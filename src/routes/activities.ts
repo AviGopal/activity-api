@@ -6122,11 +6122,33 @@ app.post('/recommend', async (c) => {
           const prefixed = `activity:⟨${bare}⟩`;
           if (prefixed !== stored) contextScoresMap.set(prefixed, entry);
         }
+        // ★ ONE COLUMN, TWO SUBJECTS — and this reader asks for the one nobody
+        //   writes. `context_bucket` is populated by the credit path with a
+        //   STATE-SPACE SIGNATURE: computeStateSpaceSignature, sha256 over
+        //   shapes|provenance|missing, `.digest().slice(0, 8)` = **16 hex**
+        //   (session-context.ts:161/181/185). This lookup asks for
+        //   computeContextBucket: sha256 over task-semantics|org|goal_cluster,
+        //   `.digest().slice(0, 4)` = **8 hex** (:201). Different algorithm,
+        //   different inputs, different WIDTH — no width fix could make them
+        //   meet, and measured live it is exactly what happens: bucket
+        //   `b832569e` (8 hex) against stored 16-hex rows, matched:0 on 23/23
+        //   then 17 more.
+        //
+        //   Kept, not deleted: its subject is not dead (2,120 rows, 246k
+        //   observations, still written), so removing the reader would discard a
+        //   live posterior. But it must not be MISTAKEN for a working
+        //   conditional lookup — `matched:0` here is structural, not evidence
+        //   that the conditional agreed with the global. The v1 signature-keyed
+        //   reader below is the one whose key can actually bind.
         logger.info('context_thompson_scores lookup', {
           event: 'cts_lookup',
           requested: activityIds.length,
           matched: contextScoresMap.size,
           bucket: contextBucket,
+          bucket_subject: 'task_semantics_8hex',
+          note: contextScoresMap.size === 0
+            ? 'structural zero: this reader keys on computeContextBucket (8 hex) while the credit path writes computeStateSpaceSignature (16 hex)'
+            : undefined,
         });
       } catch (ctxErr: any) {
         logger.warn('context_thompson_scores lookup failed (non-blocking)', {
@@ -6267,8 +6289,18 @@ app.post('/recommend', async (c) => {
           for (const [k, v] of repairBoostFromRows(repairRows || [])) repairScoresMap.set(k, v);
         } catch { /* non-fatal */ }
       }
-      logger.debug('v1 conditional posterior lookup', {
+      // ★ COUNTED AT INFO, NOT DEBUG. This is the read that decides whether the
+      //   conditional posterior ever overrides the global — the payoff of the
+      //   entire credit path — and it was logged at `debug` with debug disabled,
+      //   so ZERO of these lines have ever been emitted. A seam whose only
+      //   instrument is switched off is indistinguishable from a seam that
+      //   works: `hits:0` and "the conditional agreed with the global" look the
+      //   same from outside. Every defect found tonight was found by a counter
+      //   at the consumer; this is that counter for the highest-stakes seam.
+      logger.info('v1 conditional posterior lookup', {
+          event: 'cts_sig_lookup',
           sig: stateSpaceSig,
+          requested: activityIds.length,
           hits: sigScoresMap.size,
           floor: SIGNATURE_SAMPLING_FLOOR,
         });
