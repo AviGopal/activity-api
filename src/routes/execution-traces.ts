@@ -1845,16 +1845,26 @@ export async function deriveCompositionEdgeFromParent(
     const priorSuccess = Number(existingRow?.success_count ?? 0);
     const nextCount = priorCount + 1;
     const nextSuccess = priorSuccess + (success ? 1 : 0);
+    // ★ INTERPOLATE, AS THE WORKING WRITER DOES. This is the LAST remaining
+    //   difference from composition-edge-reconcile.ts:480, which has written
+    //   this table successfully for months: it builds the CONTENT body from
+    //   JSON.stringify'd literals, while this path bound $params. With every
+    //   other difference eliminated and the write still silently no-op'ing
+    //   (39 derive_wrote_nothing, no error, row untouched), the bindings not
+    //   reaching a CONTENT {} body is the remaining explanation.
+    //
+    //   Values are JSON.stringify'd, and every interpolated value here is
+    //   either a server-derived id, a boolean, or a number — never caller text.
     const upsertSql = `
         UPSERT activity_composition_graph:\`${edgeKey}\` CONTENT {
-          parent_activity_id: $parent,
-          child_activity_id: $child,
-          execution_id: $execution_id,
-          org_id: $org_id,
-          success: $success,
-          execution_count: $execution_count,
-          success_count: $success_count,
-          weight: $weight,
+          parent_activity_id: ${JSON.stringify(asPrefixed(parentActivityId))},
+          child_activity_id: ${JSON.stringify(asPrefixed(childActivityId))},
+          execution_id: ${JSON.stringify(childExecutionId ?? bareParent)},
+          org_id: ${JSON.stringify(orgId)},
+          success: ${success ? 'true' : 'false'},
+          execution_count: ${nextCount},
+          success_count: ${nextSuccess},
+          weight: ${nextCount > 0 ? nextSuccess / nextCount : 0},
           account_id_version: 0,
           edge_kind: 'derived',
           genuine: true,
