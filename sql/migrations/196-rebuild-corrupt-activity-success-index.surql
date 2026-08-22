@@ -1,0 +1,68 @@
+-- 196: rebuild idx_execution_activity_success_time — it returns ZERO for rows that exist
+--
+-- This is not a performance migration. The index is returning WRONG ANSWERS.
+--
+-- MEASURED 2026-08-22 on the live local volume (activity-system/learning_loop). The same
+-- conjunction, answered two ways:
+--
+--   SELECT count() FROM execution WHERE activity_id='validator-dispatch' AND success=true
+--     -> 0        in    2.0 ms     (index probe)
+--   SELECT count() FROM execution WHERE activity_id='validator-dispatch' AND success!=false
+--     -> 5619     in  749.8 ms     (full scan)
+--   SELECT count() FROM execution WHERE activity_id='validator-dispatch' AND success
+--     -> 5619     in  652.9 ms     (full scan)
+--
+-- The shape is unmistakable: fast-and-zero is the index probe, slow-and-correct is the
+-- scan. Reproduced on a second activity (`ribosome-extract` -> 0 from the index, while
+-- `GROUP BY success` on the same activity reports 118 true / 1 false).
+--
+-- POSITIVE CONTROL, so this is not a claim about the whole table or about `success`
+-- itself. The SINGLE-field index is HEALTHY and its arithmetic closes exactly:
+--
+--   WHERE success = true   -> 8315
+--   WHERE success = false  -> 141687
+--   total rows             -> 150002        (8315 + 141687 = 150002 ✓)
+--
+-- So `success` is populated, correctly typed (`TYPE bool ASSERT $value != NONE`), and
+-- indexable. Only the three-field composite mis-serves.
+--
+-- WHY IT MATTERS — this is the enabler for the trace store's auth-noise problem, not a
+-- cosmetic defect. The per-stratum retention sweep filters on exactly this predicate
+-- (`activity_id = $x AND success = <bool>`), so it selects zero rows and deletes nothing,
+-- every run, silently. `execution` is a 150,000-row FIFO ring at cap
+-- (`trace_store_counters:execution` cap=150000, row_count≈150040) and a credential-failure
+-- storm wrote 142,951 auth rows into it — 95.27% of the table, 133,622 of them older than
+-- 24h. A working stratified sweep is what should have protected real traces from that.
+--
+-- Roughly 49 call sites in activity-api alone use an `AND success = <bool>` predicate.
+-- Each one that hits this index has been reading zero rows and reporting OK.
+--
+-- WHY REMOVE-THEN-DEFINE, not DEFINE IF NOT EXISTS: the index already exists. It has to be
+-- torn down and rebuilt from the current data; `IF NOT EXISTS` would be a no-op and change
+-- nothing.
+--
+-- CONCURRENTLY IS LOAD-BEARING — see migration 194's header, which this migration follows
+-- verbatim. A blocking index build over ~150k rows cannot finish inside applySQLFile's 45s
+-- window, and that window must NOT be widened: init-database is an ExecStartPre, so slow
+-- DDL converts a fast failure into a restart loop that takes the trace store offline. 194
+-- recorded exactly that failure (`✗ ... error: TimeoutError`) when CONCURRENTLY was
+-- omitted. The build is asynchronous; the statement returns immediately.
+--
+-- BETWEEN THE REMOVE AND THE REBUILD COMPLETING, these queries fall back to a full scan:
+-- slower, and CORRECT. That is strictly better than fast and wrong.
+--
+-- NOT BATCHED, per 194's standing rule ("each needs its own migration AND its own
+-- measurement; do not batch them"). The sibling composite
+-- `idx_execution_org_success_time` is corrupt in the same way and is rebuilt separately in
+-- migration 197.
+--
+-- HOW TO VERIFY THIS WORKED (run after the rebuild reports complete):
+--   SELECT count() FROM execution WHERE activity_id='validator-dispatch' AND success=true;
+-- Expect a non-zero count that agrees with the `AND success` (scan) form above. If it
+-- still returns 0 fast, the rebuild did not take and the index should be left REMOVED —
+-- a missing index degrades to a correct scan, a corrupt one silently lies.
+--
+-- No data is touched.
+
+REMOVE INDEX IF EXISTS idx_execution_activity_success_time ON execution;
+DEFINE INDEX IF NOT EXISTS idx_execution_activity_success_time ON execution FIELDS activity_id, success, executed_at CONCURRENTLY;

@@ -1,0 +1,44 @@
+-- 197: rebuild idx_execution_org_success_time — same corruption as 196, sibling index
+--
+-- Not a performance migration. The index returns WRONG ANSWERS.
+--
+-- MEASURED 2026-08-22 on the live local volume, same session and same instrument as
+-- migration 196:
+--
+--   SELECT count() FROM execution WHERE org_id='organizations:substrate' AND success=true
+--     -> 0   in 3.5 ms    (index probe)
+--   SELECT count() FROM execution WHERE org_id='organizations:substrate' AND success=false
+--     -> 0   in 4.0 ms    (index probe)
+--
+-- Both branches of a boolean return zero on a table holding 150,002 rows, essentially all
+-- of them under this org. The single-field `idx_execution_success` is healthy over the
+-- same data and its arithmetic closes exactly (8315 true + 141687 false = 150002), so
+-- `success` itself is fine — the three-field composite is what mis-serves.
+--
+-- This is the same defect class as 196 (`idx_execution_activity_success_time`), on the
+-- same table, with `org_id` as the leading field instead of `activity_id`. Two independent
+-- composites containing `success` are corrupt; the one-field index over the same column is
+-- not. Recorded as a pair because that pattern is the useful signal — whatever damaged
+-- them acted on multi-field indexes over this table, and any future composite on
+-- `execution` should be probed before it is trusted.
+--
+-- CONCURRENTLY IS LOAD-BEARING — see 194's header. A blocking build over ~150k rows
+-- exceeds applySQLFile's 45s window, and init-database is an ExecStartPre, so slow DDL
+-- becomes a restart loop that takes the trace store offline. The build is asynchronous and
+-- the statement returns immediately.
+--
+-- BETWEEN REMOVE AND REBUILD these queries fall back to a full scan: slower, and CORRECT.
+--
+-- SEPARATE FROM 196 by 194's standing rule ("each needs its own migration AND its own
+-- measurement; do not batch them"), so that if one rebuild takes and the other does not,
+-- the record says which.
+--
+-- HOW TO VERIFY:
+--   SELECT count() FROM execution WHERE org_id='organizations:substrate' AND success=true;
+-- Expect a large non-zero count. If it still returns 0 fast, leave the index REMOVED — a
+-- missing index degrades to a correct scan, a corrupt one silently lies.
+--
+-- No data is touched.
+
+REMOVE INDEX IF EXISTS idx_execution_org_success_time ON execution;
+DEFINE INDEX IF NOT EXISTS idx_execution_org_success_time ON execution FIELDS org_id, success, executed_at CONCURRENTLY;
