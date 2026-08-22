@@ -75,6 +75,21 @@ function evaluate(sql: string, params: any): Row[] {
   });
 }
 
+// A MODULE MOCK MUST EXPORT EVERYTHING THE REAL MODULE DOES.
+//
+// The first version of this file omitted `dbStats` and `getDbStats`, which broke
+// unrelated suites in a full `bun test` run while passing in isolation — and
+// substrate-pull-sync correctly refused to converge on it. This repo has a
+// meta-test that enumerates the omissions ("mocks '../db/surreal' but omits:
+// getDbStats, dbStats"); that guard is what caught it, so keep this list in sync
+// with `src/db/surreal.ts`'s exports rather than trimming it to what this file
+// happens to use.
+const dbStatsStub = {
+  snapshot: () => ({}),
+  record: () => {},
+  reset: () => {},
+};
+
 mock.module('../db/surreal', () => ({
   surrealDB: {
     query: async (sql: string, params: any) => {
@@ -84,6 +99,8 @@ mock.module('../db/surreal', () => ({
   },
   queryWithAuth: async () => [],
   createAuthenticatedClient: async () => ({}),
+  dbStats: dbStatsStub,
+  getDbStats: () => ({}),
 }));
 
 const { getActivityScores } = await import('./paradigm');
