@@ -1948,10 +1948,18 @@ export async function deriveCompositionEdgeFromParent(
     //   can legitimately see different row sets and the instrument could
     //   disagree with itself. An instrument on a different auth context than the
     //   operation it checks is not checking that operation.
+    // ★ VERIFY THE RECORD WE WROTE, NOT A PAIR THAT MATCHES.
+    //
+    //   This matched on (parent, child) while the write targets record id
+    //   sha256(parent|child) — so it kept finding the PRE-EXISTING reconciler
+    //   row for the same pair (execution_count 3782, updated_at stale since
+    //   08-18) and reporting derive_wrote_nothing about a row the write never
+    //   addressed. A verification that reads a different record than the write
+    //   wrote is not a verification; it is a third instrument defect on this
+    //   seam, after asserting existence instead of mutation and reading on the
+    //   wrong connection.
     const verifySql =
-      `SELECT execution_count, updated_at FROM activity_composition_graph
-         WHERE (parent_activity_id = $parent OR parent_activity_id = $parent_bare)
-           AND (child_activity_id = $child OR child_activity_id = $child_bare) LIMIT 1`;
+      `SELECT execution_count, updated_at FROM activity_composition_graph:\`${edgeKey}\``;
     const verifyParams = {
       parent: params.parent,
       child: params.child,
