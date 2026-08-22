@@ -544,8 +544,24 @@ async function getCanonicalPosteriors(
        WHERE ((account_id = $account_id) OR (account_id IS NONE AND (org_id = $org_id OR org_id = $org_id_prefix)))
          AND variant_id IN $activity_ids`,
       {
-        // Same dual-tenant scoping and the same plain-string org form the legacy
-        // fallback below uses — this reads the identical rows it would have read.
+        // BOTH FORMS ARE REQUIRED — do not "simplify" this back to the bare one.
+        //
+        // Binding only the stripped form matched NOTHING. Measured on the live table:
+        //   org_id = 'substrate'                ->     0 rows
+        //   org_id = 'organizations:substrate'  -> 3,275 rows
+        // (distribution: organizations:substrate 3275, organizations:metabob 76,
+        //  public 17, metabob_internal 1, unknown 1)
+        //
+        // So this returned an empty map on EVERY call, and the doc comment on this
+        // function says what that means: every caller falls back to the uninformative
+        // prior. That is why every Thompson draw was Beta(1,1) plus heuristic boosts,
+        // and why beta sat pinned at 1.0 — no failure evidence could reach the draw.
+        //
+        // The strip was a back-compat shim for legacy plain-string rows. Those 19 rows
+        // are real, so this accepts EITHER form rather than swapping one for the other.
+        // The same both-forms pattern is already used elsewhere in this file (see the
+        // $org_id_bare / $org_id_prefixed clauses); these two queries were the ones left
+        // out of it. Pinned by src/db/paradigm.org-id-binding.test.ts.
         org_id: orgId.startsWith('organizations:') ? orgId.replace('organizations:', '') : orgId,
         org_id_prefix: orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`,
         account_id: accountId,
