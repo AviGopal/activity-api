@@ -1710,10 +1710,16 @@ export async function deriveCompositionEdgeFromParent(
           { pid },
         );
       }
+      // MEASURED, not guessed: a stored row's `execution_id` reads
+      // `execution:exec_rppwzhsx` — qualified with the SOURCE table `execution`,
+      // which is what `meta::id(id)` yields here. My first attempt bound
+      // `activity_execution_traces:<id>` by copying the sibling filter's prefix
+      // without checking, and missed for a sixth time. Bind every form the
+      // column is observed to hold.
       const bare = pid.includes(':') ? pid.split(':').pop()!.replace(/[⟨⟩]/g, '') : pid;
       return surrealDB.query<{ activity_id?: string }>(viewSql, {
-        pid,
-        pid_qualified: `activity_execution_traces:${bare}`,
+        pid: bare,
+        pid_qualified: `execution:${bare}`,
       });
     };
     let parentRows = await tryLookup(parentExecutionId);
