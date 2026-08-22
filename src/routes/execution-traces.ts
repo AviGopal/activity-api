@@ -1890,7 +1890,26 @@ export async function deriveCompositionEdgeFromParent(
     if (jwtToken) {
       await queryWithAuth(jwtToken, upsertSql, params);
     } else {
-      await surrealDB.query(upsertSql, params);
+      // ★ INSPECT THE RAW RESULT. `surrealDB.query()` returns `result[0]` and
+      //   NEVER checks per-statement status (db/surreal.ts:186-190) — so a
+      //   statement SurrealDB rejects resolves as an empty array and the caller
+      //   sees success. The reconciler, which writes this table successfully,
+      //   uses its own sql() helper that rethrows on `status != OK`; that is why
+      //   its failures surface and this path's never have.
+      //
+      //   Go around the wrapper for this one write so the rejection is visible.
+      //   Not changing query() itself: it is on the fleet's hot path, and a
+      //   behaviour change there belongs in its own reviewed commit.
+      const raw = await surrealDB.queryRaw(upsertSql, params);
+      const slots = Array.isArray(raw) ? (raw as Array<{ status?: string; result?: unknown }>) : [];
+      const bad = slots.find((r) => r && typeof r === 'object' && 'status' in r && r.status !== 'OK');
+      if (bad) {
+        logger.warn('[composition-edge] upsert_rejected', {
+          outcome: 'upsert_rejected',
+          status: bad.status,
+          detail: typeof bad.result === 'string' ? bad.result.slice(0, 300) : null,
+        });
+      }
     }
     // ★ VERIFY THE ROW, DO NOT TRUST THE CALL. `derive_ok` was logged
     //   unconditionally after the statement returned — which reports that the

@@ -166,6 +166,25 @@ class SurrealDBClient {
     return this.connecting;
   }
 
+  /**
+   * Execute a statement and return SurrealDB's RAW result array — one slot per
+   * statement, each carrying `{status, result}`.
+   *
+   * `query()` below returns `result[0]` and never inspects `status`, so a
+   * statement the database REJECTS resolves to an empty array and the caller
+   * reads it as success. That is invisible-failure by construction, and it hid a
+   * composition-edge write that had never landed. Callers that must know whether
+   * their statement was ACCEPTED use this and check `status`.
+   *
+   * Deliberately additive: `query()` is on the fleet's hot path, so changing its
+   * contract belongs in its own reviewed commit.
+   */
+  async queryRaw(sql: string, params?: Record<string, unknown>): Promise<unknown> {
+    if (!this.db) await this.connect();
+    if (!this.db) throw new Error('SurrealDB not connected');
+    return this.db.query(sql, params as Record<string, unknown>);
+  }
+
   async query<T = any>(sql: string, params?: Record<string, any>, _isRetry = false, _conflictRetries = 0): Promise<T[]> {
     await this.connect();
 
