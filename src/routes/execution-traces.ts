@@ -1820,6 +1820,7 @@ export async function deriveCompositionEdgeFromParent(
       execution_id: childExecutionId ?? bareParent,
       org_id: orgId,
     };
+    const issuedAt = Date.now();
     if (jwtToken) {
       await queryWithAuth(jwtToken, upsertSql, params);
     } else {
@@ -1835,8 +1836,13 @@ export async function deriveCompositionEdgeFromParent(
     //   mixes id forms (a live row carries parent `activity:⟨slot-binding⟩` with
     //   child `validator-dispatch`), so an existence check on one form alone
     //   both misses the UPDATE and cannot confirm the CREATE.
-    const verifyRows = await surrealDB.query<{ execution_count?: number }>(
-      `SELECT execution_count FROM activity_composition_graph
+    // ★ ASSERT THE MUTATION, NOT THE EXISTENCE. The previous readback confirmed
+    //   the pair EXISTS — which was never in question — so it logged derive_ok
+    //   30 times while `updated_at` stayed at 2026-07-02 and execution_count at
+    //   19. A readback must assert the thing the write was supposed to CHANGE.
+    //   Compare updated_at against the moment the write was issued.
+    const verifyRows = await surrealDB.query<{ execution_count?: number; updated_at?: string }>(
+      `SELECT execution_count, updated_at FROM activity_composition_graph
          WHERE (parent_activity_id = $parent OR parent_activity_id = $parent_bare)
            AND (child_activity_id = $child OR child_activity_id = $child_bare) LIMIT 1`,
       {
@@ -1846,12 +1852,20 @@ export async function deriveCompositionEdgeFromParent(
         child_bare: childActivityId,
       },
     );
-    const landed = Array.isArray(verifyRows) && (verifyRows as unknown[]).flat().length > 0;
-    if (!landed) {
+    const verified = (verifyRows as unknown[] | undefined)?.flat?.()[0] as
+      | { execution_count?: number; updated_at?: string }
+      | undefined;
+    // Mutated iff updated_at is at/after the instant we issued the write.
+    const mutated =
+      !!verified?.updated_at && new Date(verified.updated_at).getTime() >= issuedAt - 1000;
+    if (!mutated) {
       logger.warn('[composition-edge] derive_wrote_nothing', {
         outcome: 'derive_wrote_nothing',
         parent_activity_id: params.parent,
         child_activity_id: params.child,
+        row_present: !!verified,
+        stale_updated_at: verified?.updated_at ?? null,
+        execution_count: verified?.execution_count ?? null,
       });
       return;
     }
