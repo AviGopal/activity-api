@@ -757,11 +757,47 @@ export async function propagateCreditAlongChain(
  * Default posterior-decay half-life in days. Overridable at use time via the
  * authored `substrate_tuning_param` row THOMPSON_DECAY_HALFLIFE_DAYS (a shaped
  * config the substrate can steer without a restart — see
- * resolveThompsonDecayHalfLifeDays). 3 days matches the llm-resolver-vessel
- * decayedCounts fix this mirrors
- * (openspec/changes/2026-07-29-thompson-posterior-time-decay).
+ * resolveThompsonDecayHalfLifeDays).
+ *
+ * WAS 3, "to match the llm-resolver-vessel decayedCounts fix this mirrors"
+ * (openspec/changes/2026-07-29-thompson-posterior-time-decay). That is the defect:
+ * a constant calibrated for one population was applied to a population with a
+ * completely different execution cadence. LLM resolver arms fire many times an
+ * hour, so a 3-day half-life barely touches them. Activity templates fire on a
+ * cycle of weeks, so the same constant annihilates them.
+ *
+ * MEASURED on the live substrate 2026-08-22, over the 1,821 arms carrying real
+ * evidence (alpha+beta > 4):
+ *
+ *   staleness      arms        retained = 0.5^(age/3)
+ *   <1d              81        ~100%
+ *   3-7d              3        20% - 0.4%
+ *   14-30d          409        3.9% - 0.098%
+ *   >30d          1,328        <0.098%
+ *
+ *   95.4% of them retain LESS THAN 5% of their evidence.
+ *   The median arm retains 0.0002%.
+ *
+ * Verified end to end against the sampler's own log: `detect-vessel-code-drift`
+ * stores alpha=23.76/beta=10.86 and was 33.9 days stale, which decays to
+ * alpha=1.009/beta=1.004; plus the 3.0 heuristic boost that is exactly the
+ * alpha=4.0/beta=1.0 the selector logged. The posterior was not missing — it was
+ * decayed to the uniform prior before the draw. Same arithmetic reproduces
+ * `operator-mcp-isomorphism-probe` (alpha=21.62/beta=18.22, 25.8d -> 1.054/1.045).
+ *
+ * WHY RAISING THIS IS SAFE FOR THE HOT SET, not just good for the cold set: the
+ * decay factor is 0.5^(age/halfLife), so for a freshly-written row (age ~ 0) the
+ * factor is ~1 regardless of the half-life. Lengthening it therefore cannot change
+ * what a frequently-executed arm draws; it only stops annihilating arms that have
+ * not run recently. The decay's stated purpose — healing a posterior poisoned
+ * during a transient outage — still works: at 30 days, 90 days of staleness
+ * retains 12.5% and 180 days retains 3%.
+ *
+ * 30 days is chosen against the measured re-execution cadence: an arm drawn
+ * roughly monthly retains half its evidence, so credit compounds instead of
+ * resetting. Steer it with the shaped row rather than editing this constant.
  */
-export const THOMPSON_DECAY_HALFLIFE_DAYS_DEFAULT = 3;
+export const THOMPSON_DECAY_HALFLIFE_DAYS_DEFAULT = 30;
 
 /**
  * Resolve the posterior-decay half-life (days), consuming the
