@@ -1645,10 +1645,27 @@ export async function deriveCompositionEdgeFromParent(
     //   `type::thing('execution', $pid)` addresses the row by the key the table
     //   actually uses — which is what the `bareParent` normalization above was
     //   always preparing for.
-    const parentRows = await surrealDB.query<{ activity_id?: string }[]>(
-      `SELECT activity_id FROM type::thing('execution', $pid) LIMIT 1`,
-      { pid: bareParent },
-    );
+    //   (3) …and it must be read THROUGH AUTH. `execution` carries
+    //       `PERMISSIONS FOR select WHERE org_id = $auth.org_id`
+    //       (migrations/074:178-186). The root connection has an empty `$auth`,
+    //       so PERMISSIONS filters out every row and the select returns nothing
+    //       — silently, exactly like an absent column. Measured: 40
+    //       parent_lookup_miss in 10 minutes on parents that resolve fine
+    //       through the authenticated API (`exec_0gkibtpm` →
+    //       `activity_id: validator-dispatch`).
+    //
+    //       The shadow table this lookup used to read had no such clause, which
+    //       is why THAT query returned its 12% and this one returned 0%. Use the
+    //       caller's JWT when present, and fall back to the compat view — which
+    //       is permission-transparent — when this is an api-key ingest with no
+    //       JWT to borrow.
+    const parentSql = `SELECT activity_id FROM type::thing('execution', $pid) LIMIT 1`;
+    let parentRows = jwtToken
+      ? await queryWithAuth<{ activity_id?: string }[]>(jwtToken, parentSql, { pid: bareParent })
+      : await surrealDB.query<{ activity_id?: string }[]>(
+          `SELECT activity_id FROM v_paradigm_execution_traces WHERE execution_id = $pid LIMIT 1`,
+          { pid: bareParent },
+        );
     const parentActivityId = Array.isArray(parentRows)
       ? (parentRows.flat()[0] as { activity_id?: string } | undefined)?.activity_id
       : undefined;
