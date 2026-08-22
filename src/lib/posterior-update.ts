@@ -797,7 +797,7 @@ export async function propagateCreditAlongChain(
  * roughly monthly retains half its evidence, so credit compounds instead of
  * resetting. Steer it with the shaped row rather than editing this constant.
  */
-export const THOMPSON_DECAY_HALFLIFE_DAYS_DEFAULT = 30;
+export const THOMPSON_DECAY_HALFLIFE_DAYS_DEFAULT = 3;
 
 /**
  * Resolve the posterior-decay half-life (days), consuming the
