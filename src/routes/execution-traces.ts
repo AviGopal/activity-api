@@ -1767,18 +1767,23 @@ export async function deriveCompositionEdgeFromParent(
       });
       return;
     }
+    // ★ The UPDATE targets `$existing[0].id` — the record the SELECT above
+    //   already found — instead of re-running the same disjunctive WHERE
+    //   against the table. That second predicate evaluation matched NOTHING
+    //   while the identical SELECT matched, measured on ONE connection so it is
+    //   not an auth artefact: 23 derive_wrote_nothing carrying row_present:true,
+    //   execution_count:3782, updated_at four days stale. Addressing the row by
+    //   id removes the predicate from the write path entirely.
     const upsertSql = `
         LET $existing = (SELECT * FROM activity_composition_graph
           WHERE (parent_activity_id = $parent OR parent_activity_id = $parent_bare)
             AND (child_activity_id = $child OR child_activity_id = $child_bare) LIMIT 1);
         IF array::len($existing) > 0 THEN (
-          UPDATE activity_composition_graph SET
+          UPDATE $existing[0].id SET
             execution_count = execution_count + 1,
             success_count = (IF $success THEN success_count + 1 ELSE success_count END),
             weight = (IF $success THEN success_count + 1 ELSE success_count END) / (execution_count + 1),
             updated_at = time::now()
-          WHERE (parent_activity_id = $parent OR parent_activity_id = $parent_bare)
-            AND (child_activity_id = $child OR child_activity_id = $child_bare)
         ) ELSE (
           CREATE activity_composition_graph SET
             parent_activity_id = $parent,
