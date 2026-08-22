@@ -539,12 +539,29 @@ async function getCanonicalPosteriors(
       thompson_beta: number | null;
     }>(
       `SELECT variant_id, thompson_alpha, thompson_beta FROM variant_performance_metrics
-       WHERE ((account_id = $account_id) OR (account_id IS NONE AND org_id = $org_id))
+       WHERE ((account_id = $account_id)
+              OR (account_id IS NONE AND (org_id = $org_id OR org_id = $org_id_prefixed)))
          AND variant_id IN $activity_ids`,
       {
-        // Same dual-tenant scoping and the same plain-string org form the legacy
-        // fallback below uses — this reads the identical rows it would have read.
+        // MATCH BOTH STORED FORMS. Binding only the stripped form matched NOTHING:
+        // measured on the live table, org_id is `organizations:substrate` on 3,275 rows
+        // and `organizations:metabob` on 76, against 19 plain-string rows in total
+        // (`public` 17, `metabob_internal` 1, `unknown` 1).
+        //
+        //   WHERE account_id IS NONE AND org_id = 'substrate'                ->     0
+        //   WHERE account_id IS NONE AND org_id = 'organizations:substrate'  -> 3,275
+        //
+        // So this returned an empty map on EVERY call, and the doc comment above says
+        // what that means: every caller falls back to the uninformative prior. That is
+        // why every Thompson draw was Beta(1,1) plus heuristic boosts, and why beta was
+        // pinned at 1.0 — no failure evidence could reach the draw.
+        //
+        // The strip was a back-compat shim for legacy plain-string rows (see the same
+        // pattern in the legacy fallback below). Those rows are real, so the fix widens
+        // to accept EITHER form rather than swapping one for the other — dropping the
+        // bare form would orphan the 19 the shim was written for.
         org_id: orgId.startsWith('organizations:') ? orgId.replace('organizations:', '') : orgId,
+        org_id_prefixed: orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`,
         account_id: accountId,
         activity_ids: activityIds,
       },
@@ -703,11 +720,21 @@ export async function getActivityScores(
     if (orgId) {
       // Phase E: dual-tenant scoping on the legacy fallback. account_id wins;
       // legacy rows (account_id IS NONE) match via org_id. Both params bound.
-      query += ` WHERE ((account_id = $account_id) OR (account_id IS NONE AND org_id = $org_id))`;
-      // Legacy table (variant_performance_metrics) may have existing data with plain strings
-      // TODO: After migrating existing data to record format, use orgId directly
-      // For backward compatibility, strip organizations: prefix if present
+      query += ` WHERE ((account_id = $account_id)`
+        + ` OR (account_id IS NONE AND (org_id = $org_id OR org_id = $org_id_prefixed)))`;
+      // MATCH BOTH STORED FORMS — see the identical fix in getCanonicalPosteriors above.
+      //
+      // The TODO below was written expecting a migration to record format, after which
+      // `orgId` could be used directly. That migration HAPPENED: the live table now holds
+      // 3,351 prefixed rows against 19 plain-string ones. The shim outlived the
+      // incompatibility it was written for and inverted — it matched the 19-row minority
+      // and orphaned the majority, so this fallback returned nothing for the main tenant.
+      //
+      // Binding both forms is what makes the TODO safe to retire: the prefixed form covers
+      // the migrated rows, the bare form still covers the legacy ones, and neither is
+      // dropped on the way.
       params.org_id = orgId.startsWith('organizations:') ? orgId.replace('organizations:', '') : orgId;
+      params.org_id_prefixed = orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`;
       params.account_id = accountId;
     }
 
