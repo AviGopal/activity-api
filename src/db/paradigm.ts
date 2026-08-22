@@ -722,12 +722,22 @@ export async function getActivityScores(
     if (orgId) {
       // Phase E: dual-tenant scoping on the legacy fallback. account_id wins;
       // legacy rows (account_id IS NONE) match via org_id. Both params bound.
-      query += ` WHERE ((account_id = $account_id) OR (account_id IS NONE AND org_id = $org_id))`;
-      // Legacy table (variant_performance_metrics) may have existing data with plain strings
-      // TODO: After migrating existing data to record format, use orgId directly
-      // For backward compatibility, strip organizations: prefix if present
+      query += ` WHERE ((account_id = $account_id)`
+        + ` OR (account_id IS NONE AND (org_id = $org_id OR org_id = $org_id_prefix)))`;
+      // BOTH FORMS — same defect and same fix as getCanonicalPosteriors above.
+      //
+      // The TODO below expected a migration to record format, after which `orgId` could be
+      // used directly. That migration HAPPENED: this table now holds 3,351 prefixed rows
+      // against 19 plain-string ones, so the strip inverted — it matched the minority and
+      // orphaned the majority, and this fallback returned nothing for the main tenant.
+      //
+      // NOTE: this widening was silently dropped once already. A substrate-authored commit
+      // consolidated this function and reverted the clause to the single form while LEAVING
+      // `params.org_id_prefix` bound — an unused parameter, which no placeholder/binding
+      // check catches because the mismatch runs the harmless direction. If you are about to
+      // simplify this line, that is the failure mode to avoid.
       params.org_id = orgId.startsWith('organizations:') ? orgId.replace('organizations:', '') : orgId;
-        params.org_id_prefix = orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`;
+      params.org_id_prefix = orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`;
       params.account_id = accountId;
     }
 

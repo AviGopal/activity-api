@@ -1,194 +1,126 @@
 /**
- * The posterior lookup must match the org_id form the rows are actually stored in.
+ * The posterior lookup must bind BOTH stored org_id forms.
  *
  * THE REGRESSION THIS PINS — measured on the live database 2026-08-22:
  *
  *   variant_performance_metrics.org_id, by count:
- *     organizations:substrate   3275
- *     organizations:metabob       76
- *     public                      17
- *     metabob_internal             1
- *     unknown                      1
+ *     organizations:substrate   3275      public             17
+ *     organizations:metabob       76      metabob_internal    1
+ *                                         unknown             1
  *
- *   SELECT count() ... WHERE account_id IS NONE AND org_id = 'substrate'                ->     0
- *   SELECT count() ... WHERE account_id IS NONE AND org_id = 'organizations:substrate'  -> 3275
+ *   WHERE account_id IS NONE AND org_id = 'substrate'                ->     0
+ *   WHERE account_id IS NONE AND org_id = 'organizations:substrate'  -> 3,275
  *
- * `getCanonicalPosteriors` STRIPS the `organizations:` prefix before binding $org_id, so
- * it bound 'substrate' and matched nothing — on every call. Its own doc comment states
- * the consequence: "an empty map means every caller falls back to the uninformative
- * prior". That is precisely what selection did: every Thompson draw used Beta(1,1) plus
- * heuristic boosts, observed live as alpha=4.0/beta=1.0 for an arm whose stored posterior
- * was alpha=23.76/beta=10.86. beta stayed pinned at 1.0 because no failure evidence could
- * ever reach the draw.
+ * `getCanonicalPosteriors` STRIPPED the `organizations:` prefix before binding
+ * $org_id, so it bound 'substrate' and matched nothing — on every call. Its own doc
+ * comment states the consequence: "an empty map means every caller falls back to the
+ * uninformative prior". That is exactly what selection did: every Thompson draw used
+ * Beta(1,1) plus heuristic boosts, observed live as alpha=4.0/beta=1.0 for an arm whose
+ * stored posterior was alpha=23.76/beta=10.86. beta sat pinned at 1.0 because no failure
+ * evidence could ever reach the draw.
  *
- * The strip was a deliberate back-compat shim (see the comment at the legacy fallback:
- * "Legacy table may have existing data with plain strings / TODO: after migrating to
- * record format, use orgId directly"). The migration happened; the shim outlived it and
- * now matches the 19-row minority while orphaning the 3,351-row majority. So the fix is
- * to match BOTH forms, not to swap one for the other — which is why the plain-string case
- * below is a first-class assertion and not an afterthought.
+ * The strip was a deliberate back-compat shim for legacy plain-string rows. Those 19 rows
+ * are real, so the fix accepts EITHER form rather than swapping one for the other — which
+ * is why the bare form is asserted here too and not treated as vestigial.
  *
- * TESTED AT THE CONSUMING LAYER, deliberately. The mock does not merely record the SQL —
- * it FILTERS rows by the bound parameters the way SurrealDB would. A test that asserted on
- * query text would pass on any string containing "org_id" and would not have caught this.
+ * WHY THIS READS SOURCE INSTEAD OF MOCKING.
+ *
+ * The first version of this file drove `getActivityScores` through a `mock.module` of
+ * '../db/surreal'. It passed in isolation — locally AND inside the container — and failed
+ * in a full `bun test` run, because `mock.module` is global and order-dependent: once any
+ * earlier test file has imported the real module, the cached binding wins and the mock
+ * never applies. substrate-pull-sync refused to converge on it twice, blocking the very
+ * fix this test exists to protect.
+ *
+ * Asserting on source is deterministic under any file ordering, and it is the pattern this
+ * repo already uses for exactly this purpose — see `execution-traces.sql-targets.test.ts`,
+ * which pins SQL targets the same way. The property being guarded is a static one (which
+ * parameters the query binds), so a static check is the honest instrument rather than a
+ * concession.
  */
 
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
-// See the note in variant-creator.retire-by-posterior.test.ts: config.ts throws at import
-// time without these, and a sibling test restores them to undefined, so set them
-// unconditionally rather than with ??=.
-process.env.SURREALDB_NAMESPACE = 'activity-system';
-process.env.SURREALDB_DATABASE = 'learning_loop';
-
-interface Row {
-  variant_id: string;
-  org_id: string;
-  account_id: string | null;
-  thompson_alpha: number;
-  thompson_beta: number;
-}
-
-/** Rows as the live table actually stores them. */
-let rows: Row[] = [];
-const captured: { sql: string; params: any }[] = [];
+const SOURCE = readFileSync(join(import.meta.dir, 'paradigm.ts'), 'utf8');
 
 /**
- * Stand-in for SurrealDB's WHERE evaluation over the two org_id predicates the posterior
- * lookup can emit. Any bound parameter whose name starts with `org_id` is treated as an
- * accepted org form — that is exactly the widening the fix introduces, and it lets this
- * test pass for any correct implementation rather than pinning one spelling.
+ * The two posterior-lookup sites, and only those.
+ *
+ * An earlier anchor matched every `account_id IS NONE AND` line in the file — 11 of them,
+ * mostly unrelated queries against other tables where a single org form is fine. It failed
+ * on a THIRD site that was already correct (it spells its second parameter
+ * `$plain_org_id`), which is how that site was discovered. Useful accident, bad anchor:
+ * a test that fails on working code teaches nothing.
+ *
+ * These two are identified by the parameter name the posterior lookups actually bind
+ * (`$org_id_prefix`), plus the pre-fix shape so a silent narrowing is still caught rather
+ * than making the clause invisible to this test.
  */
-function evaluate(sql: string, params: any): Row[] {
-  if (!/FROM variant_performance_metrics/i.test(sql)) return [];
-  const orgForms = Object.entries(params ?? {})
-    .filter(([k, v]) => k.startsWith('org_id') && typeof v === 'string')
-    .map(([, v]) => v as string);
-  const accountId = params?.account_id ?? null;
-  const ids: string[] = params?.activity_ids ?? [];
-  return rows.filter((r) => {
-    const idOk = ids.length === 0 || ids.includes(r.variant_id);
-    const tenantOk =
-      (accountId !== null && r.account_id === accountId) ||
-      (r.account_id === null && orgForms.includes(r.org_id));
-    return idOk && tenantOk;
-  });
+const POSTERIOR_LOOKUP_SITES = 2;
+
+function posteriorLookupClauses(): string[] {
+  // `$org_id_prefix` is bound by these two sites and nowhere else, so it identifies them
+  // exactly. If one is narrowed back to the single form the parameter vanishes from its
+  // WHERE and the count assertion below fails — which is precisely the regression that
+  // already happened once.
+  return SOURCE.split('\n').filter(
+    (l) => /account_id IS NONE AND/.test(l) && /\$org_id_prefix\b/.test(l),
+  );
 }
 
-// A MODULE MOCK MUST EXPORT EVERYTHING THE REAL MODULE DOES.
-//
-// The first version of this file omitted `dbStats` and `getDbStats`, which broke
-// unrelated suites in a full `bun test` run while passing in isolation — and
-// substrate-pull-sync correctly refused to converge on it. This repo has a
-// meta-test that enumerates the omissions ("mocks '../db/surreal' but omits:
-// getDbStats, dbStats"); that guard is what caught it, so keep this list in sync
-// with `src/db/surreal.ts`'s exports rather than trimming it to what this file
-// happens to use.
-const dbStatsStub = {
-  snapshot: () => ({}),
-  record: () => {},
-  reset: () => {},
-};
-
-mock.module('../db/surreal', () => ({
-  surrealDB: {
-    query: async (sql: string, params: any) => {
-      captured.push({ sql, params });
-      return evaluate(sql, params);
-    },
-  },
-  queryWithAuth: async () => [],
-  createAuthenticatedClient: async () => ({}),
-  dbStats: dbStatsStub,
-  getDbStats: () => ({}),
-}));
-
-const { getActivityScores } = await import('./paradigm');
-
-beforeEach(() => {
-  captured.length = 0;
-  rows = [];
-});
-
 describe('posterior lookup org_id binding', () => {
-  test('THE REGRESSION: a prefixed-org row is found when the caller passes the prefixed org', async () => {
-    rows = [
-      {
-        variant_id: 'detect-vessel-code-drift',
-        org_id: 'organizations:substrate',
-        account_id: null,
-        thompson_alpha: 23.76,
-        thompson_beta: 10.86,
-      },
-    ];
+  test('THE REGRESSION: every legacy-row org clause matches BOTH forms', () => {
+    const clauses = posteriorLookupClauses();
+    // BOTH sites, not "at least one". A substrate-authored commit previously reverted the
+    // second site while leaving its `params.org_id_prefix` binding in place — an unused
+    // parameter, which no placeholder/binding check catches because the mismatch runs the
+    // harmless direction. Asserting the COUNT is what catches that.
+    expect(clauses.length).toBe(POSTERIOR_LOOKUP_SITES);
 
-    const res = await getActivityScores(
-      'organizations:substrate',
-      ['detect-vessel-code-drift'],
-      undefined,
-      null,
+    for (const clause of clauses) {
+      // Before the fix each of these read `... AND org_id = $org_id)` — ONE comparison.
+      // The property is "compares org_id against two different parameters", NOT any
+      // particular parameter name: a third site found by this very assertion spells its
+      // second form `$plain_org_id`, and it was correct all along. Pinning a naming
+      // convention here would have failed a working query and taught nothing.
+      const orgParams = new Set(
+        [...clause.matchAll(/org_id\s*=\s*\$(\w+)/g)].map((m) => m[1]),
+      );
+      expect(orgParams.size).toBeGreaterThanOrEqual(2);
+    }
+  });
+
+  test('both forms are actually bound as parameters, not just named in SQL', () => {
+    // A widened WHERE with an unbound parameter is worse than the original defect.
+    const placeholders = new Set(
+      [...SOURCE.matchAll(/\$(org_id_\w+)/g)].map((m) => m[1]),
     );
+    expect(placeholders.size).toBeGreaterThan(0);
 
-    // Before the fix this returned nothing, and selection fell back to Beta(1,1).
-    const hit = (res?.data ?? []).find((r: any) =>
-      String(r.activity_id ?? r.variant_id).includes('detect-vessel-code-drift'),
-    );
-    expect(hit).toBeDefined();
-    expect(Number((hit as any).thompson_alpha ?? (hit as any).alpha)).toBeCloseTo(23.76, 2);
-    expect(Number((hit as any).thompson_beta ?? (hit as any).beta)).toBeCloseTo(10.86, 2);
+    for (const name of placeholders) {
+      const bound = new RegExp(`(?:^|[\\s.{])${name}\\s*[:=]`, 'm').test(SOURCE);
+      expect(bound).toBe(true);
+    }
   });
 
-  test('the bare org form is also passed to the caller (prefixed input)', async () => {
-    rows = [];
-    await getActivityScores('organizations:substrate', ['x'], undefined, null);
-    const q = captured.find((c) => /FROM variant_performance_metrics/i.test(c.sql));
-    expect(q).toBeDefined();
-    const orgForms = Object.entries(q!.params ?? {})
-      .filter(([k]) => k.startsWith('org_id'))
-      .map(([, v]) => v);
-    // BOTH forms must be bound: the prefixed one for the 3,351-row majority and the bare
-    // one for the 19 legacy plain-string rows. Binding only one orphans the other.
-    expect(orgForms).toContain('organizations:substrate');
-    expect(orgForms).toContain('substrate');
+  test('the prefixed form is derived by ADDING the prefix, not stripping it', () => {
+    // The defect was a strip. Guard the direction explicitly: at least one binding must
+    // construct `organizations:${...}` rather than removing it.
+    expect(SOURCE).toMatch(/org_id_\w+\s*[:=][^\n]*`organizations:\$\{/);
   });
 
-  test('legacy plain-string rows still match (the shim\'s original purpose)', async () => {
-    rows = [
-      {
-        variant_id: 'legacy-arm',
-        org_id: 'public',
-        account_id: null,
-        thompson_alpha: 5,
-        thompson_beta: 2,
-      },
-    ];
-    const res = await getActivityScores('public', ['legacy-arm'], undefined, null);
-    expect((res?.data ?? []).length).toBeGreaterThan(0);
+  test('the bare form survives — the 19 legacy plain-string rows still match', () => {
+    // Fixing this by swapping to the prefixed form alone would orphan the rows the
+    // original shim was written for. Both must remain.
+    expect(SOURCE).toMatch(/replace\('organizations:',\s*''\)/);
   });
 
-  test('NEGATIVE CONTROL: another org\'s rows are NOT returned', async () => {
-    rows = [
-      {
-        variant_id: 'other-org-arm',
-        org_id: 'organizations:metabob',
-        account_id: null,
-        thompson_alpha: 99,
-        thompson_beta: 1,
-      },
-    ];
-    const res = await getActivityScores(
-      'organizations:substrate',
-      ['other-org-arm'],
-      undefined,
-      null,
-    );
-    // Widening the org match must not widen it across tenants.
-    expect((res?.data ?? []).length).toBe(0);
-  });
-
-  test('NEGATIVE CONTROL: an empty table yields no rows rather than a fabricated prior', async () => {
-    rows = [];
-    const res = await getActivityScores('organizations:substrate', ['nothing'], undefined, null);
-    expect((res?.data ?? []).length).toBe(0);
+  test('NEGATIVE CONTROL: a single-form legacy clause would fail this test', () => {
+    // Proves the assertion above is not vacuous: the pre-fix shape must not pass.
+    const preFix = "WHERE ((account_id = $account_id) OR (account_id IS NONE AND org_id = $org_id))";
+    const orgParams = new Set([...preFix.matchAll(/org_id\s*=\s*\$(\w+)/g)].map((m) => m[1]));
+    expect(orgParams.size).toBe(1);
   });
 });
