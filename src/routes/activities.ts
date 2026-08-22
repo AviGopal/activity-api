@@ -4865,25 +4865,49 @@ app.get('/corpus-summary', async (c) => {
 
     logger.info('GET /v2/activities/corpus-summary', { orgId });
 
-    // org_id in v_activity_score is stored as record ID (e.g., "organizations:metabob_internal")
+    // THIS READ ANSWERED ZEROS FOR THE WHOLE CORPUS. It selected `FROM v_activity_score`,
+    // and that view does not exist in the database — SurrealDB treats a missing table as
+    // an empty one (`status: OK`, zero rows, no error), so the endpoint reported a healthy
+    // 200 with every count at 0 and `avg_belief` at its 0.5 default.
+    //
+    // The view cannot come back by itself: it is defined with IF NOT EXISTS in
+    // sql/schemas/021-paradigm-computed-views-v3.surql, init_migrations records that file
+    // as applied (2026-06-28), and init-database.ts skips any recorded filename. That is
+    // the same stranded-view class migration 174 fixed for seven siblings.
+    //
+    // NOT restored, deliberately. It was a live aggregate `FROM execution` — the hot trace
+    // table — and migration 165 removed its sibling v_activity_score_enhanced for exactly
+    // that reason ("a dead write-amplifying aggregate over the hot execution table").
+    // Re-creating it would reintroduce write amplification on the busiest table in the
+    // system to serve one reporting endpoint. Its own header also declared it a
+    // replacement for variant_performance_metrics, which is the table that actually won:
+    // durable, credit-weighted, and what every other reader here already uses
+    // (paradigm.ts:541, posterior-update.ts:902, discover-by-shapes.ts:261).
+    //
+    // So this reads the surviving producer instead of resurrecting a duplicate. Counts are
+    // now integer executions from the metrics rows rather than a re-aggregation of a
+    // 2-day retention window, which also makes the summary stable across trace eviction.
+    //
+    // org_id is stored in BOTH forms on this table (3,275 prefixed vs 19 plain, measured
+    // 2026-08-22) — the same split that made the posterior lookup match zero rows. Bind
+    // both; see the note in db/paradigm.ts getCanonicalPosteriors.
+    const bareOrgId = orgId.startsWith('organizations:') ? orgId.replace('organizations:', '') : orgId;
     const fullOrgId = orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`;
 
-    // Query aggregate metrics from v_activity_score
-    // Note: org_id in the view is a record reference, so we use type::record() to convert
     const summaryResult = await surrealDB.query(`
       SELECT
         count() AS total_activities,
         math::sum(total_executions) AS total_executions,
-        math::sum(successes) AS total_successes,
-        math::sum(failures) AS total_failures,
-        math::sum(total_cost_usd) AS total_cost_usd,
-        math::mean(<float> alpha / (<float> alpha + <float> beta)) AS avg_belief,
+        math::sum(successful_executions) AS total_successes,
+        math::sum(total_executions) - math::sum(successful_executions) AS total_failures,
+        math::sum(avg_cost_usd * total_executions) AS total_cost_usd,
+        math::mean(<float> thompson_alpha / (<float> thompson_alpha + <float> thompson_beta)) AS avg_belief,
         count(IF total_executions < 5 THEN 1 ELSE NONE END) AS exploration_count,
         count(IF total_executions >= 10 THEN 1 ELSE NONE END) AS exploitation_count
-      FROM v_activity_score
-      WHERE org_id = type::record($org_id)
+      FROM variant_performance_metrics
+      WHERE org_id = $org_id_bare OR org_id = $org_id_prefixed
       GROUP ALL
-    `, { org_id: fullOrgId });
+    `, { org_id_bare: bareOrgId, org_id_prefixed: fullOrgId });
 
     const stats = summaryResult[0] as any || {};
 
