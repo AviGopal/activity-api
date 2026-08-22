@@ -273,31 +273,61 @@ export async function enrichTemplatesWithMetrics(
     // Combine both normalized and original IDs to cover all matching cases
     const allMatchIds = [...new Set([...normalizedIds, ...originalIds])];
 
+    // A FALLBACK GUARDED BY try/catch CANNOT CATCH A MISSING TABLE.
+    //
+    // This read `SELECT * FROM v_activity_score` with the variant_performance_metrics
+    // fallback in a `catch`. `v_activity_score` does not exist in this database, and
+    // SurrealDB reports a missing table as an EMPTY one — `status: OK`, zero rows, no
+    // exception. So the catch never ran: measured 2026-08-22, the string "falling back to
+    // variant_performance_metrics" appears ZERO times in activity-api's entire journal.
+    // The fallback was correct and unreachable.
+    //
+    // The consequence is the widest of any defect found in this audit, because this
+    // endpoint is what boredom-vessel scores the pool with, and the pool is the
+    // substrate's dominant traffic — measured over one post-deploy window, 387 executions
+    // of which ~95% were pool ticks (gap-to-scenario-bridge 113, detectors 97,
+    // validator-dispatch 68, slot-binding 14) against 18 auth checks.
+    //
+    // Every template therefore arrived with NO metrics, so boredom's
+    // `metrics?.thompson_alpha ?? 1` resolved to the uniform prior for all of them. In
+    // the exercise path (boredom index.ts:1048) that makes `curAlpha > bestAlpha` never
+    // true, so "pick the template with the HIGHEST alpha" silently degrades to "pick the
+    // first candidate". 2,894 of 3,425 metric rows carry a real posterior that this
+    // endpoint has never delivered to anyone.
+    //
+    // Reads the surviving producer directly — same resolution as corpus-summary, and law
+    // 3: reuse the existing producer rather than resurrect a view that was a
+    // write-amplifying aggregate over the hot `execution` table.
+    const metricsQuery = `
+      SELECT activity_id, variant_id,
+             total_executions, successful_executions, failed_executions,
+             thompson_alpha, thompson_beta, success_rate,
+             avg_duration_ms, avg_cost_usd, total_selections
+      FROM variant_performance_metrics
+      WHERE activity_id IN $activity_ids OR variant_id IN $activity_ids
+    `;
     try {
-      const metricsQuery = `
-        SELECT * FROM v_activity_score
-        WHERE activity_id IN $activity_ids
-      `;
       metricsResult = await surrealDB.query<any>(metricsQuery, {
-        activity_ids: allMatchIds
+        activity_ids: allMatchIds,
       });
     } catch (error: any) {
-      // Fallback to variant_performance_metrics if view doesn't exist or fails
-      logger.warn('Failed to query v_activity_score, falling back to variant_performance_metrics', {
-        error: error.message
+      // A real query failure must not silently degrade every template to the prior — that
+      // is the failure mode this whole comment is about. Surface it and continue empty.
+      logger.error('template metrics read failed; templates will score on the prior', {
+        event: 'template_metrics_read_failed',
+        error: error.message,
       });
-      const fallbackQuery = `
-        SELECT activity_id, variant_id,
-               total_executions, successful_executions, failed_executions,
-               thompson_alpha, thompson_beta, success_rate,
-               avg_duration_ms, avg_cost_usd, total_selections
-        FROM variant_performance_metrics
-        WHERE activity_id IN $activity_ids
-      `;
-      metricsResult = await surrealDB.query<any>(fallbackQuery, {
-        activity_ids: allMatchIds  // Use combined IDs to match all formats
-      });
+      metricsResult = [];
     }
+    logger.info('template metrics fetched', {
+      event: 'template_metrics_fetched',
+      requested: allMatchIds.length,
+      matched: metricsResult.length,
+      // matched:0 with a non-zero request is the signature of the defect above returning.
+      note: metricsResult.length === 0 && allMatchIds.length > 0
+        ? 'no metrics matched — every template will score on the uniform prior'
+        : undefined,
+    });
 
     // For templates not found in v_activity_score (no executions yet),
     // try to get initial metrics from variant_performance_metrics
