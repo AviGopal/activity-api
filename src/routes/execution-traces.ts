@@ -1773,8 +1773,8 @@ export async function deriveCompositionEdgeFromParent(
         IF array::len($existing) > 0 THEN (
           UPDATE activity_composition_graph SET
             execution_count = execution_count + 1,
-            success_count = IF($success, success_count + 1, success_count),
-            weight = (IF($success, success_count + 1, success_count)) / (execution_count + 1),
+            success_count = (IF $success THEN success_count + 1 ELSE success_count END),
+            weight = (IF $success THEN success_count + 1 ELSE success_count END) / (execution_count + 1),
             updated_at = time::now()
           WHERE parent_activity_id = $parent AND child_activity_id = $child
         ) ELSE (
@@ -1785,8 +1785,8 @@ export async function deriveCompositionEdgeFromParent(
             org_id = $org_id,
             success = $success,
             execution_count = 1,
-            success_count = IF($success, 1, 0),
-            weight = IF($success, 1.0, 0.0),
+            success_count = (IF $success THEN 1 ELSE 0 END),
+            weight = (IF $success THEN 1.0 ELSE 0.0 END),
             created_at = time::now(),
             updated_at = time::now()
         ) END;
