@@ -1793,19 +1793,6 @@ export async function deriveCompositionEdgeFromParent(
     //
     //   The id is hashed rather than concatenated because activity ids contain
     //   `:` and `⟨⟩`, which are not safe in a record key.
-    const upsertSql = `
-        UPSERT type::thing('activity_composition_graph', $edge_key) SET
-          parent_activity_id = $parent,
-          child_activity_id = $child,
-          execution_id = $execution_id,
-          org_id = $org_id,
-          success = $success,
-          execution_count = (execution_count ?? 0) + 1,
-          success_count = (success_count ?? 0) + (IF $success THEN 1 ELSE 0 END),
-          weight = ((success_count ?? 0) + (IF $success THEN 1 ELSE 0 END)) / ((execution_count ?? 0) + 1),
-          created_at = (created_at ?? time::now()),
-          updated_at = time::now()
-      `;
     // ★ BIND EVERY REQUIRED COLUMN. activity_composition_graph is SCHEMAFULL and
     //   `execution_id`, `success` (sql/002-learning-system-phase1.surql:29,36)
     //   and `org_id` (migrations/031:45) all carry `ASSERT $value != NONE` with
@@ -1828,12 +1815,63 @@ export async function deriveCompositionEdgeFromParent(
       .update(`${asPrefixed(parentActivityId)}|${asPrefixed(childActivityId)}`)
       .digest('hex')
       .slice(0, 32);
+    // Read the prior counters so CONTENT (a whole-record replace) can carry them
+    // forward. Addressed by the same derived id the write uses, so read and write
+    // cannot disagree about which row they mean.
+    const existingRows = await surrealDB.query<{ execution_count?: number; success_count?: number }>(
+      `SELECT execution_count, success_count FROM activity_composition_graph:\`${edgeKey}\``,
+      {},
+    );
+    const existingRow = (existingRows as unknown[] | undefined)?.flat?.()[0] as
+      | { execution_count?: number; success_count?: number }
+      | undefined;
+    // ★ MATCH THE WRITE FORM THAT DEMONSTRABLY WORKS. Every other shape of this
+    //   statement wrote nothing: LET/IF with a predicate, LET/IF addressed by
+    //   primary key, and a plain parameterised UPSERT — all reporting success
+    //   while the row was untouched (44, then 26 derive_wrote_nothing carrying
+    //   row_present:true and a stale updated_at).
+    //
+    //   The batch reconciler HAS been writing this table successfully for
+    //   months. Its form (scripts/substrate/composition-edge-reconcile.ts:480)
+    //   differs in three ways this now copies exactly: a backtick-quoted record
+    //   id literal rather than type::thing(), CONTENT rather than SET, and the
+    //   columns SET silently omitted — account_id_version, edge_kind, genuine.
+    //   Diffing against a writer that works beats reasoning about the schema;
+    //   that is the lesson this seam has taught eight times.
+    //
+    //   CONTENT replaces the whole record, so the read-modify-write is explicit:
+    //   $existing supplies the prior counters, defaulting on first sight.
+    const priorCount = Number(existingRow?.execution_count ?? 0);
+    const priorSuccess = Number(existingRow?.success_count ?? 0);
+    const nextCount = priorCount + 1;
+    const nextSuccess = priorSuccess + (success ? 1 : 0);
+    const upsertSql = `
+        UPSERT activity_composition_graph:\`${edgeKey}\` CONTENT {
+          parent_activity_id: $parent,
+          child_activity_id: $child,
+          execution_id: $execution_id,
+          org_id: $org_id,
+          success: $success,
+          execution_count: $execution_count,
+          success_count: $success_count,
+          weight: $weight,
+          account_id_version: 0,
+          edge_kind: 'derived',
+          genuine: true,
+          derived_from: 'ingest_derive',
+          created_at: time::now(),
+          updated_at: time::now()
+        }
+      `;
     const params = {
       parent: asPrefixed(parentActivityId),
       child: asPrefixed(childActivityId),
       parent_bare: parentActivityId,
       child_bare: childActivityId,
       edge_key: edgeKey,
+      execution_count: nextCount,
+      success_count: nextSuccess,
+      weight: nextCount > 0 ? nextSuccess / nextCount : 0,
       success,
       execution_id: childExecutionId ?? bareParent,
       org_id: orgId,
