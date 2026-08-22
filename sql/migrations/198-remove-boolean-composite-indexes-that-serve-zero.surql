@@ -1,0 +1,56 @@
+-- 198: REMOVE the two `success` composite indexes — rebuilding them did not work
+--
+-- This reverses migrations 196/197 on their own stated terms. Both carried the
+-- instruction: "If it still returns 0 fast, the rebuild did not take and the index should
+-- be left REMOVED — a missing index degrades to a correct scan, a corrupt one silently
+-- lies." It still returns 0. So they come out.
+--
+-- WHAT 196/197 ASSUMED, AND WHY IT WAS WRONG. They diagnosed index CORRUPTION — damaged
+-- entries that a rebuild from current data would repair. Measured after both applied
+-- (init_migrations records them; INFO FOR TABLE shows both indexes present, no build
+-- pending):
+--
+--   WHERE activity_id='validator-dispatch' AND success=true   ->     0   in  0.68 ms
+--   WHERE org_id='organizations:substrate' AND success=true   ->     0   in  0.77 ms
+--   WHERE activity_id='validator-dispatch' AND success        -> 5,844   in   226 ms
+--
+-- Fast-and-zero, from indexes built minutes earlier out of the live data. Corruption is
+-- refuted: you cannot rebuild your way out of a fault that the rebuild reproduces. The
+-- remaining explanation is structural — this SurrealDB version does not correctly serve an
+-- equality probe against a composite index with a `bool` in a non-leading position.
+--
+-- The single-field index over the same column is HEALTHY and stays:
+--
+--   WHERE success = true   -> 8,704   in 7.5 ms
+--
+-- so `success` is fine as an indexed column on its own. It is the composite that fails.
+--
+-- WHY REMOVING IS RIGHT AND NOT A RETREAT. These indexes make queries FAST AND WRONG.
+-- Roughly 49 call sites in activity-api use an `AND success = <bool>` predicate, and the
+-- per-stratum retention sweep is one of them — which is how `execution` became a
+-- 150,000-row FIFO ring at cap with 95.27% credential telemetry: the sweep selected zero
+-- rows and deleted nothing, forever, while reporting success. Without these indexes those
+-- same queries fall back to a full scan: ~226 ms instead of ~0.7 ms, and CORRECT.
+--
+-- A correct answer in 226 ms is not a regression against a wrong answer in 0.7 ms. It is
+-- the first correct answer these call sites have had.
+--
+-- COST, STATED PLAINLY: every `activity_id + success` or `org_id + success` filter now
+-- scans. On a 150k-row table that measured 226 ms. If that proves too slow for the
+-- retention sweep's budget, the fix is a different index SHAPE — e.g. leading with
+-- `success`, or a computed non-boolean discriminator — NOT the reinstatement of one that
+-- returns zero. Any replacement must be probed against the scan form before it is trusted:
+--
+--   SELECT count() FROM execution WHERE activity_id='validator-dispatch' AND success=true;
+--   SELECT count() FROM execution WHERE activity_id='validator-dispatch' AND success;
+--
+-- Those two must AGREE. They have never agreed on this table.
+--
+-- WHAT THIS DOES NOT FIX: the ring is still at cap and still mostly auth rows. Removing a
+-- lying index lets the sweep see its work; it does not do the work. Expect the sweep to
+-- start deleting on its next run, and verify that it does rather than assuming it.
+--
+-- No data is touched.
+
+REMOVE INDEX IF EXISTS idx_execution_activity_success_time ON execution;
+REMOVE INDEX IF EXISTS idx_execution_org_success_time ON execution;
