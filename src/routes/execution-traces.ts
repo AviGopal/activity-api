@@ -7,6 +7,7 @@
 
 import { validRepairSignature, priorRepairDelta } from '../lib/repair-signature-consume';
 import { Hono } from 'hono';
+import { createHash } from 'node:crypto';
 import { surrealDB, queryWithAuth } from '../db/surreal';
 import { logger } from '../utils/logger';
 import type { SessionData } from '../models/schemas';
@@ -1774,29 +1775,36 @@ export async function deriveCompositionEdgeFromParent(
     //   not an auth artefact: 23 derive_wrote_nothing carrying row_present:true,
     //   execution_count:3782, updated_at four days stale. Addressing the row by
     //   id removes the predicate from the write path entirely.
+    // ★ ONE UNCONDITIONAL UPSERT, KEYED ON A DETERMINISTIC ID.
+    //
+    //   The previous form was `LET $existing = (SELECT …); IF … THEN UPDATE …
+    //   ELSE CREATE … END`. It wrote NOTHING — measured by elimination, on one
+    //   connection: the UPDATE failed both by disjunctive predicate AND when
+    //   addressed by the primary key the SELECT in the same statement had just
+    //   returned (44 derive_wrote_nothing, row_present:true, updated_at stale).
+    //   With the predicate, the id form, the auth context, the parse and the
+    //   lookup all fixed and verified, the multi-statement block itself is what
+    //   does not write.
+    //
+    //   So remove it. A record id derived from (parent, child) makes the write
+    //   idempotent by construction: UPSERT creates on first sight and updates
+    //   thereafter, with no branch, no LET, and no predicate. This is the form
+    //   the codebase already uses successfully for substrate_tuning_param.
+    //
+    //   The id is hashed rather than concatenated because activity ids contain
+    //   `:` and `⟨⟩`, which are not safe in a record key.
     const upsertSql = `
-        LET $existing = (SELECT * FROM activity_composition_graph
-          WHERE (parent_activity_id = $parent OR parent_activity_id = $parent_bare)
-            AND (child_activity_id = $child OR child_activity_id = $child_bare) LIMIT 1);
-        IF array::len($existing) > 0 THEN (
-          UPDATE $existing[0].id SET
-            execution_count = execution_count + 1,
-            success_count = (IF $success THEN success_count + 1 ELSE success_count END),
-            weight = (IF $success THEN success_count + 1 ELSE success_count END) / (execution_count + 1),
-            updated_at = time::now()
-        ) ELSE (
-          CREATE activity_composition_graph SET
-            parent_activity_id = $parent,
-            child_activity_id = $child,
-            execution_id = $execution_id,
-            org_id = $org_id,
-            success = $success,
-            execution_count = 1,
-            success_count = (IF $success THEN 1 ELSE 0 END),
-            weight = (IF $success THEN 1.0 ELSE 0.0 END),
-            created_at = time::now(),
-            updated_at = time::now()
-        ) END;
+        UPSERT type::thing('activity_composition_graph', $edge_key) SET
+          parent_activity_id = $parent,
+          child_activity_id = $child,
+          execution_id = $execution_id,
+          org_id = $org_id,
+          success = $success,
+          execution_count = (execution_count ?? 0) + 1,
+          success_count = (success_count ?? 0) + (IF $success THEN 1 ELSE 0 END),
+          weight = ((success_count ?? 0) + (IF $success THEN 1 ELSE 0 END)) / ((execution_count ?? 0) + 1),
+          created_at = (created_at ?? time::now()),
+          updated_at = time::now()
       `;
     // ★ BIND EVERY REQUIRED COLUMN. activity_composition_graph is SCHEMAFULL and
     //   `execution_id`, `success` (sql/002-learning-system-phase1.surql:29,36)
@@ -1816,11 +1824,16 @@ export async function deriveCompositionEdgeFromParent(
       const bare = id.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
       return `activity:⟨${bare}⟩`;
     };
+    const edgeKey = createHash('sha256')
+      .update(`${asPrefixed(parentActivityId)}|${asPrefixed(childActivityId)}`)
+      .digest('hex')
+      .slice(0, 32);
     const params = {
       parent: asPrefixed(parentActivityId),
       child: asPrefixed(childActivityId),
       parent_bare: parentActivityId,
       child_bare: childActivityId,
+      edge_key: edgeKey,
       success,
       execution_id: childExecutionId ?? bareParent,
       org_id: orgId,
