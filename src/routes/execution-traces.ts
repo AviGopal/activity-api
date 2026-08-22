@@ -1841,17 +1841,25 @@ export async function deriveCompositionEdgeFromParent(
     //   30 times while `updated_at` stayed at 2026-07-02 and execution_count at
     //   19. A readback must assert the thing the write was supposed to CHANGE.
     //   Compare updated_at against the moment the write was issued.
-    const verifyRows = await surrealDB.query<{ execution_count?: number; updated_at?: string }>(
+    // ★ VERIFY THROUGH THE SAME CONNECTION THAT WROTE. The write goes through
+    //   queryWithAuth when a JWT is present while this read was always on root,
+    //   and activity_composition_graph inherits tenancy PERMISSIONS — so the two
+    //   can legitimately see different row sets and the instrument could
+    //   disagree with itself. An instrument on a different auth context than the
+    //   operation it checks is not checking that operation.
+    const verifySql =
       `SELECT execution_count, updated_at FROM activity_composition_graph
          WHERE (parent_activity_id = $parent OR parent_activity_id = $parent_bare)
-           AND (child_activity_id = $child OR child_activity_id = $child_bare) LIMIT 1`,
-      {
-        parent: params.parent,
-        child: params.child,
-        parent_bare: parentActivityId,
-        child_bare: childActivityId,
-      },
-    );
+           AND (child_activity_id = $child OR child_activity_id = $child_bare) LIMIT 1`;
+    const verifyParams = {
+      parent: params.parent,
+      child: params.child,
+      parent_bare: parentActivityId,
+      child_bare: childActivityId,
+    };
+    const verifyRows = jwtToken
+      ? await queryWithAuth<{ execution_count?: number; updated_at?: string }>(jwtToken, verifySql, verifyParams)
+      : await surrealDB.query<{ execution_count?: number; updated_at?: string }>(verifySql, verifyParams);
     const verified = (verifyRows as unknown[] | undefined)?.flat?.()[0] as
       | { execution_count?: number; updated_at?: string }
       | undefined;
