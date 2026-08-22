@@ -1112,6 +1112,24 @@ export const FailureModeSchema: z.ZodType<unknown> = z.lazy(() =>
       abort_source: z.string(),
     }),
     z.object({
+      // THE TYPE 98% OF REAL FAILURES ACTUALLY CARRY, and it was missing here.
+      //
+      // The engine emits `{ type: "execution_error", reason: message }` for an
+      // unhandled resolver throw (ias-executor engine.ts:1407). Measured on the
+      // live substrate 2026-08-22: 1,761 of 1,801 failures are this type, against
+      // 36 cascading and 4 verifier_negative. Every canonical type in this union
+      // together accounts for 2% of what the system actually records.
+      //
+      // Because it was absent, the trace sink filtered it at the wire boundary and
+      // sent a bare `{ type: "execution_error" }` — no reason — so blame could not
+      // be attributed: an arm that is genuinely bad and an arm that merely ran
+      // during an infrastructure outage recorded the identical, information-free
+      // failure. `reason` is optional because the historical rows written under the
+      // stripped shape have none, and this schema must still describe them.
+      type: z.literal("execution_error"),
+      reason: z.string().optional(),
+    }),
+    z.object({
       type: z.literal("prediction_disagreement"),
       reason: z.string(),
       // The substrate-authored activity whose declared output shape produced
@@ -1176,6 +1194,13 @@ export type FailureMode =
       type: "user_abort";
       reason: string;
       abort_source: string;
+    }
+  | {
+      // 98% of real failures — see the note on the zod variant above. `reason` is
+      // optional because rows written before 2026-08-22 have none: the trace sink
+      // stripped it at the wire boundary, which is what made blame unattributable.
+      type: "execution_error";
+      reason?: string;
     }
   | {
       type: "prediction_disagreement";

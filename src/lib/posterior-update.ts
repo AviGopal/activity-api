@@ -298,7 +298,60 @@ export function successYield(
   return Math.max(refs.floor, Math.min(1, y));
 }
 
-function computeDeltas(
+/**
+ * Does this failure reason describe the ENVIRONMENT rather than the arm?
+ *
+ * An infrastructure failure is not the activity's fault. When the trace store is
+ * unreachable or a vessel is mid-restart, every arm that happens to run records a
+ * failure it did not cause — and under the old `default:` branch every one of them took
+ * a full β=1 penalty. That is how an outage silently condemns arms wholesale, and it is
+ * the reason the posterior decay had to be aggressive enough to forget real evidence
+ * (see posterior-decay-halflife.test.ts for the conflict that created).
+ *
+ * Matching is deliberately NARROW: transport and availability signatures only. A resolver
+ * that threw because its own logic is wrong must still be penalised, so anything not
+ * recognised here keeps the strict default. False abstention costs a lost blame signal;
+ * false blame condemns a working arm — and the second is what this codebase keeps paying
+ * for, so the asymmetry is chosen on purpose.
+ */
+const ENVIRONMENTAL_FAILURE_PATTERNS: RegExp[] = [
+  /\bECONNREFUSED\b/i,
+  /\bECONNRESET\b/i,
+  /\bETIMEDOUT\b/i,
+  /\bEAI_AGAIN\b/i,
+  /\bENOTFOUND\b/i,
+  /\bEHOSTUNREACH\b/i,
+  /\bENETUNREACH\b/i,
+  /\bEPIPE\b/i,
+  /connection refused/i,
+  /connection reset/i,
+  /socket hang ?up/i,
+  /network (?:is )?unreachable/i,
+  /fetch failed/i,
+  /failed to fetch/i,
+  /request timed? ?out/i,
+  // Status codes only in an explicit HTTP context. A bare /\b50[234]\b/ was tried and
+  // its own negative control caught it matching "returned 5031 rows, expected 502" —
+  // an arm-fault message that would then have escaped blame. Gateway errors in practice
+  // always carry either the HTTP prefix or the phrase forms below.
+  /\bHTTP[\/ ]?\s*(?:502|503|504)\b/i,
+  /\bstatus\s*(?:code\s*)?(?:502|503|504)\b/i,
+  /bad gateway/i,
+  /service unavailable/i,
+  /gateway time-?out/i,
+  /upstream connect error/i,
+];
+
+export function isEnvironmentalFailureReason(reason: unknown): boolean {
+  if (typeof reason !== 'string' || reason.length === 0) return false;
+  return ENVIRONMENTAL_FAILURE_PATTERNS.some((re) => re.test(reason));
+}
+
+// Exported for direct test: the delta this returns IS the blame decision, and asserting
+// it through applyOutcomeToPosteriors would require a DB mock, which in this repo is
+// global and order-dependent (a sibling test passed in isolation and failed in a
+// full-suite run for exactly that reason). A pure function deserves a pure test.
+export function computeDeltas(
   success: boolean,
   failureMode: FailureMode | null | undefined,
   warnings: string[],
@@ -367,6 +420,34 @@ function computeDeltas(
         `prediction_disagreement with unknown sub_type "${subType ?? "<absent>"}", defaulting to β=0.5`,
       );
       return { alphaDelta: 0, betaDelta: 0.5 };
+    }
+
+    case 'execution_error': {
+      // THE 98% CASE. Measured 2026-08-22: 1,761 of 1,801 recorded failures are this
+      // type, against 36 cascading and 4 verifier_negative. It previously fell through
+      // to `default:` and took a FULL β=1 penalty while warning "unknown
+      // failure_mode.type" — so the overwhelming majority of all blame in this system
+      // was assigned by a branch that did not know what it was looking at.
+      //
+      // An unhandled resolver throw is two different events wearing one label: the
+      // resolver's own logic failed (the arm's fault), or the infrastructure it called
+      // was unreachable (not the arm's fault). Blame the first, abstain on the second —
+      // exactly the distinction `cascading` already makes for a downstream victim.
+      const reason = (failureMode as unknown as { reason?: unknown }).reason;
+      if (isEnvironmentalFailureReason(reason)) {
+        // {0,0} matches 'cascading' / 'user_abort' and suppresses the S1-S4 side-writes
+        // through their existing (alphaDelta!==0||betaDelta!==0) guards.
+        return { alphaDelta: 0, betaDelta: 0 };
+      }
+      if (typeof reason !== 'string' || reason.length === 0) {
+        // No reason to judge by. Historical rows carry none, because the trace sink
+        // stripped it at the wire boundary before 2026-08-22. Keep the strict penalty
+        // rather than abstaining blind: silently forgiving every unlabelled failure
+        // would be a much larger behaviour change than the one being made here.
+        warnings.push('execution_error with no reason; cannot distinguish environmental failure, applying strict penalty');
+        return { alphaDelta: 0, betaDelta: 1 };
+      }
+      return { alphaDelta: 0, betaDelta: 1 };
     }
 
     default:
@@ -759,45 +840,39 @@ export async function propagateCreditAlongChain(
  * config the substrate can steer without a restart — see
  * resolveThompsonDecayHalfLifeDays).
  *
- * WAS 3, "to match the llm-resolver-vessel decayedCounts fix this mirrors"
- * (openspec/changes/2026-07-29-thompson-posterior-time-decay). That is the defect:
- * a constant calibrated for one population was applied to a population with a
- * completely different execution cadence. LLM resolver arms fire many times an
- * hour, so a 3-day half-life barely touches them. Activity templates fire on a
- * cycle of weeks, so the same constant annihilates them.
+ * RAISED 3 -> 30 on 2026-08-22, and only after blame attribution was fixed.
  *
- * MEASURED on the live substrate 2026-08-22, over the 1,821 arms carrying real
- * evidence (alpha+beta > 4):
+ * The 3 came from "matching the llm-resolver-vessel decayedCounts fix this mirrors".
+ * That was a constant calibrated for arms that fire many times an hour, applied to
+ * activity templates that fire on a cycle of weeks. Measured cost over the 1,821 arms
+ * carrying real evidence (alpha+beta > 4): 95.4% retained LESS THAN 5% of it and the
+ * median retained 0.0002%. Credit accumulated correctly and was forgotten faster than
+ * arms re-executed, which is what "learning does not compound" meant mechanically.
  *
- *   staleness      arms        retained = 0.5^(age/3)
- *   <1d              81        ~100%
- *   3-7d              3        20% - 0.4%
- *   14-30d          409        3.9% - 0.098%
- *   >30d          1,328        <0.098%
+ * WHY IT COULD NOT SIMPLY BE RAISED BEFORE. One constant was serving two incompatible
+ * jobs. Fast forgetting existed to heal posteriors poisoned by transient outages —
+ * alpha=1, beta=81, failures the arm did not earn — and slow forgetting is what lets
+ * earned credit compound. Swept across 15 half-lives from 0.5 to 1000 days, the set
+ * satisfying both was EMPTY (posterior-decay-halflife.test.ts proves it).
  *
- *   95.4% of them retain LESS THAN 5% of their evidence.
- *   The median arm retains 0.0002%.
+ * WHAT CHANGED. The conflict was dissolved rather than traded: `execution_error` now
+ * carries its reason across the wire, and computeDeltas abstains (beta += 0) when that
+ * reason is a transport/availability failure. Outage poison is no longer CREATED, so
+ * decay no longer has to erase real evidence to remove it. Blame for a genuinely broken
+ * arm is unchanged at beta=1.
  *
- * Verified end to end against the sampler's own log: `detect-vessel-code-drift`
- * stores alpha=23.76/beta=10.86 and was 33.9 days stale, which decays to
- * alpha=1.009/beta=1.004; plus the 3.0 heuristic boost that is exactly the
- * alpha=4.0/beta=1.0 the selector logged. The posterior was not missing — it was
- * decayed to the uniform prior before the draw. Same arithmetic reproduces
- * `operator-mcp-isomorphism-probe` (alpha=21.62/beta=18.22, 25.8d -> 1.054/1.045).
+ * RESIDUAL, measured and accepted: 32 of 509 arms with real beta still carry the historic
+ * poison signature (beta > 10, alpha <= 2). A beta=81 row crosses back to re-selectable
+ * at roughly 220 days rather than 30 — stated rather than rounded, because at 180 days it
+ * is still suppressed at mean 0.308. The two worst are `auth_resolve_v1` (beta=399,770,
+ * the credential storm — environmental by definition and not a selectable activity) and
+ * `create-shape-provider-goal` (a hook subscriber already excluded from the conditional
+ * posterior), so the slow fade lands where it costs least.
  *
- * WHY RAISING THIS IS SAFE FOR THE HOT SET, not just good for the cold set: the
- * decay factor is 0.5^(age/halfLife), so for a freshly-written row (age ~ 0) the
- * factor is ~1 regardless of the half-life. Lengthening it therefore cannot change
- * what a frequently-executed arm draws; it only stops annihilating arms that have
- * not run recently. The decay's stated purpose — healing a posterior poisoned
- * during a transient outage — still works: at 30 days, 90 days of staleness
- * retains 12.5% and 180 days retains 3%.
- *
- * 30 days is chosen against the measured re-execution cadence: an arm drawn
- * roughly monthly retains half its evidence, so credit compounds instead of
- * resetting. Steer it with the shaped row rather than editing this constant.
+ * Steer with the shaped substrate_tuning_param row THOMPSON_DECAY_HALFLIFE_DAYS rather
+ * than editing this constant.
  */
-export const THOMPSON_DECAY_HALFLIFE_DAYS_DEFAULT = 3;
+export const THOMPSON_DECAY_HALFLIFE_DAYS_DEFAULT = 30;
 
 /**
  * Resolve the posterior-decay half-life (days), consuming the

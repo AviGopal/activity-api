@@ -1,10 +1,18 @@
 /**
  * The posterior decay half-life is over-subscribed: one constant, two incompatible jobs.
  *
- * WHAT THIS FILE IS. Not a fix. A proof that the current design cannot be fixed by
- * choosing a better number, plus the measurement that shows the cost of the number in
- * force. The resolution is a design decision and is deliberately left to the operator;
- * see validation/reports/ for the writeup.
+ * WHAT THIS FILE IS. The proof that the half-life could not be fixed by choosing a better
+ * number — and, since 2026-08-22, the record of how the conflict was dissolved instead.
+ *
+ * RESOLVED. The half-life is now 30 days. That became safe only after blame attribution
+ * was fixed: `execution_error` now carries its reason across the wire, and computeDeltas
+ * abstains (beta += 0) when that reason is a transport/availability failure. Outage
+ * poison is no longer MANUFACTURED, so decay no longer has to erase real evidence to
+ * remove it. R1 below is therefore served upstream rather than by fast forgetting.
+ *
+ * The sweep is kept, not deleted: it is what proves the two requirements could never have
+ * been reconciled by tuning, which is why the fix had to go upstream. If someone later
+ * proposes serving R1 with the half-life again, the sweep still says no.
  *
  * ── THE MEASUREMENT ────────────────────────────────────────────────────────────────
  *
@@ -51,7 +59,15 @@
  * deepen the failure it appears to fix. Recorded so the next reader does not re-derive it.
  *
  * The real target is upstream: blame recorded during an infrastructure outage is not the
- * arm's fault, and decay is a workaround for attributing it in the first place.
+ * arm's fault, and decay is a workaround for attributing it in the first place. That is
+ * what was done — see blame-attribution.test.ts.
+ *
+ * RESIDUAL COST, stated rather than rounded: 32 of 509 arms with real beta already carry
+ * the historic poison signature. A beta=81 row now crosses back to re-selectable at
+ * roughly 240 days instead of 30; at 180 days it is still suppressed at mean 0.308. The
+ * two worst are auth_resolve_v1 (beta=399,770, the credential storm, not a selectable
+ * activity) and a hook subscriber already excluded from the conditional posterior, so the
+ * slow fade lands where it costs least.
  */
 
 import { describe, expect, test } from 'bun:test';
@@ -83,25 +99,32 @@ const evidenceRetained = (a: number, b: number, days: number, hl: number) => {
 };
 
 describe('posterior decay: the measurement', () => {
-  test('at the in-force default, a month-old earned posterior is annihilated', () => {
-    // This is the current, deployed behaviour. It is a characterization, not an
-    // aspiration: if someone changes the default, this fails and sends them to the
-    // conflict below rather than letting the change land silently.
+  test('RESOLVED: a month-old earned posterior now survives', () => {
+    // This asserted `< 0.01` while the default was 3 days — a characterization of the
+    // defect. The conflict that forced it has been dissolved (see below), so the
+    // assertion is inverted to pin the repair instead.
     const retained = evidenceRetained(
       EARNED.alpha, EARNED.beta, 30, THOMPSON_DECAY_HALFLIFE_DAYS_DEFAULT,
     );
-    expect(retained).toBeLessThan(0.01);
+    expect(retained).toBeGreaterThan(0.25);
   });
 
-  test('THE EXACT LIVE CASE: 33.9 days collapses to the heuristic boost alone', () => {
-    const d = decayedThompsonCounts(
+  test('THE EXACT LIVE CASE no longer collapses to the heuristic boost alone', () => {
+    // detect-vessel-code-drift: stored 23.76/10.86, 33.9 days stale. At the old 3-day
+    // half-life this decayed to 1.009/1.004 which, plus the 3.0 heuristic boost, is
+    // exactly the alpha=4.0/beta=1.0 the sampler logged — the observation that started
+    // this whole investigation.
+    const oldD = decayedThompsonCounts(EARNED.alpha, EARNED.beta, at(33.9), NOW, 3);
+    expect(oldD.alpha).toBeCloseTo(1.009, 2);
+    expect(oldD.beta).toBeCloseTo(1.004, 2);
+
+    const now = decayedThompsonCounts(
       EARNED.alpha, EARNED.beta, at(33.9), NOW, THOMPSON_DECAY_HALFLIFE_DAYS_DEFAULT,
     );
-    // 1.009 / 1.004 — plus the 3.0 boost, exactly the alpha=4.0/beta=1.0 in the log.
-    expect(d.alpha).toBeCloseTo(1.009, 2);
-    expect(d.beta).toBeCloseTo(1.004, 2);
-    // beta pinned at ~1 IS the tell: no failure evidence can reach the draw.
-    expect(d.beta).toBeLessThan(1.02);
+    expect(now.alpha).toBeGreaterThan(8);
+    // beta moving off 1.0 is the load-bearing change: failure evidence can reach the
+    // draw again, and beta pinned at exactly 1.0 everywhere was the original tell.
+    expect(now.beta).toBeGreaterThan(4);
   });
 
   test('a freshly written row is undecayed — the hot set never saw this defect', () => {
@@ -114,11 +137,19 @@ describe('posterior decay: the measurement', () => {
 });
 
 describe('posterior decay: the conflict', () => {
-  test('R1 holds at the in-force default — poison heals, which is why it is 3 days', () => {
+  test('R1 IS NO LONGER SERVED BY DECAY — it is served upstream', () => {
+    // At 30 days the poisoned posterior is NOT healed, and that is now correct rather
+    // than a regression: outage poison is no longer manufactured. computeDeltas abstains
+    // (beta += 0) when an execution_error's reason is a transport failure, so the
+    // alpha=1/beta=81 shape stops being created. Decay only has to fade the 32 historical
+    // arms that already carry it. See blame-attribution.test.ts.
     const stale = decayedThompsonCounts(
       POISONED.alpha, POISONED.beta, at(30), NOW, THOMPSON_DECAY_HALFLIFE_DAYS_DEFAULT,
     );
-    expect(meanOf(stale)).toBeGreaterThan(0.4);
+    expect(meanOf(stale)).toBeLessThan(0.4);
+    // and it still heals eventually, monotonically
+    const later = decayedThompsonCounts(POISONED.alpha, POISONED.beta, at(240), NOW, THOMPSON_DECAY_HALFLIFE_DAYS_DEFAULT);
+    expect(meanOf(later)).toBeGreaterThan(meanOf(stale));
   });
 
   test('NO SINGLE HALF-LIFE SATISFIES BOTH — proved over the parameter space', () => {

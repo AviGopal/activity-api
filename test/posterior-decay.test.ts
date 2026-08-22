@@ -61,17 +61,43 @@ describe('decayedThompsonCounts', () => {
     expect(beta).toBeCloseTo(41, 10);
   });
 
-  test('30-day-stale poisoned posterior (alpha=1, beta=81) heals toward the neutral prior', () => {
+  test('a poisoned posterior heals — over a quarter now, not a fortnight', () => {
+    // THIS TEST'S PREMISE CHANGED ON 2026-08-22, and the change is the point.
+    //
+    // It used to assert that alpha=1, beta=81 — a posterior poisoned by a transient
+    // outage — healed to re-selectable within 30 DAYS, which pinned the half-life at 3.
+    // That requirement existed because outage poison was being CREATED: every
+    // `execution_error` fell through computeDeltas' `default:` branch and took a full
+    // beta=1 penalty, so any arm that happened to run during an outage was condemned for
+    // a failure it did not cause. 98% of all recorded failures took that branch.
+    //
+    // Blame attribution now abstains on transport/availability failures
+    // (isEnvironmentalFailureReason + the execution_error case in computeDeltas), so this
+    // poison is no longer manufactured. Decay's remaining job is to fade the 32 historical
+    // arms that already carry it, and it does — the beta=81 case crosses back to
+    // re-selectable (mean > 0.4) at roughly 220 days rather than 30. That is the
+    // deliberate trade for keeping earned evidence alive, and the figure is stated
+    // rather than rounded: at 180 days the mean is 0.308, still suppressed.
+    //
+    // The property still asserted: decay MOVES a poisoned posterior toward re-selectable,
+    // monotonically, and gets there. Only the timescale moved.
     const now = Date.now();
-    const stale = decayedThompsonCounts(1, 81, now - 30 * DAY_MS, now);
     const fresh = decayedThompsonCounts(1, 81, now - 10_000, now);
-    // 30d at 3d half-life = 10 half-lives: beta = 1 + 80 * 2^-10 ≈ 1.078
-    expect(stale.beta).toBeCloseTo(1 + 80 * Math.pow(0.5, 10), 6);
-    // Property under test: the stale posterior's mean is materially higher than
-    // the fresh one's — the stale poison no longer suppresses re-selection.
+    const oneMonth = decayedThompsonCounts(1, 81, now - 30 * DAY_MS, now);
+    const halfYear = decayedThompsonCounts(1, 81, now - 180 * DAY_MS, now);
+    const fullFade = decayedThompsonCounts(1, 81, now - 240 * DAY_MS, now);
     const meanOf = (c: { alpha: number; beta: number }) => c.alpha / (c.alpha + c.beta);
-    expect(meanOf(stale)).toBeGreaterThan(0.4);
+
+    // Fresh poison still suppresses, as it must — a genuinely failing arm is not excused.
     expect(meanOf(fresh)).toBeLessThan(0.02);
+    // Healing is monotone in staleness.
+    expect(meanOf(oneMonth)).toBeGreaterThan(meanOf(fresh));
+    expect(meanOf(halfYear)).toBeGreaterThan(meanOf(oneMonth));
+    expect(meanOf(fullFade)).toBeGreaterThan(meanOf(halfYear));
+    // Still suppressed at half a year — recorded so the cost is explicit, not implied.
+    expect(meanOf(halfYear)).toBeLessThan(0.4);
+    // And it does arrive at re-selectable.
+    expect(meanOf(fullFade)).toBeGreaterThan(0.4);
   });
 
   test('future timestamps (clock skew) clamp to no decay', () => {
