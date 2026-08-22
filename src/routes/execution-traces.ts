@@ -1692,7 +1692,16 @@ export async function deriveCompositionEdgeFromParent(
     //       uses, then the normalized one. Cheap (indexed, LIMIT 1) and it
     //       removes an entire class of guess from a lookup that has now failed
     //       for four distinct reasons in a row.
-    const viewSql = `SELECT activity_id FROM v_paradigm_execution_traces WHERE execution_id = $pid LIMIT 1`;
+    //   (5) …and `execution_id` on the view can hold a TABLE-QUALIFIED value.
+    //       The working filter in this same file (:855-858) binds BOTH forms —
+    //       the bare id and `activity_execution_traces:<id>` — for exactly this
+    //       reason. Binding only one is the fifth way this lookup has missed:
+    //       measured 6 parent_lookup_miss on `exec_1jyd9ugg` / `exec_2gf8ljfw`,
+    //       both of which resolve to `validator-dispatch` through the API at the
+    //       same moment. Match the pattern the working query already proves.
+    const viewSql =
+      `SELECT activity_id FROM v_paradigm_execution_traces
+       WHERE execution_id = $pid OR execution_id = $pid_qualified LIMIT 1`;
     const tryLookup = async (pid: string): Promise<unknown> => {
       if (jwtToken) {
         return queryWithAuth<{ activity_id?: string }>(
@@ -1701,7 +1710,11 @@ export async function deriveCompositionEdgeFromParent(
           { pid },
         );
       }
-      return surrealDB.query<{ activity_id?: string }>(viewSql, { pid });
+      const bare = pid.includes(':') ? pid.split(':').pop()!.replace(/[⟨⟩]/g, '') : pid;
+      return surrealDB.query<{ activity_id?: string }>(viewSql, {
+        pid,
+        pid_qualified: `activity_execution_traces:${bare}`,
+      });
     };
     let parentRows = await tryLookup(parentExecutionId);
     const firstOf = (rows: unknown): string | undefined =>
