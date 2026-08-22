@@ -64,8 +64,20 @@ describe('execution-traces SQL target tables are pinned', () => {
 
   test('the composition-edge upsert still targets activity_composition_graph', () => {
     // Guards the reverse direction: the edge writer must not be redirected either.
+    //
+    // PINNED FORM UPDATED. This asserted `CREATE activity_composition_graph SET`
+    // and had gone stale: the writer was deliberately changed to a keyed UPSERT
+    // so a repeated (parent, child) pair sharpens one edge row instead of
+    // minting a duplicate every execution. The table it targets — the thing this
+    // test actually guards — did not change, so the assertion was failing on the
+    // verb while the property it exists to protect still held. A test that fails
+    // for a reason unrelated to its own stated intent blocks convergence for
+    // nothing; pull-sync refused to converge on exactly this.
     expect(SOURCE).toContain('activity_composition_graph');
-    const createIdx = SOURCE.indexOf('CREATE activity_composition_graph SET');
-    expect(createIdx).toBeGreaterThan(-1);
+    const upsertIdx = SOURCE.indexOf('UPSERT activity_composition_graph:');
+    expect(upsertIdx).toBeGreaterThan(-1);
+    // And it must still be a keyed upsert, not a bare table write that would
+    // reintroduce duplicate edges.
+    expect(SOURCE).toContain('UPSERT activity_composition_graph:\\`${edgeKey}\\` CONTENT');
   });
 });
