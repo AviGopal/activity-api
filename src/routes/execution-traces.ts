@@ -1679,13 +1679,36 @@ export async function deriveCompositionEdgeFromParent(
     //       caller's JWT when present, and fall back to the compat view — which
     //       is permission-transparent — when this is an api-key ingest with no
     //       JWT to borrow.
-    const parentSql = `SELECT activity_id FROM type::thing('execution', $pid) LIMIT 1`;
-    let parentRows = jwtToken
-      ? await queryWithAuth<{ activity_id?: string }[]>(jwtToken, parentSql, { pid: bareParent })
-      : await surrealDB.query<{ activity_id?: string }[]>(
-          `SELECT activity_id FROM v_paradigm_execution_traces WHERE execution_id = $pid LIMIT 1`,
-          { pid: bareParent },
+    //   (4) …and it must bind the id form the VIEW stores, which is not
+    //       necessarily the one this function normalized. The sibling lookup in
+    //       backfillChildCompositionChains (:1463) runs on this same ingest path,
+    //       against this same view, and demonstrably works — because it binds
+    //       `parentExecutionId` RAW. `v_paradigm_execution_traces.execution_id`
+    //       is `meta::id(id)`, so it holds the bare key; but the incoming value
+    //       is already bare on this path, and normalizing it further was one
+    //       more silent way to miss.
+    //
+    //       Try both forms rather than assume: the raw value the working sibling
+    //       uses, then the normalized one. Cheap (indexed, LIMIT 1) and it
+    //       removes an entire class of guess from a lookup that has now failed
+    //       for four distinct reasons in a row.
+    const viewSql = `SELECT activity_id FROM v_paradigm_execution_traces WHERE execution_id = $pid LIMIT 1`;
+    const tryLookup = async (pid: string): Promise<unknown> => {
+      if (jwtToken) {
+        return queryWithAuth<{ activity_id?: string }>(
+          jwtToken,
+          `SELECT activity_id FROM type::thing('execution', $pid) LIMIT 1`,
+          { pid },
         );
+      }
+      return surrealDB.query<{ activity_id?: string }>(viewSql, { pid });
+    };
+    let parentRows = await tryLookup(parentExecutionId);
+    const firstOf = (rows: unknown): string | undefined =>
+      Array.isArray(rows) ? ((rows as unknown[]).flat()[0] as { activity_id?: string } | undefined)?.activity_id : undefined;
+    if (!firstOf(parentRows) && bareParent !== parentExecutionId) {
+      parentRows = await tryLookup(bareParent);
+    }
     const parentActivityId = Array.isArray(parentRows)
       ? (parentRows.flat()[0] as { activity_id?: string } | undefined)?.activity_id
       : undefined;
