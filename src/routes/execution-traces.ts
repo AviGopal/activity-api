@@ -148,7 +148,26 @@ export function deriveSignatureShapes(trace: any): string[] {
   if (directInput.length > 0) return dedupe(directInput);
 
   // 2. per-task input shapes
+  //
+  // ★ READ THE KEY THE STORE ACTUALLY WRITES. This tier read
+  //   `input_impulse_shapes` and `inputShapes` off each task — but
+  //   normalizePersistedTask writes `input_shapes` (see PersistedTask above), so
+  //   the intersection was EMPTY and tier 2 could never fire. Measured by unit
+  //   probe: deriveSignatureShapes({tasks:[{input_shapes:['goal']}]}) returned
+  //   [] where it must return ['goal'].
+  //
+  //   The consequence is the whole credit seam. With tier 2 dead, every trace
+  //   fell to tier 3, which keys on the PRODUCED pool as a proxy for the INPUT
+  //   pool — a different state space than the one /recommend derives when it
+  //   reads back. Measured: 0 of 50 live traces carry a signature at all, and
+  //   the v1 conditional lookup reports hits:0 against a correctly-formed
+  //   16-hex key because there is nothing keyed to match it.
+  //
+  //   Both spellings are kept alongside the normalized one: the wire format from
+  //   ias-executor uses the camelCase form, and this function runs on both
+  //   inbound bodies and stored rows.
   const taskInput = collect(
+    ...tasks.map((t: any) => t?.input_shapes),
     ...tasks.map((t: any) => t?.input_impulse_shapes),
     ...tasks.map((t: any) => t?.inputShapes),
   );
@@ -160,6 +179,7 @@ export function deriveSignatureShapes(trace: any): string[] {
     Array.isArray(trace?.output_impulses)
       ? trace.output_impulses.map((o: any) => o?.shape)
       : [],
+    ...tasks.map((t: any) => t?.output_shapes),
     ...tasks.map((t: any) => t?.output_impulse_shapes),
     ...tasks.map((t: any) => t?.outputShapes),
   );
