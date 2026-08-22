@@ -1700,9 +1700,21 @@ export async function deriveCompositionEdgeFromParent(
     //       measured 6 parent_lookup_miss on `exec_1jyd9ugg` / `exec_2gf8ljfw`,
     //       both of which resolve to `validator-dispatch` through the API at the
     //       same moment. Match the pattern the working query already proves.
+    // ★ MATCH ON meta::id(id), THE COLUMN THAT ACTUALLY EXISTS.
+    //
+    //   PROVEN in isolation: calling this function with a parent id obtained via
+    //   `SELECT VALUE meta::id(id) FROM execution` wrote the edge and moved the
+    //   table 2000 -> 2001. Calling it with an id obtained from
+    //   `SELECT execution_id FROM execution` wrote nothing — because that column
+    //   does not exist on the base table, so the select returned a row with NO
+    //   execution_id and the function returned early on an empty parent.
+    //
+    //   The compat view synthesizes `execution_id` via meta::id(id), but matching
+    //   it through the view was still missing; matching the base table by the
+    //   same expression the view uses is direct and cannot drift from it.
     const viewSql =
-      `SELECT activity_id FROM v_paradigm_execution_traces
-       WHERE execution_id = $pid OR execution_id = $pid_qualified LIMIT 1`;
+      `SELECT activity_id FROM execution
+       WHERE meta::id(id) = $pid OR meta::id(id) = $pid_qualified LIMIT 1`;
     const tryLookup = async (pid: string): Promise<unknown> => {
       if (jwtToken) {
         return queryWithAuth<{ activity_id?: string }>(
