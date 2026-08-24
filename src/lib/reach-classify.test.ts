@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { classifyReach, isHollowSatellite } from './reach-classify';
+import { classifyReach, isHollowSatellite, isReachInapplicable } from './reach-classify';
 
 /**
  * This primitive decides whether an execution moves a Thompson posterior and whether the
@@ -65,6 +65,24 @@ describe('classifyReach', () => {
     expect(classifyReach({ success: true, tags: ['dispatcher_used:goal-host'] })).toBe('ungraded');
   });
 
+  it("REACH-INAPPLICABLE: a telemetry/infra probe's reached:false is ABSTAINED, not penalized", () => {
+    // auth_resolve_v1 (the sole telemetry emitter) had alpha frozen at 1 while beta
+    // climbed unbounded (~1.9/min, measured live) because every successful auth was
+    // stamped reached:false — a verdict inapplicable to an infra sub-step — and read as
+    // a genuine not-reached failure. The probe must be ungraded {0,0}.
+    expect(classifyReach({ success: true, tags: ['telemetry:auth', 'reached:false', 'auth:success'] })).toBe('ungraded');
+    // A genuine reach is still honored (placed after the reached:true arm).
+    expect(classifyReach({ success: true, tags: ['telemetry:auth', 'reached:true'] })).toBe('reached');
+  });
+
+  it('DOES NOT over-broaden: a NON-telemetry reached:false still penalizes (hollow completion)', () => {
+    // The load-bearing guard: a real goal that completed cleanly but did not reach its
+    // target (success:true + reached:false, NO telemetry tag) is a genuine not-reached and
+    // MUST stay penalized. Diverting it too would gut the honest-reach gate.
+    expect(classifyReach({ success: true, tags: ['reached:false'] })).toBe('not-reached');
+    expect(classifyReach({ success: true, tags: ['dispatcher_used:goal-host', 'reached:false'] })).toBe('not-reached');
+  });
+
   it('REGRESSION: a FAILED goal-host walk awaiting its verdict is ungraded, not beta', () => {
     // Caught by re-measuring the corpus after the fix, not by reading it: dropping the
     // goal-host branch reintroduces the blocking bug with the sign flipped — the walk is
@@ -83,5 +101,15 @@ describe('isHollowSatellite', () => {
     expect(isHollowSatellite({ activity_id: 'satisfier:shellResult' })).toBe(true);
     expect(isHollowSatellite({ execution_id: 'exec_2b9e42a8', activity_id: 'development-vessel:mitosis-tick' })).toBe(false);
     expect(isHollowSatellite({})).toBe(false);
+  });
+});
+
+describe('isReachInapplicable', () => {
+  it('matches any telemetry: tag and nothing else', () => {
+    expect(isReachInapplicable({ tags: ['telemetry:auth'] })).toBe(true);
+    expect(isReachInapplicable({ tags: ['identity-vessel', 'telemetry:whatever', 'reached:false'] })).toBe(true);
+    expect(isReachInapplicable({ tags: ['reached:false', 'dispatcher_used:goal-host'] })).toBe(false);
+    expect(isReachInapplicable({ tags: [] })).toBe(false);
+    expect(isReachInapplicable({})).toBe(false);
   });
 });

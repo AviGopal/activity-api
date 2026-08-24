@@ -9,6 +9,23 @@ export function isHollowSatellite(t: { execution_id?: string; activity_id?: stri
 }
 
 /**
+ * Telemetry / infra probe — an execution that was never attempting a goal, so a
+ * goal-level `reached:false` verdict is INAPPLICABLE to it (not evidence it failed).
+ * Marked by a `telemetry:` tag (e.g. an identity-vessel auth resolve). Like a hollow
+ * satellite, such a run must be neither credited nor blamed.
+ *
+ * Why this exists: `auth_resolve_v1` — the sole `telemetry:` emitter — ran hundreds of
+ * thousands of times, every one `success:true` but stamped `reached:false` (reach is
+ * meaningless for an auth sub-step), and every one was read as a genuine not-reached
+ * failure. Its posterior collapsed to alpha=1 (FROZEN) / beta≈4e5 and CLIMBING ~1.9/min,
+ * pure blame with zero credit ever. Abstaining is the conservative side of the reach
+ * gate's own asymmetry: a false rejection is worse than a false reach.
+ */
+export function isReachInapplicable(t: { tags?: string[] }): boolean {
+  return (t.tags ?? []).some((tag) => typeof tag === 'string' && tag.startsWith('telemetry:'));
+}
+
+/**
  * The ONE honest-reach primitive shared by the ribosome (extract-or-not) and the
  * posterior (credit / penalize / skip).
  *
@@ -49,6 +66,11 @@ export function classifyReach(t: {
 }): ReachVerdict {
   const tags = t.tags ?? [];
   if (tags.includes('reached:true')) return 'reached';
+  // A telemetry/infra probe's `reached:false` is INAPPLICABLE, not a failure verdict —
+  // intercept it here, ahead of the not-reached arm, so infra sub-steps (auth resolves)
+  // are ungraded {0,0} rather than β-penalized. Placed after `reached:true` so a genuine
+  // reach is still honored; only the false-blame path is diverted.
+  if (isReachInapplicable(t)) return 'ungraded';
   if (tags.includes('reached:false')) return 'not-reached';
   if (isHollowSatellite(t)) return 'ungraded';
   // A goal-host walk with no reach tag is AWAITING its verdict — ungraded in BOTH
