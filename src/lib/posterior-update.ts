@@ -30,6 +30,7 @@ import { embedSignatureForShapes } from '../jobs/signature-embed-backfill';
 import { applyClusterPosterior } from './cluster-posterior';
 import { getTuningParam } from './tuning-params';
 import { classifyReach } from './reach-classify';
+import { recordDecisionOutcome } from './decision-credit';
 
 // Install the SIGTERM/SIGINT flush hook once on module load so buffered α/β
 // deltas are written out on shutdown rather than lost.
@@ -956,6 +957,27 @@ export async function applyOutcomeToPosteriors(
     ? { alphaDelta: 0, betaDelta: 0 }
     : computeDeltas(effectiveSuccess, trace.failure_mode, warnings, trace, yieldRefs);
   const failureModeType = trace.failure_mode?.type ?? null;
+
+  // Decision-level outcome capture (law 12), best-effort + NON-BLOCKING. This is
+  // the additive consumer of the selection→outcome join: it persists a durable
+  // decision_outcome row (survives execution-row retention) keyed on the walk's
+  // correlation id, WITHOUT touching variant_performance_metrics or selection
+  // behavior — so it cannot corrupt existing credit. Fire-and-forget (the callee
+  // self-guards and never rejects) so it adds no latency to the credit path, and a
+  // fast no-op when the trace carries no correlation tag (the common case).
+  {
+    const corrTag = (trace.tags ?? []).find(
+      (t): t is string => typeof t === 'string' && t.startsWith('correlation:'),
+    );
+    const correlationId = corrTag ? corrTag.slice('correlation:'.length) : null;
+    if (correlationId) {
+      void recordDecisionOutcome(db, {
+        correlationId,
+        success: trace.success,
+        reached: ungraded ? null : effectiveSuccess,
+      });
+    }
+  }
 
   // M4 tier-restricted bandit: when every task on the trace is deterministic,
   // the cell-local Beta posterior captures propagated upstream uncertainty
