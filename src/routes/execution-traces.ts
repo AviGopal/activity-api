@@ -4295,10 +4295,22 @@ app.get('/selection-calibration', async (c) => {
     // to the helper + the slice below.
     logger.info('Fetching selection calibration', { activityId, minExecutions, limit, offset });
 
+    // Bounded fetches — thompson_selection_log is ~30k rows and `execution` far
+    // larger, so neither an unbounded scan nor a multi-thousand-element IN clause
+    // is acceptable (both hang). Bound the selection side to the most-recent
+    // SELECTION_CAP rows, and drive outcomes from the SMALL "has a correlation_id"
+    // slice of `execution` rather than an IN over every selection id. Calibration
+    // is therefore over the recent-selection window; documented in the response.
+    const SELECTION_CAP = 5000;
+    const EXEC_CAP = 20000;
+    params.selection_cap = SELECTION_CAP;
+    params.exec_cap = EXEC_CAP;
     const selQuery = `
       SELECT activity_id, org_id, correlation_id, alpha, beta, thompson_sample, selected_at
       FROM thompson_selection_log
       WHERE 1=1 ${activityFilter}
+      ORDER BY selected_at DESC
+      LIMIT $selection_cap
     `;
     let selections: any[];
     // API-key auth produces a JWT with `id: api_key:N` which SurrealDB
@@ -4311,21 +4323,17 @@ app.get('/selection-calibration', async (c) => {
     }
     selections = selections || [];
 
-    const correlationIds = [...new Set(
-      selections
-        .map((s: any) => s.correlation_id)
-        .filter((x: any): x is string => typeof x === 'string' && x.length > 0),
-    )];
+    // Outcomes: only executions carrying a correlation_id can ever join, and that
+    // slice is small (the producer joint currently populates few). Fetch it once,
+    // no IN clause.
     const execByCorrelation = new Map<string, CalibrationExecutionRow>();
-    if (correlationIds.length > 0) {
-      const execRows = await surrealDB.query<any>(
-        `SELECT correlation_id, success, duration_ms, cost_usd, executed_at
-         FROM execution WHERE correlation_id IN $correlation_ids`,
-        { correlation_ids: correlationIds },
-      );
-      for (const e of execRows || []) {
-        if (e && typeof e.correlation_id === 'string') execByCorrelation.set(e.correlation_id, e);
-      }
+    const execRows = await surrealDB.query<any>(
+      `SELECT correlation_id, success, duration_ms, cost_usd, executed_at
+       FROM execution WHERE correlation_id != NONE LIMIT $exec_cap`,
+      { exec_cap: EXEC_CAP },
+    );
+    for (const e of execRows || []) {
+      if (e && typeof e.correlation_id === 'string') execByCorrelation.set(e.correlation_id, e);
     }
 
     const calibration = aggregateSelectionCalibration(
