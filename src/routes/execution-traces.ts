@@ -4376,6 +4376,182 @@ app.get('/selection-calibration', async (c) => {
   }
 });
 
+/** A `decision_outcome` row, as read for calibration. */
+export interface DecisionCalibrationRow {
+  activity_id: string;
+  /** capture source: 'execution' (universal per-exec) | 'selection'/absent (recommend-join) */
+  source?: string | null;
+  predicted_success?: number | null;
+  outcome_success?: boolean | null;
+  reached?: boolean | null;
+  executed_at?: string | null;
+  created_at?: string | null;
+}
+
+/**
+ * Aggregate decision→outcome calibration per (activity, source), from the
+ * `decision_outcome` table.
+ *
+ * WHY THIS EXISTS: the sibling `/selection-calibration` anchors on
+ * `thompson_selection_log`, which is written ONLY by the /recommend draw path. The
+ * substrate mostly executes via WALKS and PATHWAY-REUSE — producers picked by
+ * discover-by-shapes, which writes no selection log — so that endpoint is
+ * structurally blind to the dominant paths. `decision_outcome` captures EVERY
+ * execution's decision (run arm A) with its prediction (A's posterior mean) and its
+ * honest outcome (reached), so calibrating over it covers the paths the selection
+ * log cannot see. This is the first reader of that table (it had none).
+ *
+ * The posterior mean predicts P(reached) — it is updated FROM the reach verdict — so
+ * calibration is `predicted_success` vs the REACH rate (reached=true fraction over
+ * rows with a known verdict). `outcome_success` (exit status) is reported alongside
+ * but NOT used as the calibration target: the posterior does not predict it, and
+ * substituting it would manufacture a false calibration for reach-inapplicable infra
+ * probes (which exit success but never reach). `source` stays in the group key so a
+ * selection-sourced row is never silently pooled with an execution-sourced one.
+ */
+export function aggregateDecisionCalibration(
+  rows: DecisionCalibrationRow[],
+  min: number,
+): Array<Record<string, unknown>> {
+  const groups = new Map<string, {
+    activity_id: string; source: string;
+    total: number;
+    predictedSum: number; predictedN: number;
+    reachedKnown: number; reachedTrue: number;
+    successKnown: number; successTrue: number;
+    lastAt: string | null;
+  }>();
+  for (const r of rows) {
+    if (!r || typeof r.activity_id !== 'string') continue;
+    const source = typeof r.source === 'string' && r.source.length > 0 ? r.source : 'selection';
+    const key = `${r.activity_id} ${source}`;
+    let g = groups.get(key);
+    if (!g) {
+      g = { activity_id: r.activity_id, source, total: 0,
+        predictedSum: 0, predictedN: 0,
+        reachedKnown: 0, reachedTrue: 0,
+        successKnown: 0, successTrue: 0, lastAt: null };
+      groups.set(key, g);
+    }
+    g.total++;
+    if (typeof r.predicted_success === 'number') { g.predictedSum += r.predicted_success; g.predictedN++; }
+    if (typeof r.reached === 'boolean') { g.reachedKnown++; if (r.reached) g.reachedTrue++; }
+    if (typeof r.outcome_success === 'boolean') { g.successKnown++; if (r.outcome_success) g.successTrue++; }
+    const at = r.executed_at || r.created_at || null;
+    if (at && (!g.lastAt || at > g.lastAt)) g.lastAt = at;
+  }
+  const out: Array<Record<string, unknown>> = [];
+  for (const g of groups.values()) {
+    if (g.total < min) continue;
+    const avg_predicted_success = g.predictedN > 0 ? g.predictedSum / g.predictedN : null;
+    const actual_reach_rate = g.reachedKnown > 0 ? g.reachedTrue / g.reachedKnown : null;
+    const actual_success_rate = g.successKnown > 0 ? g.successTrue / g.successKnown : null;
+    // Calibrate the posterior mean against the REACH rate only. When reach is unknown
+    // we abstain (null) rather than substitute exit-status success — the posterior
+    // does not predict success, and substituting it fabricates calibration for infra
+    // probes that exit success but never reach.
+    const calibration_error = (avg_predicted_success !== null && actual_reach_rate !== null)
+      ? Math.abs(avg_predicted_success - actual_reach_rate) : null;
+    out.push({
+      activity_id: g.activity_id,
+      source: g.source,
+      decisions: g.total,
+      predicted_n: g.predictedN,
+      reached_known: g.reachedKnown,
+      success_known: g.successKnown,
+      avg_predicted_success,
+      actual_reach_rate,
+      actual_success_rate,
+      calibration_error,
+      last_decision_at: g.lastAt,
+    });
+  }
+  return out;
+}
+
+/**
+ * GET /v2/activities/execution-traces/decision-calibration
+ *
+ * Per-(activity, source) calibration from `decision_outcome` — the universal
+ * per-execution decision→outcome capture (law 12). Unlike /selection-calibration
+ * (anchored on thompson_selection_log, blind to the walk and pathway-reuse paths),
+ * this covers EVERY execution, so it is the first reader of decision_outcome and the
+ * calibration view for the dominant execution paths. Calibrates the posterior mean
+ * (predicted_success) against the REACH rate.
+ *
+ * Query params:
+ * - activity_id: filter by activity id
+ * - source: filter by capture source ('execution' | 'selection')
+ * - min_decisions: only activities with >= N decisions (default 1)
+ * - limit / offset: pagination (limit default 50, max 500)
+ */
+app.get('/decision-calibration', async (c) => {
+  try {
+    const activityId = c.req.query('activity_id');
+    const source = c.req.query('source');
+    const minDecisions = parseInt(c.req.query('min_decisions') || '1', 10);
+    const limitParam = parseInt(c.req.query('limit') || '50', 10);
+    const offsetParam = parseInt(c.req.query('offset') || '0', 10);
+    const limit = Math.min(Math.max(limitParam, 1), 500);
+    const offset = Math.max(offsetParam, 0);
+
+    // Bounded scan of the most-recent decisions. decision_outcome is keyed on
+    // execution/correlation id and grows with traffic, so cap it like the sibling
+    // endpoints; calibration is therefore over the recent-decision window (reported
+    // in the response). decision_outcome carries no org_id (the writer omits it), so
+    // this is a root-cred aggregate read, matching the sibling `execution` fetch.
+    const DECISION_CAP = 20000;
+    const conds: string[] = [];
+    const params: Record<string, any> = { decision_cap: DECISION_CAP };
+    if (activityId) { conds.push('activity_id = $activity_id'); params.activity_id = activityId; }
+    if (source) { conds.push('source = $source'); params.source = source; }
+    const whereClause = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+    const rowsQuery = `
+      SELECT activity_id, source, predicted_success, outcome_success, reached, executed_at, created_at
+      FROM decision_outcome
+      ${whereClause}
+      ORDER BY created_at DESC
+      LIMIT $decision_cap
+    `;
+    const rows = await surrealDB.query<DecisionCalibrationRow>(rowsQuery, params);
+
+    const calibration = aggregateDecisionCalibration(
+      (rows || []) as DecisionCalibrationRow[],
+      minDecisions,
+    );
+    // Worst-calibrated first; null (reach-unknown) sinks to the bottom.
+    calibration.sort((a: any, b: any) => {
+      if (a.calibration_error === null) return 1;
+      if (b.calibration_error === null) return -1;
+      return b.calibration_error - a.calibration_error;
+    });
+    const total = calibration.length;
+    const paged = calibration.slice(offset, offset + limit);
+
+    logger.info('Decision calibration fetched', { count: paged.length, total });
+
+    return c.json({
+      calibration: paged,
+      total,
+      limit,
+      offset,
+      window: {
+        table: 'decision_outcome',
+        decision_cap: DECISION_CAP,
+        note: 'recent-decision window; calibrates posterior mean vs reach rate',
+      },
+    });
+  } catch (error) {
+    logger.error('Failed to fetch decision calibration', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return c.json({
+      error: 'Failed to fetch decision calibration',
+      message: error instanceof Error ? error.message : 'Unknown error',
+    }, 500);
+  }
+});
+
 /**
  * GET /v2/activities/execution-traces/calibration-summary
  *
