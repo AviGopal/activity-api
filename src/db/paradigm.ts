@@ -783,6 +783,19 @@ export async function getActivityScores(
  * @param limit - Maximum number of results to return
  * @param jwtToken - Optional JWT token for RBAC
  */
+/**
+ * Candidate-admission cap for the shape-matched prefilter. The caller's `limit`
+ * is a *selection* count, but this query runs BEFORE the Thompson draw that does
+ * the selecting; truncating to `limit` here (ordered by the dead-constant `ev`,
+ * i.e. recency) starves the draw of earned, non-recent arms. Admit a bounded
+ * superset instead and let the draw pick. Mirrors discover-by-shapes.ts's
+ * ADMISSION_CAP=1000, which covers the widest live shape family with headroom;
+ * a caller asking for more than the cap still gets what it asked for.
+ */
+export function computeAdmissionLimit(limit: number, cap = 1000): number {
+  return Math.max(limit, cap);
+}
+
 export async function queryActivitiesByShapes(
   availableShapes: string[],
   orgId?: string | null,
@@ -799,7 +812,19 @@ export async function queryActivitiesByShapes(
   if (useParadigm) {
     try {
     const whereClauses: string[] = [];
-    const params: Record<string, any> = { limit };
+    // Admit a bounded superset, not the tight caller limit. The downstream
+    // Thompson layer in /recommend re-ranks this pool by α/β draws, so the
+    // selection is made there, not here — but it can only pick from what this
+    // query admits. `ev` is a computed field over activity.thompson_alpha/beta,
+    // columns that are never written (all posteriors live in
+    // variant_performance_metrics), so `ev` is a dead constant 0.5 on every row
+    // and `ORDER BY ev DESC, created_at DESC LIMIT $limit` collapses to pure
+    // recency truncation *before* the draw — earned, non-recent arms never reach
+    // it. Mirror discover-by-shapes.ts's ADMISSION_CAP: widen admission so the
+    // draw sees a real candidate pool. The shape/tenancy filter scans every
+    // matching row regardless of LIMIT, so a wider cap barely changes cost.
+    const admissionLimit = computeAdmissionLimit(limit);
+    const params: Record<string, any> = { limit, admission_limit: admissionLimit };
 
     // Shape matching: activity.input_shapes must be subset of availableShapes
     // Also include activities with empty input_shapes (backward compat)
@@ -830,18 +855,20 @@ export async function queryActivitiesByShapes(
       ? `WHERE ${whereClauses.join(' AND ')}`
       : '';
 
-    // 10.10: Pre-filter by ev (Beta posterior mean α/(α+β), computed
-    // server-side by the VALUE field from migration 109). The downstream
-    // Thompson Sampling layer in /recommend re-ranks via α/β draws, but
-    // that needs a useful candidate pool — `created_at DESC` returned
-    // recency-ordered slop, which buried high-mean templates behind newer
-    // never-executed ones. ev DESC surfaces the top-performing templates
-    // first; created_at DESC remains as a tiebreaker for ev=0.5 priors.
+    // The ORDER BY ev DESC was intended (migration 109) to surface high-mean
+    // templates ahead of newer never-executed ones. But `ev` never became live:
+    // its VALUE clause reads activity.thompson_alpha/beta, which no writer sets
+    // (posteriors live in variant_performance_metrics), so ev is 0.5 on every
+    // row and this ORDER BY is a no-op that leaves created_at DESC — recency — as
+    // the real sort. The fix is not to make ev live here (that would turn a tight
+    // LIMIT into a greedy exploit filter that starves exploration); it is to widen
+    // admission so the downstream Thompson draw, which is the real selector, sees
+    // the earned arms. Hence LIMIT $admission_limit, not $limit.
     const query = `
       SELECT * FROM activity
       ${whereClause}
       ORDER BY ev DESC, created_at DESC
-      LIMIT $limit
+      LIMIT $admission_limit
     `;
 
     const result = jwtToken
