@@ -349,6 +349,7 @@ export function resolveTemplateIdsForUpdate(args: {
 interface ExecutionTrace {
   execution_id: string;
   variant_id: string;
+  correlation_id?: string;
   activity_id: string;
   success: boolean;
   duration_ms: number;
