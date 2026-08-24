@@ -17,7 +17,55 @@ process.env.SURREALDB_URL ??= 'http://127.0.0.1:8000';
 process.env.SURREALDB_USERNAME ??= 'test';
 process.env.SURREALDB_PASSWORD ??= 'test';
 
-const { buildDecisionOutcome } = await import('./decision-credit');
+const { buildDecisionOutcome, recordExecutionDecisionOutcome } = await import('./decision-credit');
+
+describe('recordExecutionDecisionOutcome (universal per-execution capture)', () => {
+  function fakeDb(posteriorRow: unknown) {
+    const calls: Array<{ sql: string; params?: Record<string, unknown> }> = [];
+    return {
+      calls,
+      query: async <T>(sql: string, params?: Record<string, unknown>): Promise<T[]> => {
+        calls.push({ sql, params });
+        return (sql.includes('variant_performance_metrics') ? [posteriorRow].filter(Boolean) : []) as T[];
+      },
+    };
+  }
+
+  test('records predicted_success from the arm posterior and upserts keyed on execution_id', async () => {
+    const db = fakeDb({ thompson_alpha: 3, thompson_beta: 1 });
+    const rec = await recordExecutionDecisionOutcome(db, {
+      executionId: 'exec_abc', activityId: 'a1', orgId: 'organizations:substrate', success: true, reached: true,
+    });
+    expect(rec).not.toBeNull();
+    expect(rec!.predicted_success).toBeCloseTo(0.75, 5);
+    expect(rec!.outcome_success).toBe(true);
+    expect(rec!.reached).toBe(true);
+    const upsert = db.calls.find((c) => c.sql.includes('UPSERT'));
+    expect(upsert).toBeTruthy();
+    expect((upsert!.params as any).eid).toBe('exec_abc');
+    const content = (upsert!.params as any).content;
+    expect(content.correlation_id).toBe('exec_abc'); // execution_id doubles as the unique key
+    expect(content.execution_id).toBe('exec_abc');
+    expect(content.source).toBe('execution');
+  });
+
+  test('predicted_success is omitted (NONE) when the arm has no posterior row', async () => {
+    const db = fakeDb(null);
+    const rec = await recordExecutionDecisionOutcome(db, {
+      executionId: 'exec_x', activityId: 'never-run', orgId: 'o', success: false, reached: false,
+    });
+    expect(rec!.predicted_success).toBeNull();
+    const content = (db.calls.find((c) => c.sql.includes('UPSERT'))!.params as any).content;
+    expect('predicted_success' in content).toBe(false); // omitted, not null (option<T> trap)
+    expect(content.reached).toBe(false);
+  });
+
+  test('returns null without an execution id or activity id (no key)', async () => {
+    const db = fakeDb({ thompson_alpha: 1, thompson_beta: 1 });
+    expect(await recordExecutionDecisionOutcome(db, { executionId: '', activityId: 'a', orgId: 'o', success: true, reached: true })).toBeNull();
+    expect(await recordExecutionDecisionOutcome(db, { executionId: 'e', activityId: '', orgId: 'o', success: true, reached: true })).toBeNull();
+  });
+});
 
 describe('buildDecisionOutcome', () => {
   test('joins a selection to its outcome and computes predicted success', () => {

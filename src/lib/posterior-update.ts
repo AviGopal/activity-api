@@ -30,7 +30,7 @@ import { embedSignatureForShapes } from '../jobs/signature-embed-backfill';
 import { applyClusterPosterior } from './cluster-posterior';
 import { getTuningParam } from './tuning-params';
 import { classifyReach } from './reach-classify';
-import { recordDecisionOutcome } from './decision-credit';
+import { recordDecisionOutcome, recordExecutionDecisionOutcome } from './decision-credit';
 
 // Install the SIGTERM/SIGINT flush hook once on module load so buffered α/β
 // deltas are written out on shutdown rather than lost.
@@ -975,6 +975,20 @@ export async function applyOutcomeToPosteriors(
         correlationId,
         success: trace.success,
         reached: ungraded ? null : effectiveSuccess,
+      });
+    } else if (!ungraded && trace.execution_id && activityId) {
+      // Universal capture: the substrate mostly executes via walks and pathway-reuse
+      // (producers picked through discover-by-shapes, which writes no selection log),
+      // so most executions carry no correlation tag to join. But a reach-GRADED
+      // execution is itself a decision (run this arm) with a prediction (its
+      // posterior) and an outcome (reached?). Record that, keyed on execution_id.
+      // ungraded (satisfier/no-reach-tag) is skipped — no honest outcome to grade.
+      void recordExecutionDecisionOutcome(db, {
+        executionId: trace.execution_id,
+        activityId,
+        orgId,
+        success: trace.success,
+        reached: effectiveSuccess,
       });
     }
   }

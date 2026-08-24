@@ -84,6 +84,85 @@ export interface DecisionCreditDB {
   query<T = unknown>(sql: string, params?: Record<string, unknown>): Promise<T[]>;
 }
 
+/** Input for the execution-sourced (universal) capture path. */
+export interface ExecutionDecisionOutcomeInput {
+  executionId: string;
+  activityId: string;
+  orgId: string;
+  /** exit-status success of the execution */
+  success: boolean;
+  /** honest-reach verdict: true=reached, false=not-reached (ungraded is not captured here) */
+  reached: boolean | null;
+  executedAt?: string | null;
+}
+
+/**
+ * Universal decision→outcome capture, keyed on execution_id.
+ *
+ * The correlation-join path (recordDecisionOutcome) only fires when an execution
+ * carries a `correlation:<id>` tag joinable to thompson_selection_log — the
+ * /recommend draw path. The substrate mostly executes via WALKS and PATHWAY-REUSE,
+ * which select producers through discover-by-shapes (no selection log), so those
+ * executions have no correlation to join and were never captured. But every
+ * execution IS a decision (run activity A) with a prediction (A's posterior mean)
+ * and an outcome (reached?). This records that, looking up the arm's CURRENT
+ * posterior from variant_performance_metrics as the prediction — self-contained,
+ * best-effort, and keyed on execution_id so it is idempotent and cannot collide
+ * with a `sel_*` selection correlation. Never throws.
+ */
+export async function recordExecutionDecisionOutcome(
+  db: DecisionCreditDB,
+  input: ExecutionDecisionOutcomeInput,
+): Promise<DecisionOutcomeRecord | null> {
+  try {
+    if (!input.executionId || !input.activityId) return null;
+    // Look up the arm's current posterior as the prediction. Empty is normal for a
+    // never-graded arm — predicted_success then stays NONE (not a divide-by-zero).
+    const rows = await db.query<{ thompson_alpha?: number | null; thompson_beta?: number | null }>(
+      `SELECT thompson_alpha, thompson_beta FROM variant_performance_metrics
+       WHERE variant_id = $aid AND org_id = $oid LIMIT 1`,
+      { aid: input.activityId, oid: input.orgId },
+    );
+    const post = rows && rows.length > 0 ? rows[0] : null;
+    const a = post?.thompson_alpha;
+    const b = post?.thompson_beta;
+    const predicted_success =
+      typeof a === 'number' && typeof b === 'number' && a + b > 0 ? a / (a + b) : null;
+    const content: Record<string, unknown> = {
+      // execution_id doubles as the required-string natural key here; format exec_*
+      // never collides with a sel_* selection correlation.
+      correlation_id: input.executionId,
+      execution_id: input.executionId,
+      activity_id: input.activityId,
+      outcome_success: input.success,
+      source: 'execution',
+    };
+    if (predicted_success !== null) content.predicted_success = predicted_success;
+    if (input.reached !== null) content.reached = input.reached;
+    if (input.executedAt != null) content.executed_at = String(input.executedAt);
+    await db.query(`UPSERT type::thing('decision_outcome', $eid) CONTENT $content`, {
+      eid: input.executionId,
+      content,
+    });
+    return {
+      correlation_id: input.executionId,
+      activity_id: input.activityId,
+      predicted_success,
+      thompson_sample: null,
+      outcome_success: input.success,
+      reached: input.reached ?? null,
+      selected_at: null,
+      executed_at: input.executedAt ?? null,
+    };
+  } catch (e) {
+    logger.warn('[decision-credit] recordExecutionDecisionOutcome best-effort failed', {
+      error: e instanceof Error ? e.message : String(e),
+      execution_id: input.executionId,
+    });
+    return null;
+  }
+}
+
 /**
  * Best-effort persist. Looks up the selection by correlation_id (indexed, UNIQ),
  * builds the record, and UPSERTs it into `decision_outcome`. Never throws — a
