@@ -2167,6 +2167,23 @@ export async function applyChainFallback<T extends Record<string, any>>(
 }
 
 /**
+ * Selection→outcome join (law 12). The walk (goal-host) carries the Thompson
+ * selection's correlation id only as a `correlation:<id>` entry in the trace's
+ * tags, never as a top-level correlation_id. Until it is lifted onto the trace
+ * row, the selection-outcome join (sel.correlation_id = exec.correlation_id) is
+ * always empty and no selection can be graded as a *choice* — credit reaches the
+ * arm but never the decision. Returns the stripped id, or null when no
+ * correlation tag is present.
+ */
+export function deriveCorrelationIdFromTags(tags: unknown): string | null {
+  if (!Array.isArray(tags)) return null;
+  const tag = tags.find(
+    (t): t is string => typeof t === 'string' && t.startsWith('correlation:'),
+  );
+  return tag ? tag.slice('correlation:'.length) : null;
+}
+
+/**
  * POST /v2/activities/execution-traces
  *
  * Store execution trace for future reference (debugging, ribosome, impulses)
@@ -2189,6 +2206,15 @@ app.post('/', async (c) => {
         required: ['execution_id', 'template_id'],
         received: Object.keys(body),
       }, 400);
+    }
+
+    // Selection→outcome join (law 12). Lift the correlation id the walk carries
+    // as a `correlation:<id>` tag into body.correlation_id, upstream of BOTH write
+    // paths — the INSERT spread below and the UPSERT optionalFields further down
+    // both read this one field. See deriveCorrelationIdFromTags.
+    if (!body.correlation_id) {
+      const derived = deriveCorrelationIdFromTags(body.tags);
+      if (derived) body.correlation_id = derived;
     }
 
     // The posted task array, from EITHER envelope. See the tasks projection below
