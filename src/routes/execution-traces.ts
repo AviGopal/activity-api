@@ -4153,6 +4153,107 @@ app.get('/selection-outcomes', async (c) => {
   }
 });
 
+/** A thompson_selection_log row, as read for calibration. */
+export interface CalibrationSelectionRow {
+  activity_id: string;
+  org_id?: string | null;
+  correlation_id?: string | null;
+  alpha?: number | null;
+  beta?: number | null;
+  thompson_sample?: number | null;
+  selected_at?: string | null;
+}
+/** An execution outcome, keyed by correlation_id. */
+export interface CalibrationExecutionRow {
+  success?: boolean | null;
+  duration_ms?: number | null;
+  cost_usd?: number | null;
+  executed_at?: string | null;
+}
+
+/**
+ * Aggregate Thompson selection→outcome calibration per activity, JOIN-free.
+ *
+ * SurrealDB 2.3.x does not support ANSI JOIN — the prior query used
+ * `LEFT JOIN activity_execution_traces` and threw `Parse error` on every call,
+ * against a table decommissioned 07-14 besides. This computes the same per-activity
+ * calibration in memory: selections grouped by activity, joined to their outcome by
+ * correlation_id. `min` = the executed-count floor (the old HAVING clause). Returns
+ * the full aggregate; the caller sorts + paginates.
+ */
+export function aggregateSelectionCalibration(
+  selections: CalibrationSelectionRow[],
+  execByCorrelation: Map<string, CalibrationExecutionRow>,
+  min: number,
+): Array<Record<string, unknown>> {
+  const groups = new Map<string, {
+    activity_id: string; org_id: string | null;
+    total_selections: number; executed: number;
+    successful: number; failed: number;
+    predictedSum: number; predictedN: number;
+    sampleSum: number; sampleN: number;
+    durSum: number; durN: number; costSum: number; costN: number;
+    firstSel: string | null; lastSel: string | null; lastExec: string | null;
+  }>();
+  for (const sel of selections) {
+    const key = `${sel.activity_id} ${sel.org_id ?? ''}`;
+    let g = groups.get(key);
+    if (!g) {
+      g = { activity_id: sel.activity_id, org_id: sel.org_id ?? null,
+        total_selections: 0, executed: 0, successful: 0, failed: 0,
+        predictedSum: 0, predictedN: 0, sampleSum: 0, sampleN: 0,
+        durSum: 0, durN: 0, costSum: 0, costN: 0,
+        firstSel: null, lastSel: null, lastExec: null };
+      groups.set(key, g);
+    }
+    g.total_selections++;
+    const a = sel.alpha, b = sel.beta;
+    if (typeof a === 'number' && typeof b === 'number' && a + b > 0) {
+      g.predictedSum += a / (a + b); g.predictedN++;
+    }
+    if (typeof sel.thompson_sample === 'number') { g.sampleSum += sel.thompson_sample; g.sampleN++; }
+    if (sel.selected_at) {
+      if (!g.firstSel || sel.selected_at < g.firstSel) g.firstSel = sel.selected_at;
+      if (!g.lastSel || sel.selected_at > g.lastSel) g.lastSel = sel.selected_at;
+    }
+    const exec = sel.correlation_id ? execByCorrelation.get(sel.correlation_id) : undefined;
+    if (exec) {
+      g.executed++;
+      if (exec.success === true) g.successful++;
+      else if (exec.success === false) g.failed++;
+      if (typeof exec.duration_ms === 'number') { g.durSum += exec.duration_ms; g.durN++; }
+      if (typeof exec.cost_usd === 'number') { g.costSum += exec.cost_usd; g.costN++; }
+      if (exec.executed_at && (!g.lastExec || exec.executed_at > g.lastExec)) g.lastExec = exec.executed_at;
+    }
+  }
+  const out: Array<Record<string, unknown>> = [];
+  for (const g of groups.values()) {
+    if (g.executed < min) continue;
+    const avg_predicted_success = g.predictedN > 0 ? g.predictedSum / g.predictedN : 0;
+    const actual_success_rate = g.executed > 0 ? g.successful / g.executed : null;
+    out.push({
+      activity_id: g.activity_id,
+      org_id: g.org_id,
+      total_selections: g.total_selections,
+      executed_selections: g.executed,
+      pending_selections: g.total_selections - g.executed,
+      successful_executions: g.successful,
+      failed_executions: g.failed,
+      avg_predicted_success,
+      actual_success_rate,
+      avg_thompson_sample: g.sampleN > 0 ? g.sampleSum / g.sampleN : null,
+      avg_duration_ms: g.durN > 0 ? g.durSum / g.durN : null,
+      avg_cost_usd: g.costN > 0 ? g.costSum / g.costN : null,
+      first_selection_at: g.firstSel,
+      last_selection_at: g.lastSel,
+      last_execution_at: g.lastExec,
+      calibration_error: actual_success_rate !== null
+        ? Math.abs(avg_predicted_success - actual_success_rate) : null,
+    });
+  }
+  return out;
+}
+
 /**
  * GET /v2/activities/execution-traces/selection-calibration
  *
@@ -4186,65 +4287,52 @@ app.get('/selection-calibration', async (c) => {
       params.activity_id = activityId;
     }
 
-    // Query: Aggregate selection+execution data per activity
-    // This computes calibration metrics at query time
-    const query = `
-      SELECT
-        sel.activity_id AS activity_id,
-        sel.org_id AS org_id,
-        count(sel.correlation_id) AS total_selections,
-        count(exec.execution_id) AS executed_selections,
-        count(sel.correlation_id) - count(exec.execution_id) AS pending_selections,
-        count(IF exec.success = true THEN 1 ELSE NONE END) AS successful_executions,
-        count(IF exec.success = false THEN 1 ELSE NONE END) AS failed_executions,
-        math::mean(<float> sel.alpha / (<float> sel.alpha + <float> sel.beta)) AS avg_predicted_success,
-        IF count(exec.execution_id) > 0
-          THEN <float> count(IF exec.success = true THEN 1 ELSE NONE END) / <float> count(exec.execution_id)
-          ELSE NONE
-        END AS actual_success_rate,
-        math::mean(sel.thompson_sample) AS avg_thompson_sample,
-        math::mean(<float> exec.duration_ms) AS avg_duration_ms,
-        math::mean(<float> exec.cost_usd) AS avg_cost_usd,
-        time::min(sel.selected_at) AS first_selection_at,
-        time::max(sel.selected_at) AS last_selection_at,
-        time::max(exec.executed_at) AS last_execution_at
-      FROM thompson_selection_log AS sel
-      LEFT JOIN activity_execution_traces AS exec ON sel.correlation_id = exec.correlation_id
-      WHERE 1=1 ${activityFilter}
-      GROUP BY sel.activity_id, sel.org_id
-      HAVING count(exec.execution_id) >= $min_executions
-      ORDER BY count(exec.execution_id) DESC
-      LIMIT $limit
-      START $offset
-    `;
-
+    // JOIN-free calibration. SurrealDB 2.3.x does not support ANSI JOIN, so the
+    // prior `LEFT JOIN activity_execution_traces` query parse-errored on every
+    // call — against a table decommissioned 07-14 besides. Fetch selections and
+    // their outcomes (from the live `execution` table, keyed by correlation_id)
+    // separately, then aggregate in memory. The old SQL LIMIT/START/HAVING move
+    // to the helper + the slice below.
     logger.info('Fetching selection calibration', { activityId, minExecutions, limit, offset });
 
-    let calibrationRaw: any[];
-
+    const selQuery = `
+      SELECT activity_id, org_id, correlation_id, alpha, beta, thompson_sample, selected_at
+      FROM thompson_selection_log
+      WHERE 1=1 ${activityFilter}
+    `;
+    let selections: any[];
     // API-key auth produces a JWT with `id: api_key:N` which SurrealDB
-    // 3.x interprets as a record reference and rejects with "access method
-    // cannot be used". Skip JWT path for API-key auth and fall back to root
-    // creds + manual org_id filtering. Same pattern as routes/activities.ts.
+    // interprets as a record reference and rejects; skip JWT path for API-key
+    // auth and fall back to root creds. Same pattern as routes/activities.ts.
     if (useJwtAuth && jwtAuth?.jwtToken && jwtAuth.authType !== 'apikey') {
-      calibrationRaw = await queryWithAuth(jwtAuth.jwtToken, query, params);
+      selections = await queryWithAuth(jwtAuth.jwtToken, selQuery, params);
     } else {
-      calibrationRaw = await surrealDB.query(query, params);
+      selections = await surrealDB.query(selQuery, params);
+    }
+    selections = selections || [];
+
+    const correlationIds = [...new Set(
+      selections
+        .map((s: any) => s.correlation_id)
+        .filter((x: any): x is string => typeof x === 'string' && x.length > 0),
+    )];
+    const execByCorrelation = new Map<string, CalibrationExecutionRow>();
+    if (correlationIds.length > 0) {
+      const execRows = await surrealDB.query<any>(
+        `SELECT correlation_id, success, duration_ms, cost_usd, executed_at
+         FROM execution WHERE correlation_id IN $correlation_ids`,
+        { correlation_ids: correlationIds },
+      );
+      for (const e of execRows || []) {
+        if (e && typeof e.correlation_id === 'string') execByCorrelation.set(e.correlation_id, e);
+      }
     }
 
-    // Compute calibration error for each activity
-    const calibration = (calibrationRaw || []).map((row: any) => {
-      const predicted = row.avg_predicted_success || 0;
-      const actual = row.actual_success_rate;
-      const calibrationError = actual !== null && actual !== undefined
-        ? Math.abs(predicted - actual)
-        : null;
-
-      return {
-        ...row,
-        calibration_error: calibrationError,
-      };
-    });
+    const calibration = aggregateSelectionCalibration(
+      selections as CalibrationSelectionRow[],
+      execByCorrelation,
+      minExecutions,
+    );
 
     // Sort by calibration error (worst first)
     calibration.sort((a: any, b: any) => {
@@ -4253,39 +4341,16 @@ app.get('/selection-calibration', async (c) => {
       return b.calibration_error - a.calibration_error;
     });
 
-    // Get total count
-    const countQuery = `
-      SELECT count() AS total FROM (
-        SELECT sel.activity_id
-        FROM thompson_selection_log AS sel
-        LEFT JOIN activity_execution_traces AS exec ON sel.correlation_id = exec.correlation_id
-        WHERE 1=1 ${activityFilter}
-        GROUP BY sel.activity_id
-        HAVING count(exec.execution_id) >= $min_executions
-      )
-      GROUP ALL
-    `;
-
-    let countResult: { total: number }[];
-    // API-key auth produces a JWT with `id: api_key:N` which SurrealDB
-    // 3.x interprets as a record reference and rejects with "access method
-    // cannot be used". Skip JWT path for API-key auth and fall back to root
-    // creds + manual org_id filtering. Same pattern as routes/activities.ts.
-    if (useJwtAuth && jwtAuth?.jwtToken && jwtAuth.authType !== 'apikey') {
-      countResult = await queryWithAuth(jwtAuth.jwtToken, countQuery, params);
-    } else {
-      countResult = await surrealDB.query(countQuery, params);
-    }
-
-    const total = countResult?.[0]?.total || 0;
+    const total = calibration.length;
+    const paged = calibration.slice(offset, offset + limit);
 
     logger.info('Selection calibration fetched', {
-      count: calibration?.length || 0,
+      count: paged.length,
       total,
     });
 
     return c.json({
-      calibration: calibration || [],
+      calibration: paged,
       total,
       limit,
       offset,
