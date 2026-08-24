@@ -47,6 +47,26 @@ describe('recordExecutionDecisionOutcome (universal per-execution capture)', () 
     expect(content.correlation_id).toBe('exec_abc'); // execution_id doubles as the unique key
     expect(content.execution_id).toBe('exec_abc');
     expect(content.source).toBe('execution');
+    // executed_at is always stamped (ingest-time proxy when caller omits it) — a null
+    // timestamp left 100% of live rows untimed and broke time-ordered consumers.
+    expect(typeof content.executed_at).toBe('string');
+    expect(Number.isNaN(new Date(content.executed_at as string).getTime())).toBe(false);
+  });
+
+  test('stamps executed_at at ingest-time when the caller supplies none, and honors an explicit one', async () => {
+    const db = fakeDb({ thompson_alpha: 1, thompson_beta: 1 });
+    await recordExecutionDecisionOutcome(db, {
+      executionId: 'exec_nots', activityId: 'a', orgId: 'o', success: true, reached: true,
+    });
+    const c1 = (db.calls.find((c) => c.sql.includes('UPSERT'))!.params as any).content;
+    expect(typeof c1.executed_at).toBe('string'); // never null anymore
+
+    const db2 = fakeDb({ thompson_alpha: 1, thompson_beta: 1 });
+    await recordExecutionDecisionOutcome(db2, {
+      executionId: 'exec_ts', activityId: 'a', orgId: 'o', success: true, reached: true, executedAt: '2026-08-24T00:00:00.000Z',
+    });
+    const c2 = (db2.calls.find((c) => c.sql.includes('UPSERT'))!.params as any).content;
+    expect(c2.executed_at).toBe('2026-08-24T00:00:00.000Z'); // explicit wins
   });
 
   test('predicted_success is omitted (NONE) when the arm has no posterior row', async () => {

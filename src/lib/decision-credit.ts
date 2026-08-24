@@ -139,7 +139,12 @@ export async function recordExecutionDecisionOutcome(
     };
     if (predicted_success !== null) content.predicted_success = predicted_success;
     if (input.reached !== null) content.reached = input.reached;
-    if (input.executedAt != null) content.executed_at = String(input.executedAt);
+    // Always stamp executed_at. The caller (posterior-update) runs at trace-ingest,
+    // moments after the execution, so ingest-time is a faithful proxy when the caller
+    // supplies no explicit timestamp. A null executed_at (the prior behavior — the
+    // caller never passes executedAt) left 100% of execution-sourced rows untimed,
+    // breaking any time-ordered consumer or retention keyed on this field.
+    content.executed_at = input.executedAt != null ? String(input.executedAt) : new Date().toISOString();
     await db.query(`UPSERT type::thing('decision_outcome', $eid) CONTENT $content`, {
       eid: input.executionId,
       content,
