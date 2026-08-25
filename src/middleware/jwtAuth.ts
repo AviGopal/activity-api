@@ -224,6 +224,28 @@ function isPublicPath(path: string): boolean {
  * in PUBLIC_PATHS, returns 401. Route handlers should keep their existing
  * requireAuthenticated() calls as defense-in-depth.
  */
+/**
+ * SECURITY — fail closed on a Bearer credential that fails to authenticate.
+ * A malformed / expired / unverifiable Bearer token must NOT proceed as an
+ * anonymous request on a protected path. activities.ts's list routes query the
+ * module-level ROOT client and drop the org predicate when jwtAuth is null
+ * (`if (orgId)`), so a bad token becomes a cross-tenant read rather than a 401.
+ * The ApiKey branch already fails closed (INVALID_API_KEY return); this extends
+ * the same discipline to every Bearer failure branch, while keeping PUBLIC_PATHS
+ * (health, /v2/auth, /ws, boredom polling) open.
+ */
+async function denyBearerUnlessPublic(c: Context, next: Next, reason: string): Promise<Response | void> {
+  if (isPublicPath(c.req.path)) {
+    c.set('jwtAuth', null);
+    return next();
+  }
+  logger.warn('Bearer authentication failed on protected path', { path: c.req.path, reason });
+  return c.json(
+    { error: { code: 'INVALID_AUTH', message: reason } },
+    401,
+  );
+}
+
 export async function jwtAuthMiddleware(c: Context, next: Next) {
   const authHeader = c.req.header('Authorization');
   logger.debug('Auth middleware called', {
@@ -329,9 +351,7 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
       if (decoded.instanceId && decoded.orgId && decoded.expiresAt) {
         if (decoded.expiresAt < Date.now()) {
           logger.warn('MiniBob token expired', { expiresAt: new Date(decoded.expiresAt) });
-          c.set('jwtAuth', null);
-          await next();
-          return;
+          return denyBearerUnlessPublic(c, next, 'MiniBob token expired');
         }
 
         const jwtAuth: JwtAuthContext = {
@@ -356,18 +376,14 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
       // Not a valid MiniBob token - fall through
     }
 
-    c.set('jwtAuth', null);
-    await next();
-    return;
+    return denyBearerUnlessPublic(c, next, 'Bearer token is not a valid credential');
   }
 
   // Validate JWT structure (should have exactly 2 periods)
   const periodCount = (token.match(/\./g) || []).length;
   if (periodCount !== 2) {
     logger.warn('Malformed JWT token structure', { periodCount });
-    c.set('jwtAuth', null);
-    await next();
-    return;
+    return denyBearerUnlessPublic(c, next, 'Malformed JWT token structure');
   }
 
   try {
@@ -416,9 +432,7 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
 
     if (!auth) {
       logger.warn('JWT valid but no auth claims found');
-      c.set('jwtAuth', null);
-      await next();
-      return;
+      return denyBearerUnlessPublic(c, next, 'JWT valid but no auth claims found');
     }
 
     // Extract claims, handling SurrealDB record ID format (organizations:xyz -> xyz)
@@ -464,7 +478,7 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
   } catch (error) {
     const err = error as Error;
     logger.debug('JWT authentication failed', { error: err.message });
-    c.set('jwtAuth', null);
+    return denyBearerUnlessPublic(c, next, 'JWT authentication failed');
   }
 
   await next();
