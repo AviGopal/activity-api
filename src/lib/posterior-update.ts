@@ -155,6 +155,45 @@ async function resolveTdLambda(): Promise<number> {
   return value;
 }
 
+// Marginal-attribution instrument (law 12 / law 1). A ubiquitous ancestor arm accrues
+// TD(λ) credit from EVERY chain it participates in, so its stored posterior converges to
+// the GLOBAL chain reach rate rather than its own marginal quality — measured 2026-08-25:
+// validator-dispatch stored mean 0.205 (sample_count 791k) vs its OWN outcomes 0.94–0.95.
+// This shaped, TTL-cached exclusion set lets named ubiquitous/infra arms be removed from
+// ANCESTOR propagation so their posterior reflects only their own LEAF outcomes. Steered by
+// the substrate_tuning_param row 'CREDIT_PROPAGATION_EXCLUDED_ANCESTORS' (comma-separated
+// activity ids) — a shaped impulse read at use time, never an env constant (law 1). It is
+// also the counterfactual instrument: exclude one arm, watch its posterior converge to its
+// empirical rate, which measures the smearing before a permanent weighting formula is chosen.
+const CREDIT_EXCLUSION_TTL_MS = 30_000;
+let _creditExclusionCache: { value: Set<string>; expiresAt: number } | null = null;
+async function resolveCreditPropagationExclusions(db: DBQueryable): Promise<Set<string>> {
+  const now = Date.now();
+  if (_creditExclusionCache && _creditExclusionCache.expiresAt > now) return _creditExclusionCache.value;
+  let ids = new Set<string>();
+  try {
+    // Same 1.5s-deadline + fail-open discipline as getTuningParam: a policy read must never
+    // hang a credit write, and "no exclusions" is a correct fallback.
+    const rows = await Promise.race([
+      db.query<{ param_value: unknown }>(
+        'SELECT `value` AS param_value FROM substrate_tuning_param WHERE name = $name LIMIT 1',
+        { name: 'CREDIT_PROPAGATION_EXCLUDED_ANCESTORS' },
+      ),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('credit-exclusion lookup exceeded deadline')), 1_500),
+      ),
+    ]);
+    const raw = Array.isArray(rows) && rows.length > 0 ? (rows[0] as { param_value?: unknown }).param_value : null;
+    if (typeof raw === 'string' && raw.trim().length > 0) {
+      ids = new Set(raw.split(',').map((s) => normalizeActivityId(s.trim())).filter((s) => s.length > 0));
+    }
+  } catch {
+    // Absent table / transient / deadline: behave exactly as before (no exclusions). Fail open.
+  }
+  _creditExclusionCache = { value: ids, expiresAt: now + CREDIT_EXCLUSION_TTL_MS };
+  return ids;
+}
+
 /**
  * Minimal execution descriptor for chain-credit propagation.
  * Callers outside applyOutcomeToPosteriors can also use this directly.
@@ -718,6 +757,7 @@ export async function propagateCreditAlongChain(
   // Seam 3a: resolve TD(λ) from the authored tuning row (TTL-cached, env→default
   // fallback, (0,1) guard preserved). Resolved once per propagation, not per ancestor.
   const tdLambda = await resolveTdLambda();
+  const excludedAncestors = await resolveCreditPropagationExclusions(db);
 
   const isCascading = !success && failure_mode?.type === 'cascading';
 
@@ -773,6 +813,10 @@ export async function propagateCreditAlongChain(
     // Normalize to strip the `activity:` prefix so the WHERE clause matches the
     // normalized form stored in variant_performance_metrics.
     const ancestorId = normalizeActivityId(meta?.variant_id ?? ancestorExecId);
+    // Marginal-attribution (law 12): a shaped exclusion list removes named ubiquitous/infra
+    // arms from ancestor credit so their posterior reflects only their own leaf outcomes,
+    // instead of converging to the global chain rate.
+    if (excludedAncestors.has(ancestorId)) continue;
     const depth = i + 1; // 1-indexed depth from leaf
     const decayFactor = Math.pow(tdLambda, depth);
 
