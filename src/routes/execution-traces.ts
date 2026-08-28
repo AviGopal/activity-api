@@ -730,7 +730,7 @@ app.get('/', async (c) => {
     const fieldsParam = c.req.query('fields');
     const detailParam = c.req.query('detail');
     const summaryProjection =
-      fieldsParam === 'summary' || detailParam !== 'true';
+      fieldsParam === 'summary' || detailParam === 'false';
 
     // Validate and cap limit
     const limit = Math.min(Math.max(limitParam, 1), 100);
