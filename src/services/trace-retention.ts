@@ -350,8 +350,8 @@ export async function rollupReachHistory(): Promise<{ scanned: number; weeks: nu
       await surrealDB.query(
         `UPSERT reach_history:['${wk}'] SET
            week = $wk,
-           reached = (reached ?? 0) + $reached,
-           total = (total ?? 0) + $total,
+           reached = $reached,
+           total = $total,
            updated_at = time::now()`,
         { wk, reached: b.reached, total: b.total },
       );
