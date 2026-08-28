@@ -238,7 +238,7 @@ export interface UpdateSummary {
    * than informative signal (M4 tier-restricted bandit).
    * Absent when the UPDATE ran normally.
    */
-  skipped_reason?: 'all_deterministic' | 'ungraded_reach' | 'idle_yield';
+    skipped_reason?: 'all_deterministic' | 'ungraded_reach' | 'idle_yield';
 }
 
 // ---------------------------------------------------------------------------
@@ -1306,11 +1306,7 @@ export async function applyOutcomeToPosteriors(
     failure_mode_type: failureModeType,
     impulse_relevance_writes: impulseRelevanceWrites,
     warnings,
-    ...(ungraded
-      ? { skipped_reason: 'ungraded_reach' as const }
-      : skipVariantUpdate
-        ? { skipped_reason: 'all_deterministic' as const }
-        : {}),
+    skipped_reason: ungraded ? 'ungraded_reach' : (skipVariantUpdate ? (trace.metadata?.information_yield === 'idle' ? 'idle_yield' : 'all_deterministic') : undefined),
   };
 
   emitPosteriorUpdateMetric(summary);
