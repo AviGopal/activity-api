@@ -3341,6 +3341,9 @@ app.post('/', async (c) => {
           activity_id: trace.variant_id as string,
           success: trace.success as boolean,
           failure_mode: (body.failure_mode ?? null) as any,
+          ...(typeof (body.metadata as { information_yield?: unknown } | undefined)?.information_yield === 'string'
+            ? { metadata: { information_yield: (body.metadata as { information_yield: string }).information_yield } }
+            : {}),
           tasks: trace.tasks as any,
           cost_usd: trace.cost_usd as number,
           ...(typeof trace.execution_id === 'string' ? { execution_id: trace.execution_id as string } : {}),
