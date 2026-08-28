@@ -238,12 +238,16 @@ export interface UpdateSummary {
    * than informative signal (M4 tier-restricted bandit).
    * Absent when the UPDATE ran normally.
    */
-  skipped_reason?: 'all_deterministic' | 'ungraded_reach';
+  skipped_reason?: 'all_deterministic' | 'ungraded_reach' | 'idle_yield';
 }
 
 // ---------------------------------------------------------------------------
 // DB interface — thin so tests can inject a mock
 // ---------------------------------------------------------------------------
+
+export interface TraceForPosterior {
+  metadata?: { information_yield?: string };
+}
 
 export interface DBQueryable {
   query<T = any>(sql: string, params?: Record<string, unknown>): Promise<T[]>;
@@ -1066,7 +1070,7 @@ export async function applyOutcomeToPosteriors(
       return { resolver: t?.resolver, prompt: t?.prompt };
     }),
   });
-  const skipVariantUpdate = tierClass === 'all_deterministic';
+  const skipVariantUpdate = tierClass === 'all_deterministic' || trace.metadata?.information_yield === 'idle';
 
   // Atomic UPDATE — mirrors the pattern in execution-traces.ts:2235
   // Uses variant_performance_metrics (not activity_template) to avoid the
