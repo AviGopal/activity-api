@@ -757,6 +757,13 @@ export const GoalExecutionPathSchema = z.object({
   // — the mechanism looked dead when it was merely invisible. inference_confidence
   // likewise grades how sure the goal-target inference was about the plan set.
   walk_tier: z.string().optional(),
+  // Reuse lineage (2026-08-29). walk_tier says a walk reused SOMETHING; these say
+  // WHICH pathway it borrowed. Declared here as well as on the request schema for the
+  // reason the block above exists: PathsResponseSchema.parse() strips unknown keys, so
+  // a field that is stored but undeclared here is invisible to every reader and the
+  // mechanism looks dead when it is merely unreadable.
+  reused_from_goal_hash: z.string().nullable().optional(),
+  reused_from_path_signature: z.string().nullable().optional(),
   // Stored column is last_inference_confidence (the request field is
   // inference_confidence; the CREATE maps one to the other), so declare the STORED
   // name — declaring the request name silently yields nothing, which is the same
@@ -792,6 +799,15 @@ export const PathRecordRequestSchema = z.object({
   // (learned_pathway / satisfier / universal_tool_fallback / feature_compose /
   // fresh_derivation). Optional; persisted once the DEFINE FIELD migration lands.
   walk_tier: z.string().optional(),
+  // REUSE LINEAGE (2026-08-29) — deliberately NOT parent_path_signature/parent_goal_hash.
+  // Those mean SUB-GOAL lineage and carry the CC1 scope-narrowing assertion (a child must
+  // produce a SUBSET of the parent's output shapes). Borrowed-pathway reuse is the opposite
+  // relation: a nearby pathway is accepted at cover >= 0.5, so up to half the reusing walk's
+  // shapes lie outside the donor's and CC1 rejects the write. Measured once on a REACHED
+  // reuse: sending parent_* did not add lineage, it DESTROYED the record with a 400. These
+  // fields carry no scope assertion. See sql/migrations/204-goal-path-reuse-lineage.surql.
+  reused_from_goal_hash: z.string().optional(),
+  reused_from_path_signature: z.string().optional(),
   endpoint_output_shapes: z.array(z.string()).optional(),
   expected_output_shapes: z.array(z.string()).optional(),
 });

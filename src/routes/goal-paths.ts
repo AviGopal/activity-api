@@ -603,6 +603,12 @@ app.post('/', async (c) => {
           endpoint_output_shapes = $endpoint_output_shapes,
           last_executed_at = time::now(),
           walk_tier = $walk_tier ?? walk_tier,
+          -- REUSE LINEAGE (2026-08-29). The '?? existing' form so a later non-reusing run of the
+          -- same path cannot erase the record that this pathway was once borrowed; the
+          -- fact is monotonic evidence, and clobbering it to NONE would recreate the
+          -- invisibility this field exists to end. No CC1 assertion applies here.
+          reused_from_goal_hash = $reused_from_goal_hash ?? reused_from_goal_hash,
+          reused_from_path_signature = $reused_from_path_signature ?? reused_from_path_signature,
           expected_output_shapes = $expected_output_shapes ?? expected_output_shapes,
           typical_tools_used = $typical_tools_used ?? typical_tools_used,
           work_signature = $work_signature ?? work_signature,
@@ -625,6 +631,8 @@ app.post('/', async (c) => {
         endpoint_output_shapes: endpointOutputShapes,
         expected_output_shapes: validated.expected_output_shapes ?? null,
         walk_tier: validated.walk_tier ?? 'fresh_derivation',
+        reused_from_goal_hash: validated.reused_from_goal_hash ?? null,
+        reused_from_path_signature: validated.reused_from_path_signature ?? null,
         typical_tools_used: validated.tools_used ?? undefined,
         work_signature: hashWork(validated.path_activities, validated.tools_used) ?? undefined,
       });
@@ -675,6 +683,8 @@ app.post('/', async (c) => {
           work_signature: $work_signature,
           last_executed_at: time::now(),
           walk_tier: $walk_tier,
+          reused_from_goal_hash: $reused_from_goal_hash,
+          reused_from_path_signature: $reused_from_path_signature,
           created_at: time::now(),
           updated_at: time::now()
         }
@@ -705,6 +715,8 @@ app.post('/', async (c) => {
         typical_tools_used: validated.tools_used ?? undefined,
         work_signature: hashWork(validated.path_activities, validated.tools_used) ?? undefined,
         walk_tier: validated.walk_tier ?? 'fresh_derivation',
+        reused_from_goal_hash: validated.reused_from_goal_hash ?? null,
+        reused_from_path_signature: validated.reused_from_path_signature ?? null,
       });
       
       // @ts-ignore - SurrealDB query typing

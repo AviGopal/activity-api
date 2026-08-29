@@ -1,0 +1,24 @@
+-- Migration 204: reuse-lineage fields on goal_execution_paths.
+--
+-- WHY THESE ARE NEW FIELDS AND NOT parent_goal_hash / parent_path_signature.
+-- The parent_* pair already exists, but it means SUB-GOAL lineage and carries the
+-- CC1 scope-narrowing assertion (migration 100): a child MUST produce a SUBSET of
+-- the parent's endpoint_output_shapes. Borrowed-pathway reuse is the opposite
+-- relation — a nearby pathway is accepted at cover >= 0.5, so by construction up to
+-- half the reusing walk's shapes lie OUTSIDE the donor's, and CC1 rejects the write.
+--
+-- Measured (goal-host index.ts, the comment above recordGoalPath): a REACHED 2-step
+-- reuse (cover=0.50, donor 68/68 reached) had its goal-path record rejected 400.
+-- Sending the parent_* fields did not add lineage, it DESTROYED the record — for
+-- exactly the reused walks that matter most to compounding. Since then goal-host has
+-- carried the fact only as a log line: "[goal-host] REUSE LINEAGE (not yet storable)".
+--
+-- So: separate fields, separate semantics, NO scope assertion. CC1 continues to apply
+-- to parent_* and is deliberately untouched.
+--
+-- SCHEMAFULL MATTERS HERE. goal_execution_paths is SCHEMAFULL, so an undefined field
+-- is silently dropped on write — that is precisely how walk_tier was null for every
+-- row until migration 181 defined it. Defining the fields is what makes the write
+-- MEAN something rather than merely be accepted.
+DEFINE FIELD IF NOT EXISTS reused_from_goal_hash ON goal_execution_paths TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS reused_from_path_signature ON goal_execution_paths TYPE option<string>;
