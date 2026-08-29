@@ -631,12 +631,17 @@ app.post('/', async (c) => {
         endpoint_output_shapes: endpointOutputShapes,
         expected_output_shapes: validated.expected_output_shapes ?? null,
         walk_tier: validated.walk_tier ?? 'fresh_derivation',
-        reused_from_goal_hash: validated.reused_from_goal_hash ?? null,
-        reused_from_path_signature: validated.reused_from_path_signature ?? null,
+        // reused_from_goal_hash/reused_from_path_signature are option<string> in the
+        // schema, same as last_inference_confidence above: an explicit NULL fails the
+        // whole query rather than being treated as NONE. Omit (undefined) instead so a
+        // non-reusing update leaves the SQL-side `?? reused_from_goal_hash` fallback
+        // free to keep whatever was already recorded.
+        reused_from_goal_hash: validated.reused_from_goal_hash ?? undefined,
+        reused_from_path_signature: validated.reused_from_path_signature ?? undefined,
         typical_tools_used: validated.tools_used ?? undefined,
         work_signature: hashWork(validated.path_activities, validated.tools_used) ?? undefined,
       });
-      
+
       // @ts-ignore - SurrealDB query typing
       path = updated && updated.length > 0 ? updated[0] : current;
 
@@ -715,10 +720,17 @@ app.post('/', async (c) => {
         typical_tools_used: validated.tools_used ?? undefined,
         work_signature: hashWork(validated.path_activities, validated.tools_used) ?? undefined,
         walk_tier: validated.walk_tier ?? 'fresh_derivation',
-        reused_from_goal_hash: validated.reused_from_goal_hash ?? null,
-        reused_from_path_signature: validated.reused_from_path_signature ?? null,
+        // Same option<string> NULL-vs-NONE trap as last_inference_confidence above:
+        // CREATE CONTENT assigns these directly with no SQL-side `??` fallback, so an
+        // explicit NULL here failed the ENTIRE create — no fresh (non-reused) pathway
+        // was ever persisted. Measured live 2026-08-29: every first-time pathway write
+        // for the session's shape-indexing fix (completion_shapes now populated) was
+        // silently discarded at this layer, so the fix could produce a signature but
+        // it could never be written down for future reuse to find.
+        reused_from_goal_hash: validated.reused_from_goal_hash ?? undefined,
+        reused_from_path_signature: validated.reused_from_path_signature ?? undefined,
       });
-      
+
       // @ts-ignore - SurrealDB query typing
       path = created && created.length > 0 ? created[0] : {
         goal_hash: goalHash,

@@ -100,6 +100,27 @@ describe("reuse lineage — persistence (failure mode 1)", () => {
   });
 });
 
+describe("reuse lineage — persistence (failure mode 3: NULL vs NONE)", () => {
+  // THE DEFECT (measured live 2026-08-29): both call sites bound these
+  // option<string> fields with `?? null`, mirroring the already-fixed
+  // last_inference_confidence bug in this same route ("passing NULL fails
+  // the whole CREATE silently"). Except here it was not silent: every
+  // fresh (non-reused) pathway CREATE threw "SurrealDB query failed: Found
+  // NULL for field `reused_from_goal_hash`, but expected a option<string>"
+  // and returned 500 — so NO first-time pathway was ever persisted,
+  // independent of whether reuse ever occurred. `?? undefined` lets the
+  // SurrealDB client omit the field (NONE), which the schema accepts.
+  test("the CREATE binding never passes a literal null for either reuse field", () => {
+    expect(ROUTE).not.toContain("reused_from_goal_hash: validated.reused_from_goal_hash ?? null");
+    expect(ROUTE).not.toContain("reused_from_path_signature: validated.reused_from_path_signature ?? null");
+  });
+
+  test("the CREATE and UPDATE bindings both fall back to undefined instead", () => {
+    const hits = (ROUTE.match(/reused_from_goal_hash: validated\.reused_from_goal_hash \?\? undefined/g) ?? []).length;
+    expect(hits).toBe(2); // one in the CREATE params, one in the UPDATE params
+  });
+});
+
 describe("reuse lineage — CC1 is a SIBLING semantics, not a loosened one", () => {
   // THE NEGATIVE CONTROL. The bug being fixed is that reuse was forced through parent_*,
   // which asserts scope narrowing. The fix must add a separate relation, NOT weaken CC1 —
