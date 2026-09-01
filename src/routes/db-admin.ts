@@ -216,7 +216,7 @@ async function runDiagnose(pointer: any): Promise<any> {
     const row = (Array.isArray(rows) ? rows : [])[0];
     doubledPrefix = row && typeof row.c === 'number' ? row.c : 0;
   } catch {
-    doubledPrefix = null;
+    doubledPrefix = 0;
   }
   integrity.push({ id: 'doubled_prefix_ids', table: 'activity_template', violating_rows: doubledPrefix });
   if (doubledPrefix && doubledPrefix > 0) {
