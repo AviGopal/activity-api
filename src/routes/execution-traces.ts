@@ -664,6 +664,112 @@ async function insertSystemTrace(params: SystemTraceParams, jwtToken?: string): 
 }
 
 /**
+ * THE REACH VERDICT IS ON `execution`, AND THE COMPAT VIEW DOES NOT PROJECT IT.
+ *
+ * `reached` is a column on `execution` (migration 160) — the honest "was the goal
+ * actually met" verdict, as opposed to `status`/`success`, which say only that the
+ * process exited cleanly. Every read consumer, however, goes through
+ * `v_paradigm_execution_traces`, and that view's definition (migration 167, the
+ * newest) projects 43 fields, none of them `reached`. So the load-bearing learning
+ * signal was invisible to the normal read path: anything computing a "reach rate"
+ * off this endpoint was silently computing something else, and no gap could ever be
+ * filed against a reach rate nobody could see.
+ *
+ * ★ DO NOT "FIX" THIS BY ADDING `reached` TO THE VIEW'S SELECT LIST. The view is
+ *   SCHEMALESS: selecting a field it does not carry yields NONE for every row with
+ *   no error at all. That change typechecks, passes a shallow test, and manufactures
+ *   "the entire fleet is ungraded" — the exact false picture this exists to remove.
+ *   Redefining the view needs REMOVE + DEFINE (DEFINE ... AS SELECT is a no-op on an
+ *   already-defined view), which re-materialises the whole table. On the live store
+ *   that is a maintenance window, not an edit.
+ *
+ * So: hydrate the column from the canonical row, by RECORD ID. Same technique the
+ * single-trace GET already uses for the trace blob after 167 dropped it (see the
+ * `type::thing('execution', $eid)` hydrate below). One extra query per page, ≤100
+ * direct record lookups, no scan, no sort, no JSONB.
+ *
+ * ★ NULL IS A VERDICT-SHAPED HOLE, NOT A `false`. An ungraded execution has no
+ *   verdict. Coercing absent → false is how you turn "never graded" into "failed the
+ *   goal" and invent the failure picture wholesale. Every branch here yields the
+ *   boolean only when the store actually holds a boolean; everything else is null,
+ *   including the hydrate query failing outright.
+ *
+ * `reach_reason` is NOT a column anywhere — verified. Goal-host writes it inside
+ * `metadata` (goal-host-vessel/src/index.ts), and `metadata` IS projected by the
+ * view, so that value already reaches consumers on the full projection.
+ *
+ * `runQuery` is injected so this is testable without a database.
+ */
+const EXECUTION_ID_SAFE = /^[A-Za-z0-9_.:-]{1,128}$/;
+
+export async function hydrateReachedVerdicts<T extends Record<string, any>>(
+  rows: T[],
+  runQuery: (sql: string, params: Record<string, any>) => Promise<any[]>,
+): Promise<T[]> {
+  if (!Array.isArray(rows) || rows.length === 0) return rows;
+
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const raw = row?.execution_id;
+    if (typeof raw !== 'string' || raw.length === 0) continue;
+    if (seen.has(raw)) continue;
+    seen.add(raw);
+    // Record ids are built into the query text (a record target list is the only
+    // way to address N rows by primary key), so anything outside this allowlist —
+    // notably the ⟨⟩ id-quoting brackets themselves — is dropped rather than
+    // interpolated. A dropped id surfaces as null: unknown, never false.
+    if (EXECUTION_ID_SAFE.test(raw)) ids.push(raw);
+  }
+
+  const verdicts = new Map<string, boolean>();
+  if (ids.length > 0) {
+    try {
+      const targets = ids.map((id) => `execution:⟨${id}⟩`).join(', ');
+      const found = await runQuery(
+        `SELECT meta::id(id) AS eid, reached FROM ${targets}`,
+        {},
+      );
+      for (const row of found ?? []) {
+        const eid = typeof row?.eid === 'string' ? row.eid : null;
+        // ONLY a real boolean becomes a verdict. NONE/null/undefined stay absent
+        // from the map and therefore surface as null downstream.
+        if (eid && typeof row.reached === 'boolean') verdicts.set(eid, row.reached);
+      }
+      // A TOTAL MISS IS SUSPICIOUS, NOT ROUTINE. `execution` grants record users
+      // SELECT scoped by account_id/org_id (migration 099), so the JWT path can
+      // read it — but if that predicate ever diverges from the compat view's,
+      // this lookup returns nothing while the page query returns rows, and every
+      // consumer would read "the whole fleet is ungraded" with no error anywhere.
+      // That failure must be visible in the log rather than inferred from a
+      // suddenly-flat reach rate. (A genuinely all-ungraded page is possible and
+      // logs benignly; a permission divergence logs every single page.)
+      if (found && found.length === 0) {
+        logger.warn('[reach-hydrate] lookup matched ZERO of the page\'s executions — verdicts unknown, not false', {
+          idCount: ids.length,
+        });
+      }
+    } catch (err) {
+      // Loudly, and with no fabricated verdict: a failed hydrate means every row
+      // reports "not graded", which is true — we do not know.
+      logger.warn('[reach-hydrate] reached hydrate failed — surfacing null, NOT false', {
+        error: err instanceof Error ? err.message : String(err),
+        idCount: ids.length,
+      });
+    }
+  }
+
+  return rows.map((row) => {
+    // Rows unioned in from `SELECT * FROM execution` already carry the column;
+    // keep that value when the point lookup has nothing to say.
+    const existing = typeof row.reached === 'boolean' ? row.reached : null;
+    const raw = typeof row.execution_id === 'string' ? row.execution_id : '';
+    const hydrated = verdicts.has(raw) ? (verdicts.get(raw) as boolean) : null;
+    return { ...row, reached: hydrated !== null ? hydrated : existing };
+  });
+}
+
+/**
  * GET /v2/activities/execution-traces
  *
  * List execution traces with filtering and pagination
@@ -1230,12 +1336,26 @@ app.get('/', async (c) => {
       execution_id: trace.execution_id || trace.id?.toString().split(':')[1] || trace.id,
     }));
 
+    // Attach the honest reach verdict, which the compat view does not project.
+    // AFTER normalization (it keys on execution_id) and BEFORE the response is
+    // built, so the cached body carries it too — otherwise the field would blink
+    // in and out depending on cache hit, which is worse than not having it.
+    // The lookup runs on the same auth path as the page query; it only reads ids
+    // that org-scoped query already returned, so it cannot widen visibility.
+    const executionsWithReach = await hydrateReachedVerdicts(
+      executionsNormalized,
+      (sql, sqlParams) =>
+        (useJwtAuth && jwtAuth?.jwtToken && jwtAuth.authType !== 'apikey')
+          ? queryWithAuth<any>(jwtAuth.jwtToken, sql, sqlParams)
+          : surrealDB.query<any>(sql, sqlParams),
+    );
+
     // Composition chain fallback is skipped on the list endpoint — it triggers
     // one DB walk per result row for old traces with empty composition_chain,
     // adding 1-2s per row (5 rows = 10s total). The chain is only needed in the
     // single-trace detail view which fetches one row and can afford the walk.
     const response: ListExecutionTracesResponse = {
-      executions: executionsNormalized,
+      executions: executionsWithReach,
       total,
       limit,
       offset,
@@ -4843,9 +4963,14 @@ app.get('/:executionId', async (c) => {
     // `trace.tasks AS tasks` (migration-167). Hydrate the trace blob (and tasks
     // for the legacy, non-split path) from the canonical `execution` row so the
     // response shape is unchanged. Single point-lookup by record id.
+    //
+    // `reached` rides along on the SAME lookup — it is a column on `execution`
+    // that the view has never projected (see hydrateReachedVerdicts above), so
+    // the detail view was blind to the reach verdict for exactly the same reason
+    // the blob was. Free: the row is already being fetched.
     try {
       const blobRows = await surrealDB.query<any>(
-        `SELECT trace, trace.tasks AS tasks FROM type::thing('execution', $eid) LIMIT 1`,
+        `SELECT trace, trace.tasks AS tasks, reached FROM type::thing('execution', $eid) LIMIT 1`,
         { eid: (trace as any).execution_id || executionId },
       );
       const b = Array.isArray(blobRows) ? blobRows[0] : undefined;
@@ -4854,6 +4979,11 @@ app.get('/:executionId', async (c) => {
         if (contentSource !== 'split' && !(Array.isArray((trace as any).tasks) && (trace as any).tasks.length > 0)) {
           (trace as any).tasks = Array.isArray(b.tasks) ? b.tasks : [];
         }
+        // ONLY a real boolean is a verdict. An ungraded execution keeps whatever
+        // the paradigm-fallback row already had, else null — never false.
+        (trace as any).reached = typeof b.reached === 'boolean'
+          ? b.reached
+          : (typeof (trace as any).reached === 'boolean' ? (trace as any).reached : null);
       }
     } catch (blobErr) {
       logger.warn('trace blob hydrate failed', { executionId, err: blobErr instanceof Error ? blobErr.message : String(blobErr) });
@@ -4867,6 +4997,9 @@ app.get('/:executionId', async (c) => {
       execution_id: trace.execution_id || (trace as any).id?.toString().split(':')[1] || (trace as any).id,
       selection_attribution: selectionData,
       content_source: contentSource,
+      // Always present, so a consumer can tell "graded false" from "not graded"
+      // without having to distinguish an absent key from a null one.
+      reached: typeof (trace as any).reached === 'boolean' ? (trace as any).reached : null,
     };
 
     // Read-time fallback: same contract as list handler.
