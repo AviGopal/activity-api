@@ -349,6 +349,16 @@ export function resolveTemplateIdsForUpdate(args: {
 interface ExecutionTrace {
   execution_id: string;
   variant_id: string;
+  /**
+   * The goal-reach verdict, hydrated from the `execution` table because the compat
+   * view does not project it. THREE-STATE, and the third state is load-bearing:
+   * `true` reached, `false` did not reach, `null` NEVER GRADED. An ungraded
+   * execution has no verdict and must never be read as a failure to reach —
+   * conflating them is what let ~314 telemetry rows/day be counted as goal
+   * failures. Declared here because the generic call site resolves to `any`, so
+   * without this line tsc guarantees nothing about the field this endpoint ships.
+   */
+  reached?: boolean | null;
   correlation_id?: string;
   activity_id: string;
   success: boolean;
@@ -697,6 +707,11 @@ async function insertSystemTrace(params: SystemTraceParams, jwtToken?: string): 
  * `reach_reason` is NOT a column anywhere — verified. Goal-host writes it inside
  * `metadata` (goal-host-vessel/src/index.ts), and `metadata` IS projected by the
  * view, so that value already reaches consumers on the full projection.
+ *
+ * TARGET COUNT: up to 100 per page normally (the route caps `limit` at 100), but up
+ * to ~200 when `parent_execution_id` is set — the paradigm-union appends a second
+ * page before hydrate runs. Still direct record targets, still no scan; the earlier
+ * "<=100" note understated it.
  *
  * `runQuery` is injected so this is testable without a database.
  */
