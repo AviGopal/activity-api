@@ -165,8 +165,29 @@ export async function runGroupedExecutionStats(
   // `reached != NONE` is the graded predicate, copied from
   // services/trace-retention.ts (rollupReachHistory) — the proven SurrealDB form
   // for "this option<bool> has a value".
-  const reachedSql = `SELECT activity_id, count() AS value FROM execution WHERE ${whereSql} AND reached = true GROUP BY activity_id`;
-  const gradedSql = `SELECT activity_id, count() AS value FROM execution WHERE ${whereSql} AND reached != NONE GROUP BY activity_id`;
+  // EXCLUDE ROWS WHERE A GOAL VERDICT IS INAPPLICABLE (2026-09-02, review finding).
+  //
+  // lib/reach-classify.ts already defines this population and names the offender:
+  // "`auth_resolve_v1` — the sole `telemetry:` emitter — ran hundreds of thousands of
+  // times, every one success:true but stamped reached:false ... and every one was read
+  // as a genuine not-reached failure." classifyReach routes those to 'ungraded'.
+  //
+  // But routes/execution-traces.ts:3046 writes the `reached` COLUMN straight from the
+  // tag without consulting classifyReach, so the column disagrees with the classifier —
+  // 314 telemetry rows/day sit in the store stamped reached:false. Measured on the live
+  // corpus: auth_resolve_v1 alone is 255 of 393 graded rows in 24h, 0 reached. Aggregating
+  // it drags the fleet figure from 8.9% to 2.8% and would file a gap accusing a family
+  // that was never attempting a goal.
+  //
+  // Excluding here rather than fixing :3046 is deliberate: that is a WRITE-path semantics
+  // change altering what verdict is stored and therefore Thompson credit, and it needs its
+  // own before/after measurement. This read-side filter is reversible and blames nobody.
+  // Mirrors isReachInapplicable/isHollowSatellite by tag prefix, the same authority
+  // classifyReach uses.
+  const inapplicableSql =
+    `AND !array::any(tags ?? [], |$t| string::starts_with($t, "telemetry:") OR string::starts_with($t, "satisfier:"))`;
+  const reachedSql = `SELECT activity_id, count() AS value FROM execution WHERE ${whereSql} AND reached = true ${inapplicableSql} GROUP BY activity_id`;
+  const gradedSql = `SELECT activity_id, count() AS value FROM execution WHERE ${whereSql} AND reached != NONE ${inapplicableSql} GROUP BY activity_id`;
 
   const startedAt = Date.now();
   let queryOk = true;
