@@ -226,7 +226,7 @@ async function runDiagnose(pointer: any): Promise<any> {
   } catch {
     doubledPrefix = 0;
   }
-  integrity.push({ id: 'doubled_prefix_ids', table: 'activity_template', violating_rows: doubledPrefix });
+  integrity.push({ id: 'doubled_prefix_ids', table: 'activity_template', violating_rows: doubledPrefix, verify_failed: null });
   if (doubledPrefix && doubledPrefix > 0) {
     suggested.push({ operation: 'repair', params: { pattern: 'delete_doubled_prefix_ids' }, reason: `${doubledPrefix} doubled-prefix ids` });
   }
