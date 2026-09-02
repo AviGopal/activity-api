@@ -3797,13 +3797,24 @@ router.post('/resolve', async (c) => {
             authType: jwtAuth.authType,
           });
           const worst = report.rows.slice().sort((a, b) => a.success_rate - b.success_rate)[0];
+          // Reach summary over the GRADED slice only — an ungraded run has no verdict
+          // and must not read as a failure to reach (see grouped-execution-stats.ts).
+          // SCOPE: `rows` is capped at `limit` (default 25, ordered by count), so this
+          // is the top-N families, NOT a fleet-wide reach rate. Read it as "reach over
+          // the families in this report"; the fleet number needs an uncapped query.
+          const gradedTotal = report.rows.reduce((n, r) => n + r.graded_count, 0);
+          const reachedTotal = report.rows.reduce((n, r) => n + r.reached_count, 0);
+          const reachSummary =
+            gradedTotal > 0
+              ? `; reach ${((reachedTotal / gradedTotal) * 100).toFixed(1)}% (${reachedTotal}/${gradedTotal} graded, ${report.rows.reduce((n, r) => n + r.ungraded_count, 0)} ungraded)`
+              : '; reach n/a (nothing graded)';
           return c.json(
             {
               success: true,
               content: JSON.stringify(report),
               metadata: {
                 shape: 'groupedExecutionStats',
-                summary: `${report.total_groups} activit(y/ies) over ${report.window_hours}h${report.empty ? ' (no data)' : `; lowest success_rate ${worst?.activity_id ?? ''}=${worst ? (worst.success_rate * 100).toFixed(1) + '%' : ''} (${worst?.count ?? 0} runs, mode=${worst?.top_failure_mode ?? 'n/a'})`}`,
+                summary: `${report.total_groups} activit(y/ies) over ${report.window_hours}h${report.empty ? ' (no data)' : `; lowest success_rate ${worst?.activity_id ?? ''}=${worst ? (worst.success_rate * 100).toFixed(1) + '%' : ''} (${worst?.count ?? 0} runs, mode=${worst?.top_failure_mode ?? 'n/a'})`}${reachSummary}`,
               },
             } as ImpulseResolveResponse,
             200,

@@ -51,6 +51,17 @@ export interface GroupedExecutionStatsRow {
   count: number;
   success_count: number;
   success_rate: number;
+  /** Rows with a goal verdict of REACHED (`reached = true`). Never derived from `success`. */
+  reached_count: number;
+  /** Rows carrying ANY reach verdict (`reached != NONE`) — the reach_rate denominator. */
+  graded_count: number;
+  /** count - graded_count. A high value means a low/absent reach_rate says nothing. */
+  ungraded_count: number;
+  /**
+   * reached_count / graded_count, or NULL when nothing in the group was graded.
+   * NULL, not 0: "no verdict" and "every verdict was not-reached" are different facts.
+   */
+  reach_rate: number | null;
   top_failure_mode: string | null;
 }
 
@@ -62,6 +73,25 @@ export interface GroupedExecutionStats {
   total_groups: number;
   empty: boolean;
   query_ms: number;
+  /**
+   * SINGLE-GROUP PROJECTION — top-level copies of the scoped group's reach numbers.
+   *
+   * These exist for one concrete consumer: the gap sweep's Class-2 falsifier
+   * (`verifyGapConditionAsync` in development-vessel/src/resolvers/gap-to-feature.ts).
+   * That verifier reads `evidence_resolve.nonzero_field` FLAT — `inner[nonzeroField]`,
+   * with no dot/array traversal — so a predicate naming `reach_rate` would read
+   * `undefined` off `rows[0].reach_rate`, score 'present', and the gap could never
+   * close no matter how healthy the family became. A falsifier that can only ever
+   * say "still broken" is the "looks measurable, is inert" defect, not a measurement.
+   *
+   * Populated ONLY when the caller scoped the query (`activity_id`) and exactly one
+   * group came back; null otherwise, because a fleet-wide number is not a verdict
+   * about any one family.
+   */
+  reach_rate: number | null;
+  reached_count: number | null;
+  graded_count: number | null;
+  ungraded_count: number | null;
 }
 
 function clampInt(v: unknown, def: number, min: number, max: number): number {
@@ -113,10 +143,37 @@ export async function runGroupedExecutionStats(
   const totalSql = `SELECT activity_id, count() AS value FROM v_paradigm_execution_traces WHERE ${whereSql} GROUP BY activity_id`;
   const succSql = `SELECT activity_id, count() AS value FROM v_paradigm_execution_traces WHERE ${whereSql} AND success = true GROUP BY activity_id`;
 
+  // ── REACH (the goal verdict), NOT success (the exit status) ──────────────────
+  //
+  // WHY THIS EXISTS: `success_rate` above is exit cleanliness. The substrate's
+  // execution contract is stated in terms of REACH, and nothing in the fleet
+  // aggregates it — so a fleet running far below its own contract filed no gap,
+  // because no reader existed. See src/lib/reach-classify.ts: "Exiting cleanly is
+  // not evidence a goal was reached." reach_rate MUST NOT be success_count/count;
+  // several composed activities computed exactly that and called it reach_rate.
+  //
+  // WHY A DIFFERENT TABLE: `reached` is a column on `execution` (migration 160) and
+  // is NOT projected by the v_paradigm_execution_traces compat view (the live view
+  // body is migration 167's, which has no `reached` line). The view is a plain
+  // `SELECT … FROM execution` with no WHERE, so the two passes cover the identical
+  // population row-for-row — the only difference is which columns are visible.
+  // Adding `reached` to the view would need a REMOVE + DEFINE that re-materialises
+  // the whole table; reading the base table costs nothing and is what
+  // trace-retention.ts's reach rollup already does. Same window, same tenant
+  // scoping, same never-alias-the-grouped-column rule.
+  //
+  // `reached != NONE` is the graded predicate, copied from
+  // services/trace-retention.ts (rollupReachHistory) — the proven SurrealDB form
+  // for "this option<bool> has a value".
+  const reachedSql = `SELECT activity_id, count() AS value FROM execution WHERE ${whereSql} AND reached = true GROUP BY activity_id`;
+  const gradedSql = `SELECT activity_id, count() AS value FROM execution WHERE ${whereSql} AND reached != NONE GROUP BY activity_id`;
+
   const startedAt = Date.now();
   let queryOk = true;
   const totals = new Map<string, number>();
   const succs = new Map<string, number>();
+  const reacheds = new Map<string, number>();
+  const gradeds = new Map<string, number>();
   const topMode = new Map<string, string>();
 
   const readGroup = (result: unknown): Array<Record<string, unknown>> => {
@@ -132,6 +189,21 @@ export async function runGroupedExecutionStats(
   try {
     for (const r of readGroup(await db.query(totalSql, params))) totals.set(asKey(r), asNum(r.value));
     for (const r of readGroup(await db.query(succSql, params))) succs.set(asKey(r), asNum(r.value));
+
+    // Guarded like the failure_mode histogram: if the reach passes degrade (an older
+    // deployment without migration 160), the livelock signal must still survive. A
+    // degraded reach pass yields graded_count 0 -> reach_rate null, which reads as
+    // "no verdict", never as "reached nothing".
+    try {
+      for (const r of readGroup(await db.query(reachedSql, params))) reacheds.set(asKey(r), asNum(r.value));
+      for (const r of readGroup(await db.query(gradedSql, params))) gradeds.set(asKey(r), asNum(r.value));
+    } catch (rerr) {
+      logger.warn('[grouped-execution-stats] reach aggregate degraded (null reach_rate)', {
+        error: rerr instanceof Error ? rerr.message : String(rerr),
+      });
+      reacheds.clear();
+      gradeds.clear();
+    }
 
     // Best-effort dominant failure_mode per activity (failed rows only). The
     // nested-field double-group is fragile; guard it so the core stat (the
@@ -167,11 +239,39 @@ export async function runGroupedExecutionStats(
   for (const [activity_id, count] of totals) {
     if (activity_id === '(none)' || count < minCount) continue;
     const success_count = succs.get(activity_id) ?? 0;
+    const reached_count = reacheds.get(activity_id) ?? 0;
+    const graded_count = gradeds.get(activity_id) ?? 0;
     rows.push({
       activity_id,
       count,
       success_count,
       success_rate: count > 0 ? success_count / count : 0,
+      reached_count,
+      graded_count,
+      // DENOMINATOR = GRADED ONLY, and this is a load-bearing choice.
+      //
+      // `reached` is option<bool>: an ungraded run has NO verdict, and counting it
+      // as a failure to reach would manufacture the very misleading aggregate this
+      // change exists to prevent — a family whose runs are simply never graded
+      // would read as a family that never reaches. Grading is also asynchronous
+      // (POST /reach patches the row after insert), so an all-executions
+      // denominator would additionally penalise recency.
+      //
+      // In-repo precedent: services/trace-retention.ts `rollupReachHistory` buckets
+      // reached/total over `WHERE reached != NONE` — graded-only. Matching it means
+      // the weekly history and this per-activity view are the same statistic.
+      //
+      // The cost of graded-only is that a small graded slice can look extreme, so
+      // `ungraded_count` is exposed beside it: a reader (and the detector) can tell
+      // a genuinely low reach rate from a mostly-ungraded population, and the
+      // detector gates its volume threshold on graded_count rather than count.
+      //
+      // NOTE the interaction with reach-classify.ts: hollow satisfier satellites and
+      // `telemetry:`-tagged infra probes are classified 'ungraded' and persisted with
+      // `reached: null` (lib/posterior-update.ts), so graded-only already excludes
+      // them. No activity_id name filter is needed or wanted here.
+      ungraded_count: Math.max(0, count - graded_count),
+      reach_rate: graded_count > 0 ? reached_count / graded_count : null,
       top_failure_mode: topMode.get(activity_id) ?? null,
     });
   }
@@ -179,6 +279,10 @@ export async function runGroupedExecutionStats(
   // Default desc by count — a livelock is a high-count / low-success-rate row.
   rows.sort((a, b) => (order === 'ASC' ? a.count - b.count : b.count - a.count));
   if (rows.length > limit) rows = rows.slice(0, limit);
+
+  // Flat projection for the scoped single-group case (see the interface comment:
+  // the gap sweep reads nonzero_field off the top level, not out of `rows`).
+  const scoped = activityFilter !== null && rows.length === 1 ? rows[0]! : null;
 
   return {
     shape: 'groupedExecutionStats',
@@ -188,5 +292,9 @@ export async function runGroupedExecutionStats(
     total_groups: rows.length,
     empty: rows.length === 0,
     query_ms: queryOk ? Date.now() - startedAt : -1,
+    reach_rate: scoped ? scoped.reach_rate : null,
+    reached_count: scoped ? scoped.reached_count : null,
+    graded_count: scoped ? scoped.graded_count : null,
+    ungraded_count: scoped ? scoped.ungraded_count : null,
   };
 }
