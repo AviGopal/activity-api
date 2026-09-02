@@ -215,6 +215,14 @@ async function runDiagnose(pointer: any): Promise<any> {
     );
     const row = (Array.isArray(rows) ? rows : [])[0];
     doubledPrefix = row && typeof row.c === 'number' ? row.c : 0;
+    // Verify count matches before considering integrity issue resolved
+    const verifyResult = await surrealDB.query<any>(
+      `SELECT count() AS v FROM activity_template WHERE string::contains(<string> id, 'activity:⟨activity:') AND NOT string::starts_with(string::trim(id), 'activity:⟨activity:⟨activity:') GROUP ALL`
+    );
+    const verifyRow = (Array.isArray(verifyResult) ? verifyResult : [])[0];
+    if (verifyRow && typeof verifyRow.v === 'number' && verifyRow.v > 0) {
+      doubledPrefix = verifyRow.v;
+    }
   } catch {
     doubledPrefix = 0;
   }
