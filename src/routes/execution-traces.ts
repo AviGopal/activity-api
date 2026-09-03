@@ -88,12 +88,43 @@ const NON_COMPLETING_FAILURE_MODES = new Set(['execution_error']);
  * the verdict may come from a grader that never saw it. An undefined verdict
  * stays undefined (ungraded is not a negative), and a `false` claim stays false.
  */
+/**
+ * THE SECOND CONJUNCT, RESTORED (2026-09-03).
+ *
+ * The note above states the Task #55 defect as `execution_error` AND PRODUCED ZERO SHAPES.
+ * The implementation kept the failure-mode half and dropped the zero-shapes half, so it
+ * downgraded ANY claimed reach carrying that mode — including executions that plainly
+ * completed. Measured on the live store:
+ *
+ *   failure_mode='execution_error' AND status='success'        6,275
+ *   failure_mode='execution_error' AND produced output shapes  9,679  (83%)
+ *   reached=true                                                 478
+ *   reached=true AND failure_mode='execution_error'              430  (90%)
+ *
+ * A worked case: walk-satisfier-1-1788364637686 is the goal "count the TypeScript files
+ * under repos/ribosome-vessel/src". Its answer, 7, was INDEPENDENTLY VERIFIED by a host-side
+ * recount. It carries failure_mode=execution_error and was downgraded to reached=False —
+ * the downgrade fired on a walk that demonstrably reached.
+ *
+ * An execution_error that completes and emits shapes is not a non-completing failure. This
+ * narrows the rule back to what Task #55 described; the case it was written for (zero
+ * shapes) still downgrades. `producedShapeCount` is optional so un-updated callers keep the
+ * old, stricter reading rather than silently loosening.
+ *
+ * DO NOT instead propagate this rule to the reach-patch path to "make the writers agree":
+ * those 430 rows exist only because the patch skips the downgrade, so applying it uniformly
+ * would cut recorded reaches 478 -> ~48 and harden the wrong answer.
+ */
 export function reachedVerdict(
   claimed: boolean | undefined,
   failureModeType: string | undefined,
+  producedShapeCount?: number,
 ): boolean | undefined {
   if (claimed !== true) return claimed;
-  if (failureModeType != null && NON_COMPLETING_FAILURE_MODES.has(failureModeType)) return false;
+  if (failureModeType != null && NON_COMPLETING_FAILURE_MODES.has(failureModeType)) {
+    // Only a non-completing mode that ALSO produced nothing is evidence of non-completion.
+    return (producedShapeCount ?? 0) > 0 ? true : false;
+  }
   return true;
 }
 
@@ -3185,6 +3216,10 @@ app.post('/', async (c) => {
           : Array.isArray((trace as any).tags) && (trace as any).tags.includes('reached:false') ? false
           : undefined,
           body.failure_mode?.type,
+          // The second conjunct Task #55 described and the implementation dropped: an
+          // execution_error that EMITTED SHAPES completed, so it is not evidence of
+          // non-completion. Same source as the `output_impulse_shapes` written above.
+          Array.isArray(trace.output_impulse_shapes) ? trace.output_impulse_shapes.length : 0,
         ),
         version: 0,
       };

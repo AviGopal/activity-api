@@ -58,3 +58,53 @@ describe('reachedVerdict', () => {
     expect(reachedVerdict(true, 'some_future_mode')).toBe(true);
   });
 });
+
+// TASK #55's SECOND CONJUNCT, RESTORED (2026-09-03).
+//
+// The docstring on reachedVerdict states the defect it fixes as: `reached: true` persisted
+// on executions that reported `failure_mode.type = 'execution_error'` AND PRODUCED ZERO
+// SHAPES. The implementation kept the failure-mode half and dropped the zero-shapes half,
+// so it downgrades ANY claimed reach carrying that mode — including executions that plainly
+// completed.
+//
+// Measured on the live store 2026-09-03:
+//   failure_mode='execution_error' AND status='success'          6,275
+//   failure_mode='execution_error' AND produced output shapes    9,679  (83%)
+//   reached=true                                                   478
+//   reached=true AND failure_mode='execution_error'                430  (90%)
+//
+// And a worked case: walk-satisfier-1-1788364637686 is the goal "count the TypeScript files
+// under repos/ribosome-vessel/src". Its answer, 7, was INDEPENDENTLY VERIFIED by a host-side
+// recount. It carries failure_mode=execution_error and was downgraded to reached=False. The
+// downgrade fired on a walk that demonstrably reached.
+//
+// An execution_error that completes and emits shapes is not a non-completing failure.
+// Restoring the conjunct narrows the rule back to what Task #55 described, and cannot
+// re-admit the case it was written for: zero shapes still downgrades.
+describe('reachedVerdict — the produced-shapes conjunct', () => {
+  it('STILL downgrades the Task #55 case: execution_error with zero shapes', () => {
+    expect(reachedVerdict(true, 'execution_error', 0)).toBe(false);
+  });
+
+  it('does NOT downgrade an execution_error that produced shapes — it completed', () => {
+    expect(reachedVerdict(true, 'execution_error', 3)).toBe(true);
+  });
+
+  it('leaves a non-completing mode with shapes alone regardless of count', () => {
+    expect(reachedVerdict(true, 'execution_error', 1)).toBe(true);
+  });
+
+  it('preserves existing behaviour when the count is not supplied (conservative default)', () => {
+    // Callers that have not been updated keep the old, stricter reading.
+    expect(reachedVerdict(true, 'execution_error')).toBe(false);
+  });
+
+  it('never upgrades, and never touches a non-true claim', () => {
+    expect(reachedVerdict(false, 'execution_error', 5)).toBe(false);
+    expect(reachedVerdict(undefined, 'execution_error', 5)).toBeUndefined();
+  });
+
+  it('is unaffected for modes that were never non-completing', () => {
+    expect(reachedVerdict(true, 'budget_exhausted', 0)).toBe(true);
+  });
+});
