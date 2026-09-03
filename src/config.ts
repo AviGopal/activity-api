@@ -170,7 +170,31 @@ function parseEnvBool(key: string, defaultValue: boolean): boolean {
  */
 function validateNamespace(ns: string | undefined): string {
   if (!ns) {
-    throw new Error('SURREALDB_NAMESPACE environment variable is required. Set it to "activity-system" for Activity API deployment.');
+    // SAME PATTERN AS resolveJwtSecret ABOVE — production still fails fast; non-production
+    // gets a loud, explicit default "so `bun run dev` and unit tests work without manual
+    // setup". This function did not follow that precedent, and the cost was measured:
+    //
+    // Throwing here happens at MODULE LOAD, so the exported `config` const is never
+    // initialised and every later access raises "ReferenceError: Cannot access 'config'
+    // before initialization" — an error that names neither this file nor the missing
+    // variable. Measured 2026-09-03: the suite ran 1,219 pass / 273 fail; supplying
+    // SURREALDB_NAMESPACE alone moved it to 1,305 pass / 197 fail. SEVENTY-SIX failures
+    // were this one unset variable, presenting as a TDZ error that reads like a circular
+    // import — which is exactly what I first diagnosed it as.
+    //
+    // That matters beyond convenience: CLAUDE.md requires `bun test` to pass before push,
+    // and a suite this red cannot serve as a gate — a real regression is indistinguishable
+    // from the noise, so the gate gets skipped and reads as coverage while providing none.
+    const nodeEnv = process.env.NODE_ENV ?? 'development';
+    if (nodeEnv === 'production') {
+      throw new Error('SURREALDB_NAMESPACE environment variable is required. Set it to "activity-system" for Activity API deployment.');
+    }
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[config] SURREALDB_NAMESPACE unset; using non-production default "activity-system". ' +
+      'Set it explicitly for any real deployment.'
+    );
+    return 'activity-system';
   }
   
   // Validate namespace format (alphanumeric, underscore, hyphen)
