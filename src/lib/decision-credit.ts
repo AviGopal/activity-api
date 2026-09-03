@@ -9,6 +9,7 @@
  * walk's `correlation:<id>` tag onto the execution row, so the join key exists.
  *
  * This module is the *consumer* half — but deliberately the SAFE, additive half:
+ * it persists a decision→outcome record to a NEW table (`decision_outcome`),
  * Capture is limited to reach-graded executions; only these are recorded, ensuring that the fraction of rows in decision_outcome with a known reach is 100% by construction. This should not be interpreted as evidence of grading coverage across the fleet since only already-graded executions are recorded.
  * it persists a decision→outcome record to a NEW table (`decision_outcome`),
  * keyed on correlation_id, WITHOUT touching `variant_performance_metrics` or
