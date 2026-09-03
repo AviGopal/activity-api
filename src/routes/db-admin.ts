@@ -183,7 +183,7 @@ const INTEGRITY_SCANS: { id: string; table: string; where: string; remediation: 
 async function safeCount(table: string, where?: string): Promise<number | null> {
   try {
     const sql = where
-      ? `SELECT count() AS count_value FROM ${table} WHERE ${where} GROUP ALL`
+      ? `SELECT count() AS c FROM ${table} WHERE ${where} GROUP ALL`
       : `SELECT count() AS c FROM ${table} GROUP ALL`;
     const rows = await surrealDB.query<any>(sql);
     const row = (Array.isArray(rows) ? rows : [])[0];
