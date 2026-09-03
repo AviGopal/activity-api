@@ -97,7 +97,7 @@ export interface ExecutionDecisionOutcomeInput {
 }
 
 /**
- * Universal decision→outcome capture, keyed on execution_id.
+ * Capture is limited to reach-graded executions; only these are recorded, ensuring that the fraction of rows in decision_outcome with a known reach is 100% by construction. This should not be interpreted as evidence of grading coverage across the fleet since only already-graded executions are recorded.
  *
  * The correlation-join path (recordDecisionOutcome) only fires when an execution
  * carries a `correlation:<id>` tag joinable to thompson_selection_log — the
