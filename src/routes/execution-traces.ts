@@ -4145,7 +4145,7 @@ app.get('/selection-outcomes', async (c) => {
     const params: Record<string, any> = { limit, offset };
 
     if (activityId) {
-      selectionConditions.push('sel.activity_id = $activity_id');
+      selectionConditions.push('activity_id = $activity_id');
       params.activity_id = activityId;
     }
 
@@ -4176,9 +4176,9 @@ app.get('/selection-outcomes', async (c) => {
         selected_at,
         org_id,
         <float> alpha / (<float> alpha + <float> beta) AS expected_success_rate
-      FROM thompson_selection_log AS sel
+      FROM thompson_selection_log
       ${selectionWhereClause}
-      ORDER BY sel.selected_at DESC
+      ORDER BY selected_at DESC
       LIMIT $limit
       START $offset
     `;
