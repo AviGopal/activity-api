@@ -4676,8 +4676,12 @@ app.get('/decision-calibration', async (c) => {
     const DECISION_CAP = 20000;
     const conds: string[] = [];
     const params: Record<string, any> = { decision_cap: DECISION_CAP };
+    const startDate = c.req.query('start_date');
+    const endDate = c.req.query('end_date');
     if (activityId) { conds.push('activity_id = $activity_id'); params.activity_id = activityId; }
     if (source) { conds.push('source = $source'); params.source = source; }
+    if (startDate) { conds.push('created_at >= type::datetime($start_date)'); params.start_date = startDate; }
+    if (endDate) { conds.push('created_at <= type::datetime($end_date)'); params.end_date = endDate; }
     const whereClause = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
     const rowsQuery = `
       SELECT activity_id, source, predicted_success, outcome_success, reached, executed_at, created_at
