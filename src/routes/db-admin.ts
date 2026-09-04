@@ -73,6 +73,7 @@ const CATASTROPHIC_PATTERNS: { re: RegExp; label: string }[] = [
   { re: /\bDROP\s+(TABLE|DATABASE|NAMESPACE)\b/i, label: 'DROP TABLE/DATABASE/NAMESPACE' },
   { re: /\bREMOVE\s+(TABLE|DATABASE|NAMESPACE|FIELD|INDEX|EVENT)\b/i, label: 'REMOVE TABLE/DATABASE/...' },
   { re: /\bTRUNCATE\b/i, label: 'TRUNCATE' },
+  { re: /\bREINDEX\b/i, label: 'REINDEX' }
 ];
 
 /**
