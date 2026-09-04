@@ -72,6 +72,7 @@ import {
   type VariantInfo,
   type VariantScore,
   type VariantTreeNode,
+  normalizeActivityId as importedNormalizeActivityId,
 } from '../db/paradigm';
 import { mergeByRRF } from '../utils/rrf';
 import {
@@ -7294,10 +7295,12 @@ app.post('/recommend', async (c) => {
         logger.warn('Failed to log Thompson selections', { error: err.message });
       });
 
-      // Increment total_selections for recommended activities
-      // Phase B1: dual-scope WHERE — match account_id-tagged rows first, fall
-      // back to legacy org_id-only rows.
-      const activityIds = finalRecommendations.map((r: any) => r.template_id);
+      // Normalize to the plain id form variant_performance_metrics keys on. /recommend
+      // returns "activity:⟨name⟩" while variant_id holds "name", so the IN test below
+      // matched nothing and total_selections sat at 0 on all 4,049 rows while the
+      // selection log recorded ~1,800 selections a day. An UPDATE matching no rows is
+      // not an error, which is why this was silent. normalizeActivityId is idempotent.
+      const activityIds = finalRecommendations.map((r: any) => importedNormalizeActivityId(r.template_id));
       surrealDB.query(`
         UPDATE variant_performance_metrics
         SET total_selections = total_selections + 1,
