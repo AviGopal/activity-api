@@ -3376,7 +3376,7 @@ router.post('/resolve', async (c) => {
             // retired = true` in one statement. This impulse setting only `deprecated` was the
             // anomaly. `deprecated` stays as the lifecycle LABEL (why it left), `retired` as the
             // operative flag (that it left).
-            `UPDATE activity SET deprecated = true, retired = true, updated_at = time::now() WHERE record::id(id) = $id AND (${accountIdScopedWhere()} OR (scope = 'global' AND ($isAdmin = true OR $evidenceCleared = true))) RETURN AFTER`,
+            `UPDATE activity SET deprecated = true, retired = true, retired_at = time::now(), retired_reason = 'deprecate_impulse', updated_at = time::now() WHERE record::id(id) = $id AND (${accountIdScopedWhere()} OR (scope = 'global' AND ($isAdmin = true OR $evidenceCleared = true))) RETURN AFTER`,
             {
               id: templateId,
               orgId: jwtAuth.orgId,

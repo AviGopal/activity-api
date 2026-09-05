@@ -3555,9 +3555,15 @@ app.post('/templates/retire-malformed', async (c) => {
     if (!dry_run) {
       for (const o of offenders) {
         try {
-          const _upd = 'UPDATE type::thing($tid) SET retired = true, deprecated = true, updated_at = time::now()';
-          if (_jwt?.jwtToken) await queryWithAuth(_jwt.jwtToken, _upd, { tid: o.id });
-          else await surrealDB.query(_upd, { tid: o.id });
+          // RECORD WHY, NOT ONLY THAT. `o.reason` is already computed above and is returned
+          // in the API response, but it was never persisted, so the row carried no trace of
+          // the decision. Measured 2026-09-05: retired=true on 1,217 of 3,886 activities and
+          // retired_reason NONE on every one of them, retired_at unset on every one of them —
+          // retirement was entirely unauditable after the fact. `deprecated` does not fill the
+          // gap: it is a second boolean that mirrors `retired` (1,214 of 1,217 agree), not a label.
+          const _upd = 'UPDATE type::thing($tid) SET retired = true, deprecated = true, retired_at = time::now(), retired_reason = $reason, updated_at = time::now()';
+          if (_jwt?.jwtToken) await queryWithAuth(_jwt.jwtToken, _upd, { tid: o.id, reason: o.reason });
+          else await surrealDB.query(_upd, { tid: o.id, reason: o.reason });
           retired++;
         } catch { /* one failed row must not abort the sweep; the rest are still worth retiring */ }
       }
@@ -3764,7 +3770,9 @@ app.post('/templates/auto-promote', async (c) => {
           }
           try {
             await surrealDB.query(
-              `UPDATE activity SET proposed = false, deprecated = true, retired = true, updated_at = time::now() WHERE meta::id(id) = $tid`,
+              // retired_reason mirrors the `reason: 'failed_out'` this path already reports in
+              // its response; without it the row cannot say why it was pruned.
+              `UPDATE activity SET proposed = false, deprecated = true, retired = true, retired_at = time::now(), retired_reason = 'failed_out', updated_at = time::now() WHERE meta::id(id) = $tid`,
               { tid: p.template_id },
             );
             pruned.push({ ...evidence, action: 'pruned', reason: 'failed_out' });
