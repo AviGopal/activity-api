@@ -81,6 +81,29 @@ describe('goal_hash collapses instances onto a class', () => {
     const once = normalizeGoal('close substrate gap route-edit-5994fcfb');
     expect(normalizeGoal(once)).toBe(once);
   });
+
+  // EXECUTES the leading-bracket strip rather than inspecting it. Two commits to this
+  // transform landed with a FAVORABLE verdict and a green suite while matching NOTHING
+  // (3a92282 doubled the regex backslashes, b9fc69d stripped them). Neither was inert in a
+  // way any structural check could see — the regex compiled, the description matched, and
+  // no test ran it. These three cases would have failed for both.
+  it('strips a leading bracketed correlation token — the positive case', () => {
+    const stripped = normalizeGoal('[liveness-2935e6-1306] Report how many shapes are advertised.');
+    expect(stripped.startsWith('report')).toBe(true);
+    expect(stripped).not.toContain('liveness');
+  });
+
+  it('collapses two runs of the same task carrying different correlation tokens', () => {
+    const a = normalizeGoal('[liveness-2935e6-1306] Report how many shapes are advertised.');
+    const b = normalizeGoal('[liveness-99b6d6-1305] Report how many shapes are advertised.');
+    expect(a).toBe(b);
+  });
+
+  it('does NOT collapse genuinely different goals — the negative control', () => {
+    const a = normalizeGoal('[liveness-2935e6-1306] Report how many shapes are advertised.');
+    const b = normalizeGoal('[liveness-2935e6-1306] Report the total number of activity arms.');
+    expect(a).not.toBe(b);
+  });
 });
 
 describe('goal-paths route wiring', () => {
