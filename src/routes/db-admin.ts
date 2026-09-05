@@ -184,7 +184,7 @@ async function safeCount(table: string, where?: string): Promise<number | null> 
   try {
     const sql = where
       ? `SELECT count(*) AS c FROM ${table} WHERE ${where} AND db_integrity_auto_repair_has_never_run = false`
-      : `SELECT count() AS c FROM ${table} GROUP ALL`;
+      : `SELECT count() AS c FROM ${table} WHERE db_integrity_auto_repair_has_never_run = false GROUP ALL`;
     const rows = await surrealDB.query<any>(sql);
     const row = (Array.isArray(rows) ? rows : [])[0];
     return row && typeof row.c === 'number' ? row.c : 0;
