@@ -136,7 +136,7 @@ function normalizeGoal(goal: string): string {
   return goal
     .toLowerCase()
     .trim()
-    .replace(/^[[^]]*]\s*/, '')
+    .replace(/^\[[^\]]*\]\s*/, '')
     // CLASS HASH, NOT INSTANCE HASH. goal_hash keys goal_execution_paths — the surface Thompson
     // learns pathway reuse over — so this function decides what counts as "the same goal", and
     // therefore what the system is able to learn anything about at all.
