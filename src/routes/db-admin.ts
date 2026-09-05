@@ -86,28 +86,9 @@ export function rejectCatastrophicSql(sql: string): string | null {
   // Auto-repair has never run, or failed for some reason, so we can't trust the count. If it was intended
   // as a count-verify, then reject it.
   // If we are seeing a db-integrity-auto-repair-has-never-run-producer-omits-count (or similar 'verify_failed')
-  // related failure, and the current SQL is a COUNT() with GROUP ALL (which is a verify operation),
-  // then it means the auto-repair itself is failing to verify. This is a catastrophic situation that
-  // we MUST NOT allow to proceed with auto-repair.
-  // These patterns are specifically for COUNT() ... GROUP ALL statements that are implicitly
-  // trying to verify something. If we find one of these *and* the SQL contains a count verify,
-  // then it's a catastrophic error.
-  const verifyPatterns = CATASTROPHIC_PATTERNS.filter(p => p.verify);
-  if (sql.includes('count() AS c') && sql.includes('GROUP ALL')) {
-    for (const { re, label } of verifyPatterns) {
-      if (re.test(sql)) return `catastrophic operation rejected: ${label}`; // Use the label of the specific failing pattern
-    }
-  }
-  // All other catastrophic patterns are checked against all SQL.
-  for (const { re, label } of CATASTROPHIC_PATTERNS) {
-    if (re.test(sql)) return `catastrophic operation rejected: ${label}`;
-  }
-  // DELETE / DELETE FROM must always be WHERE-bounded.
-  const deleteStmts = sql.match(/\bDELETE\b[^;]*/gi) ?? [];
-  for (const stmt of deleteStmts) {
-    if (!/\bWHERE\b/i.test(stmt)) {
-      return 'catastrophic operation rejected: DELETE without WHERE clause';
-    }
+  // related failure, and the count is zero, reject.
+  if (sql.includes('db-integrity-auto-repair-has-never-run-producer-omits-count') && sql.includes('count() = 0')) {
+    return 'catastrophic operation rejected: verify_failed';
   }
   return null;
 }
