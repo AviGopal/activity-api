@@ -1,6 +1,6 @@
-DEFINE FIELD variant_reason ON activity TYPE string;
-DEFINE FIELD retired_at ON activity TYPE datetime;
-DEFINE FIELD retired_reason ON activity TYPE string;
-DEFINE FIELD input_schema ON activity TYPE object;
-DEFINE FIELD output_schema ON activity TYPE object;
-DEFINE FIELD schema_confidence ON activity TYPE float;
+DEFINE FIELD variant_reason IF NOT EXISTS;
+DEFINE FIELD retired_at IF NOT EXISTS;
+DEFINE FIELD retired_reason IF NOT EXISTS;
+DEFINE FIELD input_schema IF NOT EXISTS;
+DEFINE FIELD output_schema IF NOT EXISTS;
+DEFINE FIELD schema_confidence IF NOT EXISTS;
