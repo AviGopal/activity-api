@@ -26,6 +26,7 @@ function normalizeGoal(goal: string): string {
   return goal
     .toLowerCase()
     .trim()
+    .replace(/^\[[^\]]*\]\s*/, '')
     .replace(/\b[0-9a-f]{8,}(?::\d+)?\b/g, (m) => (/\d/.test(m) ? 'id' : m))
     .replace(/\b\d{10,}\b/g, 'n')
     .replace(/[^\w\s]/g, '')
@@ -99,5 +100,30 @@ describe('goal-paths route wiring', () => {
 
   it('requires a digit in the elided hex run', () => {
     expect(src).toContain("/\\d/.test(m)");
+  });
+
+  // THE MIRROR MUST EQUAL THE SHIPPED FUNCTION, TRANSFORM FOR TRANSFORM.
+  //
+  // The two assertions above check invariants of the source TEXT (ordering, and that one
+  // substring is present). Neither compares the mirror to the source, so the file's own claim
+  // that they "keep the mirror honest" did not hold. Measured 2026-09-05: the shipped
+  // normalizeGoal had FIVE .replace() calls after e340ad3 added the leading-bracket strip,
+  // the mirror had FOUR, and both assertions passed while every behavioural test above ran
+  // against the stale copy. That is why two inert commits to this function (3a92282,
+  // b9fc69d) passed the test gate — a test that mirrors its subject cannot fail for a change
+  // to the subject.
+  //
+  // This compares the .replace() chains directly. It is deliberately structural rather than
+  // behavioural: the mirror exists only because normalizeGoal is module-private, so the real
+  // fix is to export it and import it here. Until then, this assertion is what makes the
+  // mirror honest in fact rather than by assertion.
+  it('mirror matches the shipped normalizeGoal transform-for-transform', () => {
+    const chainOf = (text: string): string[] => {
+      const start = text.indexOf('function normalizeGoal');
+      const body = text.slice(start, text.indexOf('\n}', start));
+      return (body.match(/\.replace\([^\n]*/g) ?? []).map((s) => s.replace(/\s*\/\/.*$/, '').trim());
+    };
+    const mirrorSrc = require('node:fs').readFileSync(import.meta.path, 'utf8');
+    expect(chainOf(mirrorSrc)).toEqual(chainOf(src));
   });
 });
