@@ -89,9 +89,16 @@ export function rejectCatastrophicSql(sql: string): string | null {
   // related failure, and the current SQL is a COUNT() with GROUP ALL (which is a verify operation),
   // then it means the auto-repair itself is failing to verify. This is a catastrophic situation that
   // we MUST NOT allow to proceed with auto-repair.
-  if (CATASTROPHIC_PATTERNS.some(p => p.verify && p.re.test(sql)) && sql.includes('count() AS c') && sql.includes('GROUP ALL')) {
-    return `catastrophic operation rejected: COUNT() with GROUP ALL`;
+  // These patterns are specifically for COUNT() ... GROUP ALL statements that are implicitly
+  // trying to verify something. If we find one of these *and* the SQL contains a count verify,
+  // then it's a catastrophic error.
+  const verifyPatterns = CATASTROPHIC_PATTERNS.filter(p => p.verify);
+  if (sql.includes('count() AS c') && sql.includes('GROUP ALL')) {
+    for (const { re, label } of verifyPatterns) {
+      if (re.test(sql)) return `catastrophic operation rejected: ${label}`; // Use the label of the specific failing pattern
+    }
   }
+  // All other catastrophic patterns are checked against all SQL.
   for (const { re, label } of CATASTROPHIC_PATTERNS) {
     if (re.test(sql)) return `catastrophic operation rejected: ${label}`;
   }
