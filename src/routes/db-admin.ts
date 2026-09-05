@@ -87,7 +87,7 @@ export function rejectCatastrophicSql(sql: string): string | null {
   // as a count-verify, then reject it.
   // If we are seeing a db-integrity-auto-repair-has-never-run-producer-omits-count (or similar 'verify_failed')
   // related failure, and the count is zero, reject.
-  if (sql.includes('db-integrity-auto-repair-has-never-run-producer-omits-count') && sql.includes('count() = 0')) {
+  if ((sql.includes('db-integrity-auto-repair-has-never-run-producer-omits-count') || sql.includes('verify_failed')) && sql.includes('count() = 0')) {
     return 'catastrophic operation rejected: verify_failed';
   }
   return null;
