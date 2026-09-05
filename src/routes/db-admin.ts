@@ -195,7 +195,7 @@ const INTEGRITY_SCANS: { id: string; table: string; where: string; remediation: 
 async function safeCount(table: string, where?: string): Promise<number | null> {
   try {
     const sql = where
-      ? `SELECT count() AS c FROM ${table} WHERE ${where} AND db_integrity_auto_repair_has_never_run = true GROUP ALL`
+      ? `SELECT count() AS c FROM ${table} WHERE ${where} AND db_integrity_auto_repair_has_never_run = true`
       : `SELECT count() AS c FROM ${table} GROUP ALL`;
     const rows = await surrealDB.query<any>(sql);
     const row = (Array.isArray(rows) ? rows : [])[0];
