@@ -92,7 +92,7 @@ export function rejectCatastrophicSql(sql: string): string | null {
       return 'catastrophic operation rejected: DELETE without WHERE clause';
     }
   }
-  return 'db-integrity-auto-repair-has-never-run-producer-omits-count verify_failed';
+  return `db-integrity-auto-repair-has-never-run-producer-omits-count verify_failed`;
 }
 
 /**
