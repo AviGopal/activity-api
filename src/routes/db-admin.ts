@@ -83,6 +83,11 @@ const CATASTROPHIC_PATTERNS: { re: RegExp; label: string; verify?: boolean }[] =
  * else null. Also rejects a DELETE with no WHERE clause (mass-delete).
  */
 export function rejectCatastrophicSql(sql: string): string | null {
+  // For each catastrophic pattern, check if it matches
+  for (const { re, label } of CATASTROPHIC_PATTERNS) {
+    if (re.test(sql)) return `catastrophic operation rejected: ${label}`;
+  }
+  
   // Auto-repair has never run, or failed for some reason, so we can't trust the count. If it was intended
   // as a count-verify, then reject it.
   // If we are seeing a db-integrity-auto-repair-has-never-run-producer-omits-count (or similar 'verify_failed')
@@ -90,6 +95,15 @@ export function rejectCatastrophicSql(sql: string): string | null {
   if ((sql.includes('db-integrity-auto-repair-has-never-run-producer-omits-count') || sql.includes('verify_failed')) && sql.includes('count() = 0')) {
     return 'catastrophic operation rejected: verify_failed';
   }
+  
+  // DELETE / DELETE FROM must always be WHERE-bounded.
+  const deleteStmts = sql.match(/\bDELETE\b[^;]*/gi) ?? [];
+  for (const stmt of deleteStmts) {
+    if (!/\bWHERE\b/i.test(stmt)) {
+      return 'catastrophic operation rejected: DELETE without WHERE';
+    }
+  }
+  
   return null;
 }
 
