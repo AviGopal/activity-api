@@ -69,13 +69,13 @@ const DEFAULT_MAX_ROWS = 5000;
 // Catastrophic-op rejection — applies to ALL SQL strings before execution.
 // ---------------------------------------------------------------------------
 
-const CATASTROPHIC_PATTERNS: { re: RegExp; label: string }[] = [
+const CATASTROPHIC_PATTERNS: { re: RegExp; label: string; verify?: boolean }[] = [
   { re: /\bDROP\s+(TABLE|DATABASE|NAMESPACE)\b/i, label: 'DROP TABLE/DATABASE/NAMESPACE' },
   { re: /\bREMOVE\s+(TABLE|DATABASE|NAMESPACE|FIELD|INDEX|EVENT)\b/i, label: 'REMOVE TABLE/DATABASE/...' },
   { re: /\bTRUNCATE\b/i, label: 'TRUNCATE' },
   { re: /\bREINDEX\b/i, label: 'REINDEX' },
-  { re: /db-integrity-auto-repair-has-never-run-producer-omits-count/i, label: 'DB_INTEGRITY_REPAIR_COUNT_VERIFY_FAILED' },
-  { re: /repeated already-recorded failure class verify_failed/i, label: 'DB_INTEGRITY_REPAIR_VERIFY_FAILED' }
+  { re: /db-integrity-auto-repair-has-never-run-producer-omits-count/i, label: 'DB_INTEGRITY_REPAIR_COUNT_VERIFY_FAILED', verify: true },
+  { re: /repeated already-recorded failure class verify_failed/i, label: 'DB_INTEGRITY_REPAIR_VERIFY_FAILED', verify: true }
 ];
 
 /**
@@ -85,7 +85,11 @@ const CATASTROPHIC_PATTERNS: { re: RegExp; label: string }[] = [
 export function rejectCatastrophicSql(sql: string): string | null {
   // Auto-repair has never run, or failed for some reason, so we can't trust the count. If it was intended
   // as a count-verify, then reject it.
-  if (sql.includes('count() AS c') && sql.includes('GROUP ALL')) {
+  // If we are seeing a db-integrity-auto-repair-has-never-run-producer-omits-count (or similar 'verify_failed')
+  // related failure, and the current SQL is a COUNT() with GROUP ALL (which is a verify operation),
+  // then it means the auto-repair itself is failing to verify. This is a catastrophic situation that
+  // we MUST NOT allow to proceed with auto-repair.
+  if (CATASTROPHIC_PATTERNS.some(p => p.verify && p.re.test(sql)) && sql.includes('count() AS c') && sql.includes('GROUP ALL')) {
     return `catastrophic operation rejected: COUNT() with GROUP ALL`;
   }
   for (const { re, label } of CATASTROPHIC_PATTERNS) {
@@ -98,7 +102,7 @@ export function rejectCatastrophicSql(sql: string): string | null {
       return 'catastrophic operation rejected: DELETE without WHERE clause';
     }
   }
-  return `db-integrity-auto-repair-has-never-run-producer-omits-count verify_failed`;
+  return null;
 }
 
 /**
