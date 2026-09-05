@@ -74,7 +74,8 @@ const CATASTROPHIC_PATTERNS: { re: RegExp; label: string }[] = [
   { re: /\bREMOVE\s+(TABLE|DATABASE|NAMESPACE|FIELD|INDEX|EVENT)\b/i, label: 'REMOVE TABLE/DATABASE/...' },
   { re: /\bTRUNCATE\b/i, label: 'TRUNCATE' },
   { re: /\bREINDEX\b/i, label: 'REINDEX' },
-  { re: /db-integrity-auto-repair-has-never-run-producer-omits-count/i, label: 'DB_INTEGRITY_REPAIR_COUNT_VERIFY_FAILED' }
+  { re: /db-integrity-auto-repair-has-never-run-producer-omits-count/i, label: 'DB_INTEGRITY_REPAIR_COUNT_VERIFY_FAILED' },
+  { re: /repeated already-recorded failure class verify_failed/i, label: 'DB_INTEGRITY_REPAIR_VERIFY_FAILED' }
 ];
 
 /**
