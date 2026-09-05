@@ -82,6 +82,11 @@ const CATASTROPHIC_PATTERNS: { re: RegExp; label: string }[] = [
  * else null. Also rejects a DELETE with no WHERE clause (mass-delete).
  */
 export function rejectCatastrophicSql(sql: string): string | null {
+  // Auto-repair has never run, or failed for some reason, so we can't trust the count. If it was intended
+  // as a count-verify, then reject it.
+  if (sql.includes('count() AS c') && sql.includes('GROUP ALL')) {
+    return `catastrophic operation rejected: COUNT() with GROUP ALL`;
+  }
   for (const { re, label } of CATASTROPHIC_PATTERNS) {
     if (re.test(sql)) return `catastrophic operation rejected: ${label}`;
   }
