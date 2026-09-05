@@ -1,0 +1,2 @@
+DEFINE FIELD org_id OPTION STRING IF NOT EXISTS ON execution_traces;
+DEFINE FIELD ci_status OPTION STRING IF NOT EXISTS ON execution_traces;
