@@ -67,6 +67,21 @@ type RepairPattern = {
 };
 
 const REPAIR_PATTERNS: Record<string, RepairPattern> = {
+  // Zero-length ids (`activity:⟨⟩`) are unreachable via type::record() and pollute
+  // the registry. Delete them. (This is distinct from null/undefined ids which
+  // are caught by required() validators.)
+  delete_zero_length_ids: {
+    describe: () => 'DELETE activity_template rows with zero-length ids',
+    validate: () => null,
+    countSql: () => ({
+      sql: `SELECT count() AS c FROM activity_template WHERE string::contains(<string> id, 'activity:⟨⟩') GROUP ALL`,
+      params: {},
+    }),
+    mutateSql: () => ({
+      sql: `DELETE activity_template WHERE string::contains(<string> id, 'activity:⟨⟩')`,
+      params: {},
+    }),
+  },
   // Delete orphaned `activity_state_pattern` records that reference non-existent `activity` records.
   delete_orphaned_activity_state_pattern: {
     describe: () => 'DELETE orphaned activity_state_pattern records',
