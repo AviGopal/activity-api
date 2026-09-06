@@ -67,6 +67,19 @@ type RepairPattern = {
 };
 
 const REPAIR_PATTERNS: Record<string, RepairPattern> = {
+  // Delete doubled-prefix activity_template_field_state ids (`activity:⟨activity:⟨…⟩⟩`).
+  delete_doubled_prefix_activity_template_field_state_ids: {
+    describe: () => 'DELETE activity_template_field_state rows with doubled-prefix ids',
+    validate: () => null,
+    countSql: () => ({
+      sql: `SELECT count() AS c FROM activity_template_field_state WHERE string::contains(<string> id, 'activity:⟨activity:') GROUP ALL`,
+      params: {},
+    }),
+    mutateSql: () => ({
+      sql: `DELETE activity_template_field_state WHERE string::contains(<string> id, 'activity:⟨activity:')`,
+      params: {},
+    }),
+  },
   // Shape-blind pathways: `endpoint_output_shapes` is the donor index the shape-signature
   // match reads (`WHERE endpoint_output_shapes CONTAINSANY $target_shapes`), and an EMPTY
   // ARRAY MATCHES NOTHING — so a pathway that recorded no shapes is invisible as a donor
