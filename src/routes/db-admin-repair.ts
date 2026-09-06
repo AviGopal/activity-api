@@ -67,6 +67,20 @@ type RepairPattern = {
 };
 
 const REPAIR_PATTERNS: Record<string, RepairPattern> = {
+  // Delete orphaned `activity_state_pattern` records that reference non-existent `activity` records.
+  delete_orphaned_activity_state_pattern: {
+    describe: () => 'DELETE orphaned activity_state_pattern records',
+    validate: () => null,
+    countSql: () => ({
+      sql: `SELECT count() AS c FROM activity_state_pattern WHERE activity_id NOT IN (SELECT id FROM activity) GROUP ALL`,
+      params: {},
+    }),
+    mutateSql: () => ({
+      sql: `DELETE activity_state_pattern WHERE activity_id NOT IN (SELECT id FROM activity)`,
+      params: {},
+    }),
+    backupExempt: true,
+  },
   // Delete doubled-prefix activity_template_field_state ids (`activity:⟨activity:⟨…⟩⟩`).
   delete_doubled_prefix_activity_template_field_state_ids: {
     describe: () => 'DELETE activity_template_field_state rows with doubled-prefix ids',
