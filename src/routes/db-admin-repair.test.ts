@@ -108,6 +108,30 @@ describe('resolveRepairOrPrune — the rails hold regardless of which pattern is
     expect(captured[1]!.sql).toContain('child_activity_id');
   });
 
+  it('recover_endpoint_output_shapes is reachable by name and counts before it writes', async () => {
+    const captured: Captured[] = [];
+    const r = await resolveRepairOrPrune('repair', { pattern: 'recover_endpoint_output_shapes' }, 'test', stubCtx(captured, 1644) as any);
+    expect(r.status).toBe(200);
+    expect(JSON.parse(r.body.content).affected_count).toBe(1644);
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.sql).toContain('goal_execution_paths');
+    // The guard must be the array::len form. `= []` matches nothing in SurrealDB, so a guard
+    // written that way would silently never fire and the recovery would report success having
+    // touched zero rows.
+    expect(captured[0]!.sql).toContain('array::len(endpoint_output_shapes ?? []) = 0');
+    expect(captured[0]!.sql).not.toMatch(/endpoint_output_shapes\s*=\s*\[\]/);
+  });
+
+  it('recover_endpoint_output_shapes survives the backup derivation — it is revertible', async () => {
+    // An UPDATE the derivation regex cannot parse aborts with "could not derive"; this pins that
+    // the new pattern's SQL is shaped so the snapshot rail can capture the rows it will change.
+    const captured: Captured[] = [];
+    const r = await resolveRepairOrPrune('repair', { pattern: 'recover_endpoint_output_shapes', apply: true }, 'test', stubCtx(captured) as any);
+    expect(String(r.body.error ?? '')).not.toContain('could not derive');
+    expect(captured.length).toBeGreaterThan(1);
+    expect(captured[1]!.sql).toMatch(/^\s*SELECT\s+\*\s+FROM\s+goal_execution_paths\s+WHERE\s+/i);
+  });
+
   it('reports the impact count from the pattern own count query before anything is applied', async () => {
     const captured: Captured[] = [];
     const r = await resolveRepairOrPrune('repair', { pattern: 'delete_none_fk' }, 'test', stubCtx(captured, 42) as any);

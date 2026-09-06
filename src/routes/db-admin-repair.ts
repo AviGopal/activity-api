@@ -67,6 +67,35 @@ type RepairPattern = {
 };
 
 const REPAIR_PATTERNS: Record<string, RepairPattern> = {
+  // Shape-blind pathways: `endpoint_output_shapes` is the donor index the shape-signature
+  // match reads (`WHERE endpoint_output_shapes CONTAINSANY $target_shapes`), and an EMPTY
+  // ARRAY MATCHES NOTHING — so a pathway that recorded no shapes is invisible as a donor
+  // however often it succeeded. 8,314 of 9,853 pathways are shape-blind and 1,958 of those
+  // succeeded at least once.
+  //
+  // A `satisfier:<shape>` id NAMES ITS OWN OUTPUT SHAPE, so decoding it is exact by
+  // construction rather than inferred, and needs no execution join. Controlled against the
+  // 1,175 rows that already carry recorded shapes, split either side of 2026-08-26, this
+  // derivation produced 775 exact and 400 subset matches and ZERO supersets. The direction is
+  // the whole argument: cover is computed donor-covers-goal, so a subset label can only
+  // depress the score and miss a donor, while a superset label would invent a shape the
+  // pathway never produced and manufacture a confidently wrong one.
+  //
+  // The guard is `array::len(... ?? []) = 0`, NOT `= []` — the latter matches nothing in
+  // SurrealDB, so a guard written that way would silently never fire (measured: 0 rows).
+  recover_endpoint_output_shapes: {
+    describe: () => 'BACKFILL endpoint output shapes on successful shape-blind pathways from satisfier path ids',
+    validate: () => null,
+    countSql: () => ({
+      sql: "SELECT count() AS c FROM goal_execution_paths WHERE successful_executions > 0 AND array::len(endpoint_output_shapes ?? []) = 0 AND array::len(array::filter(path_activities ?? [], |$a| string::starts_with($a, 'satisfier:'))) > 0 GROUP ALL",
+      params: {},
+    }),
+    mutateSql: () => ({
+      sql: "UPDATE goal_execution_paths SET endpoint_output_shapes = array::distinct(array::sort(array::map(array::filter(path_activities ?? [], |$a| string::starts_with($a, 'satisfier:')), |$a| string::slice($a, 10)))) WHERE successful_executions > 0 AND array::len(endpoint_output_shapes ?? []) = 0 AND array::len(array::filter(path_activities ?? [], |$a| string::starts_with($a, 'satisfier:'))) > 0",
+      params: {},
+    }),
+  },
+
   // Orphaned composition edges: a derived edge whose endpoints are unset is
   // unusable for credit-mixing and pollutes λ₁ accounting.
   delete_none_fk: {
