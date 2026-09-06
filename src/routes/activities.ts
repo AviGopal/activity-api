@@ -5987,6 +5987,66 @@ app.get('/conservation-audit', async (c) => {
   }
 });
 
+app.post('/conservation-audit-emit', async (c) => {
+  // REPORT-TO-GAP BRIDGE. Reads this vessel's own conservation-audit endpoint and
+  // upserts at most one substrateGap per invariant into development-vessel, which
+  // owns the gap store. Aggregation is mandatory: the auditors re-emit identical
+  // violations every run, so one gap per finding would flood the ledger. Bounded
+  // at six gaps, stable ids, idempotent: re-running refreshes counts, never grows.
+  try {
+    const auditRes = await fetch('http://127.0.0.1:8080/v2/activities/conservation-audit?invariant=all', {
+      signal: AbortSignal.timeout(30000),
+    }).catch(() => null);
+    if (!auditRes || !auditRes.ok) {
+      return c.json({ error: 'could not read conservation audit', status: auditRes ? auditRes.status : 'unreachable' }, 502);
+    }
+    const audit = (await auditRes.json().catch(() => null)) as { violations?: Array<Record<string, unknown>> } | null;
+    const violations = Array.isArray(audit?.violations) ? audit!.violations! : [];
+    const byInvariant = new Map<string, Array<Record<string, unknown>>>();
+    for (const v of violations) {
+      const inv = String(v['invariant'] ?? 'unknown');
+      const list = byInvariant.get(inv) ?? [];
+      list.push(v);
+      byInvariant.set(inv, list);
+    }
+    const emitUrl = 'http://127.0.0.1:8090/v2/impulses/resolve';
+    const apiKey = process.env['METABOB_API_KEY'] ?? '';
+    const emitted: Array<Record<string, unknown>> = [];
+    for (const [inv, list] of byInvariant) {
+      const worst = list.slice(0, 5).map((v) => String(v['activity_id'] ?? v['table'] ?? 'unknown')).join(', ');
+      const note = String(list[0]?.['note'] ?? '');
+      const summary = `Conservation invariant '${inv}' is violated by ${list.length} arm(s). ` +
+        `Worst offenders: ${worst}. ${note} ` +
+        `This gap is filed automatically by the conservation-audit-emit bridge and refreshed on each run; ` +
+        `it aggregates all ${list.length} violations of this invariant into one demand rather than one gap per arm.`;
+      const gapBody = {
+        impulse: {
+          type: 'substrateGap_write',
+          id: `conservation-${inv}-junction-violated`,
+          category: 'systematic_failure',
+          source: 'substrate_detected',
+          status: 'open',
+          summary,
+        },
+      };
+      try {
+        const gr = await fetch(emitUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...(apiKey ? { Authorization: `ApiKey ${apiKey}` } : {}) },
+          body: JSON.stringify(gapBody),
+          signal: AbortSignal.timeout(15000),
+        }).catch(() => null);
+        emitted.push({ invariant: inv, arms: list.length, gap_id: `conservation-${inv}-junction-violated`, posted: !!(gr && gr.ok) });
+      } catch {
+        emitted.push({ invariant: inv, arms: list.length, gap_id: `conservation-${inv}-junction-violated`, posted: false });
+      }
+    }
+    return c.json({ invariants_violated: byInvariant.size, gaps_emitted: emitted.length, emitted });
+  } catch (error: unknown) {
+    return c.json({ error: 'conservation-audit-emit failed', message: String((error as Error)?.message ?? error) }, 500);
+  }
+});
+
 export default app;
 /**
  * POST /recommend
