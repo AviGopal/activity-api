@@ -5904,6 +5904,89 @@ app.get('/conservation-audit', async (c) => {
     return c.json({ error: 'conservation audit failed', message: String((error as Error)?.message ?? error) }, 500);
   }
 });
+app.get('/conservation-audit', async (c) => {
+  // CONSERVATION AUDIT — read-only invariant checks over the junctions where
+  // consequence crosses representations. Each check is a books-balance test;
+  // a violation is a silent-break candidate, not proof of one. Deliberately no
+  // datetime WHERE clauses anywhere here: on this store a datetime conjunct
+  // silently drops its partner predicate, so all windowing is client-side.
+  try {
+    const invariant = String(c.req.query('invariant') ?? 'all');
+    const want = (k: string) => invariant === 'all' || invariant === k;
+    const perArm = await surrealDB.query<Record<string, unknown>>(
+      'SELECT activity_id, count() AS n FROM execution GROUP BY activity_id'
+    );
+    const rowsByArm = new Map<string, number>();
+    for (const r of perArm ?? []) rowsByArm.set(String(r['activity_id']), Number(r['n'] ?? 0));
+    const metrics = await surrealDB.query<Record<string, unknown>>(
+      'SELECT activity_id, thompson_alpha, thompson_beta FROM variant_performance_metrics WHERE (thompson_alpha + thompson_beta) >= 50'
+    );
+    const violations: Array<Record<string, unknown>> = [];
+    if (want('posterior')) {
+      for (const m of metrics ?? []) {
+        const a = Number(m['thompson_alpha'] ?? 0);
+        const b = Number(m['thompson_beta'] ?? 0);
+        const rows = rowsByArm.get(String(m['activity_id'])) ?? 0;
+        if (rows > 0 && a + b > rows * 1.5) {
+          violations.push({ invariant: 'posterior', activity_id: m['activity_id'], alpha: a, beta: b, trace_rows: rows, note: 'posterior observations exceed 1.5x recorded executions - chain-credit inflation or evicted rows' });
+        }
+      }
+    }
+    if (want('emission')) {
+      for (const m of metrics ?? []) {
+        const a = Number(m['thompson_alpha'] ?? 0);
+        const b = Number(m['thompson_beta'] ?? 0);
+        const rows = rowsByArm.get(String(m['activity_id'])) ?? 0;
+        if (rows === 0 && a + b >= 100) {
+          violations.push({ invariant: 'emission', activity_id: m['activity_id'], alpha: a, beta: b, trace_rows: 0, note: 'heavily observed posterior with zero execution rows - the lane is not emitting, or its history was evicted' });
+        }
+      }
+      if ((rowsByArm.get('patch_with_tools') ?? 0) === 0) {
+        violations.push({ invariant: 'emission', activity_id: 'patch_with_tools', trace_rows: 0, note: 'known code-writing lane has no execution rows at all' });
+      }
+    }
+    if (want('addressing')) {
+      const fc = await surrealDB.query<Record<string, unknown>>(
+        "SELECT reached, count() AS n FROM execution WHERE (activity_id = 'feature_compose') GROUP BY reached"
+      );
+      let graded = 0;
+      let total = 0;
+      for (const r of fc ?? []) {
+        const n = Number(r['n'] ?? 0);
+        total += n;
+        if (r['reached'] !== null && r['reached'] !== undefined) graded += n;
+      }
+      if (total > 0 && graded / total < 0.5) {
+        violations.push({ invariant: 'addressing', activity_id: 'feature_compose', graded, total, note: 'most self-development executions carry no verdict - verdicts are not reaching the rows they judge' });
+      }
+    }
+    if (want('structure')) {
+      const arms = rowsByArm.size;
+      let single = 0;
+      for (const n of rowsByArm.values()) if (n === 1) single += 1;
+      if (arms > 0 && single / arms >= 0.5) {
+        violations.push({ invariant: 'structure', arms, one_execution_arms: single, note: 'over half of all arms have exactly one execution - minting outruns the grading budget' });
+      }
+    }
+    if (want('memory')) {
+      const counters = await surrealDB.query<Record<string, unknown>>('SELECT * FROM trace_store_counters');
+      for (const r of counters ?? []) {
+        const rows = Number(r['row_count'] ?? 0);
+        const cap = Number(r['cap'] ?? 0);
+        if (cap > 0 && rows > cap * 0.8) {
+          violations.push({ invariant: 'memory', table: r['table_name'], row_count: rows, cap, note: 'trace store within twenty percent of its cap - eviction will amputate history nothing has digested' });
+        }
+      }
+    }
+    const selectionNote = want('selection')
+      ? 'selection conservation is not yet measurable: decision records carry no candidate set, so predicted-versus-observed share cannot be computed - that absence is itself the finding'
+      : undefined;
+    return c.json({ invariant, checked_arms: rowsByArm.size, metered_arms: (metrics ?? []).length, violations, ...(selectionNote ? { selection_note: selectionNote } : {}) });
+  } catch (error: unknown) {
+    return c.json({ error: 'conservation audit failed', message: String((error as Error)?.message ?? error) }, 500);
+  }
+});
+
 export default app;
 /**
  * POST /recommend
