@@ -67,6 +67,28 @@ type RepairPattern = {
 };
 
 const REPAIR_PATTERNS: Record<string, RepairPattern> = {
+  // Delete deprecated activity_execution_traces older than `older_than_days` (default 365).
+  // Only deletes rows where deprecated=true and created_at is older than the threshold.
+  delete_deprecated_traces_older_than: {
+    describe: (p) => `DELETE deprecated activity_execution_traces older than ${p?.older_than_days ?? 365} days`,
+    validate: (p, ctx) => {
+      const table = p?.table ?? 'activity_execution_traces';
+      if (!ctx.PRUNE_TABLE_WHITELIST.has(table)) return `delete_deprecated_traces: table "${table}" not in prune whitelist`;
+      const days = p?.older_than_days ?? 365;
+      if (typeof days !== 'number' || days < 90) return 'delete_deprecated_traces: older_than_days must be a number >= 90 (refusing to delete recent deprecated data)';
+      return null;
+    },
+    countSql: (p) => ({
+      sql: `SELECT count() AS c FROM ${p?.table ?? 'activity_execution_traces'} WHERE deprecated = true AND created_at < (time::now() - ${Math.floor(p?.older_than_days ?? 365)}d) GROUP ALL`,
+      params: {},
+    }),
+    mutateSql: (p) => ({
+      sql: `DELETE ${p?.table ?? 'activity_execution_traces'} WHERE deprecated = true AND created_at < (time::now() - ${Math.floor(p?.older_than_days ?? 365)}d)`,
+      params: {},
+    }),
+    backupExempt: true,
+  },
+
   // Zero-length ids (`activity:⟨⟩`) are unreachable via type::record() and pollute
   // the registry. Delete them. (This is distinct from null/undefined ids which
   // are caught by required() validators.)
