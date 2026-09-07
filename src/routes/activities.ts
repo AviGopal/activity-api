@@ -5886,6 +5886,32 @@ app.get('/conservation-audit', async (c) => {
         violations.push({ invariant: 'structure', arms, one_execution_arms: single, note: 'over half of all arms have exactly one execution - minting outruns the grading budget' });
       }
     }
+    if (want('liveness')) {
+      // LIVENESS — a lane that STOPS emitting while the fleet keeps working is a
+      // silent break. Measured as SHARE of recent executions, never a raw count,
+      // so an idle substrate does not read as a broken one. No datetime WHERE
+      // anywhere: on this store a datetime conjunct silently drops its partner
+      // predicate, so the window is cut client-side from an ordered fetch.
+      const recentRows = await surrealDB.query<Record<string, unknown>>(
+        'SELECT activity_id FROM execution ORDER BY created_at DESC LIMIT 2000'
+      );
+      const rows = recentRows ?? [];
+      if (rows.length >= 800) {
+        const newest = rows.slice(0, 500);
+        const prior = rows.slice(500);
+        const shareIn = (set: Array<Record<string, unknown>>, id: string): number =>
+          set.length === 0 ? 0 : set.filter((r) => String(r['activity_id']) === id).length / set.length;
+        const priorIds = new Set(prior.map((r) => String(r['activity_id'])));
+        for (const id of priorIds) {
+          const before = shareIn(prior, id);
+          if (before < 0.01) continue;
+          const after = shareIn(newest, id);
+          if (after < before * 0.25) {
+            violations.push({ invariant: 'liveness', activity_id: id, prior_share: Number(before.toFixed(4)), recent_share: Number(after.toFixed(4)), note: 'lane emission share collapsed while the fleet kept executing - the lane is silently broken, not merely idle' });
+          }
+        }
+      }
+    }
     if (want('memory')) {
       const counters = await surrealDB.query<Record<string, unknown>>('SELECT * FROM trace_store_counters');
       for (const r of counters ?? []) {
