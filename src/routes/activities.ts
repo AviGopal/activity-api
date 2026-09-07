@@ -6111,6 +6111,67 @@ app.get('/conservation-residual-trend', async (c) => {
   }
 });
 
+app.get('/conservation-residual-trend', async (c) => {
+  // RESIDUAL MOTION, not residual level. Reads the conservation auditors' own
+  // execution history — each run stamps its violation count in
+  // metadata.findings_count — and reports per invariant whether that count is
+  // falling (a repair is working), rising (the world is outrunning repair: a
+  // horizon), or flat. No datetime WHERE clause anywhere: on this store a
+  // datetime conjunct silently drops its partner predicate, so all windowing is
+  // done client-side after the rows are pulled.
+  try {
+    const rows = await surrealDB.query<Record<string, unknown>>(
+      "SELECT activity_id, created_at, metadata.findings_count AS findings FROM execution WHERE string::contains(activity_id, 'conservation-audit')"
+    );
+    const series = new Map<string, Array<{ at: string; n: number }>>();
+    for (const r of rows ?? []) {
+      const findings = r['findings'];
+      if (typeof findings !== 'number') continue;
+      const inv = String(r['activity_id'] ?? '').replace('conservation-audit-', '').replace('-junction', '');
+      const at = String(r['created_at'] ?? '');
+      if (!inv || !at) continue;
+      const list = series.get(inv) ?? [];
+      list.push({ at, n: findings });
+      series.set(inv, list);
+    }
+    const trends: Array<Record<string, unknown>> = [];
+    for (const [inv, listRaw] of series) {
+      const list = listRaw.slice().sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+      if (list.length < 4) {
+        trends.push({ invariant: inv, samples: list.length, verdict: 'insufficient_samples', note: 'fewer than four observations; motion is not yet measurable' });
+        continue;
+      }
+      const half = Math.floor(list.length / 2);
+      const mean = (xs: Array<{ n: number }>) => xs.reduce((s, x) => s + x.n, 0) / (xs.length || 1);
+      const older = mean(list.slice(0, half));
+      const newer = mean(list.slice(half));
+      const delta = newer - older;
+      const denom = Math.max(Math.abs(older), 1);
+      const relative = delta / denom;
+      const verdict = relative <= -0.1 ? 'converging' : relative >= 0.1 ? 'DIVERGING' : 'flat';
+      trends.push({
+        invariant: inv,
+        samples: list.length,
+        first: list[0]?.n ?? null,
+        last: list[list.length - 1]?.n ?? null,
+        older_mean: Number(older.toFixed(2)),
+        newer_mean: Number(newer.toFixed(2)),
+        relative_change: Number(relative.toFixed(4)),
+        verdict,
+        note: verdict === 'DIVERGING'
+          ? 'this residual is growing faster than it is being repaired - candidate horizon, not a bug to patch'
+          : verdict === 'converging'
+            ? 'this residual is shrinking - a repair is taking effect'
+            : 'no measurable motion in either direction',
+      });
+    }
+    const diverging = trends.filter((t) => t['verdict'] === 'DIVERGING').length;
+    return c.json({ invariants: trends.length, diverging, trends });
+  } catch (error: unknown) {
+    return c.json({ error: 'conservation residual trend failed', message: String((error as Error)?.message ?? error) }, 500);
+  }
+});
+
 export default app;
 /**
  * POST /recommend
