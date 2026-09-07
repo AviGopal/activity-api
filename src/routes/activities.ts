@@ -5893,7 +5893,7 @@ app.get('/conservation-audit', async (c) => {
       // anywhere: on this store a datetime conjunct silently drops its partner
       // predicate, so the window is cut client-side from an ordered fetch.
       const recentRows = await surrealDB.query<Record<string, unknown>>(
-        'SELECT activity_id FROM execution ORDER BY created_at DESC LIMIT 2000'
+        'SELECT activity_id, created_at FROM execution ORDER BY created_at DESC LIMIT 2000'
       );
       const rows = recentRows ?? [];
       if (rows.length >= 800) {
