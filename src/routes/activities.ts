@@ -5994,8 +5994,9 @@ app.post('/conservation-audit-emit', async (c) => {
   // violations every run, so one gap per finding would flood the ledger. Bounded
   // at six gaps, stable ids, idempotent: re-running refreshes counts, never grows.
   try {
+    const ACTIVITY_API_ENDPOINT = process.env['ACTIVITY_API_ENDPOINT'] ?? 'http://127.0.0.1:8080';
     const selfKey = process.env['METABOB_API_KEY'] ?? '';
-    const auditRes = await fetch('http://127.0.0.1:8080/v2/activities/conservation-audit?invariant=all', {
+    const auditRes = await fetch(`${ACTIVITY_API_ENDPOINT}/v2/activities/conservation-audit?invariant=all`, {
       headers: selfKey ? { Authorization: `ApiKey ${selfKey}` } : {},
       signal: AbortSignal.timeout(30000),
     }).catch(() => null);
