@@ -1072,14 +1072,9 @@ export async function applyOutcomeToPosteriors(
   });
   const skipVariantUpdate = tierClass === 'all_deterministic' || trace.metadata?.information_yield === 'idle';
   if (skipVariantUpdate || ungraded || (alphaDelta === 0 && betaDelta === 0)) {
-    const reason = skipVariantUpdate
-      ? (tierClass === 'all_deterministic' ? 'all_deterministic' : 'information_yield_idle')
-      : (ungraded ? 'reach_ungraded' : 'zero_deltas');
-    logger.debug('posterior-update: skipped variant posterior update', { activity_id: activityId, org_id: orgId, reason });
-
     logger.info('posterior variant update SKIPPED', {
       activity_id: activityId,
-      reason,
+      reason: skipVariantUpdate ? (tierClass === 'all_deterministic' ? 'all_deterministic' : 'information_yield_idle') : (ungraded ? 'reach_ungraded' : 'zero_deltas'),
       reach_verdict: reachVerdict,
       tier_class: tierClass,
       alpha_delta: alphaDelta,
