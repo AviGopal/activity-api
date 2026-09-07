@@ -145,8 +145,8 @@ const HOOK_SUBSCRIBER_PATTERN = /validator-dispatch|slot-binding|create-shape-pr
 async function resolveTdLambda(): Promise<number> {
   const value = await getTuningParam('TD_LAMBDA', process.env.TD_LAMBDA, TD_LAMBDA_DEFAULT);
   if (!Number.isFinite(value) || value <= 0 || value >= 1) {
-    logger.warn('td_lambda_invalid', {
-      event: 'td_lambda_invalid',
+    logger.warn('variant_posterior_update_skipped', {
+      reason: 'td_lambda_invalid',
       raw: value,
       fallback: TD_LAMBDA_DEFAULT,
     });
