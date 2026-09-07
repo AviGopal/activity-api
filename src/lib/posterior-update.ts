@@ -134,6 +134,9 @@ const TD_LAMBDA_DEFAULT = 0.7;
 // update their own variant_performance_metrics posterior.
 const HOOK_SUBSCRIBER_PATTERN = /validator-dispatch|slot-binding|create-shape-provider-goal/;
 
+// Record why a variant posterior update was skipped
+logger.debug('variant_update_skipped', { reason: 'hook_subscriber_pattern_match' });
+
 /**
  * Resolve the TD(λ) eligibility-trace decay, consuming the substrate_tuning_param
  * row 'TD_LAMBDA' (seam 3a) with the historical env→default fallback chain. The
