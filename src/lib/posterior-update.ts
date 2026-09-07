@@ -1071,6 +1071,18 @@ export async function applyOutcomeToPosteriors(
     }),
   });
   const skipVariantUpdate = tierClass === 'all_deterministic' || trace.metadata?.information_yield === 'idle';
+  if (skipVariantUpdate || ungraded || (alphaDelta === 0 && betaDelta === 0)) {
+    logger.info('posterior variant update SKIPPED', {
+      activity_id: activityId,
+      reason: skipVariantUpdate ? (tierClass === 'all_deterministic' ? 'all_deterministic' : 'information_yield_idle') : (ungraded ? 'reach_ungraded' : 'zero_deltas'),
+      reach_verdict: reachVerdict,
+      tier_class: tierClass,
+      alpha_delta: alphaDelta,
+      beta_delta: betaDelta,
+      has_tags: Array.isArray(trace.tags) && trace.tags.length > 0,
+      task_count: Array.isArray(trace.tasks) ? trace.tasks.length : 0,
+    });
+  }
 
   // Atomic UPDATE — mirrors the pattern in execution-traces.ts:2235
   // Uses variant_performance_metrics (not activity_template) to avoid the
