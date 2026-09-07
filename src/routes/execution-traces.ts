@@ -5242,7 +5242,16 @@ app.post('/reach', async (c) => {
         activity_id: preActivityId,
         tags: preTags,
       });
-      if (preVerdict === 'ungraded') {
+      // Widened from 'ungraded' only. A row whose verdict tag was written by the
+      // mirror path before this check classifies as 'not-reached' or 'reached',
+      // never 'ungraded', so requiring 'ungraded' stranded it permanently: the
+      // verdict existed and no posterior ever moved. Measured on feature_compose:
+      // 34 rows held reached:false with no reach_graded:true stamp while alpha and
+      // beta sat unchanged for eleven hours, against only 7 rows ever stamped.
+      // reach_graded:true in the enclosing condition is the real double-count
+      // guard and is written below before credit is applied, so a row arriving
+      // here without it has provably never been credited.
+      if (preVerdict === 'ungraded' || preVerdict === 'not-reached' || preVerdict === 'reached') {
         // Idempotence marker on the AUTHORITATIVE row, written before the credit so a
         // retry of this endpoint cannot grade the same execution twice even if the
         // reach-tag mirror below fails.
