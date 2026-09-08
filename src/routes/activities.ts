@@ -5848,7 +5848,7 @@ app.get('/conservation-audit', async (c) => {
         const b = Number(m['thompson_beta'] ?? 0);
         const rows = rowsByArm.get(String(m['activity_id'])) ?? 0;
         if (rows > 0 && a + b > rows * 1.5) {
-          violations.push({ invariant: 'posterior', activity_id: m['activity_id'], alpha: a, beta: b, trace_rows: rows, note: 'posterior observations exceed 1.5x recorded executions - chain-credit inflation or evicted rows' });
+          violations.push({ invariant: 'posterior', activity_id: m['activity_id'], alpha: a, beta: b, trace_rows: rows, note: 'posterior observations exceed 1.5x recorded executions - chain-credit inflation or evicted rows', severity: 'warning' });
         }
       }
     }
