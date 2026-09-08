@@ -2446,7 +2446,9 @@ app.post('/executions', async (c) => {
         // body, so an exit-status completion is UNGRADED, not credit. Synthetic
         // goal-host tag => classifyReach => 'ungraded' => SKIP (learn nothing, never
         // mis-credit). Remove once goal-host emits reach tags on this path.
-        tags: ['dispatcher_used:goal-host'],
+        tags: typeof (validated.metadata as Record<string, unknown> | undefined)?.['reached'] === 'boolean'
+          ? [((validated.metadata as Record<string, unknown>)['reached'] ? 'reached:true' : 'reached:false')]
+          : ['dispatcher_used:goal-host'],
       },
       surrealDB,
       orgId!,
