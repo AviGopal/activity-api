@@ -5858,7 +5858,7 @@ app.get('/conservation-audit', async (c) => {
         const b = Number(m['thompson_beta'] ?? 0);
         const rows = rowsByArm.get(String(m['activity_id'])) ?? 0;
         if (rows === 0 && a + b >= 100) {
-          violations.push({ invariant: 'emission', activity_id: m['activity_id'], alpha: a, beta: b, trace_rows: 0, note: 'heavily observed posterior with zero execution rows - the lane is not emitting, or its history was evicted' });
+          violations.push({ invariant: 'emission', activity_id: m['activity_id']!, alpha: a, beta: b, trace_rows: 0, note: 'heavily observed posterior with zero execution rows - the lane is not emitting, or its history was evicted' });
         }
       }
       if ((rowsByArm.get('patch_with_tools') ?? 0) === 0) {
