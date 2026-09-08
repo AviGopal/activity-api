@@ -307,6 +307,8 @@ async function tryIdentityVesselValidation(
       logger.warn('[auth] Identity vessel validation failed', {
         url: identityVesselUrl,
         status: response.status,
+        credential_prefix: typeof apiKey === 'string' ? apiKey.slice(0, 3) : 'absent',
+        credential_len: typeof apiKey === 'string' ? apiKey.length : 0,
       });
       return {
         authenticated: false,
