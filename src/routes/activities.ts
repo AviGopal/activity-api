@@ -1209,7 +1209,7 @@ app.get('/deliverable-shapes', async (c) => {
       'fileWriteResult', 'activityExecutionSummary', 'trace', 'patch_proposal', 'patch',
       'analysis', 'json_extracted_value', 'llm_completion_result',
     ]);
-    const denyRe = /(^producer_|^consumer_|^pool_|^validated_|^normalized_|^guard|^escalation_|^llm_filled|^gap_resolution|^enforced_|_metadata$|_validated$|_state$|_status$|_check$|_extracted$|^autoDraftedOutput_|^composedDeliverable_)/;
+    const denyRe = /(^producer_|^consumer_|^pool_|^validated_|^normalized_|^guard|^escalation_|^llm_filled|^gap_resolution|^enforced_|_metadata$|_validated$|_state$|_status$|_check$|_extracted$|^autoDraftedOutput_|^composedDeliverable_|^prompt_)/;
     const stepRe = /_s\d+$/;
     const result = await surrealDB.query<any>(
       `SELECT meta::id(id) AS id, tasks FROM activity
