@@ -1182,6 +1182,9 @@ export async function applyOutcomeToPosteriors(
   if (
     !skipVariantUpdate &&
     !HOOK_SUBSCRIBER_PATTERN.test(activityId) &&
+    ((alphaDelta !== 0 || betaDelta !== 0) && !trace.signature
+      ? (logger.warn('posterior-update: non-zero delta dropped, execution carries no signature key so no posterior row can be written', { activity_id: activityId, alpha_delta: alphaDelta, beta_delta: betaDelta }), false)
+      : true) &&
     trace.signature &&
     typeof trace.signature_version === 'number' &&
     (alphaDelta !== 0 || betaDelta !== 0)
