@@ -44,7 +44,7 @@ export async function selectExemplarsForActivity(activity_id: string): Promise<v
 
   // SurrealDB 3.x requires ORDER BY fields to be included in the SELECT clause.
   const successDigests = await surrealDB.query<{ id: string; execution_id: string }>(
-    `SELECT id, execution_id, executed_at FROM trace_digest WHERE activity_id = $activity_id AND success = true ORDER BY executed_at DESC LIMIT $n`,
+    `SELECT id, execution_id, executed_at FROM trace_digest WHERE activity_id = $activity_id AND success != false ORDER BY executed_at DESC LIMIT $n`,
     { activity_id, n: n_success }
   );
 
