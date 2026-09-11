@@ -986,7 +986,7 @@ app.get('/', async (c) => {
       const windowHours = Number(process.env.TRACE_LIST_DEFAULT_WINDOW_HOURS ?? '24');
       const hours = Number.isFinite(windowHours) && windowHours > 0 ? windowHours : 24;
       const windowStart = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
-      whereConditions.push('executed_at >= type::datetime($start_date)');
+      whereConditions.push('executed_at >= <datetime> $start_date');
       params.start_date = windowStart;
     }
 
