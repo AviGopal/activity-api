@@ -5337,7 +5337,7 @@ app.post('/reach', async (c) => {
     let mirrored = 0;
     try {
       const mres = await surrealDB.query(
-        `UPDATE type::thing('execution', $execution_id) SET reached = $reached, completion_shapes = $completion_shapes, tags = array::union(tags ?? [], [IF $reached { 'reached:true' } ELSE { 'reached:false' }])`,
+        `UPDATE type::thing('execution', $execution_id) SET reached = $reached, completion_shapes = $completion_shapes, tags = array::union(tags ?? [], [IF $reached = true THEN 'reached:true' ELSE 'reached:false' END])`,
         { reached: body.reached, completion_shapes, execution_id: String(execId) },
       );
       mirrored = Array.isArray(mres) && Array.isArray(mres[0]) ? (mres[0] as unknown[]).length : (Array.isArray(mres) ? mres.length : 0);
