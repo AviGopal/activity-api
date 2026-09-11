@@ -5169,7 +5169,7 @@ app.post('/reach', async (c) => {
     let preReadOk = false;
     try {
       const preRes = await surrealDB.query<any>(
-        `SELECT variant_id, activity_id, success, tags, cost_usd, org_id, signature, signature_version, composition_chain, failure_mode, resolver_tier, trace.tasks AS tasks FROM type::thing('execution', $execution_id) LIMIT 1`,
+        `SELECT variant_id, activity_id, success, tags, cost_usd, org_id, signature, signature_version, composition_chain, failure_mode, resolver_tier, trace.tasks AS tasks FROM type::thing('execution', $execution_id) WHERE activity_id = $activity_id LIMIT 1`,
         { execution_id: String(execId) },
       );
       preRow = Array.isArray(preRes) && preRes.length > 0
