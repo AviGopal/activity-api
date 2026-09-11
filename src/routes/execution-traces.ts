@@ -1452,7 +1452,7 @@ app.get('/', async (c) => {
  * Response shape: { source: "exemplar" | "digest_fallback", items: ExemplarItem[] }
  */
 app.get('/exemplars', async (c) => {
-  const activity_id = c.req.query('activity_id');
+  const activity_id = c.req.query('activity_id') ?? undefined;
   if (!activity_id) return c.json({ error: 'activity_id query parameter required' }, 400);
 
   try {
