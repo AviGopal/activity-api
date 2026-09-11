@@ -949,7 +949,7 @@ app.get('/', async (c) => {
 
     // Filter by date range
     if (startDate) {
-      whereConditions.push('executed_at >= type::datetime($start_date)');
+      whereConditions.push('executed_at >= <datetime> $start_date');
       params.start_date = startDate;
     } else {
       // ★ THIS GUARD DID NOT FAIL — IT ERODED. It was written as "last 30 days ... instead of
