@@ -60,7 +60,7 @@ export async function selectExemplarsForActivity(activity_id: string): Promise<v
 
   for (const d of (successDigests ?? [])) {
     await surrealDB.query(
-      `INSERT INTO execution_exemplar { activity_id: $activity_id, execution_id: $execution_id, success: true, digest_id: $digest_id, org_id: 'public' }`,
+      `INSERT INTO execution_exemplar { activity_id: $activity_id, execution_id: $execution_id, success: true, digest_id: $digest_id, org_id: 'public', selected_at: time::now() }`,
       { activity_id, execution_id: d.execution_id, digest_id: String(d.id) }
     ).catch(err => {
       logger.warn('exemplar success insert failed', { activity_id, execution_id: d.execution_id, err: err instanceof Error ? err.message : String(err) });
