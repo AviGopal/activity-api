@@ -1085,6 +1085,14 @@ export async function applyOutcomeToPosteriors(
       has_tags: Array.isArray(trace.tags) && trace.tags.length > 0,
       task_count: Array.isArray(trace.tasks) ? trace.tasks.length : 0,
     });
+  } else {
+    logger.info('posterior variant update APPLIED', {
+      activity_id: activityId,
+      reach_verdict: reachVerdict,
+      tier_class: tierClass,
+      alpha_delta: alphaDelta,
+      beta_delta: betaDelta,
+    });
   }
 
   // Atomic UPDATE — mirrors the pattern in execution-traces.ts:2235
