@@ -2116,7 +2116,16 @@ app.post('/executions', async (c) => {
       logger.debug('Execution recorded in activity_execution_traces (shadow)', { executionId });
     }
 
-    // trace_store_counters bookkeeping (migration 156) — fire-and-forget,
+    // DIGEST CO-WRITE: trace_digest had exactly one writer, the POST / handler of the
+// execution-traces router, so executions recorded through THIS route were never
+// digested. Measured 2026-09-12: activity feature_compose had 2491 execution rows
+// and ZERO trace_digest rows, and execution_exemplar is extracted only from digests,
+// so the highest-traffic authoring activity was invisible to the extraction stage.
+// Dynamic import avoids a static cycle between the two route modules.
+// FAIL-OPEN and fire-and-forget: never blocks or fails the execution write.
+void import("./execution-traces").then((m) => m.insertTraceDigest({ execution_id: executionId, activity_id: activityIdFromRequest, success: validated.success, duration_ms: validated.duration_ms ?? 0, cost_usd: 0, org_id: orgId ?? "public", executed_at: new Date().toISOString() }, body)).catch(() => {});
+
+// trace_store_counters bookkeeping (migration 156) — fire-and-forget,
     // never blocks the trace insert's critical path.
     void incrementTraceStoreCounter();
 
