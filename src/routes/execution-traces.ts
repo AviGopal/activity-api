@@ -558,7 +558,7 @@ interface SystemTraceParams {
  * Write a slim digest row co-produced alongside each AET row (Phase B dual-write).
  * Enables fast exemplar recall without loading the full 16KB AET payload.
  */
-async function insertTraceDigest(trace: any, body: any, jwtToken?: string): Promise<void> {
+export async function insertTraceDigest(trace: any, body: any, jwtToken?: string): Promise<void> {
   const taskSummaries = Array.isArray(trace.tasks)
     ? trace.tasks.map((t: any) => ({
         id: t.id,
