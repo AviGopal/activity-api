@@ -3877,7 +3877,7 @@ router.post('/resolve', async (c) => {
         ].filter((t) => t.length > 0);
         const activitySearchTokens = new Set([
           'activity', 'activities', 'template', 'templates', 'search', 'find',
-          'semantic', 'capability', 'registry', 'discover',
+          'semantic', 'capability', 'registry', 'discover', 'mcp',
         ]);
         const mcpHits = mcpQueryTokens.filter((t) => activitySearchTokens.has(t)).length;
         const mcpKeywordScore = mcpQueryTokens.length > 0 ? mcpHits / mcpQueryTokens.length : 0;
