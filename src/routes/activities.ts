@@ -5898,7 +5898,12 @@ app.post('/conservation-audit-emit', async (c) => {
   }
 });
 
-app.get('/conservation-residual-trend', async (c) => {
+app.post('/conservation-audit-emit', async (c) => {
+  // REPORT-TO-GAP BRIDGE. Reads this vessel's own conservation-audit endpoint and
+  // upserts at most one substrateGap per invariant into development-vessel, which
+  // owns the gap store. Aggregation is mandatory: the auditors re-emit identical
+  // violations every run, so one gap per finding would flood the ledger. Bounded
+  // at six gaps, stable ids, idempotent: re-running refreshes counts, never grows.residual-trend', async (c) => {
   // RESIDUAL MOTION, not residual level. Reads the conservation auditors' own
   // execution history — each run stamps its violation count in
   // metadata.findings_count — and reports per invariant whether that count is
