@@ -3920,6 +3920,30 @@ router.post('/resolve', async (c) => {
             matched_input_shapes: [],
             matched_output_shapes: ['activity_search_result'],
           },
+          {
+            shape: 'mcpTool',
+            vessel_id: config.discovery.vesselId,
+            vessel_endpoint: mcpVesselEndpoint,
+            tool_name: 'keyword_extractor',
+            description: 'Given a goal or goal enrichment result, identifies domain-specific keywords and phrases that could be used for relevance filtering, concept lookup, or impulse disambiguation.',
+            input_schema: {
+              type: 'object',
+              properties: {
+                goal_text: {
+                  type: 'string',
+                  description: 'Natural language goal text to extract keywords from',
+                  required: true
+                }
+              },
+              required: ['goal_text'],
+            },
+            resolve_endpoint: '/v2/impulses/resolve',
+            resolve_request_format: 'pointer',
+            auth_scheme: 'ApiKey',
+            relevance_score: 0.3 * mcpKeywordScore + 0.15,
+            matched_input_shapes: [],
+            matched_output_shapes: ['keyword_extraction_result'],
+          },
         ]
           .filter((t) => t.relevance_score >= mcpMinRelevance)
           .slice(0, mcpLimit);
