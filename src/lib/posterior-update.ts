@@ -1193,6 +1193,9 @@ export async function applyOutcomeToPosteriors(
     ((alphaDelta !== 0 || betaDelta !== 0) && !trace.signature
       ? (logger.warn('posterior-update: non-zero delta dropped, execution carries no signature key so no posterior row can be written', { activity_id: activityId, alpha_delta: alphaDelta, beta_delta: betaDelta }), false)
       : true) &&
+    ((alphaDelta !== 0 || betaDelta !== 0) && !trace.signature
+      ? (logger.warn('posterior-update: non-zero delta dropped, execution carries no signature key so no posterior row can be written', { activity_id: activityId, alpha_delta: alphaDelta, beta_delta: betaDelta }), false)
+      : true) &&
     trace.signature &&
     typeof trace.signature_version === 'number' &&
     (alphaDelta !== 0 || betaDelta !== 0)
