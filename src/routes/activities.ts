@@ -1725,7 +1725,7 @@ app.get('/templates/proposed-for-exercise', async (c) => {
         const failures = Math.max(0, beta - 1);
         const empiricalSamples = successes + failures;
         const executions = (typeof m.total_executions === 'number' && Number.isFinite(m.total_executions))
-          ? Math.max(m.total_executions, empiricalSamples)
+          ? Math.max(0, m.total_executions, empiricalSamples)
           : empiricalSamples;
         const successRate = empiricalSamples > 0 ? successes / empiricalSamples : null;
         // A draft exercised enough times that still fails the promotion bar has
