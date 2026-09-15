@@ -238,7 +238,7 @@ export function loadTraceRetentionConfig(env = process.env): TraceRetentionConfi
     ceilingPerSweepCap: parseInt(env.TRACE_RETENTION_CEILING_PER_SWEEP_CAP ?? '20000', 10),
     ceilingBudgetMs: parseInt(env.TRACE_RETENTION_CEILING_BUDGET_MS ?? String(5 * 60 * 1000), 10),
     orphanReapEnabled: env.TRACE_RETENTION_ORPHAN_REAP_ENABLED !== 'false', // on by default
-    orphanReapPerSweepCap: parseInt(env.TRACE_RETENTION_ORPHAN_MAX ?? '20000', 10),
+    orphanReapPerSweepCap: parseInt(env.TRACE_RETENTION_ORPHAN_REAP_CAP ?? '20000', 10),
     orphanReapBudgetMs: parseInt(env.TRACE_RETENTION_ORPHAN_BUDGET_MS ?? '120000', 10),
     orphanReapMinAgeMs: parseInt(env.TRACE_RETENTION_ORPHAN_MIN_AGE_MS ?? String(60 * 60 * 1000), 10),
   };
