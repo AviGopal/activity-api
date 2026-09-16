@@ -22,7 +22,8 @@ export function isHollowSatellite(t: { execution_id?: string; activity_id?: stri
  * gate's own asymmetry: a false rejection is worse than a false reach.
  */
 export function isReachInapplicable(t: { tags?: string[] }): boolean {
-  return (t.tags ?? []).some((tag) => typeof tag === 'string' && tag.startsWith('telemetry:'));
+  return (t.tags ?? []).some((tag) => typeof tag === 'string' && 
+    (tag.startsWith('telemetry:') || (tag.startsWith('declined:') && tag.length > 'declined:'.length)));
 }
 
 /**
