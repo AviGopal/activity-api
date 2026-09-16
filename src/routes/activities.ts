@@ -6444,6 +6444,26 @@ app.post('/recommend', async (c) => {
       typeof callerStateSignature === 'string' && /^[0-9a-f]{16}$/.test(callerStateSignature)
         ? callerStateSignature
         : null;
+    // SAY WHEN A CALLER'S SIGNATURE IS REJECTED. It was discarded silently, and silence is
+    // why this went unnoticed: the caller believes it supplied context, the server derives
+    // none, and every downstream table fills with nulls without a single error anywhere.
+    //
+    // THE LENGTH CHECK ABOVE IS NOT AN OFF-BY-ONE — DO NOT WIDEN IT. Two different
+    // signatures currently share this field name. The canonical derivation here hashes the
+    // SHAPE POOL (shapes + provenance + missing) and yields sixteen hex. At least one caller
+    // sends a SITUATIONAL signature instead — host load, trace statistics, catalogue size, UI
+    // state, rhythm — which is a different quantity answering a different question, and
+    // happens to be shorter. Accepting it would key shape-pool posteriors by situational
+    // hashes, merging two incompatible partitions into one column; unlike today's failure,
+    // that one would look like it was working. The mismatch needs resolving at the SENDER, or
+    // by a deliberate decision about which signature is the context key — not here.
+    if (callerStateSignature !== undefined && callerStateSignature !== null && callerSig === null) {
+      logger.warn('POST /v2/activities/recommend — caller state_signature REJECTED (wrong form)', {
+        received_length: typeof callerStateSignature === 'string' ? callerStateSignature.length : null,
+        expected: '16 lowercase hex characters (shape-pool signature)',
+        note: 'a situational signature is a DIFFERENT quantity and must not be accepted here; falling back to server-side derivation',
+      });
+    }
     const sigShapes = hasStateSpace
       ? (impulse_state_space as any[]).map((e: any) => e.shape ?? e).filter(Boolean)
       : effectiveShapes;
