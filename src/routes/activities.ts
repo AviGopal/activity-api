@@ -136,7 +136,7 @@ import {
 } from '../models/schemas';
 import { broadcaster } from '../websocket/broadcaster';
 import { autoCreateVariantIfNeeded, checkAndRetireTemplate } from '../services/variant-creator';
-import { applyOutcomeToPosteriors, decayedThompsonCounts, resolveThompsonDecayHalfLifeDays } from '../lib/posterior-update';
+import { applyOutcomeToPosteriors, decayedThompsonCounts, isEnvironmentalFailureReason, resolveThompsonDecayHalfLifeDays } from '../lib/posterior-update';
 import { incrementTraceStoreCounter } from '../lib/trace-store-counters';
 import { classifyTemplateTiers } from '../services/tier-classifier';
 import { lookupAssignment, readClusterPosterior } from '../lib/cluster-posterior';
@@ -5355,6 +5355,49 @@ app.post('/feedback', async (c) => {
       orgId,
       accountId,
     });
+
+    // AN ARM MUST BE GRADED ON ITS OWN BEHAVIOUR, NOT ON ITS ENVIRONMENT — AND THIS ROUTE
+    // WAS THE HOLE IN THAT RULE.
+    //
+    // computeDeltas already abstains for infrastructure failures, and its comment states the
+    // asymmetry deliberately: "False abstention costs a lost blame signal; false blame
+    // condemns a working arm — and the second is what this codebase keeps paying for." But
+    // that abstention lives on the TRACE path, keyed off a recorded failure_mode. Negative
+    // feedback arriving here never becomes a failure_mode, so it bypassed the check entirely
+    // and took its penalty whatever the cause.
+    //
+    // Measured consequence: a goal dispatched at a disconnected human surface returned
+    // "unreachable" every thirty minutes for two days, and every one of those became a full
+    // negative against the activity. The activity was fine; the surface was absent. The bill
+    // is paid twice — once in the wrong penalty, and again because the posterior decay has to
+    // be aggressive enough to forget false blame, which discards real evidence along with it.
+    //
+    // Reuses isEnvironmentalFailureReason rather than re-deriving a pattern set, so the two
+    // paths cannot drift and the negative control already written for it (a message reading
+    // "returned 5031 rows, expected 502" must NOT match) protects this call site too.
+    //
+    // Scope is deliberately narrow — NEGATIVE feedback only. Positive feedback is unaffected,
+    // and anything not recognised as environmental keeps the strict default, so an arm that
+    // failed through its own logic is penalised exactly as before. The response still reports
+    // success: the caller's report was received and correctly attributed, which is not the
+    // same as it having moved a posterior.
+    if (validated.direction === 'negative' && isEnvironmentalFailureReason(validated.reason)) {
+      logger.info('POST /v2/activities/feedback — ABSTAINED (environmental)', {
+        activity_id: validated.activity_id,
+        reason: validated.reason,
+        note: 'reason matched an infrastructure/availability signature; no posterior change applied',
+        orgId,
+      });
+      return c.json({
+        success: true,
+        applied: false,
+        abstained: 'environmental_failure',
+        activity_id: validated.activity_id,
+        message:
+          'Negative feedback attributed to the environment rather than the activity; no posterior change applied. ' +
+          'The underlying dependency failure should be addressed where it occurs.',
+      });
+    }
 
     // Map intensity to multiplier (0=1.5x, 1=2x, 2=2.5x, 3=3x)
     const multiplier = 1.5 + (validated.intensity * 0.5);
