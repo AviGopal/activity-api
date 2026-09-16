@@ -89,6 +89,26 @@ export interface TraceRetentionConfig {
    * == SENSE by construction; set TRACE_RETENTION_GLOBAL_CEILING to decouple. 0 = off.
    */
   globalCeiling: number;
+  /**
+   * BYTE budget for the trace working set, and the reason it exists.
+   *
+   * `globalCeiling` bounds ROWS. The store fails on BYTES. Rows are not fungible — a trace
+   * carrying a large metadata blob costs orders of magnitude more than a bare one — so a
+   * row ceiling can be satisfied with complete fidelity while the footprint grows without
+   * limit. Measured: the valve reported total 106,673 against a ceiling of 150,000 and
+   * declined to prune, while the store sat at ~23 GB resident, in the throttle band where
+   * it stops answering even a trivial query and never crosses the hard limit that would
+   * trigger a restart.
+   *
+   * So the valve now derives a SECOND ceiling from observed mean row size and takes
+   * whichever binds first. Bytes is the quantity that actually fails; rows remain as a
+   * cheap upper bound and a floor against a pathological size estimate.
+   *
+   * 0 = off (row ceiling only, the previous behaviour).
+   */
+  globalCeilingBytes: number;
+  /** How many rows to sample when estimating mean row size. Kept small; this runs every sweep. */
+  rowSizeSampleN: number;
   /** Toggle just the global-ceiling valve (still overall-gated by enabled + dryRun). */
   globalCeilingEnabled: boolean;
   /**
@@ -230,6 +250,12 @@ export function loadTraceRetentionConfig(env = process.env): TraceRetentionConfi
     // TRACE_RETENTION_GLOBAL_CEILING overrides for headroom (keeps the stratified
     // policy primary); 0 disables. Still overall-gated by enabled + dryRun.
     globalCeiling: parseInt(env.TRACE_RETENTION_GLOBAL_CEILING ?? env.TRACE_STORE_CAP ?? '50000', 10),
+    // Default chosen against the store's own memory ceiling rather than picked round: the
+    // unit throttles in the low-20s of GB, and the trace working set is only one consumer
+    // alongside RocksDB's block cache and index. 8 GB leaves the cache genuine room. Set
+    // TRACE_RETENTION_GLOBAL_CEILING_BYTES to retune, 0 to disable and keep rows-only.
+    globalCeilingBytes: parseInt(env.TRACE_RETENTION_GLOBAL_CEILING_BYTES ?? '8589934592', 10),
+    rowSizeSampleN: parseInt(env.TRACE_RETENTION_ROW_SAMPLE_N ?? '25', 10),
     globalCeilingEnabled: env.TRACE_RETENTION_GLOBAL_CEILING_ENABLED !== 'false', // on by default
     // 20000/sweep at a 30-min interval is ~40k/hr of drain capacity against a measured
     // intake of ~275 rows/hr, so a 156k surplus clears in ~8 sweeps while leaving the
@@ -499,15 +525,51 @@ async function runTraceRetentionSweepInner(
   // Once the valve brings the store back under the ceiling, the next cycle
   // discovers and sweeps strata as before — over a smaller table, so the scan
   // is cheaper too.
+  /**
+   * ONE ceiling computation, used by BOTH the sense check below and the enforce valve later.
+   *
+   * The config states the invariant plainly — ENFORCE == SENSE by construction — and a
+   * byte-derived bound would break it if only one side learned about bytes. The hazard is
+   * concrete: a store over the BYTE ceiling but under the ROW ceiling would have sense report
+   * "not over", run the expensive stratum auto-discovery, and risk overrunning the cycle
+   * before ever reaching the cheap indexed valve. That is precisely the failure the sense
+   * check exists to prevent, reintroduced for the new bound.
+   *
+   * Sampling is bounded and its failure is non-silent: if the estimate cannot be taken, the
+   * row ceiling stands and the log says so, rather than a wider bound appearing by default.
+   */
+  const computeEffectiveCeiling = async (): Promise<{ ceiling: number; boundBy: string; meanBytes: number | null }> => {
+    if (!(cfg.globalCeilingBytes > 0)) return { ceiling: cfg.globalCeiling, boundBy: 'rows', meanBytes: null };
+    try {
+      const sampleN = Math.max(1, Math.min(200, cfg.rowSizeSampleN));
+      const sample = await surrealDB.query<Record<string, unknown>>(`SELECT * FROM ${TABLE} LIMIT ${sampleN}`);
+      const arr = Array.isArray(sample) ? sample : [];
+      if (arr.length === 0) return { ceiling: cfg.globalCeiling, boundBy: 'rows', meanBytes: null };
+      const meanBytes =
+        arr.reduce((acc, r) => acc + Buffer.byteLength(JSON.stringify(r ?? {}), 'utf8'), 0) / arr.length;
+      if (!(meanBytes > 0)) return { ceiling: cfg.globalCeiling, boundBy: 'rows', meanBytes: null };
+      const byteDerived = Math.floor(cfg.globalCeilingBytes / meanBytes);
+      return byteDerived < cfg.globalCeiling
+        ? { ceiling: byteDerived, boundBy: 'bytes', meanBytes }
+        : { ceiling: cfg.globalCeiling, boundBy: 'rows', meanBytes };
+    } catch (err) {
+      logger.warn('[trace-retention] row-size sample failed; the ROW ceiling stands for BOTH sense and enforce', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return { ceiling: cfg.globalCeiling, boundBy: 'rows', meanBytes: null };
+    }
+  };
+
   let overCeiling = false;
   if (cfg.globalCeilingEnabled && cfg.globalCeiling > 0) {
     try {
       const rows = await surrealDB.query<{ count: number }>(`SELECT count() FROM ${TABLE} GROUP ALL`);
       const total = Array.isArray(rows) && rows.length > 0 ? Number(rows[0]?.count ?? 0) : 0;
-      overCeiling = total > cfg.globalCeiling;
+      const eff = await computeEffectiveCeiling();
+      overCeiling = total > eff.ceiling;
       if (overCeiling) {
         logger.warn('[trace-retention] over global ceiling — skipping stratum auto-discovery this cycle so the indexed valve is reached', {
-          total, ceiling: cfg.globalCeiling, surplus: total - cfg.globalCeiling,
+          total, ceiling: eff.ceiling, rowCeiling: cfg.globalCeiling, boundBy: eff.boundBy, surplus: total - eff.ceiling,
         });
       }
     } catch (err) {
@@ -675,10 +737,35 @@ async function runTraceRetentionSweepInner(
   });
   if (cfg.globalCeilingEnabled && cfg.globalCeiling > 0) {
     let total = 0;
+    let effectiveCeiling = cfg.globalCeiling;
+    let boundBy = 'rows';
     try {
       const rows = await surrealDB.query<{ count: number }>(`SELECT count() FROM ${TABLE} GROUP ALL`);
       total = Array.isArray(rows) && rows.length > 0 ? Number(rows[0]?.count ?? 0) : 0;
-      logger.info('[trace-retention] global-ceiling valve: counted', { total, ceiling: cfg.globalCeiling, willPrune: total > cfg.globalCeiling });
+
+      // Same computation the sense check used — one function, so the two can never disagree.
+      // See computeEffectiveCeiling for why that invariant is load-bearing.
+      const eff = await computeEffectiveCeiling();
+      effectiveCeiling = eff.ceiling;
+      boundBy = eff.boundBy;
+      if (eff.meanBytes !== null) {
+        logger.info('[trace-retention] global-ceiling valve: size-derived bound', {
+          meanRowBytes: Math.round(eff.meanBytes),
+          byteBudget: cfg.globalCeilingBytes,
+          rowCeiling: cfg.globalCeiling,
+          effectiveCeiling,
+          boundBy,
+          estimatedWorkingSetBytes: Math.round(eff.meanBytes * total),
+        });
+      }
+
+      logger.info('[trace-retention] global-ceiling valve: counted', {
+        total,
+        ceiling: effectiveCeiling,
+        rowCeiling: cfg.globalCeiling,
+        boundBy,
+        willPrune: total > effectiveCeiling,
+      });
     } catch (err) {
       logger.warn('[trace-retention] global-ceiling count failed; skipping valve this cycle', {
         error: err instanceof Error ? err.message : String(err),
@@ -686,9 +773,9 @@ async function runTraceRetentionSweepInner(
       total = 0;
     }
 
-    if (total > cfg.globalCeiling) {
-      const surplus = total - cfg.globalCeiling;
-      const keepProb = cfg.globalCeiling / total;
+    if (total > effectiveCeiling) {
+      const surplus = total - effectiveCeiling;
+      const keepProb = effectiveCeiling / total;
       let removed: number | null = null;
       if (!cfg.dryRun) {
         const batchSize = cfg.deleteBatchSize;
