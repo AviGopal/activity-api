@@ -23,7 +23,7 @@ export function isHollowSatellite(t: { execution_id?: string; activity_id?: stri
  */
 export function isReachInapplicable(t: { tags?: string[] }): boolean {
   return (t.tags ?? []).some((tag) => typeof tag === 'string' && 
-    (tag.startsWith('telemetry:') || (tag.startsWith('declined:') && tag.length > 'declined:'.length)));
+    (tag.startsWith('telemetry:') || tag.startsWith('declined:')));
 }
 
 /**
@@ -67,8 +67,8 @@ export function classifyReach(t: {
 }): ReachVerdict {
   const tags = t.tags ?? [];
   if (tags.includes('reached:true')) return 'reached';
-  // A telemetry/infra probe's `reached:false` is INAPPLICABLE, not a failure verdict —
-  // intercept it here, ahead of the not-reached arm, so infra sub-steps (auth resolves)
+  // A telemetry/infra probe's or declined execution's `reached:false` is INAPPLICABLE, not a failure verdict —
+  // intercept it here, ahead of the not-reached arm, so infra sub-steps (auth resolves) and principled declines
   // are ungraded {0,0} rather than β-penalized. Placed after `reached:true` so a genuine
   // reach is still honored; only the false-blame path is diverted.
   if (isReachInapplicable(t)) return 'ungraded';
