@@ -7435,6 +7435,26 @@ app.post('/recommend', async (c) => {
         selection_method: 'thompson_sampling',
         candidates_count: templates.length,
         exploration_slot: rec.selection_metadata.exploration_slot,
+        // THE CONTEXT THE SELECTOR USED, RECORDED WHERE THE SELECTION IS RECORDED.
+        //
+        // This log already captures the full ranked candidate set — every contender with its
+        // sample, alpha and beta, not merely the winner — which is the expensive half of
+        // counterfactual selection data and it has been accumulating all along. What it has
+        // never carried is the CONTEXT the draw was made in. The column exists and is
+        // populated on zero rows.
+        //
+        // Selection is specified as CONTEXTUAL Thompson, keyed by state signature, and the
+        // signature is computed right here and used for the lookup a few hundred lines above.
+        // Discarding it at write time is what makes the whole corpus context-free after the
+        // fact: you can ask "which arm won" but never "which arm won IN THIS SITUATION", so
+        // no amount of accumulated history can distinguish an arm that is good everywhere
+        // from one that is good only where it has happened to be tried.
+        //
+        // Null is meaningful and is kept as null rather than coerced: it records that this
+        // draw genuinely had no context, which is different from a context that was known and
+        // dropped. The reader must be able to tell those apart or it will treat the whole
+        // pre-existing corpus as a single context and conclude the obvious wrong thing.
+        state_signature: stateSpaceSig ?? null,
       }));
 
       // Guard the all-or-nothing FOR batch: one row violating a schema ASSERT
@@ -7474,6 +7494,10 @@ app.post('/recommend', async (c) => {
             selection_method: $log.selection_method,
             candidates_count: $log.candidates_count,
             exploration_slot: $log.exploration_slot,
+            // NONE rather than null when absent, matching how this row treats every other
+            // optional field, so "no context" is stored the same way the schema stores every
+            // other absence instead of inventing a second spelling for it.
+            state_signature: IF $log.state_signature IS NULL THEN NONE ELSE $log.state_signature END,
             org_id: $org_name,
             account_id: IF $account_id IS NULL THEN NONE ELSE $account_id END,
             account_id_version: 1,
