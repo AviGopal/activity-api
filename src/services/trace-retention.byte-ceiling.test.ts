@@ -15,6 +15,18 @@
 // a footprint that can vary by orders of magnitude. A count-based ceiling cannot bound a
 // byte-based resource, and lowering the row ceiling would only have worked by accident — and
 // been wrong again the moment mean row size moved.
+//
+// WHAT THE VALVE THEN REPORTED, AND WHY THAT MATTERED MORE THAN THE FIX: once it logged the
+// quantity it was bounding, the reading refuted the story above. Mean row size is small, not
+// large, and the bounded working set is a tiny fraction of the store's footprint. The bytes
+// are not in the rows this valve counts, and the process memory that actually wedges the
+// store is not row payload at all. So these tests pin a correct bound on a real quantity that
+// is NOT the one that wedges the store — worth keeping, and not to be mistaken for the remedy.
+//
+// The invariant that survives, and the reason the reporting is the load-bearing part: an
+// instrument that reports only its verdict can be confidently wrong forever, while one that
+// reports the quantity behind the verdict can refute the belief that built it. Pin the bound;
+// trust the reading over the rationale.
 import { describe, expect, test } from 'bun:test';
 
 /** The decision under test: take whichever ceiling binds first. */
@@ -29,9 +41,10 @@ function effectiveCeiling(rowCeiling: number, byteBudget: number, meanRowBytes: 
 const GB = 1024 ** 3;
 
 describe('retention ceiling: the binding quantity', () => {
-  test('FAT rows bind on bytes long before the row ceiling — the live failure', () => {
-    // ~215 KB mean, which is what ~23 GB across ~107k rows implies. The row ceiling of
-    // 150,000 would have permitted roughly 32 GB; the byte budget stops it far earlier.
+  test('FAT rows bind on bytes long before the row ceiling', () => {
+    // A hypothetical fat-row regime, NOT a measurement: the live store turned out to hold
+    // small rows. It is kept because the bound must hold whenever mean row size grows, and
+    // that is precisely the case a row ceiling cannot express.
     const { ceiling, boundBy } = effectiveCeiling(150_000, 8 * GB, 215_000);
     expect(boundBy).toBe('bytes');
     expect(ceiling).toBeLessThan(150_000);
