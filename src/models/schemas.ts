@@ -351,6 +351,8 @@ export const ExecutionRecordSchema = z.object({
     pointer: z.record(z.unknown()),
   })).optional(),
   metadata: z.record(z.unknown()).optional(),
+  // Track whether pull-sync has reported this execution as synced
+  report_synced: z.boolean().default(false),
   // Engine-emitted failure_mode (per FailureModeSchema). The activity_execution_
   // traces table has had this field defined since migration 091; without it
   // declared in the request schema, Zod strips the payload and refusal
