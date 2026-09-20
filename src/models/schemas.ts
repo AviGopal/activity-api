@@ -299,6 +299,8 @@ export const CreateTemplateRequestSchema = z.object({
   // extracted from, so provenance is legible. extracted_from column already exists.
   extracted_from: z.string().optional(),
   source_execution_id: z.string().optional(),
+  // When extracted_from is an execution, this is the ID of that execution's trace.
+  extracted_from_trace_id: z.string().optional(),
   metadata: z.record(z.any()).optional(),
 }).refine(
   data => data.tags?.length || data.category,
