@@ -65,6 +65,8 @@ export interface TemplateAuditInput {
 }
 
 export interface TemplateDeficiencies {
+  /** Judgment of Value (JEV) decision. */
+  jev_decision?: 'undecided' | 'promising' | 'neutral' | 'unpromising';
   missing_input_shapes: boolean;
   missing_output_shapes: boolean;
   /** Matches migration-044 category defaults (e.g. ['goal'], ['patch']) exactly. */
@@ -476,7 +478,7 @@ async function queryTemplates(
   if (scope) params.scope = scope;
 
   const fields =
-    'id, name, variant_name, description, scope, org_id, tags, input_shapes, output_shapes, tasks, task_steps';
+    'id, name, variant_name, description, scope, org_id, tags, input_shapes, output_shapes, tasks, task_steps, jev_decision';
 
   const rows: RawTemplateRow[] = [];
 
