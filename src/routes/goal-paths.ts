@@ -611,6 +611,7 @@ app.post('/', async (c) => {
           reused_from_goal_hash = $reused_from_goal_hash ?? reused_from_goal_hash,
           reused_from_path_signature = $reused_from_path_signature ?? reused_from_path_signature,
           expected_output_shapes = $expected_output_shapes ?? expected_output_shapes,
+          state_signature = $state_signature ?? state_signature,
           typical_tools_used = $typical_tools_used ?? typical_tools_used,
           work_signature = $work_signature ?? work_signature,
           updated_at = time::now()
@@ -631,6 +632,7 @@ app.post('/', async (c) => {
         inference_confidence: validated.inference_confidence ?? null,
         endpoint_output_shapes: endpointOutputShapes,
         expected_output_shapes: validated.expected_output_shapes ?? null,
+        state_signature: validated.state_signature ?? undefined,
         walk_tier: validated.walk_tier ?? 'fresh_derivation',
         // reused_from_goal_hash/reused_from_path_signature are option<string> in the
         // schema, same as last_inference_confidence above: an explicit NULL fails the
@@ -672,6 +674,7 @@ app.post('/', async (c) => {
           path_signature: $path_signature,
           endpoint_output_shapes: $endpoint_output_shapes,
           expected_output_shapes: $expected_output_shapes,
+          state_signature: $state_signature,
           total_executions: 1,
           execution_count: 1,
           success_count: $successful_executions,
@@ -700,6 +703,7 @@ app.post('/', async (c) => {
         goal_hash: goalHash,
         org_id: (body as any).org_id ?? 'public',
         expected_output_shapes: validated.expected_output_shapes ?? null,
+        state_signature: validated.state_signature ?? null,
         goal_text: validated.goal_text,
         goal_category: validated.goal_category,
         path_activities: validated.path_activities,
