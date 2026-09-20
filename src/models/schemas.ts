@@ -797,6 +797,10 @@ export const PathRecordRequestSchema = z.object({
   // See sql/migrations/100-cc1-scope-narrowing-assert.surql §G2.
   parent_path_signature: z.string().optional(),
   parent_goal_hash: z.string().optional(),
+  // Situation at decision time (2026-09-20). Selection ASKS with state_signature
+  // (recommend paths) but the record never kept it — absent from all 13,423 rows
+  // measured 2026-09-16. Receiver half of the recording joint; DB field is migration 211.
+  state_signature: z.string().optional(),
   // Ratchet legibility (2026-07-24): which walk tier reached this path
   // (learned_pathway / satisfier / universal_tool_fallback / feature_compose /
   // fresh_derivation). Optional; persisted once the DEFINE FIELD migration lands.
