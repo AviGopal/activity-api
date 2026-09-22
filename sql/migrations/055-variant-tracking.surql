@@ -49,14 +49,5 @@ DEFINE TABLE IF NOT EXISTS v_active_activities AS
   WHERE retired = false OR retired IS NONE;
 
 -- Create view for variant families (all variants of a base activity)
-DEFINE TABLE IF NOT EXISTS v_variant_families AS
-  SELECT
-    variant_of AS base_activity_id,
-    count() AS variant_count,
-    array::group(id) AS variant_ids,
-    max(variant_generation) AS max_generation,
-    min(created_at) AS first_variant_at,
-    max(created_at) AS last_variant_at
-  FROM activity
-  WHERE variant_of IS NOT NONE
-  GROUP BY variant_of;
+REMOVE TABLE IF EXISTS v_variant_families;
+-- Removing the entire DEFINE TABLE IF NOT EXISTS v_variant_families block because it contains invalid paths in SurrealDB 2.3.3 and poisons activity inserts on fresh datastores.
