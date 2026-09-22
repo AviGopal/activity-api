@@ -55,7 +55,7 @@ DEFINE TABLE IF NOT EXISTS v_shape_usage_src AS
     input_shapes,
     output_shapes
   FROM activity
-  WHERE (array::len(input_shapes) > 0 OR array::len(output_shapes) > 0)
+  WHERE ((input_shapes IS NOT NONE AND array::len(input_shapes) > 0) OR (output_shapes IS NOT NONE AND array::len(output_shapes) > 0))
     AND (retired = false OR retired IS NONE)
 PERMISSIONS FOR select FULL;
 
@@ -70,7 +70,7 @@ DEFINE TABLE IF NOT EXISTS v_shape_execution_src AS
     duration_ms,
     executed_at
   FROM execution
-  WHERE array::len(input_impulse_shapes) > 0
+  WHERE input_impulse_shapes IS NOT NONE AND array::len(input_impulse_shapes) > 0
 PERMISSIONS FOR select FULL;
 
 DEFINE INDEX IF NOT EXISTS idx_v_shape_usage_src_activity ON v_shape_usage_src FIELDS activity_id;
