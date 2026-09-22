@@ -62,32 +62,13 @@ DEFINE INDEX IF NOT EXISTS idx_v_shape_score_signature
 -- Useful for discovering effective impulse combinations
 -- ============================================================================
 
-DEFINE TABLE IF NOT EXISTS v_shape_pattern_performance AS
-  SELECT
-    array::sort(array::distinct(input_impulse_shapes)) AS shape_pattern,
-    org_id,
-    count() AS total_uses,
-    count(IF success = true THEN 1 ELSE NONE END) AS successes,
-    count(IF success = false THEN 1 ELSE NONE END) AS failures,
-    -- Overall success rate for this shape pattern
-    <float> count(IF success = true THEN 1 ELSE NONE END) / <float> count() AS success_rate,
-    -- Number of unique activities this pattern was used with
-    array::len(array::distinct(array::group(activity_id))) AS activity_count,
-    -- Most recent use
-    time::max(executed_at) AS last_used_at
-  FROM execution
-  WHERE input_impulse_shapes IS NOT NONE
-    AND array::len(input_impulse_shapes) > 0
-  -- GROUP BY the ALIAS (see note above); shape_pattern is the same projection.
-  GROUP BY shape_pattern, org_id
-PERMISSIONS
-  FOR select WHERE org_id = $auth.org_id;
-
--- Index for pattern analysis
-DEFINE INDEX IF NOT EXISTS idx_v_pattern_perf_org
-  ON v_shape_pattern_performance FIELDS org_id;
-DEFINE INDEX IF NOT EXISTS idx_v_pattern_perf_success_rate
-  ON v_shape_pattern_performance FIELDS org_id, success_rate;
+REMOVE TABLE IF EXISTS v_shape_pattern_performance;
+-- v_shape_pattern_performance is retired because it has zero code readers, and when defined
+-- over an empty execution table (every cold boot) its incremental maintenance throws
+-- "Incorrect arguments for function array::group()" on every subsequent INSERT INTO execution,
+-- making POST /v2/activities/execution-traces return 500 permanently on fresh datastores.
+-- The v_shape_conditioned_score view earlier in this file has real readers and is insert-safe:
+-- it must remain byte-identical.
 
 -- ============================================================================
 -- Helper: Get shape-conditioned score for an activity
