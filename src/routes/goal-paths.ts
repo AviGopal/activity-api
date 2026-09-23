@@ -1048,7 +1048,8 @@ app.post('/recommend', async (c) => {
     // same proven-failing bar applies, because a nearby path that never reached
     // is no more reusable than an exact one that never reached.
     let shapeMatched = 0;
-    if (paths.length === 0 && targetShapes.length > 0) {
+    const eligibleByHash = paths.filter((p) => ((p.successful_executions ?? 0) >= 3) && ((p.total_executions ?? 0) >= 5));
+    if (eligibleByHash.length === 0 && targetShapes.length > 0) {
       const shapeQuery = `
         SELECT * FROM goal_execution_paths
         WHERE endpoint_output_shapes CONTAINSANY $target_shapes
