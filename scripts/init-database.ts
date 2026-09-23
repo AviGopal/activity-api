@@ -174,6 +174,14 @@ async function applySQLFile(filePath: string): Promise<boolean> {
   try {
     let sqlContent = await readFile(filePath, 'utf-8');
 
+    // Guard against unparseable migration files: clearly non-SQL or binary content
+    const hasCtlChars = /[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(sqlContent);
+    const looksLikeSQL = /(CREATE|DEFINE|UPDATE|DELETE|INSERT|RELATE|SELECT|USE|BEGIN|COMMIT|CANCEL|IF|LET)\s/i.test(sqlContent) || sqlContent.includes(';');
+    if (hasCtlChars || !looksLikeSQL) {
+      console.warn(`[Migration] Skipping unparseable file ${fileName}: does not look like SQL${hasCtlChars ? ' (binary/control chars detected)' : ''}.`);
+      return false;
+    }
+
     // Substitute the JWT_SECRET placeholder in schema files that DEFINE
     // ACCESS ... TYPE JWT methods. The placeholder `__JWT_SECRET__` is the
     // single source of truth for the JWT secret across schema and runtime
