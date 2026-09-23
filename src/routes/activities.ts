@@ -515,6 +515,13 @@ app.post('/templates', async (c) => {
       // to land templates safely in the registry without affecting selection. An operator
       // (or future autonomous promoter) flips it off via POST /templates/:id/promote.
       proposed: validated.proposed ?? false,
+      // learning_track is TYPE string with an ASSERT on the activity table. Since the
+      // 2026-09-22 20:06 restart every template registration failed with "Found NONE
+      // for field learning_track" (1,300 in 24 h; nothing minted for six hours) because
+      // the row arrived without the field and the schema-side default did not apply.
+      // Set it explicitly to the classifier's own initial value; the classifier job
+      // re-evaluates it every 6 h.
+      learning_track: (validated as { learning_track?: unknown }).learning_track ?? 'unclassified',
     };
 
     // Add org_id only if provided (optional field, let schema handle default)
