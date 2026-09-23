@@ -49,6 +49,16 @@ interface CacheEntry {
 
 const cache = new Map<string, CacheEntry>();
 const inflight = new Map<string, Promise<JwtAuthContext | null>>();
+/** apiKey -> expiry of a transient-failure verdict; read by the middleware to label a null honestly. */
+const lastTransient = new Map<string, number>();
+
+/** True while the most recent verdict for this key was a transient upstream failure, not a rejection. */
+export function isTransientlyUnavailable(apiKey: string): boolean {
+  const until = lastTransient.get(apiKey);
+  if (until === undefined) return false;
+  if (until <= Date.now()) { lastTransient.delete(apiKey); return false; }
+  return true;
+}
 
 function ttlMs(): number {
   const raw = process.env.AUTH_KEY_CACHE_TTL_MS;
@@ -127,6 +137,11 @@ export async function getOrFetchValidatedApiKey(
       const transient = value === undefined;
       const ttl = transient ? TRANSIENT_NEGATIVE_TTL_MS : ttlMs();
       cache.set(apiKey, { value: value ?? null, expiresAt: Date.now() + ttl });
+      // Remember, per key, that the last verdict was a TRANSIENT upstream failure
+      // (identity 429/5xx/network), so the middleware can answer 503 rather than
+      // telling the caller its key is revoked. Measured 2026-09-23: identity's
+      // limiter 429'd the whole fleet and every vessel read it as a revocation.
+      if (transient) lastTransient.set(apiKey, Date.now() + ttl); else lastTransient.delete(apiKey);
       sweepIfLarge(Date.now());
       if (transient) {
         logger.warn('[auth-cache] transient upstream failure — short negative TTL', {

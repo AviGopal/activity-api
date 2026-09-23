@@ -30,7 +30,7 @@ import { Context, Next } from 'hono';
 import { createAuthenticatedClient } from '../db/surreal';
 import { validateApiKeyWithFallback, generateJwtToken } from '../services/auth';
 import { logger } from '../utils/logger';
-import { getOrFetchValidatedApiKey } from './auth-cache';
+import { getOrFetchValidatedApiKey, isTransientlyUnavailable } from './auth-cache';
 
 export interface JwtAuthContext {
   jwtToken: string;
@@ -311,6 +311,18 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
     // query - it REMOVES the filter. Falling through without an identity is
     // therefore not an unauthenticated read, it is a cross-tenant read.
     if (!jwtAuth) {
+      // A null verdict has TWO generators: identity rejected the key, or identity
+      // could not be asked (429/5xx/network). Only the first is a revocation. Saying
+      // "revoked" for the second sent the whole fleet chasing a credential that was
+      // valid (2026-09-23: identity rate-limited the fleet; every vessel read it as
+      // INVALID_API_KEY). Label the transient case as what it is.
+      if (isTransientlyUnavailable(apiKey)) {
+        logger.warn('API key validation unavailable (transient upstream failure)', { path: c.req.path });
+        return c.json(
+          { error: { code: 'IDENTITY_UNAVAILABLE', message: 'API key could not be validated: identity-vessel is rate-limiting or unavailable; retry' } },
+          503,
+        );
+      }
       logger.warn('API key validation failed', { path: c.req.path });
       return c.json(
         { error: { code: 'INVALID_API_KEY', message: 'API key is invalid or has been revoked' } },
