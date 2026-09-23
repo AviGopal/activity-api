@@ -1118,7 +1118,8 @@ app.post('/recommend', async (c) => {
           const bExec = b.total_executions || 0;
           return aExec - bExec; // Ascending (fewer executions first)
         })
-        .slice(0, validated.top_k);
+        .slice(0, Math.max(0, validated.top_k - 1));
+      { const _best = paths.slice().sort((a: any, b: any) => ((b.success_rate ?? 0) - (a.success_rate ?? 0)) || ((b.total_executions ?? 0) - (a.total_executions ?? 0)))[0]; if (_best && !sorted.includes(_best)) sorted.unshift(_best); }
 
       // Build recommendations with enhanced metadata
       recommendedPaths = await Promise.all(
