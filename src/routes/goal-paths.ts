@@ -409,6 +409,7 @@ app.post('/', async (c) => {
   try {
     const body = await c.req.json();
     const validated = PathRecordRequestSchema.parse(body);
+    for (const k of ["expected_output_shapes", "endpoint_output_shapes"] as const) { const v = (validated as Record<string, unknown>)[k]; if (Array.isArray(v)) (validated as Record<string, unknown>)[k] = [...new Set(v.map(String))]; }
 
     const goalHash = hashGoal(validated.goal_text);
     // §12.6 step 5 (hub bucketing, 2026-08-14): key the per-goal-path posterior CELL on the WORK the
