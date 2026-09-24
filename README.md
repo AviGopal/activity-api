@@ -107,6 +107,8 @@ THOMPSON_SAMPLING_SEED=     # Optional: integer seed for reproducible sampling (
 
 ## Development
 
+> **Developer-only.** This runs one vessel's source on your machine for iteration. The fleet is launched from the image as described in the substrate README § Installation; a change reaches a running fleet only by landing on origin/dev.
+
 ```bash
 # Run with auto-reload
 bun run dev
