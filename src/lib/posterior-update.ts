@@ -1003,8 +1003,9 @@ export async function applyOutcomeToPosteriors(
     tags: trace.tags,
   });
   const ungraded = reachVerdict === 'ungraded';
+  const failedByTask = ungraded && trace.success === false && (((trace as any).failure_count ?? 0) > 0 || ((trace as any).task_count ?? 0) === 0);
   const effectiveSuccess = reachVerdict === 'reached';
-  const { alphaDelta, betaDelta } = ungraded
+  const { alphaDelta, betaDelta } = (ungraded && !failedByTask)
     ? { alphaDelta: 0, betaDelta: 0 }
     : computeDeltas(effectiveSuccess, trace.failure_mode, warnings, trace, yieldRefs);
   const failureModeType = trace.failure_mode?.type ?? null;
@@ -1074,10 +1075,10 @@ export async function applyOutcomeToPosteriors(
     }),
   });
   const skipVariantUpdate = tierClass === 'all_deterministic' || trace.metadata?.information_yield === 'idle';
-  if (skipVariantUpdate || ungraded || (alphaDelta === 0 && betaDelta === 0)) {
+  if (skipVariantUpdate || (ungraded && !failedByTask) || (alphaDelta === 0 && betaDelta === 0)) {
     logger.info('posterior variant update SKIPPED', {
       activity_id: activityId,
-      reason: skipVariantUpdate ? (tierClass === 'all_deterministic' ? 'all_deterministic' : 'information_yield_idle') : (ungraded ? 'reach_ungraded' : 'zero_deltas'),
+      reason: skipVariantUpdate ? (tierClass === 'all_deterministic' ? 'all_deterministic' : 'information_yield_idle') : ((ungraded && !failedByTask) ? 'reach_ungraded' : 'zero_deltas'),
       reach_verdict: reachVerdict,
       tier_class: tierClass,
       alpha_delta: alphaDelta,
