@@ -5008,7 +5008,7 @@ app.get('/:id/variants', async (c) => {
     });
 
     // Phase E: pass accountId so cross-account variants stay isolated.
-    const result = await getVariantFamily(activityId, orgId, jwtAuth?.jwtToken, jwtAuth?.accountId ?? null);
+    const result = await getVariantFamily(activityId, orgId, jwtAuth?.authType === 'apikey' ? undefined : jwtAuth?.jwtToken, jwtAuth?.accountId ?? null);
 
     return c.json({
       variants: result.data,
