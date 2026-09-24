@@ -2079,7 +2079,11 @@ export async function getVariantFamily(
 
     const result = jwtToken
       ? await queryWithAuth<any[]>(jwtToken, query, params)
-      : await surrealDB.query<any[]>(query, params);
+      // surrealDB.query() returns only the FIRST statement's result, and this query is
+      // LET … ; RETURN array::union(...): the root path therefore saw null, fell to the
+      // singleton fallback, and every API-key caller got a synthesised base (measured
+      // 2026-09-24 10:38Z). queryRaw returns every statement, which result.flat() expects.
+      : (await surrealDB.queryRaw(query, params) as any[]);
 
     // Flatten result (SurrealDB may wrap in arrays)
     const activities = (result && Array.isArray(result))
