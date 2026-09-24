@@ -1487,6 +1487,7 @@ app.get('/templates', async (c) => {
     }
 
     // Apply limit
+    templates.sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')));
     templates = templates.slice(0, limit);
 
     // Skip client-side org/project filtering when the DB query ran with RBAC
