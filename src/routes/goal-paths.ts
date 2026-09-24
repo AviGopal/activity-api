@@ -704,7 +704,7 @@ app.post('/', async (c) => {
         goal_hash: goalHash,
         org_id: (body as any).org_id ?? 'public',
         expected_output_shapes: validated.expected_output_shapes ?? null,
-        state_signature: validated.state_signature ?? null,
+        state_signature: validated.state_signature ?? undefined,
         goal_text: validated.goal_text,
         goal_category: validated.goal_category,
         path_activities: validated.path_activities,
