@@ -97,7 +97,7 @@ async function runSQL(sql: string): Promise<SQLResult[]> {
       method: 'POST',
       headers: buildHeaders(),
       body: sql,
-      signal: AbortSignal.timeout(15_000),
+      signal: AbortSignal.timeout(30_000),
     });
     if (!response.ok) return [];
     return await response.json().catch(() => []);
@@ -127,12 +127,105 @@ async function getAppliedMigrations(): Promise<Set<string> | null> {
   // applied", so the caller can tell the two apart and refuse to bootstrap.
   if (!results[0] || results[0].status !== 'OK') return null;
   const rows: any[] = Array.isArray(results[0].result) ? results[0].result : [];
-  return new Set(rows.map((r: any) => r.filename));
+  const applied = new Set<string>(rows.map((r: any) => r.filename as string));
+
+  // Pre-run convergence + bounded escalation pass over on-disk migration files.
+  //  - If a file previously failed but ALL TABLES it defines now exist, mark it applied.
+  //  - If a file has failed for 3 consecutive starts, stop retrying on this start and
+  //    log a substrateGap; do NOT mark it applied in DB, but treat it as applied in-memory
+  //    so the current run skips it. (Next start re-applies the same skip unless reset.)
+  let files: string[] = [];
+  try {
+    const dir = await readdir(SQL_DIR);
+    files = dir.filter((f) => f.endsWith('.surql') || f.endsWith('.sql')).sort();
+  } catch {
+    // If we can't read the directory, just return the DB-derived set.
+    return applied;
+  }
+
+  function parseDefinedTables(sqlText: string): string[] {
+    const tables = new Set<string>();
+    const re = /DEFINE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_]+)/gi;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(sqlText)) !== null) {
+      const name = m[1];
+      if (name) tables.add(name);
+    }
+    return [...tables];
+  }
+
+  async function tableExists(name: string): Promise<boolean> {
+    // SurrealDB returns status OK for existing tables; non-existent typically ERR.
+    const res = await runSQL(`INFO FOR TABLE ${name};`);
+    return res[0]?.status === 'OK';
+  }
+
+  async function failureCountFor(filename: string): Promise<number> {
+    const esc = filename.replace(/'/g, "\\'");
+    const res = await runSQL(`SELECT failure_count FROM init_migration_failures WHERE filename='${esc}' LIMIT 1;`);
+    const row: any | undefined = res[0]?.result?.[0];
+    const n: unknown = row?.failure_count;
+    return typeof n === 'number' && Number.isFinite(n) ? n : 0;
+  }
+
+  async function bumpFailure(filename: string): Promise<number> {
+    const esc = filename.replace(/'/g, "\\'");
+    const current = await failureCountFor(filename);
+    if (current <= 0) {
+      await runSQL(`INSERT IGNORE INTO init_migration_failures (filename, failure_count) VALUES ('${esc}', 1);`);
+      return 1;
+    } else {
+      await runSQL(`UPDATE init_migration_failures SET failure_count = ${current + 1}, updated_at = time::now() WHERE filename = '${esc}';`);
+      return current + 1;
+    }
+  }
+
+  for (const f of files) {
+    if (applied.has(f)) continue;
+
+    // Escalation: skip from the 4th start on (i.e., when prior consecutive count >= 3)
+    let prior = 0;
+    try { prior = await failureCountFor(f); } catch {}
+    if (prior >= 3) {
+      console.error(`[SubstrateGap] migration-failure-threshold filename=${f} failures=${prior} message="skipping on start after repeated failures"`);
+      // Do not write to init_migrations; skip this run only.
+      applied.add(f);
+      continue;
+    }
+
+    // Convergence: if all tables defined in this file already exist, record and skip.
+    try {
+      const sqlText = await readFile(join(SQL_DIR, f), 'utf8').catch(() => '');
+      if (sqlText && sqlText.length > 0) {
+        const tables = parseDefinedTables(sqlText);
+        if (tables.length > 0) {
+          let allExist = true;
+          for (const t of tables) {
+            const ok = await tableExists(t);
+            if (!ok) { allExist = false; break; }
+          }
+          if (allExist) {
+            await markMigrationApplied(f);
+            applied.add(f);
+            continue;
+          }
+        }
+      }
+    } catch {
+      // Ignore convergence errors; fall through to bump failure for this start.
+    }
+
+    // Count this start as a failure attempt preflight; a successful application in this
+    // same start will be followed by markMigrationApplied(), which clears the counter.
+    try { await bumpFailure(f); } catch {}
+  }
+
+  return applied;
 }
 
 async function markMigrationApplied(filename: string): Promise<void> {
   await runSQL(
-    `INSERT IGNORE INTO init_migrations (filename) VALUES ('${filename.replace(/'/g, "\\'")}');`
+    `INSERT IGNORE INTO init_migrations (filename) VALUES ('${filename.replace(/'/g, "\\'")}');\nDELETE FROM init_migration_failures WHERE filename = '${filename.replace(/'/g, "\\'")}';`
   );
 }
 
