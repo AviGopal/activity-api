@@ -315,6 +315,14 @@ function filterByInputSchema(
  * Automatically creates initial performance metrics with Thompson Sampling parameters
  */
 app.post('/templates', async (c) => {
+  // Invalidate the unpaginated templates list cache so the next read repopulates from DB
+  try {
+    await (c.get as any)('redis').del(CACHE_LIST_KEY);
+  } catch (error) {
+    logger.warn('Template list cache invalidation failed (non-blocking)', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
   // Parse body early for validation trace capture
   let body: any;
   let jwtAuth: any;
