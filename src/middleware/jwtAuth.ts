@@ -26,6 +26,7 @@
  * - 2026-04-12: Migrated to vessel pattern, removed direct fallback
  */
 
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { Context, Next } from 'hono';
 import { createAuthenticatedClient } from '../db/surreal';
 import { validateApiKeyWithFallback, generateJwtToken } from '../services/auth';
@@ -67,6 +68,165 @@ export interface JwtAuthContext {
   role?: string;
   // Scopes from the token
   scopes?: string[];
+}
+
+/**
+ * CONNECTED MARKER — evidence for the `connected` readiness level.
+ *
+ * `connected` means a client configured with the emitted key has actually reached
+ * this fleet through a published port. That cannot be judged from inside the
+ * container by probing: the only proof is a request that arrives from outside.
+ * So authenticated requests whose remote address is not loopback (vessels in the
+ * container call each other over 127.0.0.1; a host client arrives through the
+ * engine's port forward with a non-loopback source) are recorded in
+ * `<install dir>/connected.json`, PER KEY. The container's own interface
+ * addresses are deliberately NOT excluded: under rootless Podman's default
+ * network a host client arrives from the host's address, which the container
+ * shares as its own, so excluding them would hide every real client there.
+ * The record:
+ *   {
+ *     first_at, remote, key_id, auth_type, emitted_key,  <- the emitted key's first
+ *                                                           request once one arrives;
+ *                                                           until then the first
+ *                                                           external request's
+ *     pid, process_started_at,
+ *     by_key_id: { <key id>: { first_at, remote, key_id, auth_type, emitted_key } }
+ *   }
+ * The emitted key is the fleet's METABOB_API_KEY, the key substrate-connect hands a
+ * client, recognised by comparing the presented key itself. Recording stops once
+ * it has been seen; other keys (federated peers calling a hub, browser JWTs) are
+ * recorded alongside and never displace it, so whichever key happens to arrive
+ * first after a restart cannot hide the emitted key's arrival.
+ * `first_at` values are this process's, and the file is replaced by the first
+ * write of each process, so a reader can tell a connection observed since the
+ * current boot from one left on the volume by an earlier container. Best-effort:
+ * it never delays or fails a request, and a failed write is logged and retried on
+ * a later request (bounded).
+ *
+ * The directory is fixed to the workspace volume, not WORKSPACE_ROOT, which the
+ * shared env file points at the super-repo checkout.
+ */
+const PROCESS_STARTED_AT = new Date().toISOString();
+const CONNECTED_MAX_FAILURES = 3;
+// Distinct non-emitted keys recorded per process; a hub can see many peers.
+const CONNECTED_MAX_KEYS = 32;
+const connectedKeys = new Set<string>();
+let connectedEmittedSeen = false;
+let connectedFailures = 0;
+let connectedWrite: Promise<void> = Promise.resolve();
+
+export function isLoopbackAddress(address: string): boolean {
+  const a = address.trim().toLowerCase();
+  if (a === '::1' || a === '0:0:0:0:0:0:0:1' || a === 'localhost') return true;
+  const v4 = a.startsWith('::ffff:') ? a.slice('::ffff:'.length) : a;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(v4);
+}
+
+function connectedMarkerPath(): string {
+  const dir = (process.env['SUBSTRATE_INSTALL_DIR'] || '/workspace/.install').replace(/\/+$/, '');
+  return `${dir}/connected.json`;
+}
+
+/** Remote address of the request, when the server exposes it (Bun passes itself as `c.env`). */
+function remoteAddressOf(c: Context): string | null {
+  const server = c.env as { requestIP?: (req: Request) => { address?: string } | null } | undefined;
+  if (!server || typeof server.requestIP !== 'function') return null;
+  const info = server.requestIP(c.req.raw);
+  return info && typeof info.address === 'string' && info.address.length > 0 ? info.address : null;
+}
+
+/** True when the presented API key is this fleet's emitted key (METABOB_API_KEY), compared in constant time. */
+function isEmittedKey(presented: string | undefined): boolean {
+  const emitted = process.env['METABOB_API_KEY'] ?? '';
+  if (!presented || !emitted) return false;
+  const a = createHash('sha256').update(presented).digest();
+  const b = createHash('sha256').update(emitted).digest();
+  return timingSafeEqual(a, b);
+}
+
+type ConnectedEntry = { first_at: string; remote: string; key_id: string | null; auth_type: string | null; emitted_key: boolean };
+
+async function writeConnectedEntry(path: string, keyLabel: string, keyId: string | null, entry: ConnectedEntry): Promise<void> {
+  const { mkdir, writeFile, rename, readFile } = await import('node:fs/promises');
+  let current: Record<string, unknown> | null = null;
+  try {
+    const parsed = JSON.parse(await readFile(path, 'utf8')) as unknown;
+    if (parsed && typeof parsed === 'object') current = parsed as Record<string, unknown>;
+  } catch {
+    current = null;
+  }
+  // A record left by an earlier process (or an earlier container on this volume) is replaced.
+  const ours = current && current['pid'] === process.pid && current['process_started_at'] === PROCESS_STARTED_AT;
+  const byKeyId: Record<string, ConnectedEntry> = ours && current!['by_key_id'] && typeof current!['by_key_id'] === 'object'
+    ? { ...(current!['by_key_id'] as Record<string, ConnectedEntry>) }
+    : {};
+  if (!byKeyId[keyLabel]) byKeyId[keyLabel] = entry;
+  // The top-level fields name the emitted key's first request once it has arrived,
+  // and until then the first external request of this process.
+  const replaceTop = !ours || typeof current!['first_at'] !== 'string' || (entry.emitted_key && current!['emitted_key'] !== true);
+  const top = replaceTop
+    ? { first_at: entry.first_at, remote: entry.remote, key_id: keyId ?? keyLabel, auth_type: entry.auth_type, emitted_key: entry.emitted_key }
+    : {};
+  const record = {
+    ...(ours ? current! : {}),
+    ...top,
+    pid: process.pid,
+    process_started_at: PROCESS_STARTED_AT,
+    by_key_id: byKeyId,
+  };
+  await mkdir(path.slice(0, path.lastIndexOf('/')), { recursive: true });
+  const tmp = `${path}.${process.pid}.tmp`;
+  await writeFile(tmp, JSON.stringify(record, null, 2) + '\n', 'utf8');
+  await rename(tmp, path);
+}
+
+function noteAuthenticatedRequest(c: Context, auth: JwtAuthContext, presentedApiKey?: string): void {
+  if (connectedEmittedSeen || connectedFailures >= CONNECTED_MAX_FAILURES) return;
+  try {
+    const remote = remoteAddressOf(c);
+    if (!remote || isLoopbackAddress(remote)) return;
+    const emitted = isEmittedKey(presentedApiKey);
+    const keyLabel = auth.keyId ?? `unidentified:${auth.authType ?? 'unknown'}`;
+    if (!emitted && (connectedKeys.has(keyLabel) || connectedKeys.size >= CONNECTED_MAX_KEYS)) return;
+    connectedKeys.add(keyLabel);
+    if (emitted) connectedEmittedSeen = true;
+    const path = connectedMarkerPath();
+    const entry: ConnectedEntry = {
+      first_at: new Date().toISOString(),
+      remote,
+      key_id: auth.keyId ?? null,
+      auth_type: auth.authType ?? null,
+      emitted_key: emitted,
+    };
+    // Serialised: each write merges into what the previous one left.
+    connectedWrite = connectedWrite
+      .then(() => writeConnectedEntry(path, keyLabel, auth.keyId ?? null, entry))
+      .then(() => {
+        logger.info('Connected marker recorded', { path, remote, keyId: auth.keyId ?? null, emittedKey: emitted });
+      })
+      .catch((error: unknown) => {
+        connectedFailures += 1;
+        // Forget the key so a later request retries it, until the failure budget is spent.
+        connectedKeys.delete(keyLabel);
+        if (emitted) connectedEmittedSeen = false;
+        logger.warn('Connected marker write failed', {
+          path,
+          attempt: connectedFailures,
+          error: (error as Error)?.message ?? String(error),
+        });
+      });
+  } catch (error) {
+    connectedFailures += 1;
+    logger.warn('Connected marker check failed', { attempt: connectedFailures, error: (error as Error)?.message ?? String(error) });
+  }
+}
+
+/** Test hook: reset the per-process state. */
+export function _resetConnectedMarkerForTest(): void {
+  connectedKeys.clear();
+  connectedEmittedSeen = false;
+  connectedFailures = 0;
+  connectedWrite = Promise.resolve();
 }
 
 /**
@@ -331,6 +491,7 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
     }
 
     logger.info('API key authenticated', { orgId: jwtAuth.orgId, authType: jwtAuth.authType });
+    noteAuthenticatedRequest(c, jwtAuth, apiKey);
     await next();
     return;
   }
@@ -381,6 +542,7 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
         };
         c.set('jwtAuth', jwtAuth);
         logger.info('MiniBob simple token authenticated', { orgId: decoded.orgId, instanceId: decoded.instanceId });
+        noteAuthenticatedRequest(c, jwtAuth);
         await next();
         return;
       }
@@ -486,6 +648,7 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
     });
 
     c.set('jwtAuth', jwtAuth);
+    noteAuthenticatedRequest(c, jwtAuth);
 
   } catch (error) {
     const err = error as Error;
