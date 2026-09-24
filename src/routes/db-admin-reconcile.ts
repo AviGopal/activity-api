@@ -37,8 +37,8 @@
  *     unbounded global ORDER BY / GROUP BY.
  */
 
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, readdirSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 import { logger } from '../utils/logger';
 import { config } from '../config';
 import { normalizeRecordId } from '../utils/surrealdb-types';
@@ -122,6 +122,26 @@ export function validateMaintenanceLease(
   leasePath: string,
   token: string | undefined | null,
   now: Date = new Date(),
+): LeaseValidationResult {
+  const primary = validateLeaseFile(leasePath, token, now);
+  if (primary.ok || !token || typeof token !== 'string') return primary;
+  let names: string[] = [];
+  try {
+    names = readdirSync(dirname(leasePath));
+  } catch {
+    return primary;
+  }
+  for (const f of names) {
+    if (!/^maintenance-.+\.json$/.test(f)) continue;
+    const r = validateLeaseFile(join(dirname(leasePath), f), token, now);
+    if (r.ok) return r;
+  }
+  return primary;
+}
+function validateLeaseFile(
+  leasePath: string,
+  token: string | undefined | null,
+  now: Date,
 ): LeaseValidationResult {
   if (!token || typeof token !== 'string') {
     return { ok: false, error: 'reconcile_trace_store: `lease_token` is required' };
