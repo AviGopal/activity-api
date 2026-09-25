@@ -2374,6 +2374,30 @@ app.post('/', async (c) => {
       }, 400);
     }
 
+    // DUPLICATE FIRST (perf-1, 2026-09-25). Trace delivery is at-least-once: the
+    // sink retries after its client timeout while this handler is still working,
+    // and the first attempt commits. Detecting the duplicate only at the
+    // authoritative INSERT meant every redelivery re-ran the writes before it,
+    // some of them not idempotent (a posterior increment, two counters). One
+    // record-id lookup here answers a redelivery in milliseconds with the same
+    // response the outer catch gives. Any lookup error falls through to the
+    // normal path, which still maps "already exists" to the idempotent 200.
+    try {
+      const bareExecId = String(body.execution_id).includes(':')
+        ? String(body.execution_id).split(':').pop()!.replace(/[\u27e8\u27e9`]/g, '')
+        : String(body.execution_id);
+      const seen = await surrealDB.query<{ id: unknown }>(
+        'SELECT id FROM type::thing("execution", $id) LIMIT 1',
+        { id: bareExecId },
+      );
+      if (Array.isArray(seen) && seen.length > 0) {
+        logger.debug('Duplicate trace delivery (early), already stored', { execution_id: bareExecId });
+        return c.json({ success: true, stored: false, duplicate: true }, 200);
+      }
+    } catch {
+      // fall through: the authoritative INSERT still detects the duplicate
+    }
+
     // Selection→outcome join (law 12). Lift the correlation id the walk carries
     // as a `correlation:<id>` tag into body.correlation_id, upstream of BOTH write
     // paths — the INSERT spread below and the UPSERT optionalFields further down
