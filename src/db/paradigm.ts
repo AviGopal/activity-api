@@ -565,7 +565,9 @@ async function getCanonicalPosteriors(
         org_id: orgId.startsWith('organizations:') ? orgId.replace('organizations:', '') : orgId,
         org_id_prefix: orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`,
         account_id: accountId,
-        activity_ids: activityIds,
+        // Stored ids are BARE (credit writes through normalizeActivityId); callers
+        // pass record strings (activity:<...>). Normalize here so the read matches.
+        activity_ids: activityIds.map(normalizeActivityId),
       },
     );
     for (const r of rows ?? []) {
@@ -743,7 +745,8 @@ export async function getActivityScores(
 
     if (activityIds && activityIds.length > 0) {
       query += ` AND variant_id IN $activity_ids`;
-      params.activity_ids = activityIds;
+      // Stored variant_id is BARE; callers pass record strings. Normalize (see getCanonicalPosteriors).
+      params.activity_ids = activityIds.map(normalizeActivityId);
     }
 
     const result = await surrealDB.query<ActivityScore>(query, params);
@@ -1132,7 +1135,8 @@ export async function getShapeConditionedScores(
     const params = {
       org_id: fullOrgId,
       account_id: accountId,
-      activity_ids: activityIds,
+      // v_shape_conditioned_score.activity_id is BARE; normalize caller record strings.
+      activity_ids: activityIds.map(normalizeActivityId),
       signature,
     };
 
