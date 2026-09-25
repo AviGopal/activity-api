@@ -646,32 +646,12 @@ logger.info(`WebSocket endpoint available at ws://localhost:${server.port}/ws`);
 // The startup delay stays at 5 minutes to let the learning-track classifier
 // finish its ~2800-row UPDATE burst before the first REBUILD fires.
 
-const FTS_REBUILD_INTERVAL_MS = parseInt(
-  process.env.FTS_REBUILD_INTERVAL_MS ?? String(30 * 60 * 1000), 10,
-);
-
-// Use the shared rebuild job so the HTTP endpoint and periodic scheduler share
-// the same in-process concurrency guard (prevents partial-rebuild races).
-import('./jobs/fts-rebuild').then(({ rebuildFtsIndexes }) => {
-  // Initial rebuild — delayed 5 min to let the startup classifier cycle finish
-  // (it writes last_classified_at to all activity rows and takes ~30s). If we
-  // rebuild at t=15s the index build races the classifier writes and the scorer
-  // ends up cold until the next periodic cycle.
-  setTimeout(() => {
-    void rebuildFtsIndexes()
-      .then(() => logger.info('[FTS] Initial FTS scorer rebuild complete'))
-      .catch(err => logger.warn('[FTS] Initial FTS scorer rebuild failed', { error: String(err) }));
-  }, 5 * 60 * 1000);
-
-  // Periodic rebuild every FTS_REBUILD_INTERVAL_MS (default 30 min).
-  setInterval(() => {
-    void rebuildFtsIndexes()
-      .then(() => logger.info('[FTS] Periodic FTS scorer rebuild complete'))
-      .catch(err => logger.warn('[FTS] Periodic FTS scorer rebuild failed', { error: String(err) }));
-  }, FTS_REBUILD_INTERVAL_MS);
-}).catch(err => {
-  logger.error('[FTS] Failed to load fts-rebuild job', { error: String(err) });
-});
+// Scheduled FTS rebuilds removed (perf-3, 2026-09-25). SurrealDB 2.3.3 keeps
+// SEARCH indexes current on every write (the F-V45/F-V46 bug the rebuild
+// compensated for was recorded against 3.0.0). Each REBUILD rewrote every
+// ~20 KB activity row; with RocksDB blob GC off that became permanent garbage
+// and, failing on a client-side timeout, saturated the store for minutes.
+// The on-demand HTTP rebuild in jobs/fts-rebuild.ts remains for operators.
 
 // ============================================================================
 // Trace-Retention Sweep
