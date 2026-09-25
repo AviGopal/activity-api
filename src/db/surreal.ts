@@ -375,7 +375,7 @@ export async function queryWithAuth<T = any>(
       config.surrealdb.database,
     );
     try {
-      logger.info('Executing authenticated query (pooled)', {
+      logger.debug('Executing authenticated query (pooled)', {
         sql,
         params,
         namespace: config.surrealdb.namespace,
@@ -392,7 +392,7 @@ export async function queryWithAuth<T = any>(
   // Legacy path: open and close on every query.
   const db = await createAuthenticatedClient(jwtToken);
   try {
-    logger.info('Executing authenticated query', {
+    logger.debug('Executing authenticated query', {
       sql,
       params,
       namespace: config.surrealdb.namespace,
@@ -401,7 +401,7 @@ export async function queryWithAuth<T = any>(
 
     const result = await db.query(sql, params);
 
-    logger.info('Authenticated query result', {
+    logger.debug('Authenticated query result', {
       resultType: typeof result,
       resultIsArray: Array.isArray(result),
       resultLength: Array.isArray(result) ? result.length : 'N/A',
