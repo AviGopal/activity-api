@@ -1,6 +1,54 @@
 import { ParadigmActivity, queryActivitiesByDense, queryActivitiesByFTS, queryActivitiesByShapes } from "../db/paradigm";
 import { logger } from "../utils/logger";
 import { mergeByRRF } from "../utils/rrf";
+import { localEmbeddingService } from "../services/embedding-service";
+
+// Dense relevance over rows already in hand (perf-2, 2026-09-25). The Tier 1
+// blend used to call queryActivitiesByDense, which scores EVERY activity row
+// in SurrealDB (no vector index, full ~20 KB rows read from blob storage) and
+// took 1.7 s idle and up to ~106 s under load, while the similarity maths
+// itself is ~3 ms. Tier 1 rows already carry both embeddings, and the scan
+// added no candidates outside Tier 1 in 107/107 measured blends; it only
+// reorders them. Same score as the SQL: max(0, cos(name), cos(description)),
+// a vector of the wrong dimension counting as -1; embeddings are omitted
+// from the returned rows as the SQL's OMIT did.
+async function denseScoreRows(
+  searchQuery: string,
+  rows: ParadigmActivity[],
+  limit: number,
+): Promise<(ParadigmActivity & { dense_score: number })[]> {
+  if (!localEmbeddingService.isReady()) return [];
+  if (!searchQuery || searchQuery.trim() === '') return [];
+  let q: Float32Array;
+  try {
+    q = await localEmbeddingService.embed(searchQuery.trim());
+  } catch {
+    return [];
+  }
+  const dim = q.length;
+  let qNorm = 0;
+  for (let i = 0; i < dim; i++) qNorm += q[i] * q[i];
+  qNorm = Math.sqrt(qNorm);
+  const cosine = (v: unknown): number => {
+    if (!Array.isArray(v) || v.length !== dim || qNorm === 0) return -1;
+    let dot = 0;
+    let vNorm = 0;
+    for (let i = 0; i < dim; i++) {
+      const x = Number(v[i]);
+      dot += x * q[i];
+      vNorm += x * x;
+    }
+    return vNorm === 0 ? -1 : dot / (Math.sqrt(vNorm) * qNorm);
+  };
+  const scored = rows.map((r) => {
+    const { name_embedding, description_embedding, ...rest } = r as any;
+    const dense_score = Math.max(0, cosine(name_embedding), cosine(description_embedding));
+    return { ...rest, dense_score } as ParadigmActivity & { dense_score: number };
+  });
+  scored.sort((a, b) => b.dense_score - a.dense_score);
+  return scored.slice(0, limit);
+}
+
 
 export /**
  * Tiered fallback result type
@@ -104,7 +152,7 @@ async function getActivitiesWithTieredFallback(
         try {
           const [ftsBlend, denseBlend] = await Promise.all([
             queryActivitiesByFTS(goalDescription, orgId, executionType, limit * 3, jwtToken),
-            queryActivitiesByDense(goalDescription, orgId, executionType, limit * 3, jwtToken),
+            denseScoreRows(goalDescription, tier1Result.data as ParadigmActivity[], limit * 3),
           ]);
           const ftsRows = ftsBlend.data ?? [];
           const blended: ParadigmActivity[] = denseBlend.length > 0
