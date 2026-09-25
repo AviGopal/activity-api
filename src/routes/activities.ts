@@ -931,6 +931,29 @@ app.post('/templates', async (c) => {
     // so different accounts in the same org get distinct α/β rows on register.
     // Caller-without-accountId still lands at the legacy `<variant>` key.
     const metricsRecordIdSlug = variantMetricsRecordId(activityId, accountId);
+
+    // Reconcile Thompson posteriors from execution counters so failures grow beta.
+    // Some paths historically only credited successes (alpha) and ignored failures,
+    // leaving thompson_beta stagnant. This UPDATE derives alpha/beta from the
+    // durable counters on every learning write, so a run with success=false or
+    // reached=false increases beta via failed_executions.
+    try {
+      await surrealDB.query(
+        `LET $id = type::thing('variant_performance_metrics', $slug);
+         UPDATE $id SET
+           thompson_alpha = (IF successful_executions = NONE THEN 0 ELSE successful_executions END) + 1,
+           thompson_beta  = (IF failed_executions     = NONE THEN 0 ELSE failed_executions     END) + 1,
+           updated_at     = time::now()
+         WHERE thompson_alpha != ((IF successful_executions = NONE THEN 0 ELSE successful_executions END) + 1)
+            OR thompson_beta  != ((IF failed_executions     = NONE THEN 0 ELSE failed_executions     END) + 1);`,
+        { slug: metricsRecordIdSlug },
+      );
+    } catch (e) {
+      logger.warn('[learning] Variant performance posterior reconcile failed', {
+        error: (e as Error).message,
+        metrics_record: metricsRecordIdSlug,
+      });
+    }
     const insertMetricsQuery = metricsProjectId
       ? `
       UPSERT variant_performance_metrics:\`${metricsRecordIdSlug}\` SET
