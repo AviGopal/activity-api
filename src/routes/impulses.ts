@@ -1669,7 +1669,7 @@ router.post('/resolve', async (c) => {
         if (!shapeSig) {
           try {
             const sigCountQuery = `
-              SELECT count(DISTINCT shape_signature) AS sigs
+              SELECT array::len(array::distinct((SELECT VALUE shape_signature FROM execution WHERE activity_id = $variant_id ${resolvedScope === 'global' ? '(org_id IS NONE OR org_id = NONE)' : accountIdScopedWhere()})))) AS sigs
               FROM execution
               WHERE activity_id = $variant_id
                 AND ${resolvedScope === 'global' ? '(org_id IS NONE OR org_id = NONE)' : accountIdScopedWhere()}
