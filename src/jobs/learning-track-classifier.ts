@@ -72,6 +72,14 @@ function determineTrack(signals: ClassifierSignals): LearningTrack {
   return 'unclassified'; // ambiguous — straddles threshold gap
 }
 
+// When each template was last classified by THIS process. The cadence guard reads the
+// later of this and the stored last_classified_at, so a classification that changes
+// nothing no longer needs a write to advance it: stamping last_classified_at rewrote the
+// whole ~22 KB activity row for up to 2000 templates per cycle, and with blob GC off each
+// rewrite is permanent garbage (TRACE-STORE-GROWTH-2.md). Empty at process start, so the
+// first cycle after a restart evaluates everything, as before.
+const classifiedAtInProcess = new Map<string, number>();
+
 export async function classifyOneTemplate(activity_id: string): Promise<ClassifyResult> {
   // Fetch current track and declared output shapes from the activity table
   const activityRows = await surrealDB.query<{
@@ -89,8 +97,10 @@ export async function classifyOneTemplate(activity_id: string): Promise<Classify
   const declared_output_shapes_count = activityRow?.output_shapes?.length ?? 0;
 
   // Cadence guard
-  if (activityRow?.last_classified_at) {
-    const age = Date.now() - new Date(activityRow.last_classified_at).getTime();
+  const inProcessAt = classifiedAtInProcess.get(activity_id);
+  if (activityRow?.last_classified_at || inProcessAt !== undefined) {
+    const storedAt = activityRow?.last_classified_at ? new Date(activityRow.last_classified_at).getTime() : 0;
+    const age = Date.now() - Math.max(storedAt, inProcessAt ?? 0);
     if (age < CADENCE_MS) {
       return { from, to: from, signals: { avg_task_count: 0, avg_output_shape_count: 0, declared_output_shapes_count, sample_count: 0 }, skipped: true };
     }
@@ -117,11 +127,8 @@ export async function classifyOneTemplate(activity_id: string): Promise<Classify
   const sample_count = digestRows?.length ?? 0;
 
   if (sample_count < MIN_SAMPLES) {
-    // Not enough data — always update last_classified_at to advance the cadence guard
-    await surrealDB.query(
-      `UPDATE activity SET last_classified_at = time::now() WHERE id = $id`,
-      { id: activity_id }
-    );
+    // Not enough data: advance the cadence in process only (no row rewrite).
+    classifiedAtInProcess.set(activity_id, Date.now());
     return {
       from,
       to: from,
@@ -142,11 +149,15 @@ export async function classifyOneTemplate(activity_id: string): Promise<Classify
 
   const to = determineTrack(signals);
 
-  // Write the new track and advance last_classified_at regardless of transition
-  await surrealDB.query(
-    `UPDATE activity SET learning_track = $track, last_classified_at = time::now() WHERE id = $id`,
-    { id: activity_id, track: to }
-  );
+  // Write only on a transition; an unchanged track rewrote the whole row for nothing.
+  // The cadence advances in process either way.
+  classifiedAtInProcess.set(activity_id, Date.now());
+  if (to !== from) {
+    await surrealDB.query(
+      `UPDATE activity SET learning_track = $track, last_classified_at = time::now() WHERE id = $id`,
+      { id: activity_id, track: to }
+    );
+  }
 
   // Bust the in-process cache so the next write uses the new classification
   bustLearningTrackCache(activity_id);
