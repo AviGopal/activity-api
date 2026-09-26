@@ -113,7 +113,7 @@ export async function getOrFetchValidatedApiKey(
   const now = Date.now();
   const cached = cache.get(apiKey);
   if (cached && cached.expiresAt > now) {
-    logger.info('[auth-cache] hit', {
+    logger.debug('[auth-cache] hit', {
       key_fp: keyFingerprint(apiKey),
       authenticated: cached.value !== null,
       ttl_remaining_ms: cached.expiresAt - now,
