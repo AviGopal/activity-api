@@ -28,6 +28,12 @@ import { getJwtAuthFromContext } from '../middleware/jwtAuth';
 
 const eventsRouter = new Hono();
 
+// PUBLISH COUNTS. Nothing recorded which event types arrive or who sends them, so a flood
+// (~27/s on 2026-09-26, doubled in two hours) could only be attributed by elimination.
+// Counted per `type <- source_vessel_id` and summarised once per >= 60 s of traffic.
+const publishCounts = new Map<string, number>();
+let publishCountsSince = Date.now();
+
 // Dotted namespace form. All lowercase snake_case segments, 2-4 parts:
 //   <domain>.<event>            (e.g. vessel.registered)
 //   <domain>.<noun>.<verb>      (e.g. lifecycle.task.pre_binding)
@@ -64,6 +70,14 @@ eventsRouter.post('/publish', async (c) => {
   const data = (body.data && typeof body.data === 'object') ? body.data as Record<string, unknown> : {};
 
   const ts = Date.now();
+  const countKey = `${type} <- ${sourceVesselId}`;
+  publishCounts.set(countKey, (publishCounts.get(countKey) ?? 0) + 1);
+  if (ts - publishCountsSince >= 60_000) {
+    const top = [...publishCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20);
+    logger.info('[events] publish counts', { window_s: Math.round((ts - publishCountsSince) / 1000), counts: Object.fromEntries(top) });
+    publishCounts.clear();
+    publishCountsSince = ts;
+  }
   const message = {
     type,
     timestamp: new Date(ts).toISOString(),
