@@ -293,7 +293,7 @@ async function _validateApiKeyUncached(apiKey: string): Promise<JwtAuthContext |
     }
 
     // Log which method was used
-    logger.info('API key authenticated', {
+    logger.debug('API key authenticated', {
       method: result.authMethod || 'unknown',
       orgId: result.orgId,
       keyId: result.keyId,
@@ -490,7 +490,7 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
       );
     }
 
-    logger.info('API key authenticated', { orgId: jwtAuth.orgId, authType: jwtAuth.authType });
+    logger.debug('API key authenticated', { orgId: jwtAuth.orgId, authType: jwtAuth.authType });
     noteAuthenticatedRequest(c, jwtAuth, apiKey);
     await next();
     return;
