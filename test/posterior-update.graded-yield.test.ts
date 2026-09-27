@@ -17,10 +17,12 @@ describe('successYield (graded-yield reward)', () => {
     expect(y).toBeGreaterThanOrEqual(0.5);
   });
 
-  it('penalises cost: an expensive success yields less than a free one of equal productivity', () => {
+  // value-per-cost-selection 5.1: P(success) and cost are separate estimates. Cost is tracked
+  // apart from the posterior and divided in at selection, so it must not also discount success.
+  it('does not fold cost into success: an expensive success yields the same as a free one of equal productivity', () => {
     const free = successYield({ cost_usd: 0, tasks: [{ output_impulse_ids: ['a', 'b'] }] });
     const pricey = successYield({ cost_usd: 0.1, tasks: [{ output_impulse_ids: ['a', 'b'] }] });
-    expect(pricey).toBeLessThan(free);
+    expect(pricey).toBeCloseTo(free, 10);
   });
 
   it('never drops below the floor (successes stay well above failures α=0)', () => {
