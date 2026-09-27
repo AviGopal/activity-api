@@ -1361,16 +1361,28 @@ app.get('/templates', async (c) => {
     // recommendation system (Tier 3 fallback).
     const q = c.req.query('q')?.trim() ?? null;
     if (q && q.length > 0) {
-      logger.info('GET /v2/activities/templates — FTS path', { q: q.slice(0, 80), orgId, limit });
+      logger.info('GET /v2/activities/templates — FTS path', { q: q.slice(0, 80), orgId, limit, offset });
+      // THE FTS PATH HONOURS `offset` (value-per-cost-selection 4b.1). It used to fetch `limit`
+      // rows and answer `offset: 0` whatever was asked, so a caller paging until a short page
+      // (boredom fetchShapeDrivenCandidates: up to 20 pages of 100) received page 0 every time:
+      // ~20 identical FTS queries per cycle, and no match past the first 100 was ever seen.
+      // The FTS query has no START clause, so fetch the ranked window up to the end of the
+      // requested page plus one row (to tell whether more exist) and slice it. `total` is the
+      // number of matches fetched: exact on the last page, larger than offset + limit while
+      // more remain. An FTS miss still falls through to the plain listing below, as before; a
+      // hit whose requested page lies past the last match answers an empty page so pagers stop.
       const ftsResult = await queryActivitiesByFTS(
         q,
         orgId,
         executionType as 'template' | 'tool' | 'composition' | 'vessel_function' | null,
-        limit,
+        offset + limit + 1,
         useRbacJwtQuery && jwtAuth?.jwtToken ? jwtAuth.jwtToken : null
       );
-      const ftsTemplates = (ftsResult.data ?? []) as unknown as ActivityTemplate[];
-      if (ftsTemplates.length > 0) return c.json({ templates: ftsTemplates, total: ftsTemplates.length, limit, offset: 0, fts: true });
+      const ftsAll = (ftsResult.data ?? []) as unknown as ActivityTemplate[];
+      if (ftsAll.length > 0) {
+        const ftsTemplates = ftsAll.slice(offset, offset + limit);
+        return c.json({ templates: ftsTemplates, total: ftsAll.length, limit, offset, fts: true });
+      }
     }
 
     logger.info('GET /v2/activities/templates', {
