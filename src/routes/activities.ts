@@ -1401,8 +1401,35 @@ app.get('/templates', async (c) => {
     // Paginated requests (offset > 0) bypass the cache because the cache
     // holds only the top window populated on a previous limit*2 prefetch — it
     // can't satisfy mid-page slices and would silently truncate operator audits.
+    // IN-PROCESS CATALOGUE (value-per-cost-selection 4b.2): for the application-filtered path,
+    // serve this slice from the cached full enriched catalogue of this visibility key instead of
+    // a DB page (see utils/template-cache.ts). The slice matches the DB fetch below (`limit`
+    // rows at `offset` when paginating, else the limit*2 prefetch) and the total is the same
+    // count query's result, so everything after this point behaves as on a DB page. RBAC-JWT
+    // queries are not cached: their rows depend on $auth. A disabled cache, a failed load or a
+    // catalogue at the row cap leaves catalogueRows null and takes the DB path unchanged.
+    let catalogueRows: ActivityTemplate[] | null = null;
+    let catalogueTotal: number | null = null;
+    if (!useRbacJwtQuery) {
+      const { getTemplateCatalogue, templateCatalogueKey, TEMPLATE_CATALOGUE_MAX_ROWS } = await import('../utils/template-cache');
+      const accountId = jwtAuth?.accountId ?? null;
+      const catalogue = await getTemplateCatalogue<ActivityTemplate>(
+        templateCatalogueKey({ orgId, projectId, accountId, scope: scopeFilter, executionType }),
+        async () => {
+          const [rows, count] = await Promise.all([
+            listAllTemplatesFromDB(TEMPLATE_CATALOGUE_MAX_ROWS, orgId, projectId, null, scopeFilter, executionType, 0, accountId),
+            countAllTemplatesFromDB(orgId, projectId, null, scopeFilter, executionType, accountId),
+          ]);
+          return { templates: rows, total: count };
+        },
+      );
+      if (catalogue && catalogue.templates.length < TEMPLATE_CATALOGUE_MAX_ROWS) {
+        catalogueRows = catalogue.templates.slice(offset, offset + (paginating ? limit : limit * 2));
+        catalogueTotal = catalogue.total;
+      }
+    }
     const redis = RedisClient.getInstance();
-    const templateIdsSet = paginating ? [] : await redis.smembers(CACHE_LIST_KEY);
+    const templateIdsSet = paginating || catalogueRows ? [] : await redis.smembers(CACHE_LIST_KEY);
 
     let templates: ActivityTemplate[] = [];
     let cacheHit = false;
@@ -1439,7 +1466,9 @@ app.get('/templates', async (c) => {
       }
     }
 
-    if (!cacheHit) {
+    if (catalogueRows) {
+      templates = catalogueRows;
+    } else if (!cacheHit) {
       // CACHE MISS - Load from SurrealDB with distributed lock (cache stampede prevention)
       logger.info('Template list cache miss, loading from SurrealDB');
       
@@ -1560,16 +1589,19 @@ app.get('/templates', async (c) => {
       rbacEnforced: useRbacJwtQuery,
     });
 
-    // Enrich templates with execution metrics
-    templates = await enrichTemplatesWithMetrics(templates);
+    // Enrich templates with execution metrics (catalogue rows were enriched when it was loaded)
+    if (!catalogueRows) templates = await enrichTemplatesWithMetrics(templates);
     logger.debug('Template enrichment point reached', { count: templates.length });
     logger.info('Templates enriched with metrics', { templatesWithMetrics: templates.filter(t => t.metrics).length });
 
     // Query a real total count (respects same RBAC + scope/exec-type filter
     // as the list query) so paginating callers know when they've walked the full
     // visible set. category is filtered application-side; reflect that in total.
+    // A catalogue slice carries the count taken when the catalogue was loaded.
     let total: number;
-    try {
+    if (catalogueTotal !== null) {
+      total = catalogueTotal;
+    } else try {
       total = await countAllTemplatesFromDB(
         orgId,
         projectId,
@@ -3630,6 +3662,9 @@ app.post('/templates/retire-malformed', async (c) => {
         } catch { /* one failed row must not abort the sweep; the rest are still worth retiring */ }
       }
     }
+    // Retirement changes every listing that showed these rows: drop the Redis list and the
+    // in-process catalogue (value-per-cost-selection 4b.2) like the other template mutators do.
+    if (retired > 0) await invalidateTemplateCacheMany(offenders.map((o) => String(o.id)));
     console.log(`[retire-malformed] scanned=${list.length} offenders=${offenders.length} retired=${retired} dry_run=${dry_run}`);
     return c.json({ scanned: list.length, offenders, retired, dry_run });
   } catch (error) {
