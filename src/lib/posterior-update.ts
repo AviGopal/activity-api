@@ -340,7 +340,12 @@ export function successYield(
   const tasks = trace.tasks ?? [];
   const outputs = tasks.reduce((sum, t) => sum + (t.output_impulse_ids?.length ?? 0), 0);
   const productivity = Math.min(1, outputs / refs.prodRef);
-  const quality = 0.5 * costScore + 0.5 * productivity;
+  // COST IS NOT SUCCESS (value-per-cost-selection 5.1). Selection divides a success-only P(value)
+  // by a separately tracked E[cost]; folding cost in here as well would count it twice and make
+  // one number of two. Before phase 1 every cost_usd was 0 (costScore 1), so this restores that
+  // behaviour exactly for cost-free rows and stops discounting costed successes.
+  void costScore;
+  const quality = 0.5 + 0.5 * productivity;
   const y = refs.floor + (1 - refs.floor) * quality;
   return Math.max(refs.floor, Math.min(1, y));
 }
