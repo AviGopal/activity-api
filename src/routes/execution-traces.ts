@@ -1056,8 +1056,19 @@ app.get('/', async (c) => {
         (metadata.task_count ?? 0) AS task_count`;
     const query = `
       SELECT${selectFields}
-      FROM v_paradigm_execution_traces
-      ${whereClause}
+      -- Read execution directly: the v_paradigm_execution_traces view froze or vanished (09-22..09-28),
+      -- so the listing and every detector reading it saw no new traces. Fields the view derived are computed here.
+      FROM (
+        SELECT id, meta::id(id) AS execution_id, activity_id, org_id, account_id, success, error,
+          executed_at, duration_ms, cost_usd, parent_execution_id, composition_chain, vessel_id,
+          vessel_version, failure_mode, metadata, tags, output_impulse_shapes, input_impulse_shapes,
+          (variant_id ?? activity_id) AS variant_id,
+          (status ?? (IF success = true { 'success' } ELSE { 'failure' })) AS status,
+          error.message AS error_message,
+          error.task_id AS failed_task_id
+        FROM execution
+        ${whereClause}
+      )
       ORDER BY executed_at DESC
       LIMIT $limit
       START $offset
@@ -1156,7 +1167,7 @@ app.get('/', async (c) => {
     // currently forces on every caller.
     countResult = [{ total: -1 }];
     if (c.req.query('include_total') === 'true') {
-      const countQuery = `SELECT count() AS total FROM v_paradigm_execution_traces ${whereClause} GROUP ALL`;
+      const countQuery = `SELECT count() AS total FROM execution ${whereClause} GROUP ALL`;
       try {
         const countRows = (useJwtAuth && jwtAuth?.jwtToken && jwtAuth.authType !== 'apikey')
           ? await queryWithAuth<{ total: number }>(jwtAuth.jwtToken, countQuery, params)
