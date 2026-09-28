@@ -72,7 +72,13 @@ describe('lookupEmbeddingForSignature', () => {
   it('returns null without fetching when CONCEPT_DB_URL is unset', async () => {
     delete process.env.CONCEPT_DB_URL;
     let fetched = 0;
-    globalThis.fetch = mock(async () => {
+    // With the override unset the endpoint comes from discovery (how the live service runs). Discovery
+    // answers "no concept-db vessel"; only a concept-db fetch counts, which is what "without fetching" means.
+    globalThis.fetch = mock(async (input: unknown) => {
+      const url = typeof input === 'string' ? input : input instanceof Request ? input.url : String(input);
+      if (url.endsWith('/resolve')) {
+        return new Response(JSON.stringify({ content: { found: false, vessels: [] } }), { status: 200 });
+      }
       fetched += 1;
       return new Response('{}', { status: 200 });
     }) as unknown as typeof fetch;
