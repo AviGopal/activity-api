@@ -4,11 +4,14 @@
 -- zero traces since ~2026-09-22 07:01, the last gap the failure-pattern reporter filed. Same definition as 167
 -- except tokens_total: 167 added tokens_in + tokens_out, which fails the whole DEFINE with "Cannot perform
 -- addition with NONE and NONE" once any execution row lacks those fields, so a re-define could not succeed.
+-- IF NOT EXISTS, never REMOVE: defining this view over ~150k rows exceeds init-database's 45s per-migration
+-- budget, so it is built OUT OF BAND once (by running this file with a long client timeout); on the next
+-- start this migration is then an instant no-op and gets recorded. A REMOVE here would delete the
+-- out-of-band view on every start and time out rebuilding it, which is how it can vanish.
 
 
-REMOVE TABLE IF EXISTS v_paradigm_execution_traces;
 
-DEFINE TABLE v_paradigm_execution_traces TYPE ANY SCHEMALESS AS
+DEFINE TABLE IF NOT EXISTS v_paradigm_execution_traces TYPE ANY SCHEMALESS AS
   SELECT
     meta::id(id) AS execution_id,
     activity_id,
@@ -53,9 +56,9 @@ DEFINE TABLE v_paradigm_execution_traces TYPE ANY SCHEMALESS AS
     created_at AS updated_at
   FROM execution;
 
-DEFINE INDEX idx_vpet_execution_id ON v_paradigm_execution_traces FIELDS execution_id;
-DEFINE INDEX idx_vpet_org_time ON v_paradigm_execution_traces FIELDS org_id, executed_at;
-DEFINE INDEX idx_vpet_variant_exec ON v_paradigm_execution_traces FIELDS variant_id, executed_at;
-DEFINE INDEX idx_vpet_variant_time ON v_paradigm_execution_traces FIELDS variant_id, created_at;
+DEFINE INDEX IF NOT EXISTS idx_vpet_execution_id ON v_paradigm_execution_traces FIELDS execution_id;
+DEFINE INDEX IF NOT EXISTS idx_vpet_org_time ON v_paradigm_execution_traces FIELDS org_id, executed_at;
+DEFINE INDEX IF NOT EXISTS idx_vpet_variant_exec ON v_paradigm_execution_traces FIELDS variant_id, executed_at;
+DEFINE INDEX IF NOT EXISTS idx_vpet_variant_time ON v_paradigm_execution_traces FIELDS variant_id, created_at;
 
 DEFINE INDEX IF NOT EXISTS idx_vpet_executed_at ON v_paradigm_execution_traces FIELDS executed_at;
