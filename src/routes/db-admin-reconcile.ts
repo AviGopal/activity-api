@@ -123,8 +123,9 @@ export function validateMaintenanceLease(
   token: string | undefined | null,
   now: Date = new Date(),
 ): LeaseValidationResult {
-  const primary = validateLeaseFile(leasePath, token, now);
-  if (primary.ok || !token || typeof token !== 'string') return primary;
+  let primary = validateLeaseFile(leasePath, token, now);
+  if (primary.ok) return primary;
+  if (!token || typeof token !== 'string') return primary;
   let names: string[] = [];
   try {
     names = readdirSync(dirname(leasePath));
