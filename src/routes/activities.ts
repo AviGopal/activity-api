@@ -1818,7 +1818,11 @@ app.get('/templates/proposed-for-exercise', async (c) => {
           && successRate !== null && successRate < PROMOTE_SUCCESS_RATE;
 
         seenClasses.add(gap_class);
-        if (failedOut) continue;
+        if (failedOut) {
+          // This executes caching logic that had been defined but not invoked.
+          await invalidateTemplateCache(norm);
+          continue;
+        }
 
         const resolvers: string[] = Array.isArray(row?.tasks)
           ? row.tasks
