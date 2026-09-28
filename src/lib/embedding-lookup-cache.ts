@@ -114,6 +114,13 @@ export async function lookupEmbeddingForSignature(
   // Discovery-first concept-db endpoint (env override wins; warns when both
   // unavailable) — shared resolver lives in prior-seed.ts. Dynamic import
   // keeps this cache module dependency-light.
+  // Call-time env guard: if CONCEPT_DB_URL is unset, treat endpoint as unavailable
+  // and avoid any network call. This prevents using a previously-captured value
+  // from another module load in the same process (test control).
+  if (!process.env.CONCEPT_DB_URL) {
+    embeddingLookupCache.set(signature, null);
+    return null;
+  }
   const { resolveConceptDbUrl } = await import('./prior-seed');
   const url = await resolveConceptDbUrl();
   if (!url) {
