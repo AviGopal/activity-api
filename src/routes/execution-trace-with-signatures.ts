@@ -506,16 +506,21 @@ async function queryExecutions(
   `;
 
   let paradigmRows: RawExecutionRow[] = [];
-  // Skip the paradigm `execution`-table query for execution_id point-lookups: that
-  // table keys on the record `id`, not an `execution_id` field, so the filter
-  // can't use an index and scans the whole table (~26s — the silent task[0]
-  // timeout). Substrate traces (TranslatingTraceSink) live in the legacy
-  // activity_execution_traces table, which IS indexed on execution_id and served
-  // the raw row in 0.24s. So for a specific execution, the fast legacy query below
-  // is sufficient.
-  if (!input.execution_id) {
+  // POINT LOOKUP ON THE LIVE TABLE (2026-09-29). This query used to be skipped for an execution_id:
+  // filtering on an `execution_id` field scanned the table (~26s), and traces then lived in the
+  // legacy activity_execution_traces table. That table's newest row is 2026-07-14, so the legacy-only
+  // lookup returned 0 for every current trace and ribosome-extract never had input. The live table
+  // keys rows by record id = execution id, so match the RECORD ID (a key lookup, not a scan) under the
+  // same tenant clause; the legacy view below remains the fallback for old ids.
+  const pointIdSql = `
+    SELECT id, executed_at
+    FROM execution
+    WHERE ${[...where.filter((w) => !w.startsWith('execution_id')), 'id = type::thing("execution", $executionId)'].join(' AND ')}
+    LIMIT 1
+  `;
+  {
     try {
-      const idResult = await db.query(idSql, params);
+      const idResult = await db.query(input.execution_id ? pointIdSql : idSql, params);
       const idSet = Array.isArray(idResult) && idResult.length > 0 ? idResult[0] : [];
       const ids = (Array.isArray(idSet) ? (idSet as RawExecutionRow[]) : [])
         .map((r) => r.id)
