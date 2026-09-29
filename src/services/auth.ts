@@ -133,7 +133,7 @@ export async function validateJwtToken(token: string): Promise<ValidatedToken> {
     const errorMessage = error instanceof Error ? error.message : String(error);
 
     // Handle specific jose errors
-    if (errorMessage.includes('expired')) {
+    if (error instanceof jose.errors.JWTExpired || (error instanceof Error && 'code' in error && error.code === 'ERR_JWT_EXPIRED')) {
       return {
         valid: false,
         error: 'Token expired',
