@@ -512,12 +512,23 @@ async function queryExecutions(
   // lookup returned 0 for every current trace and ribosome-extract never had input. The live table
   // keys rows by record id = execution id, so match the RECORD ID (a key lookup, not a scan) under the
   // same tenant clause; the legacy view below remains the fallback for old ids.
+  // Read FROM the record: on SurrealDB 2.3.3 `WHERE id = type::thing(...)` plus the tenant clause loses
+  // the point plan and scans the table (7.8-11.4 s, over the ribosome's 8 s fetch timeout; qa 09-29).
+  // Selecting from the record reads that one row and still applies the tenant filter (0.16 ms).
+  const pointWhere = where.filter((w) => !w.startsWith('execution_id'));
   const pointIdSql = `
     SELECT id, executed_at
-    FROM execution
-    WHERE ${[...where.filter((w) => !w.startsWith('execution_id')), 'id = type::thing("execution", $executionId)'].join(' AND ')}
+    FROM type::thing("execution", $executionPointId)
+    ${pointWhere.length > 0 ? `WHERE ${pointWhere.join(' AND ')}` : ''}
     LIMIT 1
   `;
+  if (input.execution_id) {
+    // Accept bare and record forms: execution:⟨id⟩, activity_execution_traces:id, or id.
+    params.executionPointId = String(input.execution_id)
+      .replace(/^(activity_execution_traces|execution):/, '')
+      .replace(/^⟨/, '')
+      .replace(/⟩$/, '');
+  }
   {
     try {
       const idResult = await db.query(input.execution_id ? pointIdSql : idSql, params);
