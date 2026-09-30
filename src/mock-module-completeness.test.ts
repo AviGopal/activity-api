@@ -235,11 +235,7 @@ describe("mock.module factories must not amputate a module's exports", () => {
 
     // The failure message IS the fix instruction — it names the file, the module and the
     // exact missing exports, which a bare count would not.
-    expect(added).toEqual([
-      "src/lib/tuning-params.test.ts mocks '../db/surreal' but omits: getDbStats, createAuthenticatedClient, queryWithAuth, dbStats",
-      "src/middleware/jwtAuth.connected-marker.test.ts mocks '../db/surreal' but omits: getDbStats, queryWithAuth, dbStats, surrealDB",
-      "src/middleware/jwtAuth.connected-marker.test.ts mocks '../services/auth' but omits: isTransientIdentityFailure, validateJwtToken, validateApiKeyViaIdentityVessel"
-    ]);
+    expect(added).toEqual([]);
   });
 
   it("records the debt honestly rather than hiding it", () => {
