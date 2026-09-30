@@ -413,7 +413,7 @@ export async function validateApiKeyWithFallback(
   }
 
   // Check if identity-vessel returned a specific error (vs network failure)
-  const isNetworkError = isTransientIdentityFailure(identityResult.reason);
+  const isNetworkError = identityResult.transient === true || isTransientIdentityFailure(identityResult.reason);
 
   if (isNetworkError) {
     // Try discovery-vessel to find identity-vessel
@@ -436,6 +436,7 @@ export async function validateApiKeyWithFallback(
     return {
       authenticated: false,
       reason: 'Authentication service unavailable',
+      transient: true,
     };
   }
 
