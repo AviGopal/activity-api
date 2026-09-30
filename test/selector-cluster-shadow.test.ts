@@ -120,7 +120,7 @@ function makeDb(opts: {
       if (sql.includes('signature_cluster_assignment')) {
         return opts.assignment ? ([opts.assignment] as any) : ([] as any);
       }
-      if (sql.includes("type::record('context_thompson_scores'")) {
+      if (sql.includes("type::thing('context_thompson_scores'")) {
         // Only return the cluster row if the slug matches the expected cluster row.
         if (opts.expectedSlug && params.slug !== opts.expectedSlug) return [] as any;
         return opts.clusterPosterior ? ([opts.clusterPosterior] as any) : ([] as any);
