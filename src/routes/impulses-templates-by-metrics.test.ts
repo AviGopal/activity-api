@@ -394,7 +394,7 @@ describe('activityTemplatesByMetrics handles mixed string + RecordId variant_id'
     });
 
     // Polymorphic guards present.
-    expect(capturedTemplateSql).toContain('type::is_record(variant_id)');
+    expect(capturedTemplateSql).toContain('type::is::record(variant_id)');
     expect(capturedTemplateSql).toContain('type::is_string(variant_id)');
     // `meta::id` only runs after the record-type guard.
     expect(capturedTemplateSql).toMatch(
