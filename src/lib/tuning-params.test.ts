@@ -40,6 +40,14 @@ mock.module('../db/surreal', () => ({
       return [];
     },
   },
+  // Stubs to satisfy mock-module-completeness.test.ts
+  getDbStats: async () => ({}),
+  createAuthenticatedClient: async () => ({
+    query: async () => [],
+    close: () => {},
+  }),
+  queryWithAuth: async () => [],
+  dbStats: async () => ({}),
 }));
 
 const { writeTuningParam, __clearTuningParamCache } = await import('./tuning-params');
