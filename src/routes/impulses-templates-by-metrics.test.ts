@@ -85,6 +85,8 @@ mock.module('../db/surreal', () => ({
         return metricsRows;
       }
       if (sql.includes('activity_template')) {
+        // Verify SQL uses correct type::is::record spelling (SurrealDB 2.3.3)
+        expect(sql).toContain('type::is::record(variant_id)');
         return templateRows;
       }
       // Defensive fallback for any other queries the resolver issues
