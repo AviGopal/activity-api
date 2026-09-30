@@ -397,14 +397,14 @@ describe('activityTemplatesByMetrics handles mixed string + RecordId variant_id'
 
     // Polymorphic guards present.
     expect(capturedTemplateSql).toContain('type::is::record(variant_id)');
-    expect(capturedTemplateSql).toContain('type::is_string(variant_id)');
+    expect(capturedTemplateSql).toContain('type::is::string(variant_id)');
     // `meta::id` only runs after the record-type guard.
     expect(capturedTemplateSql).toMatch(
-      /type::is_record\(variant_id\)\s+AND\s+meta::id\(variant_id\)\s+IN\s+\$variant_ids/
+      /type::is::record\(variant_id\)\s+AND\s+meta::id\(variant_id\)\s+IN\s+\$variant_ids/
     );
     // Plain string equality branch present for the schemafull case.
     expect(capturedTemplateSql).toMatch(
-      /type::is_string\(variant_id\)\s+AND\s+variant_id\s+IN\s+\$variant_ids/
+      /type::is::string\(variant_id\)\s+AND\s+variant_id\s+IN\s+\$variant_ids/
     );
   });
 });
