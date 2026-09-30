@@ -167,7 +167,7 @@ describe('selector partial-pooling — (a) cold leaf falls back to cluster poste
     expect(decision.beta).toBe(clusterPosterior.beta);
     // The cluster posterior was actually consulted (both queries ran).
     expect(calls.some((s) => s.includes('signature_cluster_assignment'))).toBe(true);
-    expect(calls.some((s) => s.includes("type::record('context_thompson_scores'"))).toBe(true);
+    expect(calls.some((s) => s.includes("type::thing('context_thompson_scores'"))).toBe(true);
   });
 
   test('cold leaf with NO cluster row -> used_scope=fallback (Beta(1,1))', async () => {
