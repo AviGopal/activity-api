@@ -38,6 +38,18 @@ describe('trace-list default window', () => {
     expect(s).toContain('executed_at >= type::datetime($start_date)');
   });
 
+  it('no executed_at lower bound in CODE uses the <datetime> cast (the index stays usable)', () => {
+    // `executed_at >= <datetime> $start_date` makes SurrealDB 2.3.3 skip idx_execution_executed_at
+    // (EXPLAIN: Iterate Table + "Fallback: Unsupported value"); `type::datetime($start_date)` uses it.
+    // Measured on node 1 2026-09-29: the default-window list took ~4 s at p50 on the cast. BOTH the
+    // explicit start_date branch and the default window must drop it; the substring check above is
+    // satisfied by either one alone, or by a comment. Comment lines are stripped here, so neither
+    // a partial fix nor a comment can pass.
+    const code = source().split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    expect(code).not.toMatch(/executed_at\s*>=\s*<datetime>/);
+    expect(code).toContain('executed_at >= type::datetime($start_date)');
+  });
+
   it('THE REGRESSION: the window is hours, not a 30-day calendar span', () => {
     const s = source();
     // The old form. A month-scale default cannot bound a table whose whole history is 25 days.
