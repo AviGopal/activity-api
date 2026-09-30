@@ -113,7 +113,7 @@ describe('applyClusterPosterior — cluster row write on known cluster', () => {
     const expectedSlug = clusterRowSlug(ORG, TEMPLATE, SIG_VER, 'sigcl_abc');
     // The UPSERT addresses the row by the deterministic slug via type::record(...).
     expect(upsert.params.slug).toBe(expectedSlug);
-    expect(upsert.sql).toContain("type::record('context_thompson_scores', $slug)");
+    expect(upsert.sql).toContain("type::thing('context_thompson_scores', $slug)");
     // UPSERT-by-id: a single create-or-update statement, NOT SELECT then CREATE.
     expect(upsert.sql).toContain('UPSERT');
     expect(upsert.sql).not.toContain('SELECT');
