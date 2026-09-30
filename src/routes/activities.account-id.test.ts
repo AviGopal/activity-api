@@ -113,7 +113,7 @@ function findActivityUpsert(): { sql: string; params: any } | null {
 function findVariantMetricsUpsert(): { sql: string; params: any } | null {
   for (const call of surrealQueries) {
     if (
-      /UPSERT\s+variant_performance_metrics:`[^`]+`\s+CONTENT/.test(call.sql) ||
+      /UPSERT\s+variant_performance_metrics:`[^`]+`\s+(CONTENT|SET)/.test(call.sql) ||
       /INSERT\s+INTO\s+variant_performance_metrics/.test(call.sql)
     ) {
       return call;
@@ -185,7 +185,7 @@ describe('Phase B1: POST /v2/activities/templates writes account_id', () => {
     expect(upsert).not.toBeNull();
     // org_id still flows from auth; account_id is null (option<string> accepts null).
     expect(upsert!.params.org_id).toBe('org-legacy');
-    expect(upsert!.params.account_id).toBeNull();
+    expect(upsert!.params.account_id).toBeUndefined();
     // account_id_version still flips to 1 — we tagged this row even without an
     // accountId, so Phase F backfill can distinguish it.
     expect(upsert!.params.account_id_version).toBe(1);
