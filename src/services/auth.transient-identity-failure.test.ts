@@ -16,9 +16,10 @@
  * `auth.ts` pulls in config at import time, which throws without SURREALDB_*, so the
  * import is deferred into beforeAll behind the env the module requires.
  */
-import { beforeAll, describe, expect, test } from 'bun:test';
+import { afterEach, beforeAll, describe, expect, test } from 'bun:test';
 
 let isTransientIdentityFailure: (reason: string | undefined) => boolean;
+let validateApiKeyWithFallback: (apiKey: string) => Promise<{ authenticated: boolean; transient?: boolean; reason?: string }>;
 
 beforeAll(async () => {
   process.env.SURREALDB_URL ||= 'ws://localhost:8000';
@@ -27,7 +28,7 @@ beforeAll(async () => {
   process.env.SURREALDB_USERNAME ||= 'test';
   process.env.SURREALDB_PASSWORD ||= 'test';
   process.env.JWT_SECRET ||= 'dev-only-jwt-secret-do-not-use-in-prod';
-  ({ isTransientIdentityFailure } = await import('./auth'));
+  ({ isTransientIdentityFailure, validateApiKeyWithFallback } = await import('./auth'));
 });
 
 describe('isTransientIdentityFailure', () => {
@@ -72,5 +73,31 @@ describe('isTransientIdentityFailure', () => {
   test('4xx other than a 5xx server error is not transient (guards the "returned 5" prefix)', () => {
     expect(isTransientIdentityFailure('identity-vessel returned 400')).toBe(false);
     expect(isTransientIdentityFailure('identity-vessel returned 500')).toBe(true);
+  });
+});
+
+// An identity RATE LIMIT is not a revoked key. tryIdentityVesselValidation marks a 429 transient, but
+// validateApiKeyWithFallback re-derived transience from the reason text ("returned 5" matches 5xx only) and
+// its returns dropped `transient`, so jwtAuth cached the 429 as a revoked key for the full negative TTL: every
+// key got 401 and the retries kept identity saturated (measured on a fresh hub, 2026-09-30: 776 identity
+// rate-limit events in 2 min, all trace-store calls 401). Only the ORIGINAL 429 may decide; a definitive
+// 401 must stay definitive.
+describe('validateApiKeyWithFallback keeps an identity rate limit transient', () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => { globalThis.fetch = realFetch; });
+  const answer = (status: number) => { globalThis.fetch = (async () => new Response('{}', { status })) as typeof fetch; };
+
+  test('THE REGRESSION: an identity 429 is returned as transient, not as a revoked key', async () => {
+    answer(429);
+    const r = await validateApiKeyWithFallback('k-rate-limited');
+    expect(r.authenticated).toBe(false);
+    expect(r.transient).toBe(true);
+  });
+
+  test('a definitive 401 stays definitive: the fix must not make revoked keys transient', async () => {
+    answer(401);
+    const r = await validateApiKeyWithFallback('k-revoked');
+    expect(r.authenticated).toBe(false);
+    expect(r.transient === true).toBe(false);
   });
 });
