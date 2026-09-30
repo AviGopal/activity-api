@@ -107,7 +107,7 @@ beforeEach(() => {
 function findMetricsUpsert(): { sql: string; params: any } | null {
   for (const call of surrealQueries) {
     if (
-      /UPSERT\s+variant_performance_metrics:`[^`]+`\s+CONTENT/.test(call.sql) ||
+      /UPSERT\s+variant_performance_metrics:`[^`]+`\s+(CONTENT|SET)/.test(call.sql) ||
       /INSERT\s+INTO\s+variant_performance_metrics/.test(call.sql)
     ) {
       return call;
@@ -211,7 +211,7 @@ describe('Phase E: POST /v2/activities/templates UPSERT lands at account-keyed s
     expect(upsert!.sql).toContain(expectedSlug);
     // Legacy slug has no double-underscore separator.
     expect(expectedSlug.includes('__')).toBe(false);
-    expect(upsert!.params.account_id).toBeNull();
+    expect(upsert!.params.account_id).toBeUndefined();
   });
 
   test('two accounts in the same org register the same template → distinct UPSERT slugs', async () => {
