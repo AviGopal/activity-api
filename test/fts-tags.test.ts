@@ -39,7 +39,8 @@ const ID_AUTH_GENERAL  = `${PREFIX}auth_general`;   // tags: ["auth"]
 const ID_BUGFIX_ONLY   = `${PREFIX}bugfix_only`;    // tags: ["bugfix"]
 const ID_UNRELATED     = `${PREFIX}unrelated`;      // tags: ["documentation"]
 
-const ALL_IDS = [ID_AUTH_SPECIFIC, ID_AUTH_GENERAL, ID_BUGFIX_ONLY, ID_UNRELATED];
+const ID_FIXTURE_TEMPLATE_IN_LIVE_STORE = `${PREFIX}fixture_template_in_live_store`;  // tags: ["template", "live_store"]
+const ALL_IDS = [ID_AUTH_SPECIFIC, ID_AUTH_GENERAL, ID_BUGFIX_ONLY, ID_UNRELATED, ID_FIXTURE_TEMPLATE_IN_LIVE_STORE];
 
 function headers(): Record<string, string> {
   return {
