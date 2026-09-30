@@ -47,7 +47,11 @@ describe('trace-list default window', () => {
     // a partial fix nor a comment can pass.
     const code = source().split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
     expect(code).not.toMatch(/executed_at\s*>=\s*<datetime>/);
-    expect(code).toContain('executed_at >= type::datetime($start_date)');
+    // Each branch keeps its OWN typed lower bound. The two pushes are byte-identical, so deleting
+    // one and fixing the other would satisfy a file-wide check, and deleting the default-window
+    // bound is the 2026-08-18 outage this file documents (every default list request unbounded).
+    expect(code).toMatch(/if \(startDate\) \{\s*whereConditions\.push\('executed_at >= type::datetime\(\$start_date\)'\);/);
+    expect(code).toMatch(/const windowStart = [^\n]*\n\s*whereConditions\.push\('executed_at >= type::datetime\(\$start_date\)'\);/);
   });
 
   it('THE REGRESSION: the window is hours, not a 30-day calendar span', () => {
