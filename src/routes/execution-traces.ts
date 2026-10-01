@@ -5200,11 +5200,17 @@ app.post('/reach', async (c) => {
     // (2026-07): `execution` is the sole authoritative trace store"). DUAL_WRITE_ENABLED
     // is set in no script, unit or compose file, so on this deployment AET receives no
     // new rows at all and a pre-read there would find nothing, forever.
+    // KEYED BY RECORD ID ALONE (2026-10-01). This read carried `WHERE activity_id = $activity_id`
+    // while binding only $execution_id (introduced 2026-09-11), so $activity_id was NONE, the read
+    // matched nothing, and every late verdict since was persisted but NEVER graded — node 1 showed 0
+    // of 149,928 executions stamped reach_graded:true after 2026-09-12. The record id is unique, so
+    // the filter added nothing but the bug. A caller that names an activity is checked AFTER the
+    // read (below) instead, where a mismatch is refused loudly rather than matching nothing.
     let preRow: any = null;
     let preReadOk = false;
     try {
       const preRes = await surrealDB.query<any>(
-        `SELECT variant_id, activity_id, success, tags, cost_usd, org_id, signature, signature_version, composition_chain, failure_mode, resolver_tier, trace.tasks AS tasks FROM type::thing('execution', $execution_id) WHERE activity_id = $activity_id LIMIT 1`,
+        `SELECT variant_id, activity_id, success, tags, cost_usd, org_id, signature, signature_version, composition_chain, failure_mode, resolver_tier, trace.tasks AS tasks FROM type::thing('execution', $execution_id)`,
         { execution_id: String(execId) },
       );
       preRow = Array.isArray(preRes) && preRes.length > 0
@@ -5216,6 +5222,29 @@ app.post('/reach', async (c) => {
       // (possibly double-counting) posterior write. The verdict patch itself still
       // proceeds — persisting it is the caller's contract.
       logger.warn('[reach-patch] pre-read for posterior grading failed (verdict still patched)', { error: e instanceof Error ? e.message : String(e) });
+    }
+    // A caller that names the activity must name THIS execution's activity. A mismatch means the
+    // verdict is about a different execution than the id says — refuse it whole (no grading, no
+    // verdict mirror) and say so, rather than crediting or tagging the wrong arm.
+    if (preReadOk && preRow && body.activity_id != null) {
+      const claimed = normalizeActivityId(String(body.activity_id));
+      const actual = [preRow.activity_id, preRow.variant_id]
+        .filter((v: unknown): v is string => typeof v === 'string')
+        .map((v: string) => normalizeActivityId(v));
+      if (!actual.includes(claimed)) {
+        logger.warn('[reach-patch] activity_id MISMATCH — verdict refused', {
+          execution_id: String(execId),
+          claimed_activity_id: String(body.activity_id),
+          actual_activity_id: preRow.activity_id ?? null,
+          actual_variant_id: preRow.variant_id ?? null,
+        });
+        return c.json({
+          success: false,
+          error: 'activity_id does not match the execution',
+          execution_id: String(execId),
+          updated: 0,
+        }, 409);
+      }
     }
     const preTags: string[] = Array.isArray(preRow?.tags) ? (preRow.tags as string[]) : [];
     // AET WRITE IS GATED ON THE DUAL-WRITE SWITCH THAT ALREADY GOVERNS IT — this is
