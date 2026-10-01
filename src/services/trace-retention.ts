@@ -420,317 +420,256 @@ export async function rollupReachHistory(): Promise<{ scanned: number; weeks: nu
  */
 let sweepInFlight = false;
 
-export async function runTraceRetentionSweep(
-  cfg: TraceRetentionConfig = loadTraceRetentionConfig(),
-): Promise<{
-  results: StratumResult[];
-  durationMs: number;
-  orphanReaped: number;
-  skipped?: true;
-  skippedReason?: 'in_flight' | 'fts_rebuilding';
-}> {
-  if (sweepInFlight) {
-    logger.info('[trace-retention] sweep already in flight — skipping this invocation', {
-      note: 'timer tick and reconcile route both drive this sweep; overlapping runs would delete the same rows twice',
+/**
+ * ONE ceiling computation, used by BOTH the sense check below and the enforce valve later.
+ *
+ * The config states the invariant plainly — ENFORCE == SENSE by construction — and a
+ * byte-derived bound would break it if only one side learned about bytes. The hazard is
+ * concrete: a store over the BYTE ceiling but under the ROW ceiling would have sense report
+ * "not over", run the expensive stratum auto-discovery, and risk overrunning the cycle
+ * before ever reaching the cheap indexed valve. That is precisely the failure the sense
+ * check exists to prevent, reintroduced for the new bound.
+ *
+ * Sampling is bounded and its failure is non-silent: if the estimate cannot be taken, the
+ * row ceiling stands and the log says so, rather than a wider bound appearing by default.
+ */
+async function computeEffectiveCeiling(cfg: TraceRetentionConfig): Promise<{ ceiling: number; boundBy: string; meanBytes: number | null }> {
+  if (!(cfg.globalCeilingBytes > 0)) return { ceiling: cfg.globalCeiling, boundBy: 'rows', meanBytes: null };
+  try {
+    const sampleN = Math.max(1, Math.min(200, cfg.rowSizeSampleN));
+    const sample = await surrealDB.query<Record<string, unknown>>(`SELECT * FROM ${TABLE} LIMIT ${sampleN}`);
+    const arr = Array.isArray(sample) ? sample : [];
+    if (arr.length === 0) return { ceiling: cfg.globalCeiling, boundBy: 'rows', meanBytes: null };
+    const meanBytes =
+      arr.reduce((acc, r) => acc + Buffer.byteLength(JSON.stringify(r ?? {}), 'utf8'), 0) / arr.length;
+    if (!(meanBytes > 0)) return { ceiling: cfg.globalCeiling, boundBy: 'rows', meanBytes: null };
+    const byteDerived = Math.floor(cfg.globalCeilingBytes / meanBytes);
+    return byteDerived < cfg.globalCeiling
+      ? { ceiling: byteDerived, boundBy: 'bytes', meanBytes }
+      : { ceiling: cfg.globalCeiling, boundBy: 'rows', meanBytes };
+  } catch (err) {
+    logger.warn('[trace-retention] row-size sample failed; the ROW ceiling stands for BOTH sense and enforce', {
+      error: err instanceof Error ? err.message : String(err),
     });
-    return { results: [], durationMs: 0, orphanReaped: 0, skipped: true, skippedReason: 'in_flight' };
-  }
-
-  // DO NOT DELETE WHILE `REBUILD INDEX` HOLDS THE STORE (2026-08-16).
-  //
-  // Measured on the live hub: the ceiling valve selected 25 ids, issued its DELETE, and failed
-  // with "The operation timed out" on EVERY cycle — deleting zero while the surplus grew
-  // monotonically (294,970 -> 295,625 -> 296,430 across three sweeps against a 150,000 ceiling).
-  //
-  // The cause is a phase lock, not a batch size. Both jobs are `setInterval(30 min)` armed at the
-  // same process boot — the FTS scorer rebuild (index.ts, ~350s of sequential REBUILD INDEX on
-  // `activity`) and this sweep — so they fire together on every period, forever. The signature is
-  // two unrelated subsystems failing at the SAME MILLISECOND, exactly 30 minutes apart:
-  //
-  //   12:16:59.611Z  [trace-retention] sweep cycle failed   "The operation timed out."
-  //   12:16:59.611Z  [FTS] Periodic FTS scorer rebuild failed "The operation timed out."
-  //   12:46:59.611Z  ...both again, to the millisecond
-  //
-  // Identical timestamps mean both statements were issued together and both hit the same 300s
-  // timeout. This is why the source comment above could measure 3.52 s/row historically and the
-  // valve now achieves 0 rows/cycle: nothing about DELETE changed, the contention did.
-  //
-  // Deferring is only half the fix — a guard alone would skip EVERY cycle, since the collision is
-  // by construction. `startTraceRetentionSweep` re-arms a short retry on this reason, which lands
-  // the sweep in a rebuild-free window and breaks the phase lock. Rebuild occupies ~350s of every
-  // 1800s, so ~80% of the period is available.
-  try {
-    const { isFtsRebuildInProgress } = await import('../jobs/fts-rebuild');
-    if (isFtsRebuildInProgress()) {
-      logger.info('[trace-retention] deferring sweep — FTS REBUILD INDEX is in flight', {
-        note: 'a DELETE issued against this table while REBUILD holds it times out at 300s and commits nothing; retrying shortly to land outside the rebuild window',
-      });
-      return { results: [], durationMs: 0, orphanReaped: 0, skipped: true, skippedReason: 'fts_rebuilding' };
-    }
-  } catch {
-    // Job module unavailable: proceed. Losing the guard degrades to today's behaviour, which is
-    // strictly better than refusing to sweep because a probe could not be loaded.
-  }
-  sweepInFlight = true;
-  try {
-    return await runTraceRetentionSweepInner(cfg);
-  } finally {
-    // finally, not a trailing assignment: an exception anywhere in the sweep must not
-    // leave the guard stuck true and disable retention for the life of the process.
-    sweepInFlight = false;
+    return { ceiling: cfg.globalCeiling, boundBy: 'rows', meanBytes: null };
   }
 }
 
-async function runTraceRetentionSweepInner(
-  cfg: TraceRetentionConfig,
-): Promise<{ results: StratumResult[]; durationMs: number; orphanReaped: number }> {
-  const startedAt = Date.now();
-  // CAPTURE BEFORE DELETE. The rollup must precede every prune below, or the sweep
-  // destroys the only timestamped record of whether reach is improving.
-  await rollupReachHistory();
-  const coldCutoffIso = new Date(startedAt - cfg.hotWindowMs).toISOString();
-  const statuses = ['success', 'failure'] as const;
-  const results: StratumResult[] = [];
+// ── SET-BASED CEILING DRAIN ──────────────────────────────────────────────────
+//
+// WHY (2026-10-01). On the public hub `execution` reached ~2.11M rows against a 150,000
+// cap. The id-list valve below selects ids and issues `DELETE $ids` 25 (or 1) at a time:
+// at its measured ~5 rows/s a 2M surplus needs ~110 uninterrupted hours, and the hub's
+// self-recovery restarts activity-api every 10-60 minutes, so the drain never finishes.
+//
+// DEPENDS ON shape_score_counter (migration 213). Deleting faster is only safe because the
+// shape-conditioned evidence no longer lives in `execution` or in a view over it: the reach-graded
+// counter is written by the learner and never decremented, and this valve deletes each execution's
+// counting marker in the same transaction as the execution.
+//
+// WHAT. Delete the OLDEST cold rows as a contiguous `executed_at` range, one bounded
+// batch per statement, all server-side in ONE transaction per batch:
+//
+//   1. take the first $n cold timestamps off idx_execution_executed_at (no ORDER BY —
+//      ORDER BY on this table is MemoryOrderedLimit, a full materialize+sort);
+//   2. boundary $b = the largest of them (or the cold cutoff itself when fewer than $n
+//      cold rows exist, i.e. everything cold is in hand);
+//   3. COUNT the rows strictly older than $b ("Iterate Index Count", cheap);
+//   4. DELETE that range only if the count is >0 and fits the remaining allowance.
+//
+// Step 3 is what makes "never below the cap" a hard guarantee rather than an assumption
+// about index iteration order or timestamp ties: the delete runs only when the exact
+// number it will remove is known and allowed, and both run in one transaction so no row
+// can slip into the range between the count and the delete. Ties at $b are excluded by
+// the strict `<` and roll into the next batch.
+//
+// RESUMABLE BY CONSTRUCTION. Each batch is its own committed transaction and every tick
+// recounts the table from the index head, so a restart mid-drain loses at most the batch
+// in flight (rolled back, not half-applied) and the next tick continues where the store
+// actually is. A persisted cursor would only add a second source of truth that can drift
+// from the table.
+//
+// The id-list loop below stays as the FALLBACK: a range cannot step around a single
+// undeletable row, and this file's history is poison rows stalling the sweep. When the
+// range path cannot make progress (repeated failure even at the minimum batch, or a batch
+// of identical timestamps), the valve continues with the quarantining id-list loop.
 
-  // Auto-discover the strata actually worth sweeping this cycle: one GROUP BY,
-  // keep the largest strata whose total exceeds the combined default caps,
-  // bounded by autoDiscoverMax so a cycle's work stays bounded. Per-stratum
-  // caps below still come from policyFor (overrides respected). Best-effort:
-  // on failure we fall back to the configured list alone.
-  // ── PRESSURE CHECK: when the store is over the global ceiling, the cheap valve
-  // runs FIRST and discovery is skipped for this cycle. ────────────────────────
-  //
-  // Measured on the hub at 267,731 rows against a 150,000 ceiling: every sweep
-  // cycle for hours ended in "sweep cycle failed: The operation timed out", so
-  // `execution` was never pruned to cap and kept growing. The cycle spends its
-  // budget before it reaches the valve:
-  //
-  //   SELECT activity_id, count() AS n FROM execution GROUP BY activity_id
-  //     -> Iterate Table (FULL SCAN), 15,160ms measured
-  //
-  // and then sweeps up to autoDiscoverMax (60) discovered strata with several
-  // queries each — all before the global-ceiling valve, which is the ONLY step
-  // that bounds total size. The valve itself is cheap and index-backed:
-  //
-  //   SELECT id, executed_at FROM execution ORDER BY executed_at ASC LIMIT 1000
-  //     -> Iterate Index (idx_execution_executed_at), 237ms measured
-  //
-  // Note this is NOT an unindexed-field problem: idx_execution_activity ON
-  // execution FIELDS activity_id already exists and the GROUP BY full-scans
-  // anyway, so it cannot be indexed away — the only fix is to not pay for it
-  // while the store is over its hard bound.
-  //
-  // Ordering is the whole change. Stratified balance is the better policy and
-  // keeps running normally; it is simply not the policy to spend a timing-out
-  // budget on while the store is 1.8x over the bound it is supposed to enforce.
-  // Once the valve brings the store back under the ceiling, the next cycle
-  // discovers and sweeps strata as before — over a smaller table, so the scan
-  // is cheaper too.
-  /**
-   * ONE ceiling computation, used by BOTH the sense check below and the enforce valve later.
-   *
-   * The config states the invariant plainly — ENFORCE == SENSE by construction — and a
-   * byte-derived bound would break it if only one side learned about bytes. The hazard is
-   * concrete: a store over the BYTE ceiling but under the ROW ceiling would have sense report
-   * "not over", run the expensive stratum auto-discovery, and risk overrunning the cycle
-   * before ever reaching the cheap indexed valve. That is precisely the failure the sense
-   * check exists to prevent, reintroduced for the new bound.
-   *
-   * Sampling is bounded and its failure is non-silent: if the estimate cannot be taken, the
-   * row ceiling stands and the log says so, rather than a wider bound appearing by default.
-   */
-  const computeEffectiveCeiling = async (): Promise<{ ceiling: number; boundBy: string; meanBytes: number | null }> => {
-    if (!(cfg.globalCeilingBytes > 0)) return { ceiling: cfg.globalCeiling, boundBy: 'rows', meanBytes: null };
-    try {
-      const sampleN = Math.max(1, Math.min(200, cfg.rowSizeSampleN));
-      const sample = await surrealDB.query<Record<string, unknown>>(`SELECT * FROM ${TABLE} LIMIT ${sampleN}`);
-      const arr = Array.isArray(sample) ? sample : [];
-      if (arr.length === 0) return { ceiling: cfg.globalCeiling, boundBy: 'rows', meanBytes: null };
-      const meanBytes =
-        arr.reduce((acc, r) => acc + Buffer.byteLength(JSON.stringify(r ?? {}), 'utf8'), 0) / arr.length;
-      if (!(meanBytes > 0)) return { ceiling: cfg.globalCeiling, boundBy: 'rows', meanBytes: null };
-      const byteDerived = Math.floor(cfg.globalCeilingBytes / meanBytes);
-      return byteDerived < cfg.globalCeiling
-        ? { ceiling: byteDerived, boundBy: 'bytes', meanBytes }
-        : { ceiling: cfg.globalCeiling, boundBy: 'rows', meanBytes };
-    } catch (err) {
-      logger.warn('[trace-retention] row-size sample failed; the ROW ceiling stands for BOTH sense and enforce', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return { ceiling: cfg.globalCeiling, boundBy: 'rows', meanBytes: null };
-    }
+export interface DrainPolicy {
+  /** Rows per set-based DELETE. */
+  batch: number;
+  /** Floor the batch may halve to on a failed statement before falling back to ids. */
+  minBatch: number;
+  /** Rest between batches so live queries interleave with the drain. */
+  pauseMs: number;
+  /** Server-side bound on one batch transaction. */
+  stmtTimeoutS: number;
+  /** Rest between follow-up drain ticks while the store is still over its ceiling (0 = no follow-ups). */
+  restMs: number;
+}
+
+/**
+ * Drain knobs are read through the runtime tuning seam (substrate_tuning_param rows, law 1),
+ * never env: a drain is tuned while it runs, from what it logs, without a restart. With no
+ * row authored these defaults apply. Values are clamped so a bad row cannot make a batch
+ * unbounded or a pause negative.
+ */
+export async function loadDrainPolicy(): Promise<DrainPolicy> {
+  const { getTuningParam } = await import('../lib/tuning-params');
+  const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, Math.floor(v)));
+  const [batch, minBatch, pauseMs, stmtTimeoutS, restMs] = await Promise.all([
+    getTuningParam('TRACE_RETENTION_DRAIN_BATCH', undefined, 2000),
+    getTuningParam('TRACE_RETENTION_DRAIN_MIN_BATCH', undefined, 50),
+    getTuningParam('TRACE_RETENTION_DRAIN_PAUSE_MS', undefined, 250),
+    getTuningParam('TRACE_RETENTION_DRAIN_STMT_TIMEOUT_S', undefined, 20),
+    getTuningParam('TRACE_RETENTION_DRAIN_REST_MS', undefined, 60_000),
+  ]);
+  const b = clamp(batch, 1, 20_000);
+  return {
+    batch: b,
+    minBatch: clamp(minBatch, 1, b),
+    pauseMs: clamp(pauseMs, 0, 60_000),
+    stmtTimeoutS: clamp(stmtTimeoutS, 1, 120),
+    restMs: clamp(restMs, 0, 3_600_000),
   };
+}
 
-  let overCeiling = false;
-  if (cfg.globalCeilingEnabled && cfg.globalCeiling > 0) {
-    try {
-      const rows = await surrealDB.query<{ count: number }>(`SELECT count() FROM ${TABLE} GROUP ALL`);
-      const total = Array.isArray(rows) && rows.length > 0 ? Number(rows[0]?.count ?? 0) : 0;
-      const eff = await computeEffectiveCeiling();
-      overCeiling = total > eff.ceiling;
-      if (overCeiling) {
-        logger.warn('[trace-retention] over global ceiling — skipping stratum auto-discovery this cycle so the indexed valve is reached', {
-          total, ceiling: eff.ceiling, rowCeiling: cfg.globalCeiling, boundBy: eff.boundBy, surplus: total - eff.ceiling,
-        });
-      }
-    } catch (err) {
-      // Cannot tell: behave exactly as before rather than skipping work on a guess.
-      logger.warn('[trace-retention] pressure check failed; proceeding with the normal cycle order', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
+export interface DrainResult {
+  removed: number;
+  batches: number;
+  failures: number;
+  /**
+   * 'needs_ids' = the range path cannot progress (a head of identical timestamps a range cannot
+   * split, or repeated failure at the minimum batch); the caller continues with the id-list loop.
+   */
+  stoppedBy: 'target' | 'budget' | 'empty' | 'needs_ids';
+}
 
-  let sweepActivities = cfg.activities;
-  if (cfg.autoDiscover && !overCeiling) {
-    try {
-      const groups = await surrealDB.query<{ activity_id: unknown; n: unknown }>(
-        `SELECT activity_id, count() AS n FROM ${TABLE} GROUP BY activity_id`,
-      );
-      const overCap = (Array.isArray(groups) ? groups : [])
-        .filter((g) => typeof g?.activity_id === 'string' && Number(g?.n ?? 0) > cfg.defaultSuccessCap + cfg.defaultFailureCap)
-        .sort((a, b) => Number(b.n) - Number(a.n))
-        .slice(0, cfg.autoDiscoverMax)
-        .map((g) => g.activity_id as string);
-      sweepActivities = Array.from(new Set([...cfg.activities, ...overCap]));
-      if (overCap.length > 0) {
-        logger.info('[trace-retention] auto-discovered over-cap strata', {
-          discovered: overCap.length, sweeping: sweepActivities.length,
-        });
-      }
-    } catch (err) {
-      logger.warn('[trace-retention] stratum auto-discovery failed; sweeping configured list only', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
+const DRAIN_BATCH_SQL = (stmtTimeoutS: number) => `
+BEGIN TRANSACTION;
+LET $ts = (SELECT VALUE executed_at FROM ${TABLE} WHERE executed_at < type::datetime($cut) LIMIT $n);
+LET $b = IF array::len($ts) < $n { type::datetime($cut) } ELSE { time::max($ts) };
+LET $c = IF array::len($ts) = 0 { 0 } ELSE { (SELECT count() FROM ${TABLE} WHERE executed_at < $b GROUP ALL)[0].count ?? 0 };
+LET $ok = $c > 0 AND $c <= $max;
+IF $ok {
+  LET $__ids = (SELECT VALUE id FROM ${TABLE} WHERE executed_at < $b);
+  DELETE ${TABLE} WHERE executed_at < $b RETURN NONE TIMEOUT ${stmtTimeoutS}s;
+  ${PRUNE_MARKERS_SQL('$__ids')}
+};
+RETURN { fetched: array::len($ts), counted: $c, deleted: IF $ok { $c } ELSE { 0 } };
+COMMIT TRANSACTION;`;
 
-  for (const activityId of sweepActivities) {
-    const policy = policyFor(cfg, activityId);
-    for (const status of statuses) {
-      const succeeded = status === 'success';
-      const cap = status === 'success' ? policy.successCap : policy.failureCap;
-      const coldCount = await countCold(activityId, succeeded, coldCutoffIso);
+/**
+ * Delete an explicit id list from `execution` together with those executions' shape-counter
+ * markers (migration 213), in one transaction on the normal client path (semaphore + auth retry).
+ */
+async function deleteExecutionIds(ids: unknown[], deleteStatement: string): Promise<void> {
+  await surrealDB.queryAll(`BEGIN TRANSACTION;\n${deleteStatement};\n${PRUNE_MARKERS_SQL('$ids')}\nCOMMIT TRANSACTION;`, { ids });
+}
 
-      if (coldCount <= cap) {
-        results.push({
-          activityId, status, coldCount, cap,
-          keepProb: 1, deletedEstimate: 0, deletedActual: cfg.dryRun ? null : 0,
-        });
-        continue;
-      }
+/**
+ * ONE set-based batch: atomically take the next `n` cold timestamps, count the range strictly below
+ * their maximum, and delete it only if that count is >0 and <= `max`. Exported so its two safety
+ * properties — never past `cutIso`, never more than `max` — are tested on the statement itself.
+ */
+export async function runDrainBatch(
+  cutIso: string,
+  n: number,
+  max: number,
+  stmtTimeoutS: number,
+): Promise<{ fetched: number; counted: number; deleted: number }> {
+  const raw = await surrealDB.queryAll(DRAIN_BATCH_SQL(stmtTimeoutS), { cut: cutIso, n, max });
+  const out = (Array.isArray(raw) ? raw : []).filter(
+    (r): r is { fetched: number; counted: number; deleted: number } =>
+      !!r && typeof r === 'object' && 'deleted' in (r as object),
+  ).pop();
+  if (!out) throw new Error('drain batch returned no summary');
+  return { fetched: Number(out.fetched), counted: Number(out.counted), deleted: Number(out.deleted) };
+}
 
-      const keepProb = cap / coldCount;
-      const deletedEstimate = Math.round(coldCount * (1 - keepProb));
+/**
+ * Delete up to `target` of the oldest rows older than `cutIso`, set-based, in bounded batches,
+ * stopping at `budgetUntil`. Never deletes a row at/after the cutoff and never more than `target`.
+ */
+let carriedDrainWidth: number | null = null;
+const DRAIN_COLD_START_WIDTH = 250;
 
-      let deletedActual: number | null = null;
-      if (!cfg.dryRun) {
-        // Uniform reservoir, deleted in BOUNDED BATCHES. A single DELETE of ~20K
-        // rows blocks the single-threaded SurrealDB for minutes (the exact
-        // contention we are fixing), so we delete at most `batchSize` rows per
-        // statement: select a bounded set of ids on the "delete" side of the
-        // reservoir (rand::float() >= keepProb, evaluated per-record → uniform),
-        // then DELETE that id list. RETURN NONE so no row bodies are hauled back.
-        // Stop once we have removed the up-front surplus (coldCount - cap); no
-        // expensive per-iteration full recount.
-        const target = coldCount - cap;
-        const batchSize = cfg.deleteBatchSize;
-        const maxIters = Math.ceil(coldCount / batchSize) + 10; // generous guard
-        let removed = 0;
-        for (let iter = 0; iter < maxIters && removed < target; iter++) {
-          // Clamp the final batch so we stop exactly at `target` (= coldCount - cap)
-          // and never over-delete into the sample we mean to keep.
-          const thisBatch = Math.min(batchSize, target - removed);
-          const ids = await surrealDB.query<unknown>(
-            `SELECT VALUE id FROM ${TABLE}
-               WHERE activity_id = $aid AND success = $ok
-                 AND executed_at < type::datetime($cut) AND rand::float() >= $keepProb
-               LIMIT $batch`,
-            { aid: activityId, ok: succeeded, cut: coldCutoffIso, keepProb, batch: thisBatch },
-          );
-          if (!Array.isArray(ids) || ids.length === 0) break; // tail exhausted
-          // With its shape-counter markers, in one transaction (migration 213).
-          await surrealDB.query(`BEGIN TRANSACTION; DELETE $ids RETURN NONE; ${PRUNE_MARKERS_SQL('$ids')} COMMIT TRANSACTION;`, { ids });
-          removed += ids.length;
-        }
-        deletedActual = removed;
-      }
-
-      results.push({ activityId, status, coldCount, cap, keepProb, deletedEstimate, deletedActual });
-    }
-  }
-
-  // ── Global ceiling safety valve ────────────────────────────────────────────
-  // trace_digest / concept_usage have no per-stratum sweep and grow unbounded
-  // (the re-thrash root at 1.57M / 614k rows). Reap cold rows older than the hot
-  // window in BOUNDED batches (select-ids then DELETE $ids, same pattern as the
-  // stratified sweep) so no giant transaction spikes RSS; capped per sweep so the
-  // backlog drains over cycles rather than in one memory-ballooning DELETE.
-  if (!cfg.dryRun) {
-    const auxTables: Array<{ table: string; timeField: string }> = [
-      { table: "trace_digest", timeField: "executed_at" },
-      { table: "concept_usage", timeField: "recorded_at" },
-    ];
-    const auxCutoffIso = new Date(Date.now() - cfg.hotWindowMs).toISOString();
-    const auxMaxPerSweep = 50000;
-    const auxBatch = cfg.deleteBatchSize;
-    for (const { table, timeField } of auxTables) {
-      let removed = 0;
+export async function drainColdByRange(opts: {
+  cutIso: string;
+  target: number;
+  budgetUntil: number;
+  policy: DrainPolicy;
+}): Promise<DrainResult> {
+  const { cutIso, target, budgetUntil, policy } = opts;
+  // Start from the width the previous tick settled on, so a slow table pays its narrowing once
+  // per process rather than once per tick. After a restart start NARROW (250) and grow: on a fast
+  // table width doubles back to the policy batch within a few sub-second batches, while on a slow
+  // one (aggregate view present) a cold-start 2000-row batch would time out and roll back first.
+  let n = Math.max(1, Math.min(policy.batch, carriedDrainWidth ?? DRAIN_COLD_START_WIDTH));
+  let removed = 0;
+  let batches = 0;
+  let failures = 0;
+  try {
+    while (removed < target) {
+      if (Date.now() >= budgetUntil) return { removed, batches, failures, stoppedBy: 'budget' };
+      const allowance = target - removed;
+      const want = Math.min(n, allowance);
+      const batchStarted = Date.now();
       try {
-        for (let iter = 0; iter < Math.ceil(auxMaxPerSweep / auxBatch) && removed < auxMaxPerSweep; iter++) {
-          const ids = await surrealDB.query<unknown>(
-            `SELECT VALUE id FROM ${table} WHERE ${timeField} < type::datetime($cut) LIMIT $batch`,
-            { cut: auxCutoffIso, batch: Math.min(auxBatch, auxMaxPerSweep - removed) },
-          );
-          if (!Array.isArray(ids) || ids.length === 0) break;
-          await surrealDB.query("DELETE $ids RETURN NONE", { ids });
-          removed += ids.length;
+        const { fetched, counted, deleted } = await runDrainBatch(cutIso, want, allowance, policy.stmtTimeoutS);
+        const tookMs = Date.now() - batchStarted;
+        if (fetched === 0) return { removed, batches, failures, stoppedBy: 'empty' };
+        if (deleted > 0) {
+          removed += deleted;
+          batches++;
+          // Size by DURATION, not by success alone. Per-row delete cost on this table is not a
+          // constant (an aggregate view over `execution` recomputes on delete, and that cost grows
+          // with the table), so a fixed width either wastes round trips or keeps hitting the
+          // statement timeout — and a timed-out batch is rolled back, all of its work lost. Keep
+          // each batch well inside the timeout: halve above half of it, grow back below an eighth.
+          const timeoutMs = policy.stmtTimeoutS * 1000;
+          if (tookMs > timeoutMs / 2) n = Math.max(1, Math.floor(want / 2));
+          else if (tookMs < timeoutMs / 8) n = Math.min(policy.batch, n * 2);
+        } else if (counted > allowance && want > 1) {
+          // The range holds more rows than we may delete (ties, or a non-ascending scan): narrow it.
+          n = Math.max(1, Math.floor(want / 2));
+          continue;
+        } else {
+          // counted 0 with rows in hand = every fetched row shares the boundary timestamp; a range
+          // cannot split them. Hand the remainder to the id-list loop.
+          return { removed, batches, failures, stoppedBy: 'needs_ids' };
         }
-        if (removed > 0) logger.info("[trace-retention] aux-table reap", { table, removed });
       } catch (err) {
-        logger.warn("[trace-retention] aux-table reap failed", { table, error: err instanceof Error ? err.message : String(err) });
+        failures++;
+        const next = Math.max(policy.minBatch, Math.floor(want / 2));
+        logger.warn('[trace-retention] drain batch failed — rolled back, narrowing', {
+          batch: want, nextBatch: next, failures,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        if (want <= policy.minBatch && failures >= 3) return { removed, batches, failures, stoppedBy: 'needs_ids' };
+        n = next;
       }
+      if (policy.pauseMs > 0 && removed < target) await new Promise((r) => setTimeout(r, policy.pauseMs));
     }
+    return { removed, batches, failures, stoppedBy: 'target' };
+  } finally {
+    carriedDrainWidth = n;
   }
-  // The stratified sweep above bounds each (activity_id,status) stratum, but the
-  // store's global row_count is the SUM over ALL strata. The live fleet spreads
-  // across 1000+ distinct activity_ids (every composed-cap-*, learned-*,
-  // auto-bridge-*, and probe mint is its own stratum), so the total can sit far
-  // above the global cap while EVERY individual stratum is under its per-stratum
-  // cap — the exact condition trace_store_health_observer alarms on
-  // (trace_store_counters.row_count > cap). A purely stratified enforcer can
-  // therefore NEVER clear a global-cap alarm, and the unbounded growth axis is the
-  // strata COUNT, not any one stratum's depth (the OOM re-pressure risk).
-  //
-  // This valve keeps the newest `globalCeiling` rows globally by executed_at and
-  // drops the oldest surplus, so SENSE (the sensor's global cap) and ENFORCE (this
-  // prune) measure the SAME invariant and the loop is honest. It runs AFTER the
-  // stratified sweep (which does the per-stratum-balanced work first), reuses the
-  // same enabled/dryRun gating and the same bounded-batch delete, and pushes a
-  // synthetic StratumResult so the shared counter-decrement below AND the reconcile
-  // route's `deleted` tally both account for it (no separate decrement — that would
-  // double-count). Default ceiling == TRACE_STORE_CAP so the enforced number is the
-  // sensed number; TRACE_RETENTION_GLOBAL_CEILING decouples, and
-  // TRACE_RETENTION_GLOBAL_CEILING_ENABLED=false disables just this valve.
-  // ENTRY LOGGING, BECAUSE THIS BRANCH IS SILENTLY SKIPPED (2026-08-09).
-  //
-  // Measured on the live hub: the store sits at 2x its cap, the sensor alarms, the
-  // sweep completes without error, and the full sweep log is exactly three lines —
-  // reach-history rollup, the "over global ceiling ... so the indexed valve is
-  // reached" warning, and the aux-table reap. This valve's delete never runs and
-  // logs nothing. Net rate measured +436 rows/hr across 22 samples / 27 min with
-  // ZERO negative deltas, which is consistent with nothing deleting from `execution`
-  // at all.
-  //
-  // Its three gates all pass when checked by hand (globalCeilingEnabled default true,
-  // globalCeiling 150000, dryRun false), and the count query returns correctly —
-  // `SELECT count() FROM execution GROUP ALL` yields {"count":306191}, exactly the
-  // shape the code reads. So the skip is not the gate and not the count, and there is
-  // no return/throw between the aux reap and here.
-  //
-  // Log the entry rather than infer it from surrounding lines. Every diagnosis today
-  // that reasoned from adjacent evidence instead of instrumenting the branch itself
-  // was wrong; this makes the next cycle answer the question directly.
+}
+
+/** What the last valve run left over-ceiling, read by the scheduler to decide on a follow-up drain tick. */
+let lastCeilingOutcome: { remaining: number; stoppedBy: string } | null = null;
+export function getLastCeilingOutcome(): { remaining: number; stoppedBy: string } | null {
+  return lastCeilingOutcome;
+}
+
+/**
+ * The global-ceiling valve, callable on its own so a drain can continue between full sweeps
+ * (see runCeilingDrainTick). Returns the synthetic `__global_ceiling__` stratum when the store
+ * was over its ceiling, so callers account the deletions exactly once.
+ */
+async function runCeilingValve(cfg: TraceRetentionConfig, coldCutoffIso: string): Promise<StratumResult | null> {
+  let valveResult: StratumResult | null = null;
+  lastCeilingOutcome = null;
   logger.info('[trace-retention] global-ceiling valve: entering', {
     enabled: cfg.globalCeilingEnabled,
     ceiling: cfg.globalCeiling,
@@ -747,7 +686,7 @@ async function runTraceRetentionSweepInner(
 
       // Same computation the sense check used — one function, so the two can never disagree.
       // See computeEffectiveCeiling for why that invariant is load-bearing.
-      const eff = await computeEffectiveCeiling();
+      const eff = await computeEffectiveCeiling(cfg);
       effectiveCeiling = eff.ceiling;
       boundBy = eff.boundBy;
       if (eff.meanBytes !== null) {
@@ -792,7 +731,14 @@ async function runTraceRetentionSweepInner(
         const quarantined = new Set<string>();
         let quarantineFailures = 0;
         let stoppedBy: 'target' | 'budget' | 'empty' | 'iters' = 'iters';
-        for (let iter = 0; iter < maxIters && done < target; iter++) {
+        // SET-BASED FIRST (see drainColdByRange); the id-list loop below runs only when the range
+        // path reports it cannot progress, with whatever target and budget remain.
+        const drainPolicy = await loadDrainPolicy();
+        const range = await drainColdByRange({ cutIso: coldCutoffIso, target, budgetUntil, policy: drainPolicy });
+        done = range.removed;
+        const idFallback = range.stoppedBy === 'needs_ids';
+        if (range.stoppedBy !== 'needs_ids') stoppedBy = range.stoppedBy;
+        for (let iter = 0; idFallback && iter < maxIters && done < target; iter++) {
           if (Date.now() >= budgetUntil) { stoppedBy = 'budget'; break; }
           const thisBatch = Math.min(batchSize, target - done);
           // NO `ORDER BY` — that is the whole fix, and this file already proved it.
@@ -903,8 +849,7 @@ async function runTraceRetentionSweepInner(
             // actually delete. The clause is SurrealQL's own (paradigm.ts already uses TIMEOUT 8s
             // on a hot SELECT), so the server abandons the statement rather than the client
             // hanging up on work that continues underneath.
-            // With its shape-counter markers, in one transaction (migration 213).
-            await surrealDB.query(`BEGIN TRANSACTION; DELETE $ids RETURN NONE TIMEOUT 20s; ${PRUNE_MARKERS_SQL('$ids')} COMMIT TRANSACTION;`, { ids });
+            await deleteExecutionIds(ids, 'DELETE $ids RETURN NONE TIMEOUT 20s');
             done += ids.length;
             if (done >= target) stoppedBy = 'target';
           } catch (err) {
@@ -934,8 +879,14 @@ async function runTraceRetentionSweepInner(
         // `remaining` is what this sweep deliberately left for the next one. It is the
         // number to watch: a healthy valve shows it falling sweep over sweep. If it
         // holds steady while removed>0, intake matches drain and the cap needs raising.
+        lastCeilingOutcome = { remaining: Math.max(0, surplus - done), stoppedBy };
         logger.info('[trace-retention] global-ceiling valve: done', {
           removed,
+          mode: idFallback ? 'range+id_tail' : 'range',
+          rangeRemoved: range.removed,
+          rangeBatches: range.batches,
+          rangeFailures: range.failures,
+          drainBatch: drainPolicy.batch,
           quarantined: quarantined.size,
           quarantineFailures,
           target,
@@ -945,10 +896,34 @@ async function runTraceRetentionSweepInner(
           batchSize,
           elapsedMs: Date.now() - (budgetUntil - cfg.ceilingBudgetMs),
         });
+      } else {
+        // DRY RUN REPORTS WHAT A REAL RUN WOULD DELETE, not just the surplus: the cold range is
+        // what the valve may touch, so the honest preview is min(surplus, cold rows, per-sweep cap).
+        // One index-count, no mutation.
+        let coldRows: number | null = null;
+        try {
+          const c = await surrealDB.query<{ count: number }>(
+            `SELECT count() FROM ${TABLE} WHERE executed_at < type::datetime($cut) GROUP ALL`,
+            { cut: coldCutoffIso },
+          );
+          coldRows = Array.isArray(c) && c.length > 0 ? Number(c[0]?.count ?? 0) : 0;
+        } catch (err) {
+          logger.warn('[trace-retention] dry-run cold count failed', { error: err instanceof Error ? err.message : String(err) });
+        }
+        lastCeilingOutcome = null;
+        logger.info('[trace-retention] global-ceiling valve: DRY RUN', {
+          total,
+          ceiling: effectiveCeiling,
+          surplus,
+          coldRows,
+          cut: coldCutoffIso,
+          wouldDeleteThisTick: coldRows === null ? null : Math.min(surplus, coldRows, cfg.ceilingPerSweepCap),
+          wouldDeleteTotal: coldRows === null ? null : Math.min(surplus, coldRows),
+        });
       }
       // Synthetic stratum so the counter-decrement below and the reconcile route's
       // `deleted` reduce both include the valve's deletions.
-      results.push({
+      valveResult = {
         activityId: '__global_ceiling__',
         status: 'all',
         coldCount: total,
@@ -956,9 +931,290 @@ async function runTraceRetentionSweepInner(
         keepProb,
         deletedEstimate: surplus,
         deletedActual: removed,
+      };
+    }
+  }
+  return valveResult;
+}
+
+export async function runTraceRetentionSweep(
+  cfg: TraceRetentionConfig = loadTraceRetentionConfig(),
+): Promise<{
+  results: StratumResult[];
+  durationMs: number;
+  orphanReaped: number;
+  skipped?: true;
+  skippedReason?: 'in_flight' | 'fts_rebuilding';
+}> {
+  if (sweepInFlight) {
+    logger.info('[trace-retention] sweep already in flight — skipping this invocation', {
+      note: 'timer tick and reconcile route both drive this sweep; overlapping runs would delete the same rows twice',
+    });
+    return { results: [], durationMs: 0, orphanReaped: 0, skipped: true, skippedReason: 'in_flight' };
+  }
+
+  // DO NOT DELETE WHILE `REBUILD INDEX` HOLDS THE STORE (2026-08-16).
+  //
+  // Measured on the live hub: the ceiling valve selected 25 ids, issued its DELETE, and failed
+  // with "The operation timed out" on EVERY cycle — deleting zero while the surplus grew
+  // monotonically (294,970 -> 295,625 -> 296,430 across three sweeps against a 150,000 ceiling).
+  //
+  // The cause is a phase lock, not a batch size. Both jobs are `setInterval(30 min)` armed at the
+  // same process boot — the FTS scorer rebuild (index.ts, ~350s of sequential REBUILD INDEX on
+  // `activity`) and this sweep — so they fire together on every period, forever. The signature is
+  // two unrelated subsystems failing at the SAME MILLISECOND, exactly 30 minutes apart:
+  //
+  //   12:16:59.611Z  [trace-retention] sweep cycle failed   "The operation timed out."
+  //   12:16:59.611Z  [FTS] Periodic FTS scorer rebuild failed "The operation timed out."
+  //   12:46:59.611Z  ...both again, to the millisecond
+  //
+  // Identical timestamps mean both statements were issued together and both hit the same 300s
+  // timeout. This is why the source comment above could measure 3.52 s/row historically and the
+  // valve now achieves 0 rows/cycle: nothing about DELETE changed, the contention did.
+  //
+  // Deferring is only half the fix — a guard alone would skip EVERY cycle, since the collision is
+  // by construction. `startTraceRetentionSweep` re-arms a short retry on this reason, which lands
+  // the sweep in a rebuild-free window and breaks the phase lock. Rebuild occupies ~350s of every
+  // 1800s, so ~80% of the period is available.
+  try {
+    const { isFtsRebuildInProgress } = await import('../jobs/fts-rebuild');
+    if (isFtsRebuildInProgress()) {
+      logger.info('[trace-retention] deferring sweep — FTS REBUILD INDEX is in flight', {
+        note: 'a DELETE issued against this table while REBUILD holds it times out at 300s and commits nothing; retrying shortly to land outside the rebuild window',
+      });
+      return { results: [], durationMs: 0, orphanReaped: 0, skipped: true, skippedReason: 'fts_rebuilding' };
+    }
+  } catch {
+    // Job module unavailable: proceed. Losing the guard degrades to today's behaviour, which is
+    // strictly better than refusing to sweep because a probe could not be loaded.
+  }
+  sweepInFlight = true;
+  try {
+    return await runTraceRetentionSweepInner(cfg);
+  } finally {
+    // finally, not a trailing assignment: an exception anywhere in the sweep must not
+    // leave the guard stuck true and disable retention for the life of the process.
+    sweepInFlight = false;
+  }
+}
+
+async function runTraceRetentionSweepInner(
+  cfg: TraceRetentionConfig,
+): Promise<{ results: StratumResult[]; durationMs: number; orphanReaped: number }> {
+  const startedAt = Date.now();
+  // CAPTURE BEFORE DELETE. The rollup must precede every prune below, or the sweep
+  // destroys the only timestamped record of whether reach is improving.
+  await rollupReachHistory();
+  const coldCutoffIso = new Date(startedAt - cfg.hotWindowMs).toISOString();
+  const statuses = ['success', 'failure'] as const;
+  const results: StratumResult[] = [];
+
+  // Auto-discover the strata actually worth sweeping this cycle: one GROUP BY,
+  // keep the largest strata whose total exceeds the combined default caps,
+  // bounded by autoDiscoverMax so a cycle's work stays bounded. Per-stratum
+  // caps below still come from policyFor (overrides respected). Best-effort:
+  // on failure we fall back to the configured list alone.
+  // ── PRESSURE CHECK: when the store is over the global ceiling, the cheap valve
+  // runs FIRST and discovery is skipped for this cycle. ────────────────────────
+  //
+  // Measured on the hub at 267,731 rows against a 150,000 ceiling: every sweep
+  // cycle for hours ended in "sweep cycle failed: The operation timed out", so
+  // `execution` was never pruned to cap and kept growing. The cycle spends its
+  // budget before it reaches the valve:
+  //
+  //   SELECT activity_id, count() AS n FROM execution GROUP BY activity_id
+  //     -> Iterate Table (FULL SCAN), 15,160ms measured
+  //
+  // and then sweeps up to autoDiscoverMax (60) discovered strata with several
+  // queries each — all before the global-ceiling valve, which is the ONLY step
+  // that bounds total size. The valve itself is cheap and index-backed:
+  //
+  //   SELECT id, executed_at FROM execution ORDER BY executed_at ASC LIMIT 1000
+  //     -> Iterate Index (idx_execution_executed_at), 237ms measured
+  //
+  // Note this is NOT an unindexed-field problem: idx_execution_activity ON
+  // execution FIELDS activity_id already exists and the GROUP BY full-scans
+  // anyway, so it cannot be indexed away — the only fix is to not pay for it
+  // while the store is over its hard bound.
+  //
+  // Ordering is the whole change. Stratified balance is the better policy and
+  // keeps running normally; it is simply not the policy to spend a timing-out
+  // budget on while the store is 1.8x over the bound it is supposed to enforce.
+  // Once the valve brings the store back under the ceiling, the next cycle
+  // discovers and sweeps strata as before — over a smaller table, so the scan
+  // is cheaper too.
+
+  let overCeiling = false;
+  if (cfg.globalCeilingEnabled && cfg.globalCeiling > 0) {
+    try {
+      const rows = await surrealDB.query<{ count: number }>(`SELECT count() FROM ${TABLE} GROUP ALL`);
+      const total = Array.isArray(rows) && rows.length > 0 ? Number(rows[0]?.count ?? 0) : 0;
+      const eff = await computeEffectiveCeiling(cfg);
+      overCeiling = total > eff.ceiling;
+      if (overCeiling) {
+        logger.warn('[trace-retention] over global ceiling — skipping stratum auto-discovery this cycle so the indexed valve is reached', {
+          total, ceiling: eff.ceiling, rowCeiling: cfg.globalCeiling, boundBy: eff.boundBy, surplus: total - eff.ceiling,
+        });
+      }
+    } catch (err) {
+      // Cannot tell: behave exactly as before rather than skipping work on a guess.
+      logger.warn('[trace-retention] pressure check failed; proceeding with the normal cycle order', {
+        error: err instanceof Error ? err.message : String(err),
       });
     }
   }
+
+  let sweepActivities = cfg.activities;
+  if (cfg.autoDiscover && !overCeiling) {
+    try {
+      const groups = await surrealDB.query<{ activity_id: unknown; n: unknown }>(
+        `SELECT activity_id, count() AS n FROM ${TABLE} GROUP BY activity_id`,
+      );
+      const overCap = (Array.isArray(groups) ? groups : [])
+        .filter((g) => typeof g?.activity_id === 'string' && Number(g?.n ?? 0) > cfg.defaultSuccessCap + cfg.defaultFailureCap)
+        .sort((a, b) => Number(b.n) - Number(a.n))
+        .slice(0, cfg.autoDiscoverMax)
+        .map((g) => g.activity_id as string);
+      sweepActivities = Array.from(new Set([...cfg.activities, ...overCap]));
+      if (overCap.length > 0) {
+        logger.info('[trace-retention] auto-discovered over-cap strata', {
+          discovered: overCap.length, sweeping: sweepActivities.length,
+        });
+      }
+    } catch (err) {
+      logger.warn('[trace-retention] stratum auto-discovery failed; sweeping configured list only', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  for (const activityId of sweepActivities) {
+    const policy = policyFor(cfg, activityId);
+    for (const status of statuses) {
+      const succeeded = status === 'success';
+      const cap = status === 'success' ? policy.successCap : policy.failureCap;
+      const coldCount = await countCold(activityId, succeeded, coldCutoffIso);
+
+      if (coldCount <= cap) {
+        results.push({
+          activityId, status, coldCount, cap,
+          keepProb: 1, deletedEstimate: 0, deletedActual: cfg.dryRun ? null : 0,
+        });
+        continue;
+      }
+
+      const keepProb = cap / coldCount;
+      const deletedEstimate = Math.round(coldCount * (1 - keepProb));
+
+      let deletedActual: number | null = null;
+      if (!cfg.dryRun) {
+        // Uniform reservoir, deleted in BOUNDED BATCHES. A single DELETE of ~20K
+        // rows blocks the single-threaded SurrealDB for minutes (the exact
+        // contention we are fixing), so we delete at most `batchSize` rows per
+        // statement: select a bounded set of ids on the "delete" side of the
+        // reservoir (rand::float() >= keepProb, evaluated per-record → uniform),
+        // then DELETE that id list. RETURN NONE so no row bodies are hauled back.
+        // Stop once we have removed the up-front surplus (coldCount - cap); no
+        // expensive per-iteration full recount.
+        const target = coldCount - cap;
+        const batchSize = cfg.deleteBatchSize;
+        const maxIters = Math.ceil(coldCount / batchSize) + 10; // generous guard
+        let removed = 0;
+        for (let iter = 0; iter < maxIters && removed < target; iter++) {
+          // Clamp the final batch so we stop exactly at `target` (= coldCount - cap)
+          // and never over-delete into the sample we mean to keep.
+          const thisBatch = Math.min(batchSize, target - removed);
+          const ids = await surrealDB.query<unknown>(
+            `SELECT VALUE id FROM ${TABLE}
+               WHERE activity_id = $aid AND success = $ok
+                 AND executed_at < type::datetime($cut) AND rand::float() >= $keepProb
+               LIMIT $batch`,
+            { aid: activityId, ok: succeeded, cut: coldCutoffIso, keepProb, batch: thisBatch },
+          );
+          if (!Array.isArray(ids) || ids.length === 0) break; // tail exhausted
+          await deleteExecutionIds(ids, 'DELETE $ids RETURN NONE');
+          removed += ids.length;
+        }
+        deletedActual = removed;
+      }
+
+      results.push({ activityId, status, coldCount, cap, keepProb, deletedEstimate, deletedActual });
+    }
+  }
+
+  // ── Global ceiling safety valve ────────────────────────────────────────────
+  // trace_digest / concept_usage have no per-stratum sweep and grow unbounded
+  // (the re-thrash root at 1.57M / 614k rows). Reap cold rows older than the hot
+  // window in BOUNDED batches (select-ids then DELETE $ids, same pattern as the
+  // stratified sweep) so no giant transaction spikes RSS; capped per sweep so the
+  // backlog drains over cycles rather than in one memory-ballooning DELETE.
+  if (!cfg.dryRun) {
+    const auxTables: Array<{ table: string; timeField: string }> = [
+      { table: "trace_digest", timeField: "executed_at" },
+      { table: "concept_usage", timeField: "recorded_at" },
+    ];
+    const auxCutoffIso = new Date(Date.now() - cfg.hotWindowMs).toISOString();
+    const auxMaxPerSweep = 50000;
+    const auxBatch = cfg.deleteBatchSize;
+    for (const { table, timeField } of auxTables) {
+      let removed = 0;
+      try {
+        for (let iter = 0; iter < Math.ceil(auxMaxPerSweep / auxBatch) && removed < auxMaxPerSweep; iter++) {
+          const ids = await surrealDB.query<unknown>(
+            `SELECT VALUE id FROM ${table} WHERE ${timeField} < type::datetime($cut) LIMIT $batch`,
+            { cut: auxCutoffIso, batch: Math.min(auxBatch, auxMaxPerSweep - removed) },
+          );
+          if (!Array.isArray(ids) || ids.length === 0) break;
+          await surrealDB.query("DELETE $ids RETURN NONE", { ids });
+          removed += ids.length;
+        }
+        if (removed > 0) logger.info("[trace-retention] aux-table reap", { table, removed });
+      } catch (err) {
+        logger.warn("[trace-retention] aux-table reap failed", { table, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+  }
+  // The stratified sweep above bounds each (activity_id,status) stratum, but the
+  // store's global row_count is the SUM over ALL strata. The live fleet spreads
+  // across 1000+ distinct activity_ids (every composed-cap-*, learned-*,
+  // auto-bridge-*, and probe mint is its own stratum), so the total can sit far
+  // above the global cap while EVERY individual stratum is under its per-stratum
+  // cap — the exact condition trace_store_health_observer alarms on
+  // (trace_store_counters.row_count > cap). A purely stratified enforcer can
+  // therefore NEVER clear a global-cap alarm, and the unbounded growth axis is the
+  // strata COUNT, not any one stratum's depth (the OOM re-pressure risk).
+  //
+  // This valve keeps the newest `globalCeiling` rows globally by executed_at and
+  // drops the oldest surplus, so SENSE (the sensor's global cap) and ENFORCE (this
+  // prune) measure the SAME invariant and the loop is honest. It runs AFTER the
+  // stratified sweep (which does the per-stratum-balanced work first), reuses the
+  // same enabled/dryRun gating and the same bounded-batch delete, and pushes a
+  // synthetic StratumResult so the shared counter-decrement below AND the reconcile
+  // route's `deleted` tally both account for it (no separate decrement — that would
+  // double-count). Default ceiling == TRACE_STORE_CAP so the enforced number is the
+  // sensed number; TRACE_RETENTION_GLOBAL_CEILING decouples, and
+  // TRACE_RETENTION_GLOBAL_CEILING_ENABLED=false disables just this valve.
+  // ENTRY LOGGING, BECAUSE THIS BRANCH IS SILENTLY SKIPPED (2026-08-09).
+  //
+  // Measured on the live hub: the store sits at 2x its cap, the sensor alarms, the
+  // sweep completes without error, and the full sweep log is exactly three lines —
+  // reach-history rollup, the "over global ceiling ... so the indexed valve is
+  // reached" warning, and the aux-table reap. This valve's delete never runs and
+  // logs nothing. Net rate measured +436 rows/hr across 22 samples / 27 min with
+  // ZERO negative deltas, which is consistent with nothing deleting from `execution`
+  // at all.
+  //
+  // Its three gates all pass when checked by hand (globalCeilingEnabled default true,
+  // globalCeiling 150000, dryRun false), and the count query returns correctly —
+  // `SELECT count() FROM execution GROUP ALL` yields {"count":306191}, exactly the
+  // shape the code reads. So the skip is not the gate and not the count, and there is
+  // no return/throw between the aux reap and here.
+  //
+  // Log the entry rather than infer it from surrounding lines. Every diagnosis today
+  // that reasoned from adjacent evidence instead of instrumenting the branch itself
+  // was wrong; this makes the next cycle answer the question directly.
+  const valve = await runCeilingValve(cfg, coldCutoffIso);
+  if (valve) results.push(valve);
 
   // ── Orphaned content reap ──────────────────────────────────────────────────
   // execution_trace_content holds the split-out heavy FLEXIBLE payload (tasks,
@@ -1075,6 +1331,72 @@ async function runTraceRetentionSweepInner(
 }
 
 /**
+ * A VALVE-ONLY tick, so a large surplus drains between full sweeps instead of 20k rows per
+ * 30 minutes. It shares the sweep's re-entrancy guard and FTS deferral, recounts from the index
+ * head (resumable by construction), deletes at most one per-sweep cap within one budget, and
+ * accounts its deletions into trace_store_counters exactly as the sweep does.
+ */
+export async function runCeilingDrainTick(
+  cfg: TraceRetentionConfig = loadTraceRetentionConfig(),
+): Promise<{ skipped?: true; removed: number; remaining: number | null; durationMs: number }> {
+  if (sweepInFlight) return { skipped: true, removed: 0, remaining: lastCeilingOutcome?.remaining ?? null, durationMs: 0 };
+  try {
+    const { isFtsRebuildInProgress } = await import('../jobs/fts-rebuild');
+    if (isFtsRebuildInProgress()) return { skipped: true, removed: 0, remaining: lastCeilingOutcome?.remaining ?? null, durationMs: 0 };
+  } catch {
+    // Probe unavailable: proceed, as the sweep does.
+  }
+  sweepInFlight = true;
+  const startedAt = Date.now();
+  try {
+    const valve = await runCeilingValve(cfg, new Date(startedAt - cfg.hotWindowMs).toISOString());
+    const removed = valve?.deletedActual ?? 0;
+    if (!cfg.dryRun && removed > 0) await decrementTraceStoreCounter(removed);
+    const remaining = cfg.dryRun ? null : (lastCeilingOutcome?.remaining ?? 0);
+    const durationMs = Date.now() - startedAt;
+    logger.info('[trace-retention] drain tick', {
+      removed, remainingOverCap: remaining, durationMs,
+      stoppedBy: cfg.dryRun ? 'dry_run' : (lastCeilingOutcome?.stoppedBy ?? 'under_ceiling'),
+    });
+    return { removed, remaining, durationMs };
+  } finally {
+    sweepInFlight = false;
+  }
+}
+
+let drainFollowUpArmed = false;
+let drainFollowUpSkips = 0;
+const DRAIN_FOLLOW_UP_MAX_SKIPS = 10;
+/**
+ * Re-arm a valve-only drain tick while the last valve run left surplus behind because it hit its
+ * per-tick cap or budget. Not on 'empty' (nothing cold left to take) or an id-path stop — those
+ * wait for the next full sweep. One chain at a time; the rest between ticks is a tuning row.
+ */
+async function maybeArmDrainFollowUp(cfg: TraceRetentionConfig, afterSkip = false): Promise<void> {
+  const o = lastCeilingOutcome;
+  if (cfg.dryRun || drainFollowUpArmed) return;
+  // A tick that found the sweep in flight (timer or reconcile route) or an FTS rebuild learned
+  // nothing new — and the in-flight valve may have reset the outcome. Keep the chain alive a
+  // bounded number of times instead of letting it die until the next 30-minute timer.
+  if (afterSkip) {
+    if (++drainFollowUpSkips > DRAIN_FOLLOW_UP_MAX_SKIPS) { drainFollowUpSkips = 0; return; }
+  } else {
+    drainFollowUpSkips = 0;
+    if (!o || o.remaining <= 0) return;
+  }
+  if (!afterSkip && o && o.stoppedBy !== 'target' && o.stoppedBy !== 'budget') return;
+  const { restMs } = await loadDrainPolicy();
+  if (restMs <= 0) return;
+  drainFollowUpArmed = true;
+  setTimeout(() => {
+    drainFollowUpArmed = false;
+    void runCeilingDrainTick(cfg)
+      .then((r) => maybeArmDrainFollowUp(cfg, r.skipped === true))
+      .catch((err) => logger.warn('[trace-retention] drain tick failed', { error: err instanceof Error ? err.message : String(err) }));
+  }, restMs);
+}
+
+/**
  * Wire the periodic sweep. Mirrors exemplar-selector / learning-track-classifier:
  * delayed first run (DB warmup), then on a fixed interval. No-op if disabled.
  */
@@ -1105,6 +1427,7 @@ export function startTraceRetentionSweep(cfg: TraceRetentionConfig = loadTraceRe
   const tick = (attempt = 0): void =>
     void runTraceRetentionSweep(cfg)
       .then((r) => {
+        if (!r.skipped) void maybeArmDrainFollowUp(cfg);
         if (r.skipped && r.skippedReason === 'fts_rebuilding') {
           if (attempt + 1 < FTS_DEFER_MAX_ATTEMPTS) {
             setTimeout(() => tick(attempt + 1), FTS_DEFER_RETRY_MS);
