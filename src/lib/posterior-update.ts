@@ -30,6 +30,7 @@ import { embedSignatureForShapes } from '../jobs/signature-embed-backfill';
 import { applyClusterPosterior } from './cluster-posterior';
 import { getTuningParam } from './tuning-params';
 import { classifyReach } from './reach-classify';
+import { countShapeOutcome } from './shape-score-counter';
 import { recordDecisionOutcome, recordExecutionDecisionOutcome } from './decision-credit';
 
 // Install the SIGTERM/SIGINT flush hook once on module load so buffered α/β
@@ -72,6 +73,8 @@ export interface TraceForPosterior {
   cost_usd?: number;
   /** Execution id — read by the honest-reach gate to detect satisfier satellites (walk-satisfier- prefix). Absent on non-ingest callers. */
   execution_id?: string;
+  /** Which grading this call is: at trace insert, or a late POST /execution-traces/reach verdict. Keys the shape counter's idempotency. */
+  grading_occasion?: 'insert' | 'reach';
   /** Trace tags carrying the walk's persisted reach verdict ('reached:true'/'reached:false'/'dispatcher_used:goal-host'). Absent => legacy success-based (fail-open). */
   tags?: string[];
   /**
@@ -1008,6 +1011,7 @@ export async function applyOutcomeToPosteriors(
     tags: trace.tags,
   });
   const ungraded = reachVerdict === 'ungraded';
+
   const failedByTask = ungraded && trace.success === false && (((trace as any).failure_count ?? 0) > 0 || ((trace as any).task_count ?? 0) === 0);
   const effectiveSuccess = reachVerdict === 'reached';
   const { alphaDelta, betaDelta } = (ungraded && !failedByTask)
@@ -1111,6 +1115,23 @@ export async function applyOutcomeToPosteriors(
   // other with read/write conflicts. enqueueVariantDelta returns true when it
   // accepted the delta (coalescing ON); the `&& !` then skips the synchronous
   // UPDATE below. With POSTERIOR_COALESCE=0 it returns false → sync fallback.
+  // REACH-GRADED SHAPE COUNTER (migration 213, lib/shape-score-counter.ts): counted exactly when a
+  // variant_performance_metrics delta is applied (coalesced or synchronous) — same guard, same
+  // classifyReach verdict, same deltas — so the counter and VPM grade the same events, including a
+  // late regrade arriving through POST /execution-traces/reach (occasion 'reach'). Idempotent per
+  // (execution, occasion). Never fails the credit path.
+  if (!skipVariantUpdate && (alphaDelta !== 0 || betaDelta !== 0) && trace.execution_id) {
+    try {
+      await countShapeOutcome(db, trace.execution_id, effectiveSuccess ? 'reached' : 'not-reached',
+        trace.grading_occasion ?? 'insert', { alpha: alphaDelta, beta: betaDelta });
+    } catch (err) {
+      logger.warn('[shape-counter] count failed (credit path continues)', {
+        execution_id: trace.execution_id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   if (
     !skipVariantUpdate &&
     (alphaDelta !== 0 || betaDelta !== 0) &&

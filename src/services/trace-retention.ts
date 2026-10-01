@@ -34,6 +34,7 @@
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
 import { decrementTraceStoreCounter } from '../lib/trace-store-counters';
+import { PRUNE_MARKERS_SQL } from '../lib/shape-score-counter';
 
 // WRITE-FLIP/decommission: retention now bounds the canonical `execution`
 // table (root path). AET is the DUAL_WRITE shadow; when DUAL_WRITE is off it
@@ -648,7 +649,8 @@ async function runTraceRetentionSweepInner(
             { aid: activityId, ok: succeeded, cut: coldCutoffIso, keepProb, batch: thisBatch },
           );
           if (!Array.isArray(ids) || ids.length === 0) break; // tail exhausted
-          await surrealDB.query('DELETE $ids RETURN NONE', { ids });
+          // With its shape-counter markers, in one transaction (migration 213).
+          await surrealDB.query(`BEGIN TRANSACTION; DELETE $ids RETURN NONE; ${PRUNE_MARKERS_SQL('$ids')} COMMIT TRANSACTION;`, { ids });
           removed += ids.length;
         }
         deletedActual = removed;
@@ -901,7 +903,8 @@ async function runTraceRetentionSweepInner(
             // actually delete. The clause is SurrealQL's own (paradigm.ts already uses TIMEOUT 8s
             // on a hot SELECT), so the server abandons the statement rather than the client
             // hanging up on work that continues underneath.
-            await surrealDB.query('DELETE $ids RETURN NONE TIMEOUT 20s', { ids });
+            // With its shape-counter markers, in one transaction (migration 213).
+            await surrealDB.query(`BEGIN TRANSACTION; DELETE $ids RETURN NONE TIMEOUT 20s; ${PRUNE_MARKERS_SQL('$ids')} COMMIT TRANSACTION;`, { ids });
             done += ids.length;
             if (done >= target) stoppedBy = 'target';
           } catch (err) {

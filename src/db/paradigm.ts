@@ -9,6 +9,7 @@
  * This enables gradual migration from legacy schema to unified paradigm schema.
  */
 
+import { counterRowToScore, type ShapeScoreCounterRow } from '../lib/shape-score-counter';
 import { surrealDB, queryWithAuth } from './surreal';
 import { logger } from '../utils/logger';
 import { localEmbeddingService, getEmbeddingProvider } from '../services/embedding-service';
@@ -1079,39 +1080,71 @@ export function computeShapeSignature(shapes: string[]): string[] {
 }
 
 /**
- * Shape-conditioned scores — NEUTRALISED (2026-10-01): returns the global, non-shape-conditioned
- * posteriors (getActivityScores) with `shape_signature: []` for every call.
+ * Shape-conditioned scores from shape_score_counter — the REACH-graded, never-decremented
+ * per-(activity, org, shape signature) counter (migration 213, lib/shape-score-counter.ts).
  *
- * WHY. This used to read v_shape_conditioned_score, whose evidence is the EXIT-STATUS `success`
- * column of `execution`. The learner deliberately grades by REACH instead
- * (lib/posterior-update.ts → classifyReach, lib/reach-classify.ts: reached → credit, not-reached →
- * penalize, ungraded → skip), so an exit-status rate rewards hollow completions. On top of that,
- * SurrealDB 2.3.3 mis-maintains the view: its alpha/beta columns flip between 1 and 2 whatever the
- * counts are, and a delete that zeroes one of a group's count aggregates drops the whole group.
- * There is no correct way to read a reach posterior out of this view, so the shape-conditioned term
- * is dropped until a reach-graded per-shape counter exists (follow-up change), and selection uses
- * the same global path it already used whenever no shapes were supplied.
+ * alpha = reached + 1, beta = not_reached + 1, where the verdicts are classifyReach's (the same
+ * primitive the main learner grades by); exit status and ungraded executions are not counted.
+ * Exact signature first, then the largest group whose signature is a subset of the input; with no
+ * counted group it falls back to the global posteriors (getActivityScores), as before.
  *
- * Signature kept so callers (routes/activities.ts recommend) are unchanged; with every row carrying
- * an empty shape_signature the recommend route reports scoreMethod 'global'.
+ * (History: this read v_shape_conditioned_score, whose evidence was exit status and which SurrealDB
+ * 2.3.3 mis-maintained; that read was neutralised first, then replaced by this counter.)
  */
 export async function getShapeConditionedScores(
   orgId: string,
   activityIds: string[],
-  _inputShapes: string[],
+  inputShapes: string[],
   jwtToken?: string | null,
   accountId: string | null = null
 ): Promise<QueryPathResult<ShapeConditionedScore>> {
   const startTime = Date.now();
-  const globalResult = await getActivityScores(orgId, activityIds, jwtToken, accountId);
-  return {
-    data: globalResult.data.map(score => ({
-      ...score,
-      shape_signature: [],
-    })),
-    path: globalResult.path,
-    latency_ms: Date.now() - startTime,
+  const globalFallback = async () => {
+    const globalResult = await getActivityScores(orgId, activityIds, jwtToken, accountId);
+    return {
+      data: globalResult.data.map(score => ({
+        ...score,
+        shape_signature: [],
+      })),
+      path: globalResult.path,
+      latency_ms: Date.now() - startTime,
+    };
   };
+  if (!inputShapes || inputShapes.length === 0) return globalFallback();
+
+  const params = {
+    // Executions store org_id as written ('organizations:x' mostly, bare for a few legacy
+    // writers); bind both forms, as getCanonicalPosteriors does.
+    org_ids: [orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`, orgId.replace(/^organizations:/, '')],
+    activity_ids: activityIds.map(normalizeActivityId),
+    signature: computeShapeSignature(inputShapes),
+  };
+  const read = async (q: string) => {
+    const rows = jwtToken
+      ? await queryWithAuth<ShapeScoreCounterRow>(jwtToken, q, params)
+      : await surrealDB.query<ShapeScoreCounterRow>(q, params);
+    return (Array.isArray(rows) ? rows : []).map(counterRowToScore) as ShapeConditionedScore[];
+  };
+  try {
+    const exact = await read(`
+      SELECT * FROM shape_score_counter
+      WHERE org_id IN $org_ids AND activity_id IN $activity_ids AND shape_signature = $signature
+    `);
+    if (exact.length > 0) return { data: exact, path: 'new', latency_ms: Date.now() - startTime };
+    // One row per (activity, org, signature): the table is small, so ORDER BY here is bounded.
+    const subset = await read(`
+      SELECT * FROM shape_score_counter
+      WHERE org_id IN $org_ids AND activity_id IN $activity_ids AND shape_signature ALLINSIDE $signature
+      ORDER BY graded DESC
+      LIMIT 1
+    `);
+    if (subset.length > 0) return { data: subset, path: 'new', latency_ms: Date.now() - startTime };
+  } catch (error) {
+    logger.warn('[paradigm] shape_score_counter read failed, falling back to global', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  return globalFallback();
 }
 
 /**
@@ -1794,18 +1827,19 @@ export async function getActivityShapePatterns(
 
   try {
     const query = `
-      SELECT * FROM v_shape_conditioned_score
+      SELECT * FROM shape_score_counter
       WHERE org_id = $org_id
         AND activity_id = $activity_id
-      ORDER BY total_executions DESC
+      ORDER BY graded DESC
       LIMIT 20
     `;
 
     const params = { org_id: fullOrgId, activity_id: activityId };
 
-    const result = jwtToken
-      ? await queryWithAuth<ShapeConditionedScore>(jwtToken, query, params)
-      : await surrealDB.query<ShapeConditionedScore>(query, params);
+    // Reach-graded counter (migration 213), presented in the view's old column shape.
+    const result = ((jwtToken
+      ? await queryWithAuth<ShapeScoreCounterRow>(jwtToken, query, params)
+      : await surrealDB.query<ShapeScoreCounterRow>(query, params)) ?? []).map(counterRowToScore) as ShapeConditionedScore[];
 
     logger.debug('[paradigm] Activity shape patterns fetched', {
       activityId,

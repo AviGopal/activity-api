@@ -186,6 +186,27 @@ class SurrealDBClient {
   }
 
   async query<T = any>(sql: string, params?: Record<string, any>, _isRetry = false, _conflictRetries = 0): Promise<T[]> {
+    return (await this.exec(sql, params, 'first', _isRetry, _conflictRetries)) as T[];
+  }
+
+  /**
+   * Like query(), but returns EVERY statement's result instead of only the first — for a
+   * multi-statement script such as a BEGIN/COMMIT transaction, whose first result is a LET.
+   * Same path as query(): the concurrency semaphore, db stats, the auth-drop reconnect-and-retry
+   * and the retryable write-conflict backoff (a conflicted transaction is rolled back whole, so
+   * re-running it is safe). Prefer this over queryRaw, which bypasses all of that.
+   */
+  async queryAll(sql: string, params?: Record<string, any>): Promise<unknown[]> {
+    return (await this.exec(sql, params, 'all', false, 0)) as unknown[];
+  }
+
+  private async exec(
+    sql: string,
+    params: Record<string, any> | undefined,
+    mode: 'first' | 'all',
+    _isRetry: boolean,
+    _conflictRetries: number,
+  ): Promise<unknown> {
     await this.connect();
 
     if (!this.db) {
@@ -204,11 +225,13 @@ class SurrealDBClient {
       try { result = await this.db.query(sql, params); } finally { querySem.release(); }
 
       // SurrealDB returns array of result sets, we typically want the first one
-      const firstResult = Array.isArray(result) && result.length > 0 ? result[0] : [];
+      const out = mode === 'all'
+        ? (Array.isArray(result) ? result : [])
+        : (Array.isArray(result) && result.length > 0 ? result[0] : []);
 
       dbStats.record(sql, performance.now() - __t0, true);
       dbStats.inFlight--;
-      return firstResult as T[];
+      return out;
     } catch (error) {
       dbStats.record(sql, performance.now() - __t0, false);
       dbStats.inFlight--;
@@ -230,7 +253,7 @@ class SurrealDBClient {
         try { await this.db.close(); } catch {}
         this.db = null;
         this.connecting = null;
-        return await this.query<T>(sql, params, true);
+        return await this.exec(sql, params, mode, true, _conflictRetries);
       }
 
       // Optimistic-concurrency write conflicts ("Failed to commit transaction due to
@@ -251,7 +274,7 @@ class SurrealDBClient {
       ) {
         const backoffMs = 25 * Math.pow(2, _conflictRetries); // 25, 50, 100, 200ms
         await new Promise((resolve) => setTimeout(resolve, backoffMs));
-        return await this.query<T>(sql, params, _isRetry, _conflictRetries + 1);
+        return await this.exec(sql, params, mode, _isRetry, _conflictRetries + 1);
       }
 
       // SDK errors (notably response-deserialization failures) can carry an

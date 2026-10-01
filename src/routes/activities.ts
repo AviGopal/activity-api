@@ -5795,8 +5795,8 @@ app.post('/feedback', async (c) => {
     // by hand across every file type in every repo. Every reference to
     // impulse_shape_activity_score is a write, a schema DEFINE, a test, or a SELECT nested
     // INSIDE its own UPSERT (paradigm.ts:1774-1783 — read-modify-write, not a read). No
-    // selector consults it: shape-conditioned selection reads v_shape_conditioned_score
-    // (a computed view over `execution`), and global selection reads v_activity_score
+    // selector consults it: shape-conditioned selection reads shape_score_counter (reach-graded;
+    // it replaced v_shape_conditioned_score, an exit-status view over `execution`), and global selection reads v_activity_score
     // (likewise) overlaid with variant_performance_metrics via getCanonicalPosteriors.
     //
     // So this sentence asserts a consumer that does not exist, and that is the load-bearing

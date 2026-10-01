@@ -3552,6 +3552,7 @@ app.post('/', async (c) => {
           tasks: trace.tasks as any,
           cost_usd: trace.cost_usd as number,
           ...(typeof trace.execution_id === 'string' ? { execution_id: trace.execution_id as string } : {}),
+          grading_occasion: 'insert',
           ...(Array.isArray((trace as any).tags) && (trace as any).tags.length > 0 ? { tags: (trace as any).tags as string[] } : {}),
           ...(resolvedCompositionChain.length > 0 ? { composition_chain: resolvedCompositionChain } : {}),
           ...(v1Sig ? { signature: v1Sig, signature_version: v1SigVersion } : {}),
@@ -5337,6 +5338,7 @@ app.post('/reach', async (c) => {
             cost_usd: typeof preRow.cost_usd === 'number' ? (preRow.cost_usd as number) : 0,
             execution_id: String(execId),
             tags: gradedTags,
+            grading_occasion: 'reach',
             ...(Array.isArray(preRow.composition_chain) && preRow.composition_chain.length > 0
               ? { composition_chain: preRow.composition_chain as string[] }
               : {}),

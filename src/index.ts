@@ -666,6 +666,14 @@ import('./services/trace-retention').then(({ startTraceRetentionSweep }) => {
   logger.error('[trace-retention] Failed to load trace-retention job', { error: String(err) });
 });
 
+// One-time, resumable seed of the reach-graded shape counter (migration 213): replays classifyReach
+// over retained executions. A single marker read once it has finished.
+import('./jobs/shape-score-counter-seed').then(({ startShapeCounterSeed }) => {
+  startShapeCounterSeed();
+}).catch(err => {
+  logger.error('[shape-counter-seed] Failed to load seed job', { error: String(err) });
+});
+
 // ============================================================================
 // Signature Clustering Tick (D3.2)
 // ============================================================================
