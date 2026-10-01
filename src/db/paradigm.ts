@@ -1079,130 +1079,30 @@ export function computeShapeSignature(shapes: string[]): string[] {
 }
 
 /**
- * Get shape-conditioned Thompson priors for activities.
+ * Shape-conditioned scores — NEUTRALISED (2026-10-01): returns the global, non-shape-conditioned
+ * posteriors (getActivityScores) with `shape_signature: []` for every call.
  *
- * This allows recommendations to be informed by how well an activity
- * performs with specific input shape combinations (goals).
+ * WHY. This used to read v_shape_conditioned_score, whose evidence is the EXIT-STATUS `success`
+ * column of `execution`. The learner deliberately grades by REACH instead
+ * (lib/posterior-update.ts → classifyReach, lib/reach-classify.ts: reached → credit, not-reached →
+ * penalize, ungraded → skip), so an exit-status rate rewards hollow completions. On top of that,
+ * SurrealDB 2.3.3 mis-maintains the view: its alpha/beta columns flip between 1 and 2 whatever the
+ * counts are, and a delete that zeroes one of a group's count aggregates drops the whole group.
+ * There is no correct way to read a reach posterior out of this view, so the shape-conditioned term
+ * is dropped until a reach-graded per-shape counter exists (follow-up change), and selection uses
+ * the same global path it already used whenever no shapes were supplied.
  *
- * Example: "debug-null-pointer" might have:
- *   - α=15, β=3 when input_shapes = ['error', 'source_code']
- *   - α=5, β=8 when input_shapes = ['goal']
- *
- * This lets us learn that the activity works great for debugging errors
- * but poorly when given just a vague goal.
- *
- * @param orgId - Organization ID
- * @param activityIds - Activity IDs to get scores for
- * @param inputShapes - Input shapes being provided (for matching)
- * @param jwtToken - Optional JWT for RBAC
+ * Signature kept so callers (routes/activities.ts recommend) are unchanged; with every row carrying
+ * an empty shape_signature the recommend route reports scoreMethod 'global'.
  */
 export async function getShapeConditionedScores(
   orgId: string,
   activityIds: string[],
-  inputShapes: string[],
+  _inputShapes: string[],
   jwtToken?: string | null,
   accountId: string | null = null
 ): Promise<QueryPathResult<ShapeConditionedScore>> {
   const startTime = Date.now();
-
-  if (!inputShapes || inputShapes.length === 0) {
-    // No shapes provided - fall back to global scores
-    const globalResult = await getActivityScores(orgId, activityIds, jwtToken, accountId);
-    return {
-      data: globalResult.data.map(score => ({
-        ...score,
-        shape_signature: [],
-      })),
-      path: globalResult.path,
-      latency_ms: Date.now() - startTime,
-    };
-  }
-
-  // Compute canonical signature for matching
-  const signature = computeShapeSignature(inputShapes);
-  const fullOrgId = orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`;
-
-  try {
-    // Phase E: dual-tenant scoping. account_id wins; legacy rows
-    // (account_id IS NONE) match via org_id. Both binds are present.
-    const query = `
-      SELECT * FROM v_shape_conditioned_score
-      WHERE ((account_id = $account_id) OR (account_id IS NONE AND org_id = $org_id))
-        AND activity_id IN $activity_ids
-        AND shape_signature = $signature
-    `;
-
-    const params = {
-      org_id: fullOrgId,
-      account_id: accountId,
-      // v_shape_conditioned_score.activity_id is BARE; normalize caller record strings.
-      activity_ids: activityIds.map(normalizeActivityId),
-      signature,
-    };
-
-    const result = jwtToken
-      ? await queryWithAuth<ShapeConditionedScore>(jwtToken, query, params)
-      : await surrealDB.query<ShapeConditionedScore>(query, params);
-
-    if (result && result.length > 0) {
-      logger.info('[paradigm] Shape-conditioned scores fetched', {
-        count: result.length,
-        signature,
-        path: 'new',
-        latency_ms: Date.now() - startTime,
-      });
-
-      return {
-        data: result,
-        path: 'new',
-        latency_ms: Date.now() - startTime,
-      };
-    }
-
-    // No exact match - try partial match (shapes that are subsets)
-    // This handles the case where the activity has been used with similar
-    // but not identical shape combinations.
-    // Phase E: same dual-tenant scoping.
-    const subsetQuery = `
-      SELECT * FROM v_shape_conditioned_score
-      WHERE ((account_id = $account_id) OR (account_id IS NONE AND org_id = $org_id))
-        AND activity_id IN $activity_ids
-        AND shape_signature ALLINSIDE $signature
-      ORDER BY total_executions DESC
-      LIMIT 1
-    `;
-
-    const subsetResult = jwtToken
-      ? await queryWithAuth<ShapeConditionedScore>(jwtToken, subsetQuery, params)
-      : await surrealDB.query<ShapeConditionedScore>(subsetQuery, params);
-
-    if (subsetResult && subsetResult.length > 0) {
-      logger.debug('[paradigm] Shape-conditioned scores found via subset match', {
-        count: subsetResult.length,
-        signature,
-        matched_signatures: subsetResult.map(s => s.shape_signature),
-      });
-
-      return {
-        data: subsetResult,
-        path: 'new',
-        latency_ms: Date.now() - startTime,
-      };
-    }
-
-    // No shape-conditioned data - fall back to global scores
-    logger.debug('[paradigm] No shape-conditioned scores, falling back to global', {
-      signature,
-      activityIds,
-    });
-
-  } catch (error) {
-    logger.warn('[paradigm] Shape-conditioned score query failed, falling back', {
-      error: error instanceof Error ? error.message : String(error),
-    });
-  }
-
-  // Fallback to global activity scores
   const globalResult = await getActivityScores(orgId, activityIds, jwtToken, accountId);
   return {
     data: globalResult.data.map(score => ({
