@@ -656,6 +656,72 @@ export async function drainColdByRange(opts: {
   }
 }
 
+// ── TELEMETRY CLASS FIRST ────────────────────────────────────────────────────
+//
+// The trace store is for gradable executions. Activity ids declared telemetry-class in the tuning
+// row TRACE_RETENTION_TELEMETRY_ACTIVITIES (data, read at use time — migration 215 seeds it with
+// auth_resolve_v1) are drained BEFORE the age-ordered range path: on the hub that one id is ~68% of
+// `execution`, so draining it first takes the store from ~14x its cap to ~4.5x without touching a
+// single gradable execution. Bounded like the range path: per-batch LIMIT (never more than the
+// remaining allowance, so never below the cap), the cold cutoff (hot-window rows stay), the shared
+// time budget, one transaction per batch that also deletes the rows' shape-counter markers.
+// Within the telemetry class there is no age order (none is needed: every row is disposable).
+// WITH INDEX idx_execution_activity: left to itself the planner walks idx_execution_executed_at from
+// the oldest row, so once the old telemetry is gone every batch would re-scan all the older
+// non-telemetry rows to find its next n (quadratic on the hub). The activity index visits only this
+// id's rows. (An absent index is ignored by SurrealDB 2.3.3 and the query still runs.)
+
+const TELEMETRY_BATCH_SQL = (stmtTimeoutS: number) => `
+BEGIN TRANSACTION;
+LET $__ids = (SELECT VALUE id FROM ${TABLE} WITH INDEX idx_execution_activity WHERE activity_id = $aid AND executed_at < type::datetime($cut) LIMIT $n);
+DELETE $__ids RETURN NONE TIMEOUT ${stmtTimeoutS}s;
+${PRUNE_MARKERS_SQL('$__ids')}
+RETURN { deleted: array::len($__ids) };
+COMMIT TRANSACTION;`;
+
+export async function drainTelemetryClass(opts: {
+  cutIso: string;
+  target: number;
+  budgetUntil: number;
+  policy: DrainPolicy;
+}): Promise<{ removed: number; batches: number; activities: string[]; stoppedBy: 'target' | 'budget' | 'empty' | 'failed' | 'none_declared' }> {
+  // Vetted: ids with reach-graded evidence are refused (logged) and keep the age-ordered path.
+  const { resolveTelemetryClass } = await import('../lib/telemetry-class');
+  const activities = (await resolveTelemetryClass()).accepted;
+  if (activities.length === 0) return { removed: 0, batches: 0, activities, stoppedBy: 'none_declared' };
+  let removed = 0, batches = 0, failures = 0;
+  let n = Math.max(1, Math.min(opts.policy.batch, carriedDrainWidth ?? DRAIN_COLD_START_WIDTH));
+  for (const aid of activities) {
+    for (;;) {
+      if (removed >= opts.target) return { removed, batches, activities, stoppedBy: 'target' };
+      if (Date.now() >= opts.budgetUntil) return { removed, batches, activities, stoppedBy: 'budget' };
+      const want = Math.min(n, opts.target - removed);
+      const started = Date.now();
+      try {
+        const raw = await surrealDB.queryAll(TELEMETRY_BATCH_SQL(opts.policy.stmtTimeoutS), { aid, cut: opts.cutIso, n: want });
+        const out = (Array.isArray(raw) ? raw : []).filter((r): r is { deleted: number } => !!r && typeof r === 'object' && 'deleted' in (r as object)).pop();
+        const deleted = Number(out?.deleted ?? 0);
+        if (deleted === 0) break; // this id has no cold rows left
+        removed += deleted;
+        batches++;
+        const took = Date.now() - started;
+        const timeoutMs = opts.policy.stmtTimeoutS * 1000;
+        if (took > timeoutMs / 2) n = Math.max(1, Math.floor(want / 2));
+        else if (took < timeoutMs / 8) n = Math.min(opts.policy.batch, n * 2);
+      } catch (err) {
+        failures++;
+        logger.warn('[trace-retention] telemetry batch failed — rolled back, narrowing', {
+          activity_id: aid, batch: want, failures, error: err instanceof Error ? err.message : String(err),
+        });
+        if (want <= opts.policy.minBatch && failures >= 3) return { removed, batches, activities, stoppedBy: 'failed' };
+        n = Math.max(opts.policy.minBatch, Math.floor(want / 2));
+      }
+      if (opts.policy.pauseMs > 0) await new Promise((r) => setTimeout(r, opts.policy.pauseMs));
+    }
+  }
+  return { removed, batches, activities, stoppedBy: 'empty' };
+}
+
 /** What the last valve run left over-ceiling, read by the scheduler to decide on a follow-up drain tick. */
 let lastCeilingOutcome: { remaining: number; stoppedBy: string } | null = null;
 export function getLastCeilingOutcome(): { remaining: number; stoppedBy: string } | null {
@@ -734,8 +800,12 @@ async function runCeilingValve(cfg: TraceRetentionConfig, coldCutoffIso: string)
         // SET-BASED FIRST (see drainColdByRange); the id-list loop below runs only when the range
         // path reports it cannot progress, with whatever target and budget remain.
         const drainPolicy = await loadDrainPolicy();
-        const range = await drainColdByRange({ cutIso: coldCutoffIso, target, budgetUntil, policy: drainPolicy });
-        done = range.removed;
+        // Telemetry class first (data-declared ids), then the age-ordered range path for the rest.
+        const telemetry = await drainTelemetryClass({ cutIso: coldCutoffIso, target, budgetUntil, policy: drainPolicy });
+        const range = telemetry.removed >= target || telemetry.stoppedBy === 'budget'
+          ? { removed: 0, batches: 0, failures: 0, stoppedBy: (telemetry.removed >= target ? 'target' : 'budget') as DrainResult['stoppedBy'] }
+          : await drainColdByRange({ cutIso: coldCutoffIso, target: target - telemetry.removed, budgetUntil, policy: drainPolicy });
+        done = telemetry.removed + range.removed;
         const idFallback = range.stoppedBy === 'needs_ids';
         if (range.stoppedBy !== 'needs_ids') stoppedBy = range.stoppedBy;
         for (let iter = 0; idFallback && iter < maxIters && done < target; iter++) {
@@ -883,6 +953,9 @@ async function runCeilingValve(cfg: TraceRetentionConfig, coldCutoffIso: string)
         logger.info('[trace-retention] global-ceiling valve: done', {
           removed,
           mode: idFallback ? 'range+id_tail' : 'range',
+          telemetryRemoved: telemetry.removed,
+          telemetryActivities: telemetry.activities,
+          telemetryStoppedBy: telemetry.stoppedBy,
           rangeRemoved: range.removed,
           rangeBatches: range.batches,
           rangeFailures: range.failures,

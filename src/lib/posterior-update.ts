@@ -1122,8 +1122,15 @@ export async function applyOutcomeToPosteriors(
   // (execution, occasion). Never fails the credit path.
   if (!skipVariantUpdate && (alphaDelta !== 0 || betaDelta !== 0) && trace.execution_id) {
     try {
-      await countShapeOutcome(db, trace.execution_id, effectiveSuccess ? 'reached' : 'not-reached',
-        trace.grading_occasion ?? 'insert', { alpha: alphaDelta, beta: betaDelta });
+      // Telemetry-class ids (the same data-declared set retention drains first) are never counted:
+      // they are not gradable executions. Today they also carry no input shapes, so this is the
+      // explicit form of what the shape filter already does implicitly.
+      const { resolveTelemetryClass } = await import('./telemetry-class');
+      const telemetry = (await resolveTelemetryClass()).accepted;
+      if (!telemetry.includes(activityId)) {
+        await countShapeOutcome(db, trace.execution_id, effectiveSuccess ? 'reached' : 'not-reached',
+          trace.grading_occasion ?? 'insert', { alpha: alphaDelta, beta: betaDelta });
+      }
     } catch (err) {
       logger.warn('[shape-counter] count failed (credit path continues)', {
         execution_id: trace.execution_id,
@@ -1131,6 +1138,7 @@ export async function applyOutcomeToPosteriors(
       });
     }
   }
+
 
   if (
     !skipVariantUpdate &&

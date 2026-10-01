@@ -85,8 +85,17 @@ export async function getTuningParam(
         setTimeout(() => reject(new Error(`tuning-param lookup exceeded deadline for '${name}'`)), 1_500),
       ),
     ]);
-    if (rows && rows.length > 0 && typeof rows[0].param_value === 'number' && Number.isFinite(rows[0].param_value)) {
-      tableValue = rows[0].param_value;
+    const raw: unknown = rows && rows.length > 0 ? rows[0].param_value : null;
+    if (typeof raw === 'number' && Number.isFinite(raw)) {
+      tableValue = raw;
+    } else if (raw !== null && raw !== undefined) {
+      // `value` is `float | string` once string-valued params exist (migrations 203/215): a row a
+      // numeric reader cannot use is REFUSED loudly, never coerced, and the env/default stands.
+      logger.warn('tuning-param row is not a finite number; using env/default', {
+        event: 'tuning_param_type_mismatch',
+        name,
+        found_type: typeof raw,
+      });
     }
   } catch (err) {
     // Table absent (pre-migration) or transient DB error: behave exactly as the
@@ -181,4 +190,61 @@ export async function writeTuningParam(
 /** Test hook — drop the cache so a freshly-authored row is observed immediately. */
 export function __clearTuningParamCache(): void {
   cache.clear();
+}
+
+// ─── list-valued tuning params ──────────────────────────────────────────────
+//
+// A tuning param whose value is a comma-separated list of ids (the idiom
+// CREDIT_PROPAGATION_EXCLUDED_ANCESTORS established in lib/posterior-update.ts), read at use time
+// through a short TTL cache with the same deadline and fail-open discipline as getTuningParam.
+// Needs `substrate_tuning_param.value` to accept strings (migration 215 / the in-flight 203).
+// An absent row, a non-string value or any read error is the EMPTY list.
+const listCache = new Map<string, { value: string[]; expiresAt: number }>();
+
+/**
+ * The telemetry trace class (migration 215): activity ids whose executions are telemetry, not
+ * gradable executions. Read by trace retention (drained first) and the shape counter (never counted).
+ */
+export const TRACE_TELEMETRY_ACTIVITIES_PARAM = 'TRACE_RETENTION_TELEMETRY_ACTIVITIES';
+
+export async function getTuningParamList(name: string): Promise<string[]> {
+  const now = Date.now();
+  const cached = listCache.get(name);
+  if (cached && cached.expiresAt > now) return cached.value;
+  let value: string[] = [];
+  try {
+    const rows = await Promise.race([
+      surrealDB.query<{ param_value: unknown }>(
+        'SELECT `value` AS param_value FROM substrate_tuning_param WHERE name = $name LIMIT 1',
+        { name },
+      ),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`tuning-param list lookup exceeded deadline for '${name}'`)), 1_500),
+      ),
+    ]);
+    const raw = Array.isArray(rows) && rows.length > 0 ? rows[0]?.param_value : null;
+    if (typeof raw === 'string') {
+      value = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+    } else if (raw !== null && raw !== undefined) {
+      // A list reader refuses a non-string row loudly (a numeric value is not a list).
+      logger.warn('tuning-param list row is not a string; using the empty list', {
+        event: 'tuning_param_list_type_mismatch',
+        name,
+        found_type: typeof raw,
+      });
+    }
+  } catch (err) {
+    logger.debug('tuning-param list lookup fell back to empty', {
+      event: 'tuning_param_list_fallback',
+      name,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  listCache.set(name, { value, expiresAt: now + CACHE_TTL_MS });
+  return value;
+}
+
+/** Test hook — drop the list cache so a freshly-authored row is observed immediately. */
+export function __clearTuningParamListCache(): void {
+  listCache.clear();
 }

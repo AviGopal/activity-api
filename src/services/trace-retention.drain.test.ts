@@ -107,17 +107,19 @@ run('set-based ceiling drain (real SurrealDB)', () => {
     if (typeof (db as { queryAll?: unknown }).queryAll !== 'function') {
       throw new Error('../db/surreal is mocked in this process — run this file on its own');
     }
-    clearTuning = (await import('../lib/tuning-params')).__clearTuningParamCache;
+    const TP = await import('../lib/tuning-params');
+    const TC = await import('../lib/telemetry-class');
+    clearTuning = () => { TP.__clearTuningParamCache(); TP.__clearTuningParamListCache(); TC.__clearTelemetryClassCache(); };
     P = await import('../db/paradigm');
     PU = await import('../lib/posterior-update');
   });
 
   beforeEach(async () => {
     await q('REMOVE TABLE IF EXISTS shape_score_counter; REMOVE TABLE IF EXISTS shape_score_counted; REMOVE TABLE IF EXISTS shape_score_counter_seed; REMOVE TABLE IF EXISTS execution; REMOVE TABLE IF EXISTS substrate_tuning_param; REMOVE TABLE IF EXISTS trace_store_counters;');
-    await q('DEFINE TABLE execution SCHEMALESS; DEFINE INDEX idx_execution_executed_at ON execution FIELDS executed_at;');
+    await q('DEFINE TABLE execution SCHEMALESS; DEFINE INDEX idx_execution_executed_at ON execution FIELDS executed_at; DEFINE INDEX idx_execution_activity ON execution FIELDS activity_id;');
     // The repo's own counter migration (d2), not a copy.
     await q(COUNTER_MIGRATION);
-    await q('DEFINE TABLE substrate_tuning_param SCHEMALESS;');
+    await q('REMOVE TABLE IF EXISTS variant_performance_metrics; DEFINE TABLE substrate_tuning_param SCHEMALESS;');
     await setTuning('TRACE_RETENTION_DRAIN_BATCH', 40);
     await setTuning('TRACE_RETENTION_DRAIN_PAUSE_MS', 0);
     clearTuning();
@@ -375,6 +377,154 @@ run('set-based ceiling drain (real SurrealDB)', () => {
     expect(await markerCount()).toBe(120 - deleted); // one marker per surviving execution, none for the deleted
     expect(await posterior()).toEqual(before);
     expect((await q('SELECT * FROM shape_score_counter')).length).toBe(1);
+  });
+
+  // ── Telemetry class first (migration 215: TRACE_RETENTION_TELEMETRY_ACTIVITIES, data) ──────────
+
+  const TELE = 'auth_resolve_v1';
+  /** `tele` telemetry rows that are NEWER than `other` gradable rows (both cold), plus optional hot telemetry. */
+  async function seedMixed(tele: number, other: number, hotTele = 0) {
+    const now = Date.now();
+    const rows: Array<Record<string, unknown>> = [];
+    for (let i = 0; i < other; i++) rows.push({ id: `g${String(i).padStart(5, '0')}`, activity_id: 'gradable', success: true, executed_at: new Date(now - 5 * DAY + i * 1000) });
+    for (let i = 0; i < tele; i++) rows.push({ id: `t${String(i).padStart(5, '0')}`, activity_id: TELE, success: false, tags: ['telemetry:auth'], executed_at: new Date(now - 1 * DAY + i * 1000) });
+    for (let i = 0; i < hotTele; i++) rows.push({ id: `th${i}`, activity_id: TELE, success: false, tags: ['telemetry:auth'], executed_at: new Date(now - 60_000 + i) });
+    for (let i = 0; i < rows.length; i += 500) await q('INSERT INTO execution $rows RETURN NONE', { rows: rows.slice(i, i + 500) });
+  }
+  const countOf = async (aid: string) => Number((await q<{ count: number }>('SELECT count() FROM execution WHERE activity_id = $a GROUP ALL', { a: aid }))[0]?.count ?? 0);
+  async function declare(list: string | null) {
+    await q('DELETE substrate_tuning_param WHERE name = "TRACE_RETENTION_TELEMETRY_ACTIVITIES"');
+    if (list !== null) await q('CREATE substrate_tuning_param SET name = "TRACE_RETENTION_TELEMETRY_ACTIVITIES", `value` = $v', { v: list });
+    clearTuning(); // stands in for the 30 s TTL
+  }
+
+  test('TELEMETRY FIRST: declared telemetry rows drain before OLDER gradable rows, and never past the cap', async () => {
+    await seedMixed(300, 300);
+    await declare(TELE);
+    await M.runTraceRetentionSweep(cfgFor(400)); // surplus 200
+    expect(await countOf(TELE)).toBe(100);
+    expect(await countOf('gradable')).toBe(300); // the older gradable rows were not touched
+    expect(await total()).toBe(400);
+  });
+
+  test('NON-TELEMETRY KEEP AGE ORDER: once telemetry is gone, the oldest gradable rows go next', async () => {
+    await seedMixed(300, 300);
+    await declare(TELE);
+    await M.runTraceRetentionSweep(cfgFor(200)); // surplus 400 = 300 telemetry + 100 oldest gradable
+    expect(await countOf(TELE)).toBe(0);
+    expect(await countOf('gradable')).toBe(200);
+    const left = await q<string>('SELECT VALUE meta::id(id) FROM execution WHERE activity_id = "gradable"');
+    expect(left.sort()[0]).toBe('g00100'); // g00000..g00099 (the 100 oldest) are exactly the ones removed
+  });
+
+  test('DATA, NOT CODE: with no declaration the drain is purely age-ordered; authoring the row changes what drains', async () => {
+    await seedMixed(300, 300);
+    await declare(null);
+    await M.runTraceRetentionSweep(cfgFor(500)); // surplus 100 → the 100 OLDEST, which are gradable
+    expect([await countOf(TELE), await countOf('gradable')]).toEqual([300, 200]);
+    await declare(TELE); // a tuning row, no code edit
+    await M.runTraceRetentionSweep(cfgFor(400)); // surplus 100 → telemetry first
+    expect([await countOf(TELE), await countOf('gradable')]).toEqual([200, 200]);
+    await declare('some-other-id'); // re-declared: auth_resolve_v1 is no longer telemetry-class
+    await M.runTraceRetentionSweep(cfgFor(300)); // surplus 100 → age order again: 100 oldest gradable
+    expect([await countOf(TELE), await countOf('gradable')]).toEqual([200, 100]);
+  });
+
+  test('TELEMETRY in the hot window is kept, like every other row', async () => {
+    await seedMixed(50, 0, 30);
+    await declare(TELE);
+    await M.runTraceRetentionSweep(cfgFor(1));
+    expect(await countOf(TELE)).toBe(30);
+  });
+
+  test('COUNTER INVARIANT: draining telemetry leaves the reach-graded shape counter unchanged; telemetry is never counted', async () => {
+    await declare(TELE);
+    await seedGroup('ssfsf', { hot: 0 });            // gradable, counted through the real credit path
+    // A shaped telemetry execution graded through the same credit path (it takes β live via the
+    // ungraded-failure arm): declared and accepted telemetry-class, so the counter must not count it.
+    await q('INSERT INTO execution $r RETURN NONE', { r: { id: 'tshaped', activity_id: TELE, org_id: ORG, success: false, tags: ['telemetry:auth'], input_impulse_shapes: ['y', 'x'], executed_at: new Date(Date.now() - 2 * DAY) } });
+    await PU.applyOutcomeToPosteriors({ activity_id: TELE, success: false, failure_mode: null, execution_id: 'tshaped', tags: ['telemetry:auth', 'reached:false'], grading_occasion: 'insert' }, db, ORG);
+    // A stale counting marker on a telemetry row (as if its counter row were gone): it must go with the row.
+    await q('INSERT INTO execution $r RETURN NONE', { r: { id: 'tpre', activity_id: TELE, org_id: ORG, success: false, tags: ['telemetry:auth'], executed_at: new Date(Date.now() - 2 * DAY) } });
+    await q('UPSERT shape_score_counted:tpre SET eid = "tpre", occasions = ["insert"], verdicts = ["not-reached"], counted_at = time::now()');
+    await seedMixed(200, 0);
+    const counterBefore = await q('SELECT * FROM shape_score_counter');
+    const before = await posterior();
+    expect((counterBefore as Array<Record<string, unknown>>).map((r) => r['activity_id'])).toEqual(['A']);
+    await M.runTraceRetentionSweep(cfgFor(5));
+    expect(await countOf(TELE)).toBe(0);
+    expect(await q('SELECT * FROM shape_score_counter')).toEqual(counterBefore);
+    expect(await posterior()).toEqual(before);
+    expect(await q('SELECT VALUE eid FROM shape_score_counted WHERE eid = "tpre"')).toEqual([]); // pruned with its row
+  });
+
+  // ── The declaration is a deletion lever: ids with reach-graded evidence are refused ────────────
+
+  const warnSpy = async <T,>(fn: () => Promise<T>) => {
+    const { logger } = await import('../utils/logger');
+    const seen: Array<{ msg: string; meta: Record<string, unknown> }> = [];
+    const sp = spyOn(logger, 'warn').mockImplementation(((msg: string, meta?: Record<string, unknown>) => { seen.push({ msg, meta: meta ?? {} }); }) as typeof logger.warn);
+    try { await fn(); } finally { sp.mockRestore(); }
+    return seen;
+  };
+  const vpmRow = (alpha: number, beta: number, org = ORG) => q(
+    'CREATE variant_performance_metrics CONTENT { variant_id: $v, org_id: $o, thompson_alpha: $a, thompson_beta: $b, total_executions: 10, updated_at: time::now() }',
+    { v: TELE, o: org, a: alpha, b: beta });
+
+  test('GUARD: a declared id with reach CREDIT (VPM alpha > 1) is refused — logged, not drained first', async () => {
+    await seedMixed(300, 300);
+    await vpmRow(5, 3);
+    await declare(TELE);
+    const warns = await warnSpy(() => M.runTraceRetentionSweep(cfgFor(400)));
+    expect([await countOf(TELE), await countOf('gradable')]).toEqual([300, 100]); // age order: the 200 older gradable rows went
+    const refusal = warns.find((w) => w.meta['event'] === 'telemetry_class_refused');
+    expect(refusal?.meta['activity_id']).toBe(TELE);
+    expect(String(refusal?.meta['reason'])).toContain('thompson_alpha');
+  });
+
+  test('GUARD: a declared id with shape-counter rows is refused', async () => {
+    await seedMixed(300, 300);
+    await q('UPSERT type::thing("shape_score_counter", [$a, $o, ["x"]]) SET activity_id = $a, org_id = $o, shape_signature = ["x"], graded += 1, not_reached += 1', { a: TELE, o: ORG });
+    await declare(TELE);
+    const warns = await warnSpy(() => M.runTraceRetentionSweep(cfgFor(400)));
+    expect([await countOf(TELE), await countOf('gradable')]).toEqual([300, 100]);
+    expect(String(warns.find((w) => w.meta['event'] === 'telemetry_class_refused')?.meta['reason'])).toContain('shape_score_counter');
+  });
+
+  test('GUARD: auth_resolve_v1-like (alpha 1, huge failedByTask beta, org unknown, no counter rows) is still drained first', async () => {
+    await seedMixed(300, 300);
+    await vpmRow(1, 424903.25, 'unknown');
+    await declare(TELE);
+    const warns = await warnSpy(() => M.runTraceRetentionSweep(cfgFor(400)));
+    expect([await countOf(TELE), await countOf('gradable')]).toEqual([100, 300]);
+    expect(warns.some((w) => w.meta['event'] === 'telemetry_class_refused')).toBe(false);
+  });
+
+  test('GUARD fails CLOSED: if the evidence cannot be read, the declaration is refused', async () => {
+    await seedMixed(300, 300);
+    await declare(TELE);
+    spies.push(spyOn(db, 'queryAll').mockImplementation((async (sql: string, p?: Record<string, unknown>) => {
+      sent.push(sql);
+      if (/shape_score_counter WHERE activity_id = \$aid/.test(sql)) throw new Error('store unreadable');
+      return origAll(sql, p);
+    }) as typeof db.queryAll));
+    const warns = await warnSpy(() => M.runTraceRetentionSweep(cfgFor(400)));
+    expect([await countOf(TELE), await countOf('gradable')]).toEqual([300, 100]);
+    expect(String(warns.find((w) => w.meta['event'] === 'telemetry_class_refused')?.meta['reason'])).toContain('fail closed');
+  });
+
+  // ── Type widening (value is float | string): each reader refuses the other type, loudly ─────────
+
+  test('TYPES: a numeric reader refuses a string row (env/default stands, logged); a list reader refuses a number', async () => {
+    const TP = await import('../lib/tuning-params');
+    await q('CREATE substrate_tuning_param SET name = "TYPES_PROBE_NUM", `value` = "2000"');
+    await q('CREATE substrate_tuning_param SET name = "SOME_LIST", `value` = 0.6');
+    clearTuning();
+    const warns = await warnSpy(async () => {
+      expect(await TP.getTuningParam("TYPES_PROBE_NUM", undefined, 77)).toBe(77);
+      expect(await TP.getTuningParamList('SOME_LIST')).toEqual([]);
+    });
+    expect(warns.map((w) => w.meta['event']).sort()).toEqual(['tuning_param_list_type_mismatch', 'tuning_param_type_mismatch']);
   });
 
   test('CLIENT PATH: a drain batch goes through queryAll and survives an auth drop (reconnect + retry)', async () => {
