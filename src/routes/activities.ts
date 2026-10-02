@@ -3914,7 +3914,7 @@ app.post('/templates/auto-promote', async (c) => {
         // `activity` is a VIEW and activity_template is empty. Use WHERE clause
         // to match by meta::id since backtick-notation UPDATE finds no records.
         await surrealDB.query(
-          `UPDATE activity SET proposed = false, updated_at = time::now() WHERE meta::id(id) = $tid`,
+          `UPDATE type::thing('activity', $tid) SET proposed = false, updated_at = time::now()`,
           { tid: p.template_id },
         );
         promoted.push({ ...evidence, action: 'promoted' });
@@ -4626,7 +4626,7 @@ app.post('/templates/:templateId/promote', async (c) => {
 
     // Use WHERE clause — backtick-notation UPDATE finds no records on this table.
     await surrealDB.query(
-      `UPDATE activity SET proposed = false, updated_at = time::now() WHERE meta::id(id) = $tid`,
+      `UPDATE type::thing('activity', $tid) SET proposed = false, updated_at = time::now()`,
       { tid: cleanId },
     );
 
