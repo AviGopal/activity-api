@@ -60,13 +60,8 @@ export async function runReplicationPull(
       ? p.exclude_origin
       : null;
 
-  const where: string[] = ['executed_at >= type::datetime($since)'];
   const params: Record<string, unknown> = { since, lim: limit };
-  if (excludeOrigin) {
-    // NONE-safe: keep rows with no origin OR a different origin.
-    where.push('(origin_substrate_id IS NONE OR origin_substrate_id != $excl)');
-    params.excl = excludeOrigin;
-  }
+  let idSql: string;
 
   // OOM-safe two-step (migration-162): `SELECT *` carries the full trace blob,
   // so ORDER BY executed_at over the watermark window makes SurrealDB's
@@ -74,9 +69,25 @@ export async function runReplicationPull(
   // Step 1 sorts ONLY the narrow (id, executed_at) keys under LIMIT; step 2
   // hydrates the full rows verbatim for the chosen ids (replication needs every
   // field), preserving executed_at ASC order.
-  const idSql = `SELECT id, executed_at FROM execution WHERE ${where.join(
-    ' AND ',
-  )} ORDER BY executed_at ASC LIMIT $lim;`;
+  if (excludeOrigin) {
+    params.excl = excludeOrigin;
+    // Planner trap (SurrealDB 2.3.3): the disjunction (`IS NONE OR !=`) on
+    // `origin_substrate_id` prevents the planner from using the `executed_at`
+    // index, forcing a full table scan. This subquery forces the index-
+    // friendly range scan first, then filters the smaller result set by origin.
+    idSql = `
+      SELECT id, executed_at FROM (
+        SELECT id, executed_at, origin_substrate_id FROM execution WHERE executed_at >= type::datetime($since)
+      ) WHERE origin_substrate_id IS NONE OR origin_substrate_id != $excl
+      ORDER BY executed_at ASC LIMIT $lim TIMEOUT 30s;
+    `;
+  } else {
+    idSql = `
+      SELECT id, executed_at FROM execution
+      WHERE executed_at >= type::datetime($since)
+      ORDER BY executed_at ASC LIMIT $lim TIMEOUT 30s;
+    `;
+  }
 
   const idRes = await surrealDB.query<Record<string, unknown>>(idSql, params);
   const idRows: Record<string, unknown>[] = Array.isArray(idRes)
