@@ -5419,11 +5419,37 @@ app.post('/reach', async (c) => {
     // `missing` is deliberately not set here: it is defined on
     // activity_execution_traces but on no migration for the SCHEMAFULL `execution`
     // table, which defines reached and completion_shapes only.
+    //
+    // VERDICT CLASS ON THE LATE NOT-REACHED VERDICT (slice Y1c). The deterministic reach
+    // verdicts (e.g. `deterministic:edit-intent-no-landed-edit`) are decided AFTER insert and
+    // arrive only here; without the reason on the row they lived solely in goal-host's local
+    // failure memory, so no detector could count them. Classified once, by the same
+    // failureClassOf the insert path uses, and written to `metadata`:
+    //  - NEVER to failure_mode. On a row whose failure_mode is NONE, `failure_mode.class`
+    //    alone would create an object with no `type`: trace_failure_pattern_report skips it
+    //    and posterior-update defaults it to verifier_negative (law 12).
+    //  - only for reached === false with a non-empty string reason. A reached verdict and an
+    //    old sender's reason-less patch write no class (absent is not "unreasoned").
+    //  - the class is read from the whole reason head; the stored reason is capped at 600.
+    //  - goal_hash only when sent: the distinct-goal count reads it, and a missing hash
+    //    counts as no goal, which is conservative.
+    const reachReason = body.reached === false && typeof body.reason === 'string' ? body.reason.trim() : '';
+    const verdictParams: Record<string, unknown> = {};
+    const verdictSets: string[] = [];
+    if (reachReason) {
+      verdictParams.verdict_class = failureClassOf({ type: 'execution_error', reason: reachReason }).class;
+      verdictParams.reach_reason = reachReason.slice(0, 600);
+      verdictSets.push('metadata.verdict_class = $verdict_class', 'metadata.reach_reason = $reach_reason');
+      if (typeof body.goal_hash === 'string' && body.goal_hash.trim()) {
+        verdictParams.goal_hash = body.goal_hash.trim().slice(0, 128);
+        verdictSets.push('metadata.goal_hash = $goal_hash');
+      }
+    }
     let mirrored = 0;
     try {
       const mres = await surrealDB.query(
-        `UPDATE type::thing('execution', $execution_id) SET reached = $reached, completion_shapes = $completion_shapes, tags = array::union(tags ?? [], [IF $reached = true THEN 'reached:true' ELSE 'reached:false' END])`,
-        { reached: body.reached, completion_shapes, execution_id: String(execId) },
+        `UPDATE type::thing('execution', $execution_id) SET reached = $reached, completion_shapes = $completion_shapes, tags = array::union(tags ?? [], [IF $reached = true THEN 'reached:true' ELSE 'reached:false' END])${verdictSets.length ? ', ' + verdictSets.join(', ') : ''}`,
+        { reached: body.reached, completion_shapes, execution_id: String(execId), ...verdictParams },
       );
       mirrored = Array.isArray(mres) && Array.isArray(mres[0]) ? (mres[0] as unknown[]).length : (Array.isArray(mres) ? mres.length : 0);
     } catch (e) {

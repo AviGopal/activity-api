@@ -141,3 +141,69 @@ run('POST /execution-traces', () => {
     expect(stored?.failure_mode).toBeUndefined();
   });
 });
+
+run('POST /execution-traces/reach', () => {
+  beforeAll(boot);
+  beforeEach(freshExecutionTable);
+
+  const walk = (id: string, extra: Record<string, unknown> = {}) => db.query('CREATE type::thing("execution", $id) CONTENT $r', { id, r: {
+    activity_id: 'W', org_id: ORG, success: true, tags: ['dispatcher_used:goal-host'], executed_at: new Date(), ...extra,
+  } });
+  const REASON = 'deterministic:edit-intent-no-landed-edit — an edit goal is reached only by an edit-result shape WITH landing evidence';
+
+  test('a not-reached verdict with a deterministic reason stamps metadata.verdict_class and leaves failure_mode untouched', async () => {
+    // One row with no failure_mode / metadata at all (the common walk row), one with both.
+    await walk('r1');
+    const fm = { type: 'execution_error', reason: 'walk terminated', class: 'unclassified', step: 'walk' };
+    await walk('r2', { failure_mode: fm, metadata: { floor: false, keep: 'me' } });
+
+    const a = await post('/reach', { execution_id: 'r1', reached: false, reason: REASON, goal_hash: 'gh-abc123' });
+    const b = await post('/reach', { execution_id: 'r2', reached: false, reason: REASON, goal_hash: 'gh-abc123' });
+    expect([a.status, a.json.updated, b.status, b.json.updated]).toEqual([200, 1, 200, 1]);
+
+    const r1 = await row('r1');
+    expect(r1?.metadata?.verdict_class).toBe('deterministic:edit-intent-no-landed-edit');
+    expect(r1?.metadata?.reach_reason).toBe(REASON);
+    expect(r1?.metadata?.goal_hash).toBe('gh-abc123');
+    expect(r1?.failure_mode).toBeUndefined(); // never a type-less failure_mode
+    expect(r1?.reached).toBe(false);
+
+    const r2 = await row('r2');
+    expect(r2?.metadata).toEqual({ floor: false, keep: 'me', verdict_class: 'deterministic:edit-intent-no-landed-edit', reach_reason: REASON, goal_hash: 'gh-abc123' });
+    expect(r2?.failure_mode).toEqual(fm);
+  });
+
+  test('a structural reason is classified too (the generator, not the store, scopes to deterministic:*)', async () => {
+    await walk('r3');
+    await post('/reach', { execution_id: 'r3', reached: false, reason: "no template produces the inferred target shapes" });
+    const r3 = await row('r3');
+    expect(r3?.metadata?.verdict_class).toBe('structural:no-producer');
+    expect(r3?.metadata?.goal_hash).toBeUndefined(); // absent is absent, never fabricated
+  });
+
+  test('reached:true stamps no verdict_class', async () => {
+    await walk('r4');
+    const r = await post('/reach', { execution_id: 'r4', reached: true, reason: REASON, goal_hash: 'gh-abc123' });
+    expect([r.status, r.json.updated]).toEqual([200, 1]);
+    const r4 = await row('r4');
+    expect(r4?.reached).toBe(true);
+    expect(r4?.metadata).toBeUndefined();
+    expect(r4?.failure_mode).toBeUndefined();
+  });
+
+  test('a not-reached verdict with no reason stamps nothing (an old sender is not "unreasoned")', async () => {
+    await walk('r5');
+    await post('/reach', { execution_id: 'r5', reached: false });
+    const r5 = await row('r5');
+    expect(r5?.reached).toBe(false);
+    expect(r5?.metadata).toBeUndefined();
+  });
+
+  test('an overlong reason is stored capped, and still classified from its head', async () => {
+    await walk('r6');
+    await post('/reach', { execution_id: 'r6', reached: false, reason: REASON + ' ' + 'x'.repeat(5000) });
+    const r6 = await row('r6');
+    expect(r6?.metadata?.verdict_class).toBe('deterministic:edit-intent-no-landed-edit');
+    expect(String(r6?.metadata?.reach_reason).length).toBeLessThanOrEqual(600);
+  });
+});
