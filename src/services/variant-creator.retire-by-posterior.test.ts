@@ -43,6 +43,12 @@ mock.module('../db/surreal', () => ({
 
 mock.module('../lib/tuning-params', () => ({
   getTuningParam: async (_n: string, _e: string | undefined, d: number) => d,
+  // Stubs to satisfy mock-completeness check. These are not used by this test.
+  writeTuningParam: async () => {},
+  __clearTuningParamCache: () => {},
+  getTuningParamList: async () => [],
+  __clearTuningParamListCache: () => {},
+  TRACE_TELEMETRY_ACTIVITIES_PARAM: 'placeholder',
 }));
 
 const { checkAndRetireByPosterior } = await import('./variant-creator');
