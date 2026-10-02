@@ -796,22 +796,25 @@ describe('backfillChildCompositionChains (write-order race)', () => {
     // return a non-empty result so the UPDATE path executes, then capture the
     // UPDATE arguments and assert the parameter shape.
     const updateMock = spyOn(surrealDB, 'query')
-      .mockResolvedValueOnce(['activity_execution_traces:child-id'] as any) // probe → child exists
-      .mockResolvedValueOnce([] as any); // UPDATE
+      .mockResolvedValueOnce(['execution:child-id'] as any) // probe → child exists
+      .mockResolvedValueOnce([] as any) // UPDATE activity_execution_traces
+      .mockResolvedValueOnce([] as any); // UPDATE execution (write-flip mirror)
     queryMock = updateMock;
 
     await backfillChildCompositionChains('parent-id', []);
 
-    expect(updateMock).toHaveBeenCalledTimes(2);
-    // Call 1 is the indexed existence probe.
+    expect(updateMock).toHaveBeenCalledTimes(3);
+    // Call 1 is the indexed existence probe (on the authoritative execution table).
     const [probeSql, probeParams] = updateMock.mock.calls[0] as [string, any];
-    expect(probeSql).toMatch(/SELECT\s+VALUE\s+id\s+FROM\s+activity_execution_traces/i);
+    expect(probeSql).toMatch(/SELECT\s+VALUE\s+id\s+FROM\s+execution\b/i);
     expect(probeSql).toMatch(/parent_execution_id\s*=\s*\$parent_execution_id/i);
     expect(probeSql).toMatch(/LIMIT\s+1/i);
     expect(probeParams).toEqual({ parent_execution_id: 'parent-id' });
-    // Call 2 is the UPDATE.
+    // Call 2 is the activity_execution_traces UPDATE; call 3 mirrors it onto execution.
     const [sql, params] = updateMock.mock.calls[1] as [string, any];
-    expect(sql).toMatch(/UPDATE\s+activity_execution_traces/i);
+    expect(sql).toMatch(/UPDATE[\s\S]*\bactivity_execution_traces\b/i);
+    expect((updateMock.mock.calls[2] as [string, any])[0]).toMatch(/UPDATE[\s\S]*\bexecution\b/i);
+    expect((updateMock.mock.calls[2] as [string, any])[1]).toEqual(params);
     expect(sql).toMatch(/parent_execution_id\s*=\s*\$parent_execution_id/i);
     // Idempotency guard: only update children with empty/none chain. The
     // empty-array equality is index-eligible (replaces non-indexable array::len).
@@ -846,12 +849,13 @@ describe('backfillChildCompositionChains (write-order race)', () => {
     // parent inserts, any already-inserted children get backfilled with
     // [...parent.chain, parent.id] = [root, parent].
     queryMock = spyOn(surrealDB, 'query')
-      .mockResolvedValueOnce(['activity_execution_traces:child-id'] as any) // probe → child exists
-      .mockResolvedValueOnce([] as any); // UPDATE
+      .mockResolvedValueOnce(['execution:child-id'] as any) // probe → child exists
+      .mockResolvedValueOnce([] as any) // UPDATE activity_execution_traces
+      .mockResolvedValueOnce([] as any); // UPDATE execution
 
     await backfillChildCompositionChains('parent-id', ['root-id']);
 
-    expect(queryMock).toHaveBeenCalledTimes(2);
+    expect(queryMock).toHaveBeenCalledTimes(3);
     // UPDATE is the second call (probe is first).
     const [, params] = queryMock.mock.calls[1] as [string, any];
     expect(params).toEqual({
@@ -866,12 +870,13 @@ describe('backfillChildCompositionChains (write-order race)', () => {
     // backfillChildCompositionChains(execution_id, [])  for roots
     // (resolvedCompositionChain is empty for root-level inserts).
     queryMock = spyOn(surrealDB, 'query')
-      .mockResolvedValueOnce(['activity_execution_traces:child-id'] as any) // probe → child exists
-      .mockResolvedValueOnce([] as any); // UPDATE
+      .mockResolvedValueOnce(['execution:child-id'] as any) // probe → child exists
+      .mockResolvedValueOnce([] as any) // UPDATE activity_execution_traces
+      .mockResolvedValueOnce([] as any); // UPDATE execution
 
     await backfillChildCompositionChains('root-id', []);
 
-    expect(queryMock).toHaveBeenCalledTimes(2);
+    expect(queryMock).toHaveBeenCalledTimes(3);
     // UPDATE is the second call (probe is first).
     const [, params] = queryMock.mock.calls[1] as [string, any];
     expect(params).toEqual({
@@ -889,25 +894,44 @@ describe('backfillChildCompositionChains (write-order race)', () => {
     // same parameters — and any child already populated by an earlier call
     // is excluded by the DB-side filter. No duplicate appended ids.
     //
-    // Each invocation is probe (child exists) → UPDATE, so two invocations
-    // produce four query calls; the UPDATEs are calls 2 and 4.
+    // Each invocation is probe (child exists) → UPDATE traces → UPDATE execution,
+    // so two invocations produce six query calls; the traces UPDATEs are calls 2 and 5.
     queryMock = spyOn(surrealDB, 'query').mockResolvedValue([
-      'activity_execution_traces:child-id',
+      'execution:child-id',
     ] as any);
 
     await backfillChildCompositionChains('parent-id', ['root-id']);
     await backfillChildCompositionChains('parent-id', ['root-id']);
 
-    expect(queryMock).toHaveBeenCalledTimes(4);
+    expect(queryMock).toHaveBeenCalledTimes(6);
 
     const [sql1, params1] = queryMock.mock.calls[1] as [string, any]; // first UPDATE
-    const [sql2, params2] = queryMock.mock.calls[3] as [string, any]; // second UPDATE
+    const [sql2, params2] = queryMock.mock.calls[4] as [string, any]; // second UPDATE
 
     // Identical query and params — the DB-side guard handles dedup.
     expect(sql1).toBe(sql2);
     expect(params1).toEqual(params2);
     // The new_chain is exactly two-deep (no duplicate parent.id appends).
     expect((params1 as any).new_chain).toEqual(['root-id', 'parent-id']);
+  });
+
+  test('both UPDATEs target the parent-only id subquery and carry RETURN NONE TIMEOUT (no composition_chain index union)', async () => {
+    // Gap composition-chain-backfill-where-clause-unions-a-near-whole-table-index-scan.
+    // `WHERE parent_execution_id = $p AND (composition_chain IS NONE OR composition_chain = [])`
+    // is planned as Iterate Index(parent) > Iterate Index(composition_chain) x2: a union that reads
+    // every NONE/[] row (most of the table). 60s TIMEOUT on syzygy, 1.56s on node 1, 14.4% of hub
+    // db time. The UPDATE must select ids through the parent index only and filter the chain on
+    // that small set; RETURN NONE then TIMEOUT, in that order (the reverse is a parse error the
+    // catch-all would swallow, silently disabling the backfill).
+    queryMock = spyOn(surrealDB, 'query').mockResolvedValue(['execution:child-id'] as any);
+    await backfillChildCompositionChains('parent-id', []);
+    const updates = (queryMock.mock.calls as Array<[string, any]>).map(([q]) => q).filter((q) => /^\s*UPDATE/i.test(q));
+    expect(updates.length).toBe(2);
+    for (const q of updates) {
+      expect(q).toMatch(/UPDATE\s*\(\s*SELECT\s+VALUE\s+id\s+FROM\s*\(\s*SELECT\s+id\s*,\s*composition_chain\s+FROM\s+\w+\s+WHERE\s+parent_execution_id\s*=\s*\$parent_execution_id\s*\)/i);
+      expect(q).not.toMatch(/WHERE\s+parent_execution_id\s*=\s*\$parent_execution_id\s+AND\s*\(\s*composition_chain/i);
+      expect(q).toMatch(/RETURN\s+NONE\s+TIMEOUT\s+\d+s/i);
+    }
   });
 
   test('best-effort: UPDATE throws → returns without throwing, insert path unaffected', async () => {
