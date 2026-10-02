@@ -1231,6 +1231,32 @@ app.get('/shape-gap-resolution', async (c) => {
   }
 });
 
+/** Discovery's advertised shape vocabulary, or null when the read is indeterminate
+ *  (non-2xx, timeout, malformed body). Endpoint read at use time, not frozen at config load. */
+async function fetchAdvertisedShapes(): Promise<Set<string> | null> {
+  const endpoint = (process.env.DISCOVERY_VESSEL_ENDPOINT || config.discovery.endpoint).replace(/\/$/, '');
+  const apiKey = process.env.METABOB_API_KEY || process.env.ACTIVITY_API_KEY;
+  try {
+    const r = await fetch(`${endpoint}/registry/shapes`, {
+      headers: apiKey ? { Authorization: `ApiKey ${apiKey}` } : {},
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!r.ok) {
+      logger.warn('deliverable-shapes: discovery /registry/shapes non-2xx', { status: r.status });
+      return null;
+    }
+    const j: any = await r.json();
+    if (!Array.isArray(j?.shapes)) {
+      logger.warn('deliverable-shapes: discovery /registry/shapes body has no shapes array');
+      return null;
+    }
+    return new Set(j.shapes.filter((s: unknown): s is string => typeof s === 'string'));
+  } catch (error: any) {
+    logger.warn('deliverable-shapes: discovery /registry/shapes read failed', { error: error?.message ?? String(error) });
+    return null;
+  }
+}
+
 // GET /v2/activities/deliverable-shapes — curated vocabulary of shapes that learned
 // composites actually DELIVER (terminal = produced-minus-consumed WITHIN a composite),
 // gated on a reached run AND a live discovery advertiser, hygiene- and frequency-filtered,
@@ -1238,7 +1264,8 @@ app.get('/shape-gap-resolution', async (c) => {
 // goal at a learned deliverable WITHOUT flooding the vocabulary with intermediate byproducts.
 // A terminal with no live discovery advertiser is excluded even when learned composites
 // produce it: inference must never aim at a shape nothing currently serves. Read-only; an
-// internal error answers an empty list (goal-host then keeps its last good vocabulary).
+// internal error answers an empty list and an indeterminate discovery read answers 503 —
+// goal-host keeps its last good vocabulary on either.
 app.get('/deliverable-shapes', async (c) => {
   try {
     const FLOOR = 5;
@@ -1283,9 +1310,13 @@ app.get('/deliverable-shapes', async (c) => {
     // EARNED, not declared (REALIGNMENT V1). `ev > 0` above filters nothing — every learned/
     // composed template sits at ev 0.5 — so a terminal whose producer is gone (obsidian:write_note
     // after its vault left) stayed aimable and every walk aimed at it went hollow. A terminal is
-    // a deliverable only with BOTH evidence of a reached run producing it (goal-host posts
-    // success = reached into goal_execution_paths) AND a live advertiser in discovery, checked
-    // now, never from a static list. Gated BEFORE the cap so dropped shapes free their slots.
+    // a deliverable only with BOTH evidence of a reached run producing it AND a live advertiser
+    // in discovery, read now, never from a static list. Gated BEFORE the cap so dropped shapes
+    // free their slots.
+    //
+    // goal_execution_paths.successful_executions is the counter family REALIGNMENT §1 rules
+    // unreliable (indicative only). It is acceptable here only as one half of an AND with the
+    // live discovery measurement below; never gate on it alone.
     const pathResult = await surrealDB.query<any>(
       `SELECT endpoint_output_shapes, successful_executions FROM goal_execution_paths
          WHERE successful_executions > 0
@@ -1300,26 +1331,17 @@ app.get('/deliverable-shapes', async (c) => {
       for (const sh of (Array.isArray(outs) ? outs : [])) if (typeof sh === 'string') reachedShapes.add(sh);
     }
     const reachedCandidates = candidates.filter((sh) => reachedShapes.has(sh));
+    if (reachedCandidates.length === 0) return c.json({ shapes: [] });
 
-    const discoveryEndpoint = (process.env.DISCOVERY_VESSEL_ENDPOINT ?? 'http://127.0.0.1:8100').replace(/\/$/, '');
-    const apiKey = process.env.METABOB_API_KEY || process.env.ACTIVITY_API_KEY;
-    const advertisedFlags = await Promise.all(reachedCandidates.map(async (shape) => {
-      try {
-        const r = await fetch(`${discoveryEndpoint}/resolve`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...(apiKey ? { Authorization: `ApiKey ${apiKey}` } : {}) },
-          body: JSON.stringify({ pointer: { type: 'vesselCapability', shape } }),
-          signal: AbortSignal.timeout(3000),
-        });
-        if (!r.ok) return false;                               // unverifiable = not advertised (fail closed)
-        const j: any = await r.json();
-        const vessels = (j?.content ?? j)?.vessels;
-        return Array.isArray(vessels) && vessels.length > 0;
-      } catch {
-        return false;
-      }
-    }));
-    const shapes = reachedCandidates.filter((_, i) => advertisedFlags[i]).slice(0, CAP);
+    // ONE read of discovery's advertised vocabulary — the same source goal-host's
+    // fetchKnownShapes reads — all-or-nothing. goal-host keeps its last good vocabulary on a
+    // non-2xx or empty answer but REPLACES it with any non-empty list, so a partial or failed
+    // discovery read must never become a shrunken list: it answers 503 instead.
+    const advertised = await fetchAdvertisedShapes();
+    if (!advertised) {
+      return c.json({ reason: 'discovery_indeterminate', unresolved: reachedCandidates.length }, 503);
+    }
+    const shapes = reachedCandidates.filter((sh) => advertised.has(sh)).slice(0, CAP);
     return c.json({ shapes });
   } catch (error: any) {
     logger.warn('GET /v2/activities/deliverable-shapes failed; answering an empty list', {
