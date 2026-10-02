@@ -29,6 +29,7 @@ import { incrementExemplarBurstCounter } from '../services/exemplar-selector';
 import { incrementTraceStoreCounter } from '../lib/trace-store-counters';
 import { applyOutcomeToPosteriors } from '../lib/posterior-update';
 import { classifyReach } from '../lib/reach-classify';
+import { failureClassOf } from '../lib/failure-class';
 import { updateSuccessorFeatures } from '../lib/successor-features';
 import { applyClusterPosterior } from '../lib/cluster-posterior';
 
@@ -2787,7 +2788,27 @@ app.post('/', async (c) => {
       optionalFields.push('repair_signature: $repair_signature');
     }
     if (body.failure_mode) {
-      (trace as any).failure_mode = body.failure_mode;
+      // FAILURE CLASS AT INSERT (slice Y1b). `type` has three live values and cannot tell a
+      // HOLLOW verdict from a refused connection; the distinguishing fact lives only in
+      // `reason` prose, which no detector parses. Stamp the closed-vocabulary `class` and the
+      // failing `step` here, once, so every reader keys on one vocabulary.
+      //  - Merged BESIDE `type`, never over it: posterior-update maps `type` to beta (law 12).
+      //    That is also why only the persisted copy is stamped; body.failure_mode, which the
+      //    posterior call reads, is left exactly as posted.
+      //  - A class the sender already set is kept; a non-object failure_mode passes through.
+      //  - Tasks are the NORMALIZED ones (task_id + boolean success): a raw light-dispatch task
+      //    carries `taskId`, which the locator does not read. A task the sink marked skipped
+      //    (a conditional gate, success:false) is neutral, not the failure site.
+      const fm = body.failure_mode;
+      if (typeof fm === 'object' && !Array.isArray(fm) && fm.class == null) {
+        const tasks = Array.isArray(trace.tasks)
+          ? (trace.tasks as any[]).filter((_t, i) => rawPostedTasks?.[i]?.skipped !== true)
+          : null;
+        const { class: failureClass, step } = failureClassOf(fm, { tasks, metadata: body.metadata ?? null });
+        (trace as any).failure_mode = { ...fm, class: failureClass, ...(fm.step == null ? { step } : {}) };
+      } else {
+        (trace as any).failure_mode = fm;
+      }
       optionalFields.push('failure_mode: $failure_mode');
     }
     if (trace.metadata) optionalFields.push('metadata: $metadata');
