@@ -134,6 +134,15 @@ run('POST /execution-traces', () => {
     expect((await row('ins4'))?.failure_mode).toEqual(fm);
   });
 
+  test('a re-post of the same execution id is a duplicate: the stamped class is neither re-derived nor superseded', async () => {
+    const fm = { type: 'execution_error', reason: 'fetch failed' };
+    await post('/', trace('ins7', { success: false, failure_mode: fm }));
+    const first = await row('ins7');
+    const again = await post('/', trace('ins7', { success: true }));
+    expect(again.json.duplicate).toBe(true);
+    expect(await row('ins7')).toEqual(first);
+  });
+
   test('MUST-FAIL: a trace with no failure_mode gets none (a success is never classified)', async () => {
     await post('/', trace('ins5', { success: true }));
     const stored = await row('ins5');
@@ -205,5 +214,46 @@ run('POST /execution-traces/reach', () => {
     const r6 = await row('r6');
     expect(r6?.metadata?.verdict_class).toBe('deterministic:edit-intent-no-landed-edit');
     expect(String(r6?.metadata?.reach_reason).length).toBeLessThanOrEqual(600);
+  });
+
+  // REALIGNMENT §2.2: a correction names what it supersedes; ingestion is idempotent.
+  test('not-reached then reached: the class is cleared and recorded as superseded by reach:true', async () => {
+    await walk('s1', { metadata: { keep: 1 } });
+    await post('/reach', { execution_id: 's1', reached: false, reason: REASON, goal_hash: 'gh-s1' });
+    await post('/reach', { execution_id: 's1', reached: true });
+    const m = (await row('s1'))?.metadata;
+    expect(m?.verdict_class).toBeUndefined();
+    expect(m?.reach_reason).toBeUndefined();
+    expect(m?.keep).toBe(1);
+    expect(m?.goal_hash).toBe('gh-s1');
+    expect(m?.superseded_verdict).toMatchObject({ class: 'deterministic:edit-intent-no-landed-edit', reason: REASON, superseded_by: 'reach:true' });
+    expect(m?.superseded_verdict?.superseded_at).toBeDefined();
+  });
+
+  test('the same not-reached verdict twice is one stamp: the second write changes nothing', async () => {
+    await walk('s2');
+    await post('/reach', { execution_id: 's2', reached: false, reason: REASON, goal_hash: 'gh-s2' });
+    const first = await row('s2');
+    await post('/reach', { execution_id: 's2', reached: false, reason: REASON, goal_hash: 'gh-s2' });
+    const second = await row('s2');
+    expect(second?.metadata).toEqual(first?.metadata);
+    expect(second?.metadata?.superseded_verdict).toBeUndefined();
+  });
+
+  test('two different not-reached reasons: the second wins, the first is recorded as superseded', async () => {
+    await walk('s3');
+    const R2 = 'deterministic:wrong-git-commit-count — 3 commits, expected 1';
+    await post('/reach', { execution_id: 's3', reached: false, reason: REASON });
+    await post('/reach', { execution_id: 's3', reached: false, reason: R2 });
+    const m = (await row('s3'))?.metadata;
+    expect(m?.verdict_class).toBe('deterministic:wrong-git-commit-count');
+    expect(m?.reach_reason).toBe(R2);
+    expect(m?.superseded_verdict).toMatchObject({ class: 'deterministic:edit-intent-no-landed-edit', reason: REASON, superseded_by: 'reach:false' });
+  });
+
+  test('reached:true on an unstamped row leaves its metadata untouched', async () => {
+    await walk('s4', { metadata: { keep: 'me' } });
+    await post('/reach', { execution_id: 's4', reached: true });
+    expect((await row('s4'))?.metadata).toEqual({ keep: 'me' });
   });
 });

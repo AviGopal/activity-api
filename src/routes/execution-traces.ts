@@ -5433,17 +5433,41 @@ app.post('/reach', async (c) => {
     //  - the class is read from the whole reason head; the stored reason is capped at 600.
     //  - goal_hash only when sent: the distinct-goal count reads it, and a missing hash
     //    counts as no goal, which is conservative.
+    // A CORRECTION NAMES WHAT IT SUPERSEDES; INGESTION IS IDEMPOTENT (REALIGNMENT §2.2):
+    //  - reached === true on a stamped row moves the class + reason to
+    //    metadata.superseded_verdict {class, reason, superseded_at, superseded_by: "reach:true"}
+    //    and clears them, so no reader counts a row that later reached.
+    //  - a different not-reached class or reason replaces the stamp and records the prior one
+    //    (superseded_by: "reach:false"); the SAME class + reason rewrites identical values, so
+    //    a redelivered verdict (retry, spool drain) changes nothing and records no supersession.
+    //  - one statement, in SET order: SurrealDB evaluates SET clauses left to right, so the
+    //    superseded record is built from the row's values BEFORE the clear/replace below it.
+    //  - an unstamped row is untouched (NONE assigned to NONE creates no metadata object).
     const reachReason = body.reached === false && typeof body.reason === 'string' ? body.reason.trim() : '';
     const verdictParams: Record<string, unknown> = {};
     const verdictSets: string[] = [];
+    const supersede = (changed: string, by: string) =>
+      `metadata.superseded_verdict = IF ${changed} THEN { class: metadata.verdict_class, reason: metadata.reach_reason, superseded_at: time::now(), superseded_by: ${by} } ELSE metadata.superseded_verdict END`;
     if (reachReason) {
       verdictParams.verdict_class = failureClassOf({ type: 'execution_error', reason: reachReason }).class;
       verdictParams.reach_reason = reachReason.slice(0, 600);
-      verdictSets.push('metadata.verdict_class = $verdict_class', 'metadata.reach_reason = $reach_reason');
+      verdictParams.superseded_by_false = 'reach:false';
+      verdictSets.push(
+        supersede('metadata.verdict_class != NONE AND (metadata.verdict_class != $verdict_class OR metadata.reach_reason != $reach_reason)', '$superseded_by_false'),
+        'metadata.verdict_class = $verdict_class',
+        'metadata.reach_reason = $reach_reason',
+      );
       if (typeof body.goal_hash === 'string' && body.goal_hash.trim()) {
         verdictParams.goal_hash = body.goal_hash.trim().slice(0, 128);
         verdictSets.push('metadata.goal_hash = $goal_hash');
       }
+    } else if (body.reached === true) {
+      verdictParams.superseded_by_true = 'reach:true';
+      verdictSets.push(
+        supersede('metadata.verdict_class != NONE', '$superseded_by_true'),
+        'metadata.verdict_class = NONE',
+        'metadata.reach_reason = NONE',
+      );
     }
     let mirrored = 0;
     try {
