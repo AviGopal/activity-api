@@ -44,37 +44,50 @@ export async function selectExemplarsForActivity(activity_id: string): Promise<v
 
   // SurrealDB 3.x requires ORDER BY fields to be included in the SELECT clause.
   const successDigests = await surrealDB.query<{ id: string; execution_id: string }>(
-    `SELECT id, execution_id, executed_at FROM trace_digest WHERE activity_id = $activity_id AND success != false ORDER BY executed_at DESC LIMIT $n`,
+    `SELECT id, execution_id, executed_at FROM trace_digest WHERE activity_id = $activity_id AND success = true ORDER BY executed_at DESC LIMIT $n`,
     { activity_id, n: n_success }
   );
 
   const failureDigests = await surrealDB.query<{ id: string; execution_id: string }>(
-    `SELECT id, execution_id, executed_at FROM trace_digest WHERE activity_id = $activity_id AND success != true ORDER BY executed_at DESC LIMIT $n`,
+    `SELECT id, execution_id, executed_at FROM trace_digest WHERE activity_id = $activity_id AND success = false ORDER BY executed_at DESC LIMIT $n`,
     { activity_id, n: n_failure }
   );
 
-  await surrealDB.query(
-    `DELETE execution_exemplar WHERE activity_id = $activity_id`,
-    { activity_id }
-  );
+  const exemplarsToInsert: { execution_id: string; digest_id: string; success: boolean }[] = [];
+  const seenExecutionIds = new Set<string>();
 
   for (const d of (successDigests ?? [])) {
-    await surrealDB.query(
-      `INSERT INTO execution_exemplar { activity_id: $activity_id, execution_id: $execution_id, success: true, digest_id: $digest_id, org_id: 'public', selected_at: time::now() }`,
-      { activity_id, execution_id: d.execution_id, digest_id: String(d.id) }
-    ).catch(err => {
-      logger.warn('exemplar success insert failed', { activity_id, execution_id: d.execution_id, err: err instanceof Error ? err.message : String(err) });
-    });
+    if (!seenExecutionIds.has(d.execution_id)) {
+      exemplarsToInsert.push({ execution_id: d.execution_id, digest_id: String(d.id), success: true });
+      seenExecutionIds.add(d.execution_id);
+    }
+  }
+  for (const d of (failureDigests ?? [])) {
+    if (!seenExecutionIds.has(d.execution_id)) {
+      exemplarsToInsert.push({ execution_id: d.execution_id, digest_id: String(d.id), success: false });
+      seenExecutionIds.add(d.execution_id);
+    }
   }
 
-  for (const d of (failureDigests ?? [])) {
-    await surrealDB.query(
-      `INSERT INTO execution_exemplar { activity_id: $activity_id, execution_id: $execution_id, success: false, digest_id: $digest_id, org_id: 'public', selected_at: time::now() }`,
-      { activity_id, execution_id: d.execution_id, digest_id: String(d.id) }
-    ).catch(err => {
-      logger.warn('exemplar failure insert failed', { activity_id, execution_id: d.execution_id, err: err instanceof Error ? err.message : String(err) });
-    });
-  }
+  // Atomically delete old exemplars and insert new ones in a single transaction.
+  const statements = [`DELETE execution_exemplar WHERE activity_id = $activity_id;`];
+  const params: Record<string, any> = { activity_id };
+
+  exemplarsToInsert.forEach((exemplar, i) => {
+    const execIdParam = `execution_id_${i}`;
+    const digestIdParam = `digest_id_${i}`;
+    statements.push(
+      `INSERT INTO execution_exemplar { activity_id: $activity_id, execution_id: $${execIdParam}, success: ${String(
+        exemplar.success
+      )}, digest_id: $${digestIdParam}, org_id: 'public', selected_at: time::now() };`
+    );
+    params[execIdParam] = exemplar.execution_id;
+    params[digestIdParam] = exemplar.digest_id;
+  });
+
+  await surrealDB.query(statements.join('\n'), params).catch(err => {
+    logger.warn('exemplar update transaction failed', { activity_id, err: err instanceof Error ? err.message : String(err) });
+  });
 
   logger.debug('[exemplar] selection complete', {
     activity_id, ev, n_success, n_failure,
