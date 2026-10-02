@@ -1415,10 +1415,10 @@ router.post('/resolve', async (c) => {
               metadata: { shape: 'shape_producer_inventory', summary: 'discovery returned non-2xx — count=0' },
             } as ImpulseResolveResponse, 200);
           }
-          const spiData = (await spiRes.json()) as { vessels?: Array<{ id: string; health_score?: number }> };
-          const vesselIds = (spiData.vessels ?? []).map((v) => v.id);
+          const spiResponse = (await spiRes.json()) as { content?: { vessels?: Array<{ vesselId: string; health_score?: number }> } };
+          const vesselIds = (spiResponse.content?.vessels ?? []).map((v) => v.vesselId);
           const avgHealth = vesselIds.length > 0
-            ? (spiData.vessels ?? []).reduce((sum, v) => sum + (v.health_score ?? 1), 0) / vesselIds.length
+            ? (spiResponse.content?.vessels ?? []).reduce((sum, v) => sum + (v.health_score ?? 1), 0) / vesselIds.length
             : 0;
           const healthSummary = vesselIds.length === 0 ? 'no_producers' : avgHealth >= 0.7 ? 'healthy' : 'degraded';
           return c.json({
