@@ -154,7 +154,7 @@ describe("mock.module factories must not amputate a module's exports", () => {
    *  omission — it makes assertions pass for the wrong reason.
    *
    *  The list may SHRINK freely. It may not grow: a new omission fails the test below. */
-  const KNOWN_INCOMPLETE = new Set<string>([
+  const KNOWN_INCOMPLETE_LIST = Object.freeze([
     "src/cli/migrate-org-to-account.test.ts mocks '../db/surreal' but omits: getDbStats, dbStats",
     "src/middleware/jwtAuth.account-id.test.ts mocks '../db/surreal' but omits: getDbStats, queryWithAuth, dbStats, surrealDB",
     "src/middleware/jwtAuth.account-id.test.ts mocks '../services/auth' but omits: isTransientIdentityFailure, validateJwtToken, validateApiKeyViaIdentityVessel",
@@ -194,7 +194,29 @@ describe("mock.module factories must not amputate a module's exports", () => {
     "src/services/trace-retention.poison-row.test.ts mocks '../db/surreal' but omits: getDbStats, dbStats",
     "src/services/variant-creator.retire-by-posterior.test.ts mocks '../db/surreal' but omits: getDbStats, dbStats",
     "src/services/variant-creator.retire-by-posterior.test.ts mocks '../lib/tuning-params' but omits: writeTuningParam, __clearTuningParamCache",
-  ]);
+    // Recorded 2026-10-02 (qa). These landed while "no NEW incomplete factory" was RED on dev:
+    // calls inside that test's body, which lifted the ceiling 39 -> 45 for the next test, and a
+    // permanently red guard is subtracted as tracked-red by the pull-sync gate, so nothing
+    // stopped these. Each is debt to pay by completing the factory, not an accepted exemption.
+    "src/middleware/jwtAuth.connected-marker.test.ts mocks '../db/surreal' but omits: getDbStats, queryWithAuth, dbStats, surrealDB",
+    "src/middleware/jwtAuth.connected-marker.test.ts mocks '../services/auth' but omits: isTransientIdentityFailure, validateJwtToken, validateApiKeyViaIdentityVessel",
+    "src/routes/__tests__/phase10-atomic-alpha-beta.test.ts mocks '../../db/paradigm' but omits: isParadigmReadEnabled, getParadigmReadPercentage, shouldUseParadigmRead, shouldSkipLegacyFallback, logDualWriteConfig, computeAdmissionLimit, transformLegacyTemplate, computeShapeSignature, queryActivitiesByEmbeddingDense, updateShapeActivityScores, getActivityShapePatterns",
+    "src/routes/activities.account-id.test.ts mocks '../db/paradigm' but omits: isParadigmReadEnabled, getParadigmReadPercentage, shouldUseParadigmRead, shouldSkipLegacyFallback, logDualWriteConfig, computeAdmissionLimit, transformLegacyTemplate, computeShapeSignature, queryActivitiesByEmbeddingDense, updateShapeActivityScores, getActivityShapePatterns",
+    "src/routes/activities.thompson-account-id.test.ts mocks '../db/paradigm' but omits: isParadigmReadEnabled, getParadigmReadPercentage, shouldUseParadigmRead, shouldSkipLegacyFallback, logDualWriteConfig, computeAdmissionLimit, transformLegacyTemplate, computeShapeSignature, queryActivitiesByEmbeddingDense, updateShapeActivityScores, getActivityShapePatterns",
+    "src/routes/execution-traces.account-id.test.ts mocks '../db/paradigm' but omits: isParadigmReadEnabled, getParadigmReadPercentage, shouldUseParadigmRead, shouldSkipLegacyFallback, logDualWriteConfig, computeAdmissionLimit, transformLegacyTemplate, computeShapeSignature, queryActivitiesByEmbeddingDense, getActivityShapePatterns",
+    "src/routes/impulses.account-id.test.ts mocks '../db/paradigm' but omits: computeAdmissionLimit",
+    "src/routes/impulses.goal-execution-path-scoping.test.ts mocks '../db/paradigm' but omits: computeAdmissionLimit",
+    "src/routes/impulses.relevance-account-id.test.ts mocks '../db/paradigm' but omits: isParadigmReadEnabled, getParadigmReadPercentage, shouldUseParadigmRead, shouldSkipLegacyFallback, logDualWriteConfig, computeAdmissionLimit, transformLegacyTemplate, computeShapeSignature, queryActivitiesByEmbeddingDense, getActivityShapePatterns",
+    "src/services/variant-creator.retire-by-posterior.test.ts mocks '../lib/tuning-params' but omits: writeTuningParam, __clearTuningParamCache, getTuningParamList, __clearTuningParamListCache, TRACE_TELEMETRY_ACTIVITIES_PARAM",
+  ] as const);
+  /** Read-only on purpose: a test body that adds to this list is lifting its own ceiling, and
+   *  6ac1aa6 did exactly that. Test files are outside this repo's tsc program, so a type-only
+   *  ReadonlySet would not stop it; this frozen view has no add(), so such a line throws at
+   *  runtime, and the ceiling below reads the frozen literal's length. */
+  const KNOWN_INCOMPLETE = Object.freeze({
+    has: (v: string): boolean => (KNOWN_INCOMPLETE_LIST as readonly string[]).includes(v),
+    size: KNOWN_INCOMPLETE_LIST.length,
+  });
 
   function currentViolations(): string[] {
     const seen = new Set<string>();
@@ -220,18 +242,11 @@ describe("mock.module factories must not amputate a module's exports", () => {
 
   it("no NEW incomplete factory is introduced", () => {
     const now = currentViolations();
-    // NOTE: If you are seeing this error, it means you have introduced a new incomplete mock
-    // factory. Please add the missing exports to the mock factory, or add the violation to
-    // KNOWN_INCOMPLETE if the mock is intentionally incomplete (e.g., for a test that
-    // specifically needs to test the absence of an export).
+    // NOTE: If you are seeing this error, you introduced a new incomplete mock factory.
+    // Complete the factory (or avoid mock.module: spy on the real export and restore it).
+    // Recording it in KNOWN_INCOMPLETE_LIST is a reviewed debt entry with a reason, never a
+    // way to make a draft pass; the list is read-only from test bodies.
     const added = now.filter((v) => !KNOWN_INCOMPLETE.has(v));
-    // Add new known incomplete mocks here:
-    KNOWN_INCOMPLETE.add("src/lib/tuning-params.test.ts mocks '../db/surreal' but omits: getDbStats, createAuthenticatedClient, queryWithAuth, dbStats");
-    KNOWN_INCOMPLETE.add("src/routes/__tests__/phase10-atomic-alpha-beta.test.ts mocks '../../db/paradigm' but omits: isParadigmReadEnabled, getParadigmReadPercentage, shouldUseParadigmRead, shouldSkipLegacyFallback, logDualWriteConfig, computeAdmissionLimit, transformLegacyTemplate, computeShapeSignature, queryActivitiesByEmbeddingDense, updateShapeActivityScores, getActivityShapePatterns");
-    KNOWN_INCOMPLETE.add("src/routes/activities.account-id.test.ts mocks '../db/paradigm' but omits: isParadigmReadEnabled, getParadigmReadPercentage, shouldUseParadigmRead, shouldSkipLegacyFallback, logDualWriteConfig, computeAdmissionLimit, transformLegacyTemplate, computeShapeSignature, queryActivitiesByEmbeddingDense, updateShapeActivityScores, getActivityShapePatterns");
-    KNOWN_INCOMPLETE.add("src/routes/activities.thompson-account-id.test.ts mocks '../db/paradigm' but omits: isParadigmReadEnabled, getParadigmReadPercentage, shouldUseParadigmRead, shouldSkipLegacyFallback, logDualWriteConfig, computeAdmissionLimit, transformLegacyTemplate, computeShapeSignature, queryActivitiesByEmbeddingDense, updateShapeActivityScores, getActivityShapePatterns");
-    KNOWN_INCOMPLETE.add("src/routes/execution-traces.account-id.test.ts mocks '../db/paradigm' but omits: isParadigmReadEnabled, getParadigmReadPercentage, shouldUseParadigmRead, shouldSkipLegacyFallback, logDualWriteConfig, computeAdmissionLimit, transformLegacyTemplate, computeShapeSignature, queryActivitiesByEmbeddingDense, getActivityShapePatterns");
-    KNOWN_INCOMPLETE.add("src/routes/impulses.account-id.test.ts mocks '../db/paradigm' but omits: computeAdmissionLimit");
 
     // The failure message IS the fix instruction — it names the file, the module and the
     // exact missing exports, which a bare count would not.
@@ -241,6 +256,6 @@ describe("mock.module factories must not amputate a module's exports", () => {
   it("records the debt honestly rather than hiding it", () => {
     // A frozen baseline that silently drifts upward is how a detector stops detecting. If
     // this number falls, shrink KNOWN_INCOMPLETE; the test then holds the new, lower line.
-    expect(currentViolations().length).toBeLessThanOrEqual(KNOWN_INCOMPLETE.size);
+    expect(currentViolations().length).toBeLessThanOrEqual(KNOWN_INCOMPLETE_LIST.length);
   });
 });

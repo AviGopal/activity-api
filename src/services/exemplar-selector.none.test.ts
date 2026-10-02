@@ -8,7 +8,7 @@
  * violations in 15 min, most of the hub's db_query_failures). Unknown is not evidence: a NONE
  * digest belongs on neither side.
  */
-import { beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 
 type Digest = { id: string; execution_id: string; executed_at: string; success?: boolean };
 let digests: Digest[] = [];
@@ -40,7 +40,17 @@ mock.module('../db/surreal', () => ({
   queryWithAuth: async () => [],
   dbStats: async () => ({}),
 }));
-mock.module('../db/redis', () => ({ redis: null }));
+// The real redis module, not a process-wide mock.module replacement: a `{ redis: null }`
+// factory omits RedisClient (mock-module-completeness.test.ts) and hands null to every later
+// test file that imports redis. The client connects lazily, so importing it is inert; stub the
+// three calls the selector makes and put them back afterwards.
+const { redis } = await import('../db/redis');
+const redisSpies = [
+  spyOn(redis, 'get').mockImplementation((async () => null) as never),
+  spyOn(redis, 'set').mockImplementation((async () => undefined) as never),
+  spyOn(redis, 'del').mockImplementation((async () => undefined) as never),
+];
+afterAll(() => { for (const s of redisSpies) s.mockRestore(); });
 
 const { selectExemplarsForActivity } = await import('./exemplar-selector');
 const timesWritten = (exec: string) => writes.reduce((n, w) => n + (w.split(`"${exec}"`).length - 1), 0);
