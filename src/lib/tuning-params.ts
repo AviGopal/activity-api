@@ -231,7 +231,6 @@ export async function getTuningParamList(name: string): Promise<string[]> {
     if (typeof raw === 'string') {
       value = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
     } else if (raw !== null && raw !== undefined) {
-      // A list reader refuses a non-string row loudly (a numeric value is not a list).
       logger.warn('tuning-param list row is not a string; using the empty list', {
         event: 'tuning_param_list_type_mismatch',
         name,
@@ -239,26 +238,11 @@ export async function getTuningParamList(name: string): Promise<string[]> {
       });
     }
   } catch (err) {
-    const lastGood = listLastGood.get(name);
-    if (Array.isArray(lastGood) && lastGood.length > 0) {
-      // Back off for one TTL using the last known-good list so callers do not hammer the DB while it is unhealthy.
-      // Never cache [].
-      listCache.set(name, { value: lastGood, expiresAt: now + CACHE_TTL_MS });
-      logger.warn('tuning-param list lookup failed; answering with the last known-good list (cached for TTL)', {
-        event: 'tuning_param_list_read_failed',
-        name,
-        last_good: lastGood,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return lastGood;
-    }
-    logger.warn('tuning-param list lookup failed; answering with the last known-good list (not cached)', {
-      event: 'tuning_param_list_read_failed',
-      name,
-      last_good: lastGood ?? null,
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return lastGood ?? [];
+    logger.warn('tuning-param list read failed', { name, error: err });
+    return listLastGood.get(name) || [];
+  }
+  if (value.length === 0 && listLastGood.has(name)) {
+    return listLastGood.get(name)!;
   }
   listLastGood.set(name, value);
   listCache.set(name, { value, expiresAt: now + CACHE_TTL_MS });
