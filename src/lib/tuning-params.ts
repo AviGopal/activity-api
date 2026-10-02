@@ -240,6 +240,18 @@ export async function getTuningParamList(name: string): Promise<string[]> {
     }
   } catch (err) {
     const lastGood = listLastGood.get(name);
+    if (Array.isArray(lastGood) && lastGood.length > 0) {
+      // Back off for one TTL using the last known-good list so callers do not hammer the DB while it is unhealthy.
+      // Never cache [].
+      listCache.set(name, { value: lastGood, expiresAt: now + CACHE_TTL_MS });
+      logger.warn('tuning-param list lookup failed; answering with the last known-good list (cached for TTL)', {
+        event: 'tuning_param_list_read_failed',
+        name,
+        last_good: lastGood,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return lastGood;
+    }
     logger.warn('tuning-param list lookup failed; answering with the last known-good list (not cached)', {
       event: 'tuning_param_list_read_failed',
       name,
