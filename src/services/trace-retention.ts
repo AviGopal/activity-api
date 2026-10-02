@@ -32,6 +32,7 @@
  */
 
 import { surrealDB } from '../db/surreal';
+import { withDeadline } from '../lib/deadline';
 import { logger } from '../utils/logger';
 import { decrementTraceStoreCounter } from '../lib/trace-store-counters';
 import { PRUNE_MARKERS_SQL } from '../lib/shape-score-counter';
@@ -282,12 +283,12 @@ function policyFor(cfg: TraceRetentionConfig, activityId: string): StratumPolicy
 /** Reliable per-stratum count: GROUP ALL aggregate (not GROUP BY <field>). */
 async function countCold(activityId: string, succeeded: boolean, coldCutoffIso: string): Promise<number> {
   try {
-    const rows = await surrealDB.query<{ count: number }>(
+    const rows = await withDeadline(surrealDB.query<{ count: number }>(
       `SELECT count() FROM ${TABLE}
          WHERE activity_id = $aid AND success = $ok AND executed_at < type::datetime($cut)
-         GROUP ALL`,
+         GROUP ALL TIMEOUT ${SWEEP_READ_TIMEOUT_S}s`,
       { aid: activityId, ok: succeeded, cut: coldCutoffIso },
-    );
+    ), deadlineFor(1, SWEEP_READ_TIMEOUT_S), 'stratum cold count');
     return Array.isArray(rows) && rows.length > 0 ? Number(rows[0]?.count ?? 0) : 0;
   } catch (err) {
     logger.warn('[trace-retention] countCold failed; treating stratum as empty this cycle', {
@@ -300,11 +301,17 @@ async function countCold(activityId: string, succeeded: boolean, coldCutoffIso: 
 export interface StratumResult {
   activityId: string;
   status: string;
-  coldCount: number;
+  /** null = NOT COUNTED this sweep (see `skipped`), never "zero cold rows". */
+  coldCount: number | null;
   cap: number;
   keepProb: number;
   deletedEstimate: number;
   deletedActual: number | null; // null in dry-run
+  /**
+   * 'budget' = the strata phase budget ran out before this stratum was reached, so it was neither
+   * counted nor swept. Reported explicitly so an unswept stratum never reads as an empty one.
+   */
+  skipped?: 'budget';
 }
 
 /**
@@ -337,21 +344,21 @@ const REACH_HISTORY_WATERMARK = 'reach_history:__watermark__';
 
 export async function rollupReachHistory(): Promise<{ scanned: number; weeks: number } | null> {
   try {
-    const wmRows = await surrealDB.query<{ last_executed_at?: string }>(
-      `SELECT last_executed_at FROM ${REACH_HISTORY_WATERMARK}`,
-    );
+    const wmRows = await withDeadline(surrealDB.query<{ last_executed_at?: string }>(
+      `SELECT last_executed_at FROM ${REACH_HISTORY_WATERMARK} TIMEOUT ${SWEEP_READ_TIMEOUT_S}s`,
+    ), deadlineFor(1, SWEEP_READ_TIMEOUT_S), 'reach-history watermark read');
     // First run has no watermark: start from the oldest row the store still holds rather
     // than from epoch, so the first bucket is honest about what it could actually see.
     const since = (Array.isArray(wmRows) && wmRows[0]?.last_executed_at)
       ? String(wmRows[0].last_executed_at)
       : new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
 
-    const rows = await surrealDB.query<{ executed_at?: string; reached?: boolean }>(
+    const rows = await withDeadline(surrealDB.query<{ executed_at?: string; reached?: boolean }>(
       `SELECT executed_at, reached FROM ${TABLE}
          WHERE reached != NONE AND executed_at > type::datetime($since)
-         ORDER BY executed_at ASC LIMIT 20000`,
+         ORDER BY executed_at ASC LIMIT 20000 TIMEOUT ${SWEEP_READ_TIMEOUT_S}s`,
       { since },
-    );
+    ), deadlineFor(1, SWEEP_READ_TIMEOUT_S), 'reach-history rollup read');
     const list = Array.isArray(rows) ? rows : [];
     if (list.length === 0) return { scanned: 0, weeks: 0 };
 
@@ -374,19 +381,19 @@ export async function rollupReachHistory(): Promise<{ scanned: number; weeks: nu
     }
 
     for (const [wk, b] of buckets) {
-      await surrealDB.query(
+      await withDeadline(surrealDB.query(
         `UPSERT reach_history:['${wk}'] SET
            week = $wk,
            reached = (reached ?? 0) + $reached,
            total = (total ?? 0) + $total,
-           updated_at = time::now()`,
+           updated_at = time::now() TIMEOUT ${SWEEP_READ_TIMEOUT_S}s`,
         { wk, reached: b.reached, total: b.total },
-      );
+      ), deadlineFor(1, SWEEP_READ_TIMEOUT_S), 'reach-history week upsert');
     }
-    await surrealDB.query(
-      `UPSERT ${REACH_HISTORY_WATERMARK} SET last_executed_at = $ts, updated_at = time::now()`,
+    await withDeadline(surrealDB.query(
+      `UPSERT ${REACH_HISTORY_WATERMARK} SET last_executed_at = $ts, updated_at = time::now() TIMEOUT ${SWEEP_READ_TIMEOUT_S}s`,
       { ts: maxTs },
-    );
+    ), deadlineFor(1, SWEEP_READ_TIMEOUT_S), 'reach-history watermark upsert');
     logger.info('[trace-retention] reach-history rollup', {
       scanned: list.length, weeks: buckets.size, watermark: maxTs,
     });
@@ -421,6 +428,39 @@ export async function rollupReachHistory(): Promise<{ scanned: number; weeks: nu
 let sweepInFlight = false;
 
 /**
+ * WHERE THE IN-FLIGHT SWEEP IS (2026-10-01). On the hub a sweep logged its pressure warning and then
+ * nothing for 25+ minutes; every later invocation logged only "already in flight". The guard knew a
+ * sweep was running but not WHAT it was doing, so the stalled phase had to be inferred from which
+ * log line had NOT appeared. Every phase now records itself here, and the skip line reports it.
+ */
+let sweepPhase: { name: string; since: number; sweepStartedAt: number } | null = null;
+function enterPhase(name: string): number {
+  const now = Date.now();
+  sweepPhase = { name, since: now, sweepStartedAt: sweepPhase?.sweepStartedAt ?? now };
+  return now;
+}
+/** One progress line per completed phase: its wall time and row counts. */
+function phaseDone(name: string, started: number, extra: Record<string, unknown> = {}): void {
+  logger.info('[trace-retention] phase', { phase: name, ms: Date.now() - started, ...extra });
+}
+/** Test/diagnostic hook: the phase the in-flight sweep is in, or null when none runs. */
+export function getSweepPhase(): { name: string; ms: number; sweepMs: number } | null {
+  if (!sweepInFlight || !sweepPhase) return null;
+  const now = Date.now();
+  return { name: sweepPhase.name, ms: now - sweepPhase.since, sweepMs: now - sweepPhase.sweepStartedAt };
+}
+
+/**
+ * EVERY STATEMENT THE SWEEP AWAITS IS BOUNDED TWICE: a SurrealQL `TIMEOUT` on the statement (the
+ * server abandons it and a transaction rolls back whole — verified on 2.3.3, including inside
+ * BEGIN/COMMIT) and a client deadline on the await (covers the semaphore wait, an untimed statement
+ * and a silent socket). While the in-flight flag is held, an unbounded await disables retention for
+ * the life of the process: the module flag is only cleared in a `finally` that never runs.
+ */
+const SWEEP_READ_TIMEOUT_S = 60;
+const deadlineFor = (timedStatements: number, stmtTimeoutS: number) => (timedStatements * stmtTimeoutS + 10) * 1000;
+
+/**
  * ONE ceiling computation, used by BOTH the sense check below and the enforce valve later.
  *
  * The config states the invariant plainly — ENFORCE == SENSE by construction — and a
@@ -433,11 +473,64 @@ let sweepInFlight = false;
  * Sampling is bounded and its failure is non-silent: if the estimate cannot be taken, the
  * row ceiling stands and the log says so, rather than a wider bound appearing by default.
  */
+/** `SELECT count() … GROUP ALL` (Iterate Table Count), bounded like every other sweep statement. */
+async function countExecutionTotal(): Promise<number> {
+  const rows = await withDeadline(
+    surrealDB.query<{ count: number }>(`SELECT count() FROM ${TABLE} GROUP ALL TIMEOUT ${SWEEP_READ_TIMEOUT_S}s`),
+    deadlineFor(1, SWEEP_READ_TIMEOUT_S),
+    'execution total count',
+  );
+  return Array.isArray(rows) && rows.length > 0 ? Number(rows[0]?.count ?? 0) : 0;
+}
+
+/**
+ * The surplus over the effective ceiling, as the valve last MEASURED it (its own count and
+ * computeEffectiveCeiling — the same numbers it prunes by). Read by other heavy scanners of
+ * `execution` (the shape-counter seed) so they yield while the drain still has work, instead of
+ * competing with it for the store. Null until a sweep has counted in this process.
+ */
+let measuredSurplus: { surplus: number; at: number } | null = null;
+/**
+ * Strata rotation cursor: the activity id the next sweep's strata phase starts at (null = list
+ * order). Process-scoped; a restart starts from the top, which costs at most one sweep's order.
+ */
+let strataResumeAt: string | null = null;
+/** Test hook. */
+export function __getStrataResumeAtForTest(): string | null { return strataResumeAt; }
+export function __resetStrataCursorForTest(): void { strataResumeAt = null; }
+/** A dry-run valve deletes nothing, so a surplus it measured is no reason for anyone to wait. */
+let valveDryRun = false;
+function noteSurplus(surplus: number): void {
+  measuredSurplus = { surplus: Math.max(0, surplus), at: Date.now() };
+}
+export function getDrainPressure(): { surplus: number | null; measuredAt: number | null; drainInFlight: boolean; drainCanProgress: boolean } {
+  // A drain that has deleted since the measurement leaves less surplus than measured; the valve's own
+  // outcome is the fresher number when it exists.
+  const remaining = lastCeilingOutcome?.remaining;
+  const surplus = measuredSurplus === null ? null : (typeof remaining === 'number' ? Math.min(remaining, measuredSurplus.surplus) : measuredSurplus.surplus);
+  // 'empty' = the valve found nothing cold to delete: the surplus is all inside the hot window and no
+  // drain can shrink it, so nobody should wait on it. 'failed' = the valve could not delete at all
+  // (its candidate read failed, or every batch failed with nothing removed): a drain that is not
+  // progressing is no more a reason to wait than one that has nothing to do.
+  const stalled = lastCeilingOutcome?.stoppedBy === 'empty' || lastCeilingOutcome?.stoppedBy === 'failed';
+  return { surplus, measuredAt: measuredSurplus?.at ?? null, drainInFlight: sweepInFlight, drainCanProgress: !valveDryRun && !stalled };
+}
+/** Test hook. */
+export function __setDrainPressureForTest(surplus: number | null, inFlight = false, outcome: { remaining: number; stoppedBy: string } | null = null): void {
+  measuredSurplus = surplus === null ? null : { surplus, at: Date.now() };
+  lastCeilingOutcome = outcome;
+  valveDryRun = false;
+  sweepInFlight = inFlight;
+}
+
 async function computeEffectiveCeiling(cfg: TraceRetentionConfig): Promise<{ ceiling: number; boundBy: string; meanBytes: number | null }> {
   if (!(cfg.globalCeilingBytes > 0)) return { ceiling: cfg.globalCeiling, boundBy: 'rows', meanBytes: null };
   try {
     const sampleN = Math.max(1, Math.min(200, cfg.rowSizeSampleN));
-    const sample = await surrealDB.query<Record<string, unknown>>(`SELECT * FROM ${TABLE} LIMIT ${sampleN}`);
+    const sample = await withDeadline(
+      surrealDB.query<Record<string, unknown>>(`SELECT * FROM ${TABLE} LIMIT ${sampleN} TIMEOUT ${SWEEP_READ_TIMEOUT_S}s`),
+      deadlineFor(1, SWEEP_READ_TIMEOUT_S), 'row-size sample',
+    );
     const arr = Array.isArray(sample) ? sample : [];
     if (arr.length === 0) return { ceiling: cfg.globalCeiling, boundBy: 'rows', meanBytes: null };
     const meanBytes =
@@ -505,6 +598,13 @@ export interface DrainPolicy {
   stmtTimeoutS: number;
   /** Rest between follow-up drain ticks while the store is still over its ceiling (0 = no follow-ups). */
   restMs: number;
+  /**
+   * Wall-clock budget for EACH of the sweep's other deleting phases (the per-activity reservoir and
+   * the aux-table reap). Before 2026-10-01 neither had one: on the hub the per-activity reservoir
+   * worked through ~320k cold validator-dispatch rows at ~3 rows/s (a ~28 h phase) while holding the
+   * sweep's in-flight flag, so the valve and its telemetry-first drain never ran.
+   */
+  phaseBudgetMs: number;
 }
 
 /**
@@ -516,12 +616,13 @@ export interface DrainPolicy {
 export async function loadDrainPolicy(): Promise<DrainPolicy> {
   const { getTuningParam } = await import('../lib/tuning-params');
   const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, Math.floor(v)));
-  const [batch, minBatch, pauseMs, stmtTimeoutS, restMs] = await Promise.all([
+  const [batch, minBatch, pauseMs, stmtTimeoutS, restMs, phaseBudgetMs] = await Promise.all([
     getTuningParam('TRACE_RETENTION_DRAIN_BATCH', undefined, 2000),
     getTuningParam('TRACE_RETENTION_DRAIN_MIN_BATCH', undefined, 50),
     getTuningParam('TRACE_RETENTION_DRAIN_PAUSE_MS', undefined, 250),
     getTuningParam('TRACE_RETENTION_DRAIN_STMT_TIMEOUT_S', undefined, 20),
     getTuningParam('TRACE_RETENTION_DRAIN_REST_MS', undefined, 60_000),
+    getTuningParam('TRACE_RETENTION_PHASE_BUDGET_MS', undefined, 120_000),
   ]);
   const b = clamp(batch, 1, 20_000);
   return {
@@ -530,6 +631,7 @@ export async function loadDrainPolicy(): Promise<DrainPolicy> {
     pauseMs: clamp(pauseMs, 0, 60_000),
     stmtTimeoutS: clamp(stmtTimeoutS, 1, 120),
     restMs: clamp(restMs, 0, 3_600_000),
+    phaseBudgetMs: clamp(phaseBudgetMs, 1_000, 3_600_000),
   };
 }
 
@@ -546,14 +648,14 @@ export interface DrainResult {
 
 const DRAIN_BATCH_SQL = (stmtTimeoutS: number) => `
 BEGIN TRANSACTION;
-LET $ts = (SELECT VALUE executed_at FROM ${TABLE} WHERE executed_at < type::datetime($cut) LIMIT $n);
+LET $ts = (SELECT VALUE executed_at FROM ${TABLE} WHERE executed_at < type::datetime($cut) LIMIT $n TIMEOUT ${stmtTimeoutS}s);
 LET $b = IF array::len($ts) < $n { type::datetime($cut) } ELSE { time::max($ts) };
-LET $c = IF array::len($ts) = 0 { 0 } ELSE { (SELECT count() FROM ${TABLE} WHERE executed_at < $b GROUP ALL)[0].count ?? 0 };
+LET $c = IF array::len($ts) = 0 { 0 } ELSE { (SELECT count() FROM ${TABLE} WHERE executed_at < $b GROUP ALL TIMEOUT ${stmtTimeoutS}s)[0].count ?? 0 };
 LET $ok = $c > 0 AND $c <= $max;
 IF $ok {
-  LET $__ids = (SELECT VALUE id FROM ${TABLE} WHERE executed_at < $b);
+  LET $__ids = (SELECT VALUE id FROM ${TABLE} WHERE executed_at < $b TIMEOUT ${stmtTimeoutS}s);
   DELETE ${TABLE} WHERE executed_at < $b RETURN NONE TIMEOUT ${stmtTimeoutS}s;
-  ${PRUNE_MARKERS_SQL('$__ids')}
+  ${PRUNE_MARKERS_SQL('$__ids', stmtTimeoutS)}
 };
 RETURN { fetched: array::len($ts), counted: $c, deleted: IF $ok { $c } ELSE { 0 } };
 COMMIT TRANSACTION;`;
@@ -562,8 +664,12 @@ COMMIT TRANSACTION;`;
  * Delete an explicit id list from `execution` together with those executions' shape-counter
  * markers (migration 213), in one transaction on the normal client path (semaphore + auth retry).
  */
-async function deleteExecutionIds(ids: unknown[], deleteStatement: string): Promise<void> {
-  await surrealDB.queryAll(`BEGIN TRANSACTION;\n${deleteStatement};\n${PRUNE_MARKERS_SQL('$ids')}\nCOMMIT TRANSACTION;`, { ids });
+async function deleteExecutionIds(ids: unknown[], deleteStatement: string, stmtTimeoutS = 20): Promise<void> {
+  await withDeadline(
+    surrealDB.queryAll(`BEGIN TRANSACTION;\n${deleteStatement};\n${PRUNE_MARKERS_SQL('$ids', stmtTimeoutS)}\nCOMMIT TRANSACTION;`, { ids }),
+    deadlineFor(2, stmtTimeoutS),
+    'execution id-list delete',
+  );
 }
 
 /**
@@ -577,7 +683,11 @@ export async function runDrainBatch(
   max: number,
   stmtTimeoutS: number,
 ): Promise<{ fetched: number; counted: number; deleted: number }> {
-  const raw = await surrealDB.queryAll(DRAIN_BATCH_SQL(stmtTimeoutS), { cut: cutIso, n, max });
+  const raw = await withDeadline(
+    surrealDB.queryAll(DRAIN_BATCH_SQL(stmtTimeoutS), { cut: cutIso, n, max }),
+    deadlineFor(5, stmtTimeoutS),
+    'range drain batch',
+  );
   const out = (Array.isArray(raw) ? raw : []).filter(
     (r): r is { fetched: number; counted: number; deleted: number } =>
       !!r && typeof r === 'object' && 'deleted' in (r as object),
@@ -608,16 +718,19 @@ export async function drainColdByRange(opts: {
   let removed = 0;
   let batches = 0;
   let failures = 0;
+  const phaseStarted = enterPhase('valve:range_drain');
+  let result: DrainResult | null = null;
+  const fin = (r: DrainResult): DrainResult => (result = r);
   try {
     while (removed < target) {
-      if (Date.now() >= budgetUntil) return { removed, batches, failures, stoppedBy: 'budget' };
+      if (Date.now() >= budgetUntil) return fin({ removed, batches, failures, stoppedBy: 'budget' });
       const allowance = target - removed;
       const want = Math.min(n, allowance);
       const batchStarted = Date.now();
       try {
         const { fetched, counted, deleted } = await runDrainBatch(cutIso, want, allowance, policy.stmtTimeoutS);
         const tookMs = Date.now() - batchStarted;
-        if (fetched === 0) return { removed, batches, failures, stoppedBy: 'empty' };
+        if (fetched === 0) return fin({ removed, batches, failures, stoppedBy: 'empty' });
         if (deleted > 0) {
           removed += deleted;
           batches++;
@@ -636,7 +749,7 @@ export async function drainColdByRange(opts: {
         } else {
           // counted 0 with rows in hand = every fetched row shares the boundary timestamp; a range
           // cannot split them. Hand the remainder to the id-list loop.
-          return { removed, batches, failures, stoppedBy: 'needs_ids' };
+          return fin({ removed, batches, failures, stoppedBy: 'needs_ids' });
         }
       } catch (err) {
         failures++;
@@ -645,14 +758,15 @@ export async function drainColdByRange(opts: {
           batch: want, nextBatch: next, failures,
           error: err instanceof Error ? err.message : String(err),
         });
-        if (want <= policy.minBatch && failures >= 3) return { removed, batches, failures, stoppedBy: 'needs_ids' };
+        if (want <= policy.minBatch && failures >= 3) return fin({ removed, batches, failures, stoppedBy: 'needs_ids' });
         n = next;
       }
       if (policy.pauseMs > 0 && removed < target) await new Promise((r) => setTimeout(r, policy.pauseMs));
     }
-    return { removed, batches, failures, stoppedBy: 'target' };
+    return fin({ removed, batches, failures, stoppedBy: 'target' });
   } finally {
     carriedDrainWidth = n;
+    phaseDone('valve:range_drain', phaseStarted, { removed, batches, failures, stoppedBy: (result as DrainResult | null)?.stoppedBy ?? 'threw', width: n });
   }
 }
 
@@ -671,12 +785,21 @@ export async function drainColdByRange(opts: {
 // non-telemetry rows to find its next n (quadratic on the hub). The activity index visits only this
 // id's rows. (An absent index is ignored by SurrealDB 2.3.3 and the query still runs.)
 
+// Every statement carries TIMEOUT and the batch reports its own phase timings (time::now() advances
+// per statement inside a transaction on 2.3.3, verified), so a slow phase is named in the log rather
+// than inferred. Measured on a scratch 2.3.3 rocksdb store (300k rows, 68% one telemetry id, the live
+// execution DDL): 2000-row batches take ~0.7 s (select 30-110 ms, delete 470-830 ms, marker prune
+// ~20 ms), ~2,500 rows/s; the select grows slowly as the drain proceeds (index tombstones at the head
+// of this id's range), the delete stays flat.
 const TELEMETRY_BATCH_SQL = (stmtTimeoutS: number) => `
 BEGIN TRANSACTION;
-LET $__ids = (SELECT VALUE id FROM ${TABLE} WITH INDEX idx_execution_activity WHERE activity_id = $aid AND executed_at < type::datetime($cut) LIMIT $n);
+LET $__t0 = time::now();
+LET $__ids = (SELECT VALUE id FROM ${TABLE} WITH INDEX idx_execution_activity WHERE activity_id = $aid AND executed_at < type::datetime($cut) LIMIT $n TIMEOUT ${stmtTimeoutS}s);
+LET $__t1 = time::now();
 DELETE $__ids RETURN NONE TIMEOUT ${stmtTimeoutS}s;
-${PRUNE_MARKERS_SQL('$__ids')}
-RETURN { deleted: array::len($__ids) };
+LET $__t2 = time::now();
+${PRUNE_MARKERS_SQL('$__ids', stmtTimeoutS)}
+RETURN { deleted: array::len($__ids), select_ms: duration::millis($__t1 - $__t0), delete_ms: duration::millis($__t2 - $__t1), prune_ms: duration::millis(time::now() - $__t2) };
 COMMIT TRANSACTION;`;
 
 export async function drainTelemetryClass(opts: {
@@ -687,39 +810,68 @@ export async function drainTelemetryClass(opts: {
 }): Promise<{ removed: number; batches: number; activities: string[]; stoppedBy: 'target' | 'budget' | 'empty' | 'failed' | 'none_declared' }> {
   // Vetted: ids with reach-graded evidence are refused (logged) and keep the age-ordered path.
   const { resolveTelemetryClass } = await import('../lib/telemetry-class');
+  const evidenceStarted = enterPhase('valve:telemetry_class');
   const activities = (await resolveTelemetryClass()).accepted;
+  phaseDone('valve:telemetry_class', evidenceStarted, { accepted: activities });
   if (activities.length === 0) return { removed: 0, batches: 0, activities, stoppedBy: 'none_declared' };
   let removed = 0, batches = 0, failures = 0;
+  const sums = { select_ms: 0, delete_ms: 0, prune_ms: 0 };
   let n = Math.max(1, Math.min(opts.policy.batch, carriedDrainWidth ?? DRAIN_COLD_START_WIDTH));
+  const phaseStarted = enterPhase('valve:telemetry_drain');
+  let stoppedBy: 'target' | 'budget' | 'empty' | 'failed' = 'empty';
+  const finish = (by: typeof stoppedBy) => {
+    stoppedBy = by;
+    phaseDone('valve:telemetry_drain', phaseStarted, { removed, batches, failures, stoppedBy, width: n, ...sums });
+    return { removed, batches, activities, stoppedBy };
+  };
   for (const aid of activities) {
     for (;;) {
-      if (removed >= opts.target) return { removed, batches, activities, stoppedBy: 'target' };
-      if (Date.now() >= opts.budgetUntil) return { removed, batches, activities, stoppedBy: 'budget' };
+      if (removed >= opts.target) return finish('target');
+      if (Date.now() >= opts.budgetUntil) return finish('budget');
       const want = Math.min(n, opts.target - removed);
       const started = Date.now();
       try {
-        const raw = await surrealDB.queryAll(TELEMETRY_BATCH_SQL(opts.policy.stmtTimeoutS), { aid, cut: opts.cutIso, n: want });
-        const out = (Array.isArray(raw) ? raw : []).filter((r): r is { deleted: number } => !!r && typeof r === 'object' && 'deleted' in (r as object)).pop();
+        const raw = await withDeadline(
+          surrealDB.queryAll(TELEMETRY_BATCH_SQL(opts.policy.stmtTimeoutS), { aid, cut: opts.cutIso, n: want }),
+          deadlineFor(3, opts.policy.stmtTimeoutS),
+          `telemetry drain batch (${aid})`,
+        );
+        const out = (Array.isArray(raw) ? raw : []).filter((r): r is { deleted: number; select_ms?: number; delete_ms?: number; prune_ms?: number } =>
+          !!r && typeof r === 'object' && 'deleted' in (r as object)).pop();
         const deleted = Number(out?.deleted ?? 0);
+        sums.select_ms += Number(out?.select_ms ?? 0);
+        sums.delete_ms += Number(out?.delete_ms ?? 0);
+        sums.prune_ms += Number(out?.prune_ms ?? 0);
         if (deleted === 0) break; // this id has no cold rows left
         removed += deleted;
         batches++;
         const took = Date.now() - started;
+        // Progress, not per-batch noise: the first batch and every 25th (a 1.4M-row drain is hundreds).
+        if (batches === 1 || batches % 25 === 0) {
+          logger.info('[trace-retention] telemetry drain progress', {
+            activity_id: aid, batch: batches, deleted, removed, ms: took,
+            select_ms: out?.select_ms, delete_ms: out?.delete_ms, prune_ms: out?.prune_ms, width: want,
+          });
+        }
         const timeoutMs = opts.policy.stmtTimeoutS * 1000;
         if (took > timeoutMs / 2) n = Math.max(1, Math.floor(want / 2));
         else if (took < timeoutMs / 8) n = Math.min(opts.policy.batch, n * 2);
       } catch (err) {
         failures++;
+        // A timed-out statement (server TIMEOUT: the transaction rolled back whole) or a client
+        // deadline (the batch is abandoned; the server statement is bounded by its own TIMEOUT) is
+        // logged and the batch narrowed — never awaited past its bound.
         logger.warn('[trace-retention] telemetry batch failed — rolled back, narrowing', {
-          activity_id: aid, batch: want, failures, error: err instanceof Error ? err.message : String(err),
+          activity_id: aid, batch: want, failures, ms: Date.now() - started,
+          error: err instanceof Error ? err.message : String(err),
         });
-        if (want <= opts.policy.minBatch && failures >= 3) return { removed, batches, activities, stoppedBy: 'failed' };
+        if (want <= opts.policy.minBatch && failures >= 3) return finish('failed');
         n = Math.max(opts.policy.minBatch, Math.floor(want / 2));
       }
       if (opts.policy.pauseMs > 0) await new Promise((r) => setTimeout(r, opts.policy.pauseMs));
     }
   }
-  return { removed, batches, activities, stoppedBy: 'empty' };
+  return finish('empty');
 }
 
 /** What the last valve run left over-ceiling, read by the scheduler to decide on a follow-up drain tick. */
@@ -736,6 +888,7 @@ export function getLastCeilingOutcome(): { remaining: number; stoppedBy: string 
 async function runCeilingValve(cfg: TraceRetentionConfig, coldCutoffIso: string): Promise<StratumResult | null> {
   let valveResult: StratumResult | null = null;
   lastCeilingOutcome = null;
+  valveDryRun = cfg.dryRun;
   logger.info('[trace-retention] global-ceiling valve: entering', {
     enabled: cfg.globalCeilingEnabled,
     ceiling: cfg.globalCeiling,
@@ -747,8 +900,8 @@ async function runCeilingValve(cfg: TraceRetentionConfig, coldCutoffIso: string)
     let effectiveCeiling = cfg.globalCeiling;
     let boundBy = 'rows';
     try {
-      const rows = await surrealDB.query<{ count: number }>(`SELECT count() FROM ${TABLE} GROUP ALL`);
-      total = Array.isArray(rows) && rows.length > 0 ? Number(rows[0]?.count ?? 0) : 0;
+      const countStarted = enterPhase('valve:count');
+      total = await countExecutionTotal();
 
       // Same computation the sense check used — one function, so the two can never disagree.
       // See computeEffectiveCeiling for why that invariant is load-bearing.
@@ -772,7 +925,9 @@ async function runCeilingValve(cfg: TraceRetentionConfig, coldCutoffIso: string)
         rowCeiling: cfg.globalCeiling,
         boundBy,
         willPrune: total > effectiveCeiling,
+        ms: Date.now() - countStarted,
       });
+      noteSurplus(total - effectiveCeiling);
     } catch (err) {
       logger.warn('[trace-retention] global-ceiling count failed; skipping valve this cycle', {
         error: err instanceof Error ? err.message : String(err),
@@ -796,7 +951,7 @@ async function runCeilingValve(cfg: TraceRetentionConfig, coldCutoffIso: string)
         // undeletable row costs one failed batch per sweep instead of the entire sweep.
         const quarantined = new Set<string>();
         let quarantineFailures = 0;
-        let stoppedBy: 'target' | 'budget' | 'empty' | 'iters' = 'iters';
+        let stoppedBy: 'target' | 'budget' | 'empty' | 'iters' | 'failed' = 'iters';
         // SET-BASED FIRST (see drainColdByRange); the id-list loop below runs only when the range
         // path reports it cannot progress, with whatever target and budget remain.
         const drainPolicy = await loadDrainPolicy();
@@ -844,15 +999,26 @@ async function runCeilingValve(cfg: TraceRetentionConfig, coldCutoffIso: string)
           // and 25 all begin with the same head row, so the batch dimension was never the
           // variable. Excluding the known-bad ids is what lets the scan ADVANCE to the other
           // ~308,000 rows instead of dying on the first page.
-          const rows = await surrealDB.query<{ id: unknown }>(
-            quarantined.size > 0
-              ? `SELECT id FROM ${TABLE} WHERE executed_at < type::datetime($cut) AND id NOT IN $skip LIMIT $batch`
-              : `SELECT id FROM ${TABLE} WHERE executed_at < type::datetime($cut) LIMIT $batch`,
-            // Reuse the sweep's own cold cutoff (line ~295) rather than recomputing it,
-            // so the valve and the per-activity strata can never disagree about what
-            // "cold" means.
-            { batch: thisBatch, cut: coldCutoffIso, ...(quarantined.size > 0 ? { skip: [...quarantined] } : {}) },
-          );
+          // BOUNDED like every other sweep statement (server TIMEOUT + client deadline). A failed or
+          // abandoned candidate read has no ids to quarantine, so it ends the id loop as 'failed'.
+          let rows: Array<{ id: unknown }>;
+          try {
+            rows = await withDeadline(surrealDB.query<{ id: unknown }>(
+              quarantined.size > 0
+                ? `SELECT id FROM ${TABLE} WHERE executed_at < type::datetime($cut) AND id NOT IN $skip LIMIT $batch TIMEOUT ${drainPolicy.stmtTimeoutS}s`
+                : `SELECT id FROM ${TABLE} WHERE executed_at < type::datetime($cut) LIMIT $batch TIMEOUT ${drainPolicy.stmtTimeoutS}s`,
+              // Reuse the sweep's own cold cutoff (line ~295) rather than recomputing it,
+              // so the valve and the per-activity strata can never disagree about what
+              // "cold" means.
+              { batch: thisBatch, cut: coldCutoffIso, ...(quarantined.size > 0 ? { skip: [...quarantined] } : {}) },
+            ), deadlineFor(1, drainPolicy.stmtTimeoutS), 'valve id-fallback select');
+          } catch (err) {
+            logger.warn('[trace-retention] global-ceiling valve: id-fallback select FAILED — ending the id loop', {
+              iter, deletedSoFar: done, error: err instanceof Error ? err.message : String(err),
+            });
+            stoppedBy = 'failed';
+            break;
+          }
           const ids = (Array.isArray(rows) ? rows : [])
             .map((r) => (r as { id?: unknown })?.id)
             .filter((id) => id != null);
@@ -940,7 +1106,7 @@ async function runCeilingValve(cfg: TraceRetentionConfig, coldCutoffIso: string)
                 quarantinedTotal: quarantined.size,
                 note: 'not a poison-row problem: the store itself is refusing deletes. Investigate DB health before tuning retention.',
               });
-              stoppedBy = 'budget';
+              stoppedBy = 'failed';
               break;
             }
           }
@@ -975,10 +1141,10 @@ async function runCeilingValve(cfg: TraceRetentionConfig, coldCutoffIso: string)
         // One index-count, no mutation.
         let coldRows: number | null = null;
         try {
-          const c = await surrealDB.query<{ count: number }>(
-            `SELECT count() FROM ${TABLE} WHERE executed_at < type::datetime($cut) GROUP ALL`,
+          const c = await withDeadline(surrealDB.query<{ count: number }>(
+            `SELECT count() FROM ${TABLE} WHERE executed_at < type::datetime($cut) GROUP ALL TIMEOUT ${SWEEP_READ_TIMEOUT_S}s`,
             { cut: coldCutoffIso },
-          );
+          ), deadlineFor(1, SWEEP_READ_TIMEOUT_S), 'dry-run cold count');
           coldRows = Array.isArray(c) && c.length > 0 ? Number(c[0]?.count ?? 0) : 0;
         } catch (err) {
           logger.warn('[trace-retention] dry-run cold count failed', { error: err instanceof Error ? err.message : String(err) });
@@ -1022,6 +1188,7 @@ export async function runTraceRetentionSweep(
   if (sweepInFlight) {
     logger.info('[trace-retention] sweep already in flight — skipping this invocation', {
       note: 'timer tick and reconcile route both drive this sweep; overlapping runs would delete the same rows twice',
+      inFlightPhase: getSweepPhase(),
     });
     return { results: [], durationMs: 0, orphanReaped: 0, skipped: true, skippedReason: 'in_flight' };
   }
@@ -1062,12 +1229,14 @@ export async function runTraceRetentionSweep(
     // strictly better than refusing to sweep because a probe could not be loaded.
   }
   sweepInFlight = true;
+  sweepPhase = null;
   try {
     return await runTraceRetentionSweepInner(cfg);
   } finally {
     // finally, not a trailing assignment: an exception anywhere in the sweep must not
     // leave the guard stuck true and disable retention for the life of the process.
     sweepInFlight = false;
+    sweepPhase = null;
   }
 }
 
@@ -1077,7 +1246,9 @@ async function runTraceRetentionSweepInner(
   const startedAt = Date.now();
   // CAPTURE BEFORE DELETE. The rollup must precede every prune below, or the sweep
   // destroys the only timestamped record of whether reach is improving.
-  await rollupReachHistory();
+  const rollupStarted = enterPhase('rollup');
+  const rollup = await rollupReachHistory();
+  phaseDone('rollup', rollupStarted, { scanned: rollup?.scanned ?? null });
   const coldCutoffIso = new Date(startedAt - cfg.hotWindowMs).toISOString();
   const statuses = ['success', 'failure'] as const;
   const results: StratumResult[] = [];
@@ -1118,31 +1289,51 @@ async function runTraceRetentionSweepInner(
   // is cheaper too.
 
   let overCeiling = false;
+  let pressureUnknown = false;
   if (cfg.globalCeilingEnabled && cfg.globalCeiling > 0) {
     try {
-      const rows = await surrealDB.query<{ count: number }>(`SELECT count() FROM ${TABLE} GROUP ALL`);
-      const total = Array.isArray(rows) && rows.length > 0 ? Number(rows[0]?.count ?? 0) : 0;
+      const pressureStarted = enterPhase('pressure_check');
+      const total = await countExecutionTotal();
       const eff = await computeEffectiveCeiling(cfg);
       overCeiling = total > eff.ceiling;
+      noteSurplus(total - eff.ceiling);
       if (overCeiling) {
-        logger.warn('[trace-retention] over global ceiling — skipping stratum auto-discovery this cycle so the indexed valve is reached', {
+        logger.warn('[trace-retention] over global ceiling — running the valve FIRST and skipping stratum auto-discovery this cycle', {
           total, ceiling: eff.ceiling, rowCeiling: cfg.globalCeiling, boundBy: eff.boundBy, surplus: total - eff.ceiling,
+          ms: Date.now() - pressureStarted,
         });
       }
     } catch (err) {
-      // Cannot tell: behave exactly as before rather than skipping work on a guess.
-      logger.warn('[trace-retention] pressure check failed; proceeding with the normal cycle order', {
+      // Cannot tell: keep auto-discovery (as before), but still run the valve first — it recounts
+      // and skips itself when it cannot count, so the only cost of a wrong guess is one count.
+      pressureUnknown = true;
+      logger.warn('[trace-retention] pressure check failed; running the valve first, then the normal cycle', {
         error: err instanceof Error ? err.message : String(err),
       });
     }
   }
 
+  // VALVE FIRST WHEN OVER THE CEILING (2026-10-01). The comment above always said "the cheap valve
+  // runs FIRST"; the code only skipped auto-discovery and still ran the per-activity reservoir and
+  // the aux reap before the valve. On the hub (2.11M rows, cap 150k) the reservoir then spent the
+  // sweep on ~320k cold validator-dispatch rows at ~3 rows/s — a ~28-hour phase with no budget and
+  // no log line — so the valve (and its telemetry-first drain of the 1.44M auth_resolve_v1 rows)
+  // never ran, and every later tick logged only "already in flight". Order is now what the comment
+  // claims, and the phases after the valve are budgeted (policy.phaseBudgetMs).
+  const policy = await loadDrainPolicy();
+  let valve: StratumResult | null = null;
+  let valveRan = false;
+  if (overCeiling || pressureUnknown) {
+    valve = await runCeilingValve(cfg, coldCutoffIso);
+    valveRan = true;
+  }
+
   let sweepActivities = cfg.activities;
   if (cfg.autoDiscover && !overCeiling) {
     try {
-      const groups = await surrealDB.query<{ activity_id: unknown; n: unknown }>(
-        `SELECT activity_id, count() AS n FROM ${TABLE} GROUP BY activity_id`,
-      );
+      const groups = await withDeadline(surrealDB.query<{ activity_id: unknown; n: unknown }>(
+        `SELECT activity_id, count() AS n FROM ${TABLE} GROUP BY activity_id TIMEOUT ${SWEEP_READ_TIMEOUT_S}s`,
+      ), deadlineFor(1, SWEEP_READ_TIMEOUT_S), 'stratum auto-discovery');
       const overCap = (Array.isArray(groups) ? groups : [])
         .filter((g) => typeof g?.activity_id === 'string' && Number(g?.n ?? 0) > cfg.defaultSuccessCap + cfg.defaultFailureCap)
         .sort((a, b) => Number(b.n) - Number(a.n))
@@ -1161,11 +1352,29 @@ async function runTraceRetentionSweepInner(
     }
   }
 
-  for (const activityId of sweepActivities) {
-    const policy = policyFor(cfg, activityId);
+  const strataStarted = enterPhase('strata');
+  const strataUntil = strataStarted + policy.phaseBudgetMs;
+  let strataRemoved = 0;
+  let strataStoppedBy: 'done' | 'budget' | 'failed' = 'done';
+  // ROTATE, DON'T RESTART. With a fixed order, a stratum that spends the whole phase budget is swept
+  // first on every sweep and every stratum after it is skipped forever. The sweep resumes at the
+  // stratum where the budget last ran out (by id: the discovered list changes between sweeps).
+  const resumeIdx = strataResumeAt === null ? -1 : sweepActivities.indexOf(strataResumeAt);
+  const strataOrder = resumeIdx > 0
+    ? [...sweepActivities.slice(resumeIdx), ...sweepActivities.slice(0, resumeIdx)]
+    : [...sweepActivities];
+  let budgetHitAt: string | null = null;
+  for (const activityId of strataOrder) {
+    const stratumPolicy = policyFor(cfg, activityId);
     for (const status of statuses) {
       const succeeded = status === 'success';
-      const cap = status === 'success' ? policy.successCap : policy.failureCap;
+      const cap = status === 'success' ? stratumPolicy.successCap : stratumPolicy.failureCap;
+      if (Date.now() >= strataUntil) {
+        strataStoppedBy = 'budget';
+        budgetHitAt ??= activityId;
+        results.push({ activityId, status, coldCount: null, cap, keepProb: 1, deletedEstimate: 0, deletedActual: cfg.dryRun ? null : 0, skipped: 'budget' });
+        continue;
+      }
       const coldCount = await countCold(activityId, succeeded, coldCutoffIso);
 
       if (coldCount <= cap) {
@@ -1193,27 +1402,55 @@ async function runTraceRetentionSweepInner(
         const batchSize = cfg.deleteBatchSize;
         const maxIters = Math.ceil(coldCount / batchSize) + 10; // generous guard
         let removed = 0;
-        for (let iter = 0; iter < maxIters && removed < target; iter++) {
-          // Clamp the final batch so we stop exactly at `target` (= coldCount - cap)
-          // and never over-delete into the sample we mean to keep.
-          const thisBatch = Math.min(batchSize, target - removed);
-          const ids = await surrealDB.query<unknown>(
-            `SELECT VALUE id FROM ${TABLE}
-               WHERE activity_id = $aid AND success = $ok
-                 AND executed_at < type::datetime($cut) AND rand::float() >= $keepProb
-               LIMIT $batch`,
-            { aid: activityId, ok: succeeded, cut: coldCutoffIso, keepProb, batch: thisBatch },
-          );
-          if (!Array.isArray(ids) || ids.length === 0) break; // tail exhausted
-          await deleteExecutionIds(ids, 'DELETE $ids RETURN NONE');
-          removed += ids.length;
+        const stratumStarted = Date.now();
+        try {
+          for (let iter = 0; iter < maxIters && removed < target; iter++) {
+            // BUDGETED: this loop had no time bound, and on the hub it was the whole sweep.
+            if (Date.now() >= strataUntil) { strataStoppedBy = 'budget'; budgetHitAt ??= activityId; break; }
+            // Clamp the final batch so we stop exactly at `target` (= coldCount - cap)
+            // and never over-delete into the sample we mean to keep.
+            const thisBatch = Math.min(batchSize, target - removed);
+            const ids = await withDeadline(surrealDB.query<unknown>(
+              `SELECT VALUE id FROM ${TABLE}
+                 WHERE activity_id = $aid AND success = $ok
+                   AND executed_at < type::datetime($cut) AND rand::float() >= $keepProb
+                 LIMIT $batch TIMEOUT ${policy.stmtTimeoutS}s`,
+              { aid: activityId, ok: succeeded, cut: coldCutoffIso, keepProb, batch: thisBatch },
+            ), deadlineFor(1, policy.stmtTimeoutS), 'stratum select');
+            if (!Array.isArray(ids) || ids.length === 0) break; // tail exhausted
+            await deleteExecutionIds(ids, `DELETE $ids RETURN NONE TIMEOUT ${policy.stmtTimeoutS}s`, policy.stmtTimeoutS);
+            removed += ids.length;
+          }
+        } catch (err) {
+          // A timed-out or failed batch ends THIS stratum for this sweep (it rolled back whole);
+          // it no longer aborts the sweep, and is never awaited past its bound.
+          strataStoppedBy = 'failed';
+          logger.warn('[trace-retention] stratum batch failed — abandoning this stratum for this sweep', {
+            activityId, status, removed, ms: Date.now() - stratumStarted, error: err instanceof Error ? err.message : String(err),
+          });
         }
+        if (removed > 0) {
+          logger.info('[trace-retention] stratum pruned', { activityId, status, coldCount, cap, removed, target, ms: Date.now() - stratumStarted });
+        }
+        strataRemoved += removed;
         deletedActual = removed;
       }
 
       results.push({ activityId, status, coldCount, cap, keepProb, deletedEstimate, deletedActual });
     }
   }
+  // Next sweep resumes where the budget ran out. If it ran out inside the stratum this sweep STARTED
+  // with, resume one past it, so even a stratum that alone exceeds the budget cannot pin the start.
+  if (budgetHitAt === null) {
+    strataResumeAt = null;
+  } else {
+    strataResumeAt = budgetHitAt === strataOrder[0] && strataOrder.length > 1 ? strataOrder[1]! : budgetHitAt;
+  }
+  phaseDone('strata', strataStarted, {
+    strata: sweepActivities.length, removed: strataRemoved, stoppedBy: strataStoppedBy,
+    startedAt: strataOrder[0] ?? null, resumeAt: strataResumeAt,
+    skippedForBudget: results.filter((r) => r.skipped === 'budget').length,
+  });
 
   // ── Global ceiling safety valve ────────────────────────────────────────────
   // trace_digest / concept_usage have no per-stratum sweep and grow unbounded
@@ -1230,21 +1467,33 @@ async function runTraceRetentionSweepInner(
     const auxMaxPerSweep = 50000;
     const auxBatch = cfg.deleteBatchSize;
     for (const { table, timeField } of auxTables) {
+      // BUDGETED and BOUNDED like the valve: up to 2,000 25-row statements per table had no time
+      // budget, no TIMEOUT and a log line only after the whole table finished.
+      const auxStarted = enterPhase(`aux:${table}`);
+      const auxUntil = auxStarted + policy.phaseBudgetMs;
       let removed = 0;
+      let batches = 0;
+      let stoppedBy: 'empty' | 'cap' | 'budget' | 'failed' = 'cap';
       try {
         for (let iter = 0; iter < Math.ceil(auxMaxPerSweep / auxBatch) && removed < auxMaxPerSweep; iter++) {
-          const ids = await surrealDB.query<unknown>(
-            `SELECT VALUE id FROM ${table} WHERE ${timeField} < type::datetime($cut) LIMIT $batch`,
+          if (Date.now() >= auxUntil) { stoppedBy = 'budget'; break; }
+          const ids = await withDeadline(surrealDB.query<unknown>(
+            `SELECT VALUE id FROM ${table} WHERE ${timeField} < type::datetime($cut) LIMIT $batch TIMEOUT ${policy.stmtTimeoutS}s`,
             { cut: auxCutoffIso, batch: Math.min(auxBatch, auxMaxPerSweep - removed) },
+          ), deadlineFor(1, policy.stmtTimeoutS), `aux select ${table}`);
+          if (!Array.isArray(ids) || ids.length === 0) { stoppedBy = 'empty'; break; }
+          await withDeadline(
+            surrealDB.query(`DELETE $ids RETURN NONE TIMEOUT ${policy.stmtTimeoutS}s`, { ids }),
+            deadlineFor(1, policy.stmtTimeoutS), `aux delete ${table}`,
           );
-          if (!Array.isArray(ids) || ids.length === 0) break;
-          await surrealDB.query("DELETE $ids RETURN NONE", { ids });
           removed += ids.length;
+          batches++;
         }
-        if (removed > 0) logger.info("[trace-retention] aux-table reap", { table, removed });
       } catch (err) {
-        logger.warn("[trace-retention] aux-table reap failed", { table, error: err instanceof Error ? err.message : String(err) });
+        stoppedBy = 'failed';
+        logger.warn("[trace-retention] aux-table reap failed", { table, removed, error: err instanceof Error ? err.message : String(err) });
       }
+      phaseDone(`aux:${table}`, auxStarted, { removed, batches, stoppedBy });
     }
   }
   // The stratified sweep above bounds each (activity_id,status) stratum, but the
@@ -1286,7 +1535,7 @@ async function runTraceRetentionSweepInner(
   // Log the entry rather than infer it from surrounding lines. Every diagnosis today
   // that reasoned from adjacent evidence instead of instrumenting the branch itself
   // was wrong; this makes the next cycle answer the question directly.
-  const valve = await runCeilingValve(cfg, coldCutoffIso);
+  if (!valveRan) valve = await runCeilingValve(cfg, coldCutoffIso);
   if (valve) results.push(valve);
 
   // ── Orphaned content reap ──────────────────────────────────────────────────
@@ -1310,6 +1559,7 @@ async function runTraceRetentionSweepInner(
   // dry-run scans + counts but deletes nothing.
   let orphanReaped = 0;
   if (cfg.orphanReapEnabled && cfg.orphanReapPerSweepCap > 0) {
+    enterPhase('orphan_reap');
     const budgetUntil = Date.now() + cfg.orphanReapBudgetMs;
     const safeCutIso = new Date(startedAt - cfg.orphanReapMinAgeMs).toISOString();
     const batch = cfg.deleteBatchSize;
@@ -1324,12 +1574,12 @@ async function runTraceRetentionSweepInner(
         // rows — which timed out on EVERY sweep (reaped 0 for weeks; orphans stuck
         // at ~1.08M) and spiked RSS. Measured: with ORDER BY even LIMIT 1 times out
         // >30s; without it, LIMIT 1000 returns in ~1s.
-        const page = await surrealDB.query<string>(
+        const page = await withDeadline(surrealDB.query<string>(
           `SELECT VALUE execution_id FROM execution_trace_content
              WHERE execution_id > $cursor AND created_at < type::datetime($safeCut)
-             LIMIT $batch`,
+             LIMIT $batch TIMEOUT ${policy.stmtTimeoutS}s`,
           { cursor: orphanReapCursor, safeCut: safeCutIso, batch },
-        );
+        ), deadlineFor(1, policy.stmtTimeoutS), 'orphan page');
         if (!Array.isArray(page) || page.length === 0) {
           orphanReapCursor = ''; // index range exhausted — wrap for next sweep
           break;
@@ -1337,19 +1587,19 @@ async function runTraceRetentionSweepInner(
         scanned += page.length;
         orphanReapCursor = page[page.length - 1]; // advance + persist across sweeps
 
-        const existing = await surrealDB.query<string>(
+        const existing = await withDeadline(surrealDB.query<string>(
           `SELECT VALUE meta::id(id) FROM execution
-             WHERE id IN $eids.map(|$e| type::thing('execution', $e))`,
+             WHERE id IN $eids.map(|$e| type::thing('execution', $e)) TIMEOUT ${policy.stmtTimeoutS}s`,
           { eids: page },
-        );
+        ), deadlineFor(1, policy.stmtTimeoutS), 'orphan existence check');
         const existingSet = new Set(Array.isArray(existing) ? existing : []);
         const orphans = page.filter((eid) => !existingSet.has(eid));
 
         if (orphans.length > 0 && !cfg.dryRun) {
-          await surrealDB.query(
-            'DELETE execution_trace_content WHERE execution_id IN $orphans RETURN NONE',
+          await withDeadline(surrealDB.query(
+            `DELETE execution_trace_content WHERE execution_id IN $orphans RETURN NONE TIMEOUT ${policy.stmtTimeoutS}s`,
             { orphans },
-          );
+          ), deadlineFor(1, policy.stmtTimeoutS), 'orphan delete');
         }
         orphanReaped += orphans.length;
 
@@ -1420,6 +1670,7 @@ export async function runCeilingDrainTick(
     // Probe unavailable: proceed, as the sweep does.
   }
   sweepInFlight = true;
+  sweepPhase = null;
   const startedAt = Date.now();
   try {
     const valve = await runCeilingValve(cfg, new Date(startedAt - cfg.hotWindowMs).toISOString());
@@ -1434,6 +1685,7 @@ export async function runCeilingDrainTick(
     return { removed, remaining, durationMs };
   } finally {
     sweepInFlight = false;
+    sweepPhase = null;
   }
 }
 

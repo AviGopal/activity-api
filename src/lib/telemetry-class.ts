@@ -23,6 +23,7 @@
  * to this row can be authority-gated.
  */
 import { surrealDB } from '../db/surreal';
+import { withDeadline } from './deadline';
 import { logger } from '../utils/logger';
 import { getTuningParamList, TRACE_TELEMETRY_ACTIVITIES_PARAM } from './tuning-params';
 
@@ -34,9 +35,15 @@ export interface TelemetryClass {
 const TTL_MS = 30_000;
 let cached: { value: TelemetryClass; expiresAt: number } | null = null;
 
+// BOUNDED (both reads carry a server TIMEOUT, and the call a client deadline): this read runs inside
+// the retention valve, which holds the sweep's in-flight flag, so it must never await forever. A
+// timeout is an evidence-read failure and fails closed like any other. The counter read is a table
+// scan of shape_score_counter (no activity_id-leading index; the table is one row per shape group,
+// tens of rows on the hub), the VPM read is two idx_variant_performance_variant_id lookups.
+export const EVIDENCE_TIMEOUT_S = 10;
 const EVIDENCE_SQL = `
-LET $__c = (SELECT count() AS n FROM shape_score_counter WHERE activity_id = $aid GROUP ALL)[0].n ?? 0;
-LET $__a = (SELECT VALUE thompson_alpha FROM variant_performance_metrics WHERE variant_id = $aid OR variant_id = $br);
+LET $__c = (SELECT count() AS n FROM shape_score_counter WHERE activity_id = $aid GROUP ALL TIMEOUT ${EVIDENCE_TIMEOUT_S}s)[0].n ?? 0;
+LET $__a = (SELECT VALUE thompson_alpha FROM variant_performance_metrics WHERE variant_id = $aid OR variant_id = $br TIMEOUT ${EVIDENCE_TIMEOUT_S}s);
 RETURN { counter_rows: $__c, max_alpha: math::max(array::concat([1.0], $__a)) };`;
 
 export async function resolveTelemetryClass(): Promise<TelemetryClass> {
@@ -47,8 +54,13 @@ export async function resolveTelemetryClass(): Promise<TelemetryClass> {
   for (const raw of declared) {
     const aid = raw.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
     let reason: string | null = null;
+    const started = Date.now();
     try {
-      const res = await surrealDB.queryAll(EVIDENCE_SQL, { aid, br: `activity:⟨${aid}⟩` });
+      const res = await withDeadline(
+        surrealDB.queryAll(EVIDENCE_SQL, { aid, br: `activity:⟨${aid}⟩` }),
+        (2 * EVIDENCE_TIMEOUT_S + 5) * 1000,
+        `telemetry-class evidence read for ${aid}`,
+      );
       const ev = (Array.isArray(res) ? res : []).filter((r): r is { counter_rows: number; max_alpha: number } =>
         !!r && typeof r === 'object' && 'counter_rows' in (r as object)).pop();
       if (!ev) reason = 'evidence read returned nothing (fail closed)';
@@ -57,6 +69,9 @@ export async function resolveTelemetryClass(): Promise<TelemetryClass> {
     } catch (err) {
       reason = `evidence read failed (fail closed): ${err instanceof Error ? err.message : String(err)}`;
     }
+    logger.info('[telemetry-class] evidence read', {
+      event: 'telemetry_class_evidence', activity_id: aid, ms: Date.now() - started, accepted: reason === null,
+    });
     if (reason) out.refused.push({ activity_id: aid, reason });
     else out.accepted.push(aid);
   }

@@ -74,8 +74,8 @@ COMMIT TRANSACTION;`;
  * SurrealQL fragment for a retention delete transaction: delete the counting markers of the
  * executions that same transaction deletes. `idsExpr` evaluates to a list of execution record ids.
  */
-export const PRUNE_MARKERS_SQL = (idsExpr: string) =>
-  `DELETE (${idsExpr}).map(|$__i| type::thing('shape_score_counted', meta::id($__i))) RETURN NONE;`;
+export const PRUNE_MARKERS_SQL = (idsExpr: string, timeoutS?: number) =>
+  `DELETE (${idsExpr}).map(|$__i| type::thing('shape_score_counted', meta::id($__i))) RETURN NONE${timeoutS ? ` TIMEOUT ${timeoutS}s` : ''};`;
 
 export type CountResult = 'counted' | 'skipped' | 'duplicate';
 
