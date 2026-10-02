@@ -1233,10 +1233,12 @@ app.get('/shape-gap-resolution', async (c) => {
 
 // GET /v2/activities/deliverable-shapes — curated vocabulary of shapes that learned
 // composites actually DELIVER (terminal = produced-minus-consumed WITHIN a composite),
-// evidence-gated (ev>0), hygiene- and frequency-filtered, capped. goal-host unions this
-// into fetchKnownShapes (B2, 2026-07-31, gap-ribosome-reuse-hop-cold-blocked) so goal->target
-// inference can AIM a goal at a learned-only deliverable (e.g. conceptDescription) WITHOUT
-// flooding the inference vocabulary with intermediate byproducts. Read-only; fail-open.
+// gated on a reached run AND a live discovery advertiser, hygiene- and frequency-filtered,
+// capped. goal-host unions this into fetchKnownShapes so goal->target inference can AIM a
+// goal at a learned deliverable WITHOUT flooding the vocabulary with intermediate byproducts.
+// A terminal with no live discovery advertiser is excluded even when learned composites
+// produce it: inference must never aim at a shape nothing currently serves. Read-only; an
+// internal error answers an empty list (goal-host then keeps its last good vocabulary).
 app.get('/deliverable-shapes', async (c) => {
   try {
     const FLOOR = 5;
@@ -1272,14 +1274,58 @@ app.get('/deliverable-shapes', async (c) => {
         freq.set(sh, (freq.get(sh) ?? 0) + 1);                 // distinct-composite frequency
       }
     }
-    const shapes = [...freq.entries()]
+    const candidates = [...freq.entries()]
       .filter(([, n]) => n >= FLOOR)
       .sort((a, b) => b[1] - a[1])
-      .slice(0, CAP)
       .map(([sh]) => sh);
+    if (candidates.length === 0) return c.json({ shapes: [] });
+
+    // EARNED, not declared (REALIGNMENT V1). `ev > 0` above filters nothing — every learned/
+    // composed template sits at ev 0.5 — so a terminal whose producer is gone (obsidian:write_note
+    // after its vault left) stayed aimable and every walk aimed at it went hollow. A terminal is
+    // a deliverable only with BOTH evidence of a reached run producing it (goal-host posts
+    // success = reached into goal_execution_paths) AND a live advertiser in discovery, checked
+    // now, never from a static list. Gated BEFORE the cap so dropped shapes free their slots.
+    const pathResult = await surrealDB.query<any>(
+      `SELECT endpoint_output_shapes, successful_executions FROM goal_execution_paths
+         WHERE successful_executions > 0
+           AND array::len(array::intersect(endpoint_output_shapes ?? [], $shapes)) > 0`,
+      { shapes: candidates },
+    );
+    const pathRows = (pathResult || []).flat?.() || pathResult || [];
+    const reachedShapes = new Set<string>();
+    for (const row of (Array.isArray(pathRows) ? pathRows : [])) {
+      if (!(Number((row as any)?.successful_executions) > 0)) continue;
+      const outs = (row as any)?.endpoint_output_shapes;
+      for (const sh of (Array.isArray(outs) ? outs : [])) if (typeof sh === 'string') reachedShapes.add(sh);
+    }
+    const reachedCandidates = candidates.filter((sh) => reachedShapes.has(sh));
+
+    const discoveryEndpoint = (process.env.DISCOVERY_VESSEL_ENDPOINT ?? 'http://127.0.0.1:8100').replace(/\/$/, '');
+    const apiKey = process.env.METABOB_API_KEY || process.env.ACTIVITY_API_KEY;
+    const advertisedFlags = await Promise.all(reachedCandidates.map(async (shape) => {
+      try {
+        const r = await fetch(`${discoveryEndpoint}/resolve`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...(apiKey ? { Authorization: `ApiKey ${apiKey}` } : {}) },
+          body: JSON.stringify({ pointer: { type: 'vesselCapability', shape } }),
+          signal: AbortSignal.timeout(3000),
+        });
+        if (!r.ok) return false;                               // unverifiable = not advertised (fail closed)
+        const j: any = await r.json();
+        const vessels = (j?.content ?? j)?.vessels;
+        return Array.isArray(vessels) && vessels.length > 0;
+      } catch {
+        return false;
+      }
+    }));
+    const shapes = reachedCandidates.filter((_, i) => advertisedFlags[i]).slice(0, CAP);
     return c.json({ shapes });
-  } catch {
-    return c.json({ shapes: [] }, 200); // fail-open: goal-host falls back to registry-only vocab
+  } catch (error: any) {
+    logger.warn('GET /v2/activities/deliverable-shapes failed; answering an empty list', {
+      error: error?.message ?? String(error),
+    });
+    return c.json({ shapes: [] }, 200); // goal-host keeps its last good vocabulary on empty
   }
 });
 
