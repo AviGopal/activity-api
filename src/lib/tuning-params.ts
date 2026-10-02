@@ -21,6 +21,7 @@
 
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
+import { withDeadline } from './deadline';
 
 // Short TTL — tuning changes are rare and non-urgent; 30s keeps the hot trace-ingest
 // path off the DB for the overwhelming majority of reads while still letting an
@@ -198,8 +199,13 @@ export function __clearTuningParamCache(): void {
 // CREDIT_PROPAGATION_EXCLUDED_ANCESTORS established in lib/posterior-update.ts), read at use time
 // through a short TTL cache with the same deadline and fail-open discipline as getTuningParam.
 // Needs `substrate_tuning_param.value` to accept strings (migration 215 / the in-flight 203).
-// An absent row, a non-string value or any read error is the EMPTY list.
+// An absent row or a non-string value is the EMPTY list. A failed or timed-out read is UNKNOWN,
+// not empty: it is never cached, and it answers with the last list successfully read for that name
+// (empty only if none ever was). On the hub a 1.5s read missed under load, [] was cached for the TTL,
+// and the retention valve read it as "no telemetry declared" and silently skipped the telemetry drain.
 const listCache = new Map<string, { value: string[]; expiresAt: number }>();
+const listLastGood = new Map<string, string[]>();
+const LIST_READ_TIMEOUT_S = 5;
 
 /**
  * The telemetry trace class (migration 215): activity ids whose executions are telemetry, not
@@ -213,15 +219,14 @@ export async function getTuningParamList(name: string): Promise<string[]> {
   if (cached && cached.expiresAt > now) return cached.value;
   let value: string[] = [];
   try {
-    const rows = await Promise.race([
+    const rows = await withDeadline(
       surrealDB.query<{ param_value: unknown }>(
-        'SELECT `value` AS param_value FROM substrate_tuning_param WHERE name = $name LIMIT 1',
+        `SELECT \`value\` AS param_value FROM substrate_tuning_param WHERE name = $name LIMIT 1 TIMEOUT ${LIST_READ_TIMEOUT_S}s`,
         { name },
       ),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`tuning-param list lookup exceeded deadline for '${name}'`)), 1_500),
-      ),
-    ]);
+      (LIST_READ_TIMEOUT_S + 1) * 1_000,
+      `tuning-param list '${name}'`,
+    );
     const raw = Array.isArray(rows) && rows.length > 0 ? rows[0]?.param_value : null;
     if (typeof raw === 'string') {
       value = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
@@ -234,12 +239,16 @@ export async function getTuningParamList(name: string): Promise<string[]> {
       });
     }
   } catch (err) {
-    logger.debug('tuning-param list lookup fell back to empty', {
-      event: 'tuning_param_list_fallback',
+    const lastGood = listLastGood.get(name);
+    logger.warn('tuning-param list lookup failed; answering with the last known-good list (not cached)', {
+      event: 'tuning_param_list_read_failed',
       name,
+      last_good: lastGood ?? null,
       error: err instanceof Error ? err.message : String(err),
     });
+    return lastGood ?? [];
   }
+  listLastGood.set(name, value);
   listCache.set(name, { value, expiresAt: now + CACHE_TTL_MS });
   return value;
 }
@@ -247,4 +256,5 @@ export async function getTuningParamList(name: string): Promise<string[]> {
 /** Test hook — drop the list cache so a freshly-authored row is observed immediately. */
 export function __clearTuningParamListCache(): void {
   listCache.clear();
+  listLastGood.clear();
 }
