@@ -5434,20 +5434,26 @@ app.post('/reach', async (c) => {
     //  - goal_hash only when sent: the distinct-goal count reads it, and a missing hash
     //    counts as no goal, which is conservative.
     // A CORRECTION NAMES WHAT IT SUPERSEDES; INGESTION IS IDEMPOTENT (REALIGNMENT §2.2):
-    //  - reached === true on a stamped row moves the class + reason to
-    //    metadata.superseded_verdict {class, reason, superseded_at, superseded_by: "reach:true"}
-    //    and clears them, so no reader counts a row that later reached.
-    //  - a different not-reached class or reason replaces the stamp and records the prior one
-    //    (superseded_by: "reach:false"); the SAME class + reason rewrites identical values, so
-    //    a redelivered verdict (retry, spool drain) changes nothing and records no supersession.
+    //  - reached === true on a stamped row appends {class, reason, superseded_at,
+    //    superseded_by: "reach:true"} to metadata.superseded_verdicts and clears the stamp, so
+    //    no reader counts a row that later reached.
+    //  - a different not-reached class or reason replaces the stamp and appends the prior one
+    //    (superseded_by: "reach:false"). The list is append-only history, bounded to the last
+    //    SUPERSEDED_VERDICTS_KEPT entries, so A -> B -> reached keeps both A and B in order.
+    //  - the SAME not-reached verdict (class + reason, and goal hash when sent) on a row that
+    //    already holds it is NOT WRITTEN AT ALL: a WHERE excludes it, so a redelivery (retry,
+    //    spool drain) never looks like a fresh update to a reader windowing on write time. It
+    //    is still reported as persisted (`updated`), because it is.
     //  - one statement, in SET order: SurrealDB evaluates SET clauses left to right, so the
-    //    superseded record is built from the row's values BEFORE the clear/replace below it.
+    //    superseded entry is built from the row's values BEFORE the clear/replace below it.
     //  - an unstamped row is untouched (NONE assigned to NONE creates no metadata object).
+    const SUPERSEDED_VERDICTS_KEPT = 10;
     const reachReason = body.reached === false && typeof body.reason === 'string' ? body.reason.trim() : '';
     const verdictParams: Record<string, unknown> = {};
     const verdictSets: string[] = [];
+    let sameVerdict = '';
     const supersede = (changed: string, by: string) =>
-      `metadata.superseded_verdict = IF ${changed} THEN { class: metadata.verdict_class, reason: metadata.reach_reason, superseded_at: time::now(), superseded_by: ${by} } ELSE metadata.superseded_verdict END`;
+      `metadata.superseded_verdicts = IF ${changed} THEN array::slice(array::append(metadata.superseded_verdicts ?? [], { class: metadata.verdict_class, reason: metadata.reach_reason, superseded_at: time::now(), superseded_by: ${by} }), -${SUPERSEDED_VERDICTS_KEPT}) ELSE metadata.superseded_verdicts END`;
     if (reachReason) {
       verdictParams.verdict_class = failureClassOf({ type: 'execution_error', reason: reachReason }).class;
       verdictParams.reach_reason = reachReason.slice(0, 600);
@@ -5457,9 +5463,11 @@ app.post('/reach', async (c) => {
         'metadata.verdict_class = $verdict_class',
         'metadata.reach_reason = $reach_reason',
       );
+      sameVerdict = 'reached = false AND metadata.verdict_class = $verdict_class AND metadata.reach_reason = $reach_reason';
       if (typeof body.goal_hash === 'string' && body.goal_hash.trim()) {
         verdictParams.goal_hash = body.goal_hash.trim().slice(0, 128);
         verdictSets.push('metadata.goal_hash = $goal_hash');
+        sameVerdict += ' AND metadata.goal_hash = $goal_hash';
       }
     } else if (body.reached === true) {
       verdictParams.superseded_by_true = 'reach:true';
@@ -5470,12 +5478,22 @@ app.post('/reach', async (c) => {
       );
     }
     let mirrored = 0;
+    let idempotent = false;
     try {
+      const mparams = { reached: body.reached, completion_shapes, execution_id: String(execId), ...verdictParams };
       const mres = await surrealDB.query(
-        `UPDATE type::thing('execution', $execution_id) SET reached = $reached, completion_shapes = $completion_shapes, tags = array::union(tags ?? [], [IF $reached = true THEN 'reached:true' ELSE 'reached:false' END])${verdictSets.length ? ', ' + verdictSets.join(', ') : ''}`,
-        { reached: body.reached, completion_shapes, execution_id: String(execId), ...verdictParams },
+        `UPDATE type::thing('execution', $execution_id) SET reached = $reached, completion_shapes = $completion_shapes, tags = array::union(tags ?? [], [IF $reached = true THEN 'reached:true' ELSE 'reached:false' END])${verdictSets.length ? ', ' + verdictSets.join(', ') : ''}${sameVerdict ? ` WHERE !(${sameVerdict})` : ''}`,
+        mparams,
       );
       mirrored = Array.isArray(mres) && Array.isArray(mres[0]) ? (mres[0] as unknown[]).length : (Array.isArray(mres) ? mres.length : 0);
+      if (mirrored === 0 && sameVerdict) {
+        // Nothing written: either no such row, or the row already holds this exact verdict.
+        const held = await surrealDB.query(
+          `SELECT VALUE id FROM type::thing('execution', $execution_id) WHERE ${sameVerdict}`,
+          mparams,
+        );
+        if (Array.isArray(held) && held.length > 0) { mirrored = 1; idempotent = true; }
+      }
     } catch (e) {
       logger.warn('[reach-patch] execution mirror update failed (non-fatal)', { error: e instanceof Error ? e.message : String(e) });
     }
@@ -5483,7 +5501,7 @@ app.post('/reach', async (c) => {
     // and abandons the verdict whenever it is 0, so the mirror must be counted.
     const aetUpdated = Array.isArray(res) && Array.isArray(res[0]) ? (res[0] as unknown[]).length : (Array.isArray(res) ? res.length : 0);
     const updated = aetUpdated + mirrored;
-    return c.json({ success: true, execution_id: String(execId), reached: body.reached, updated }, 200);
+    return c.json({ success: true, execution_id: String(execId), reached: body.reached, updated, ...(idempotent ? { idempotent: true } : {}) }, 200);
   } catch (err) {
     logger.warn('[reach-patch] failed to persist reach verdict on trace', { error: err instanceof Error ? err.message : String(err) });
     return c.json({ success: false, error: err instanceof Error ? err.message : String(err) }, 500);

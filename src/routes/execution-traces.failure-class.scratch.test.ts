@@ -58,6 +58,9 @@ async function freshExecutionTable() {
     DEFINE FIELD reached ON execution TYPE option<bool>;
     DEFINE FIELD completion_shapes ON execution TYPE option<array<string>>;
     DEFINE FIELD tags ON execution TYPE option<array<string>>;
+    -- Test device, not a live field: recomputed on EVERY write, so "no write happened" is
+    -- observable (the live table has no updated_at; a same-value SET would be invisible).
+    DEFINE FIELD touched_at ON execution VALUE time::now();
   `);
 }
 
@@ -140,7 +143,9 @@ run('POST /execution-traces', () => {
     const first = await row('ins7');
     const again = await post('/', trace('ins7', { success: true }));
     expect(again.json.duplicate).toBe(true);
-    expect(await row('ins7')).toEqual(first);
+    const after = await row('ins7');
+    expect(after).toEqual(first);
+    expect(String(after?.touched_at)).toBe(String(first?.touched_at)); // not re-written at all
   });
 
   test('MUST-FAIL: a trace with no failure_mode gets none (a success is never classified)', async () => {
@@ -226,18 +231,49 @@ run('POST /execution-traces/reach', () => {
     expect(m?.reach_reason).toBeUndefined();
     expect(m?.keep).toBe(1);
     expect(m?.goal_hash).toBe('gh-s1');
-    expect(m?.superseded_verdict).toMatchObject({ class: 'deterministic:edit-intent-no-landed-edit', reason: REASON, superseded_by: 'reach:true' });
-    expect(m?.superseded_verdict?.superseded_at).toBeDefined();
+    expect(m?.superseded_verdicts).toHaveLength(1);
+    expect(m?.superseded_verdicts[0]).toMatchObject({ class: 'deterministic:edit-intent-no-landed-edit', reason: REASON, superseded_by: 'reach:true' });
+    expect(m?.superseded_verdicts[0]?.superseded_at).toBeDefined();
   });
 
-  test('the same not-reached verdict twice is one stamp: the second write changes nothing', async () => {
+  test('the same not-reached verdict twice is one stamp: the second delivery is NOT written at all', async () => {
     await walk('s2');
     await post('/reach', { execution_id: 's2', reached: false, reason: REASON, goal_hash: 'gh-s2' });
     const first = await row('s2');
-    await post('/reach', { execution_id: 's2', reached: false, reason: REASON, goal_hash: 'gh-s2' });
+    const again = await post('/reach', { execution_id: 's2', reached: false, reason: REASON, goal_hash: 'gh-s2' });
     const second = await row('s2');
-    expect(second?.metadata).toEqual(first?.metadata);
-    expect(second?.metadata?.superseded_verdict).toBeUndefined();
+    // No write touched the row; it is still reported persisted (it is), marked idempotent.
+    // touched_at is a driver DateTime object; toEqual sees no enumerable fields on it and
+    // calls any two equal, so compare its ISO string.
+    expect(first?.touched_at).toBeDefined();
+    expect(String(second?.touched_at)).toBe(String(first?.touched_at));
+    expect([again.status, again.json.updated, again.json.idempotent]).toEqual([200, 1, true]);
+    expect(second).toEqual(first);
+    expect(second?.metadata?.superseded_verdicts).toBeUndefined();
+  });
+
+  test('A, then B, then reached: both prior verdicts are kept, in order', async () => {
+    await walk('s5');
+    const RB = 'deterministic:wrong-git-commit-count — 3 commits, expected 1';
+    await post('/reach', { execution_id: 's5', reached: false, reason: REASON });
+    await post('/reach', { execution_id: 's5', reached: false, reason: RB });
+    await post('/reach', { execution_id: 's5', reached: true });
+    const m = (await row('s5'))?.metadata;
+    expect(m?.verdict_class).toBeUndefined();
+    expect((m?.superseded_verdicts ?? []).map((v: any) => [v.class, v.reason, v.superseded_by])).toEqual([
+      ['deterministic:edit-intent-no-landed-edit', REASON, 'reach:false'],
+      ['deterministic:wrong-git-commit-count', RB, 'reach:true'],
+    ]);
+  });
+
+  test('the supersession history is bounded to the last 10 entries', async () => {
+    await walk('s6');
+    for (let i = 0; i < 12; i++) await post('/reach', { execution_id: 's6', reached: false, reason: `deterministic:class-${i} — attempt ${i}` });
+    const m = (await row('s6'))?.metadata;
+    expect(m?.verdict_class).toBe('deterministic:class-11');
+    expect(m?.superseded_verdicts).toHaveLength(10);
+    expect(m?.superseded_verdicts[0]?.class).toBe('deterministic:class-1');
+    expect(m?.superseded_verdicts[9]?.class).toBe('deterministic:class-10');
   });
 
   test('two different not-reached reasons: the second wins, the first is recorded as superseded', async () => {
@@ -248,7 +284,8 @@ run('POST /execution-traces/reach', () => {
     const m = (await row('s3'))?.metadata;
     expect(m?.verdict_class).toBe('deterministic:wrong-git-commit-count');
     expect(m?.reach_reason).toBe(R2);
-    expect(m?.superseded_verdict).toMatchObject({ class: 'deterministic:edit-intent-no-landed-edit', reason: REASON, superseded_by: 'reach:false' });
+    expect(m?.superseded_verdicts).toHaveLength(1);
+    expect(m?.superseded_verdicts[0]).toMatchObject({ class: 'deterministic:edit-intent-no-landed-edit', reason: REASON, superseded_by: 'reach:false' });
   });
 
   test('reached:true on an unstamped row leaves its metadata untouched', async () => {
