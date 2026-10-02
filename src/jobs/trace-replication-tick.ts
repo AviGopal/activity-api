@@ -230,9 +230,10 @@ export async function runTraceReplicationTick(): Promise<void> {
       'activityExecutionTrace',
     );
     const selfId = config.discovery.vesselId;
+    const ownSubstrateId = process.env.FED_SUBSTRATE_ID || '';
     const peers = (vessels as unknown as PeerVessel[]).filter(
       (v) =>
-        v.vesselId !== selfId &&
+        v.vesselId !== selfId && (!ownSubstrateId || !v.vesselId.endsWith(`@${ownSubstrateId}`)) &&
         v.protocol === 'libp2p' &&
         Array.isArray(v.libp2p_multiaddr) &&
         v.libp2p_multiaddr.length > 0,
