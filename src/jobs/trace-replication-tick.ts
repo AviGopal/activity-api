@@ -29,6 +29,21 @@ import { discoveryClient } from '../services/discovery-client';
 import { config } from '../config';
 
 const EGRESS_URL = `http://localhost:${process.env.FED_HEALTH_PORT || '8401'}/egress/resolve`;
+
+// THE CALLER'S CREDENTIAL RIDES THE LOCAL TRANSPORT HOP AS A HEADER, NEVER IN THE POINTER.
+// The peer's ingress admits a caller only by its own credential (executionReplicationPull is
+// trust_group in federationShapePolicy) and the transport never lends the node's key, so a
+// pull that crosses with none is refused. The local transport moves this request's
+// Authorization header into the wire pointer itself and the far ingress strips it before any
+// log or trace. This is the same key activity-api already presents to discovery
+// (discovery-client), read at use time like there. EGRESS_URL is always the local transport.
+function transportHopHeaders(): Record<string, string> {
+  const apiKey = process.env.METABOB_API_KEY || process.env.ACTIVITY_API_KEY;
+  return {
+    'Content-Type': 'application/json',
+    ...(apiKey ? { Authorization: `ApiKey ${apiKey}` } : {}),
+  };
+}
 const SELF_ORIGIN =
   process.env.FED_SUBSTRATE_ID || process.env.SUBSTRATE_ID || '';
 const PULL_LIMIT = Math.max(
@@ -139,7 +154,7 @@ async function pullFromPeer(peer: PeerVessel): Promise<{ pulled: number; stored:
     try {
       const resp = await fetch(EGRESS_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: transportHopHeaders(),
         body: JSON.stringify({
           target,
           pointer: {
