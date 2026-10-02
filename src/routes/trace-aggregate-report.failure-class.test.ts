@@ -132,4 +132,31 @@ describe('Y1-read-b: failure-class dimension, signature filters, measured flag',
     expect(r.measured).toBe(true);
     expect(r.matched_total).toBe(0);
   });
+
+  it('an unserved group_by is refused (HTTP 400 or measured:false reason unserved_group_by), never activity_id rows under the requested label', async () => {
+    // Today an unknown group_by silently falls back to activity_id and answers activity-grouped
+    // counts labelled as whatever was asked: a consumer asking for a dimension this resolver does
+    // not serve gets the wrong dimension with no signal. Refusal is the only honest answer.
+    const { db, calls } = fakeDb([
+      { activity_id: 'a', value: 5 }, { activity_id: 'b', value: 4 },
+    ]);
+    let r: Record<string, unknown> | undefined;
+    let thrown: unknown;
+    try {
+      r = (await runTraceAggregateReport(db, { group_by: 'not_a_dimension' }, AUTH)) as unknown as Record<string, unknown>;
+    } catch (err) {
+      thrown = err;
+    }
+    // No query may group by the fallback dimension on this request.
+    for (const c of calls) expect(c.sql).not.toMatch(/GROUP BY\s+activity_id\b/);
+    if (thrown !== undefined) {
+      const e = thrown as { status?: number; statusCode?: number };
+      expect(e.status ?? e.statusCode).toBe(400);
+      return;
+    }
+    expect(r!.measured).toBe(false);
+    expect(r!.reason).toBe('unserved_group_by');
+    expect(r!.group_by).not.toBe('activity_id');
+    expect((r!.rows as unknown[] | undefined) ?? []).toEqual([]);
+  });
 });
