@@ -1755,18 +1755,16 @@ export async function backfillChildCompositionChains(
     // (migration 099); use the inbound JWT when available so the UPDATE
     // doesn't silently no-op under root signin.
     const updateSql = `
-        UPDATE activity_execution_traces
+        UPDATE (SELECT VALUE id FROM (SELECT id, composition_chain FROM activity_execution_traces WHERE parent_execution_id = $parent_execution_id) WHERE composition_chain IS NONE OR composition_chain = []) 
         SET composition_chain = $new_chain
-        WHERE parent_execution_id = $parent_execution_id
-          AND (composition_chain IS NONE OR composition_chain = [])
+        RETURN NONE TIMEOUT 5s
       `;
     // WRITE-FLIP: mirror the chain backfill onto the authoritative `execution`
     // table (indexed on parent_execution_id; root path, non-fatal).
     const updateExecSql = `
-        UPDATE execution
+        UPDATE (SELECT VALUE id FROM (SELECT id, composition_chain FROM execution WHERE parent_execution_id = $parent_execution_id) WHERE composition_chain IS NONE OR composition_chain = []) 
         SET composition_chain = $new_chain
-        WHERE parent_execution_id = $parent_execution_id
-          AND (composition_chain IS NONE OR composition_chain = [])
+        RETURN NONE TIMEOUT 5s
       `;
     const updateParams = {
       parent_execution_id: insertedExecutionId,
