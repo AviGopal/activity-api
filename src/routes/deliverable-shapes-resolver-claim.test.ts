@@ -179,6 +179,61 @@ describe('deliverable-shapes: a composite terminal is claimed when every task re
     expect(body.shapes).not.toContain('unknownResolverTerminal');
   });
 
+  /**
+   * The engine's registered names as of 2026-10-02 (ias-executor-ts dev ed58e66):
+   *   hosts/goal-host.ts GoalHost constructor (~663-740): file-read (id at :92), bash (:117),
+   *     llm (:147), llm-prompt, impulse_preparation, iteration, impulse_pool_selection,
+   *     producer_selection, impulse-resolve, validation, activity, learning_signal_writer;
+   *   engine.ts:544 dispatches compose and compose_parallel itself (never looked up as resolvers).
+   * goal-host-vessel adds activity_recommendation and impulse_cooccurrence (index.ts ~15354/15427).
+   * The promote gate's inline set drifted: it has `file_read` (registered nowhere) and lacks
+   * `file-read` and `compose_parallel`.
+   */
+  test('CHECK: BUILTIN_RESOLVER_IDS carries the engine-registered names (file-read, compose_parallel), not the drifted file_read', () => {
+    const builtins = builtinResolverIds();
+    for (const id of [
+      'file-read', 'bash', 'llm', 'llm-prompt', 'impulse_preparation', 'iteration',
+      'impulse_pool_selection', 'producer_selection', 'impulse-resolve', 'validation', 'activity',
+      'learning_signal_writer', 'compose', 'compose_parallel',
+      'activity_recommendation', 'impulse_cooccurrence',
+    ]) {
+      expect(builtins).toContain(id);
+    }
+    expect(builtins).not.toContain('file_read');
+  });
+
+  test('CHECK: the promote gate and deliverable-shapes consult the SAME exported BUILTIN_RESOLVER_IDS object', async () => {
+    const shared = (activitiesModule as Record<string, unknown>).BUILTIN_RESOLVER_IDS;
+    expect(shared instanceof Set).toBe(true);
+    const set = shared as Set<string>;
+    const builtin = [...set].find((b) => b !== 'compose' && b !== 'compose_parallel')!;
+    const hasSpy = spyOn(set, 'has');
+    try {
+      // deliverable-shapes: a composite whose builtin task resolver is not in the registry
+      templateRows = [
+        ...composites('memoryNote_write', [undefined, undefined]),
+        ...composites('builtinClaimedTerminal', [builtin, 'concept_search']),
+      ];
+      registryShapes = ['memoryNote_write', 'concept_search'];
+      await deliverables();
+      expect(hasSpy.mock.calls.some((args) => args[0] === builtin)).toBe(true);
+
+      // promote gate: a proposed template whose only task uses that builtin
+      hasSpy.mockClear();
+      querySpy?.mockImplementation((async (sql: string) => {
+        if (/FROM\s+activity:`/i.test(sql)) {
+          return [{ id: 'activity:proposed-builtin', proposed: true, name: 'proposed-builtin', tasks: [{ id: 't1', resolver: builtin }], input_shapes: ['goal'], output_shapes: ['x'] }];
+        }
+        return [];
+      }) as any);
+      registryShapes = [];
+      await app.request('/v2/activities/templates/proposed-builtin/promote', { method: 'POST' });
+      expect(hasSpy.mock.calls.some((args) => args[0] === builtin)).toBe(true);
+    } finally {
+      hasSpy.mockRestore();
+    }
+  });
+
   test('CONTROL: a terminal with a direct live advertiser is admitted regardless of task resolvers', async () => {
     templateRows = [
       ...composites('memoryNote_write', [undefined, undefined]),
