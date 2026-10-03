@@ -60,9 +60,11 @@ function runSql(sql: string, params: Record<string, unknown> = {}): Row[] {
     return [row];
   }
   if (/^\s*SELECT \* FROM goal_verification_labels/.test(sql)) {
-    const conds = [...sql.matchAll(/(\w+) = \$(\w+)/g)].map((m) => [m[1]!, m[2]!] as const);
+    // `field = $p` keeps equal rows; `field != $p` keeps rows whose field is ABSENT or differs
+    // (SurrealDB: NONE != 'x' is true — verified on the 2.3.10 engine, see the commit).
+    const conds = [...sql.matchAll(/(\w+) (!?=) \$(\w+)/g)].map((m) => [m[1]!, m[2]!, m[3]!] as const);
     const rows = store
-      .filter((r) => conds.every(([f, p]) => r[f] === params[p]))
+      .filter((r) => conds.every(([f, op, p]) => (op === '=' ? r[f] === params[p] : r[f] !== params[p])))
       .sort((a, b) => Number(b.created_at) - Number(a.created_at));
     return rows.slice(0, Number(params.limit ?? 20));
   }
@@ -163,6 +165,32 @@ describe('goal_verification_label: calibration fields round-trip', () => {
     expect(createSql[0]).toMatch(/\bpurpose\b/);
     expect(createSql[0]).toMatch(/\bwindow_id\b/);
     expect(createSql[0]).toMatch(/\bsample_draw_id\b/);
+  });
+
+  test('MUST-FAIL: exclude_purpose skips calibration rows server side — 15 newer calibration rows cannot hide the older human row at limit 1', async () => {
+    await resolve({ ...BASE, execution_id: 'exec-masked', verdict: 'achieved', notes: 'the ordinary human verdict' });
+    for (let i = 0; i < 15; i++) {
+      await resolve({ ...BASE, execution_id: 'exec-masked', purpose: 'calibration', window_id: 'win-m', sample_draw_id: `draw-${i}` });
+    }
+    const rows = await readByExec('exec-masked', { limit: 1, exclude_purpose: 'calibration' });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.notes).toBe('the ordinary human verdict');
+    expect(rows[0]!.purpose).toBeUndefined();
+    // a row with a DIFFERENT purpose is not excluded
+    await resolve({ ...BASE, execution_id: 'exec-masked', purpose: 'something-new', notes: 'other purpose' });
+    const rows2 = await readByExec('exec-masked', { limit: 1, exclude_purpose: 'calibration' });
+    expect(rows2[0]!.notes).toBe('other purpose');
+  });
+
+  test('CONTROL: without exclude_purpose the read is unchanged — the newest row comes first, calibration or not', async () => {
+    await resolve({ ...BASE, execution_id: 'exec-unfiltered', verdict: 'achieved', notes: 'human' });
+    await resolve({ ...BASE, execution_id: 'exec-unfiltered', purpose: 'calibration', window_id: 'w', sample_draw_id: 'd' });
+    const rows = await readByExec('exec-unfiltered', { limit: 1 });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.purpose).toBe('calibration');
+    // an empty exclude_purpose is ignored, not turned into a filter
+    const rows2 = await readByExec('exec-unfiltered', { limit: 1, exclude_purpose: '' });
+    expect(rows2[0]!.purpose).toBe('calibration');
   });
 
   test('the migration defines the fields as option<string> with no ASSERT', () => {
