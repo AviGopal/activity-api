@@ -1547,9 +1547,13 @@ app.get('/selection-events', async (c) => {
       ? `WHERE ${whereConditions.join(' AND ')}`
       : '';
 
+    // Filter INSIDE the subquery, sort + page OUTSIDE it. On SurrealDB 2.3.10 (also 2.4.1,
+    // 2.5.0) a range on the single-field idx_thompson_selection_time plus ORDER BY selected_at
+    // DESC plus LIMIT returns the LOWEST rows of the range (the limit stops the ascending index
+    // scan before the sort), so start_date listed the oldest selections of the window. Pinned by
+    // test/selection-events-newest-first.test.ts, which expands this template verbatim.
     const query = `
-      SELECT * FROM thompson_selection_log
-      ${whereClause}
+      SELECT * FROM (SELECT * FROM thompson_selection_log ${whereClause})
       ORDER BY selected_at DESC
       LIMIT $limit
       START $offset
