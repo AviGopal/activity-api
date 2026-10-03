@@ -478,10 +478,21 @@ async function queryExecutions(
   // collect every matched blob row into RAM before LIMIT. Step 1 sorts ONLY the
   // narrow (id, executed_at) keys under the bounded LIMIT; step 2 hydrates the
   // fat rows for the chosen ids.
+  //
+  // The filter runs INSIDE a subquery and the sort + limit run OUTSIDE it. On SurrealDB 2.3.10
+  // (also 2.4.1, 2.5.0) a range on the single-field idx_execution_executed_at plus ORDER BY
+  // executed_at DESC plus LIMIT returns the LOWEST rows of the range: the limit stops the
+  // ascending index scan before the sort, so the reader handed the ribosome the OLDEST executions
+  // of its window. The subquery keeps the index for the range and sorts the narrow keys after.
+  // Cost is O(rows in the window), the same order the correct engine (2.3.3) paid for the
+  // unwrapped form. Pinned by test/signature-reader-newest-first.test.ts.
   const idSql = `
     SELECT id, executed_at
-    FROM execution
-    WHERE ${where.join(' AND ')}
+    FROM (
+      SELECT id, executed_at
+      FROM execution
+      WHERE ${where.join(' AND ')}
+    )
     ORDER BY executed_at DESC
     LIMIT $lim
   `;
