@@ -2848,6 +2848,7 @@ router.post('/resolve', async (c) => {
           execution_id?: string;
           goal?: string;
           activity_id?: string;
+          purpose?: string;
         };
         const limit = Math.min(Math.max(gvlReadPointer.limit ?? 20, 1), 100);
         const validVerdicts = ['achieved', 'not_achieved', 'partial'];
@@ -2855,6 +2856,8 @@ router.post('/resolve', async (c) => {
         const hasExecId = typeof gvlReadPointer.execution_id === 'string' && gvlReadPointer.execution_id.length > 0;
         const hasGoal = typeof gvlReadPointer.goal === 'string' && gvlReadPointer.goal.length > 0;
         const hasActivityId = typeof gvlReadPointer.activity_id === 'string' && gvlReadPointer.activity_id.length > 0;
+        // purpose filter (migration 216): the blind-calibration report reads purpose:'calibration'.
+        const hasPurpose = typeof gvlReadPointer.purpose === 'string' && gvlReadPointer.purpose.length > 0;
 
         try {
           let whereClause = '';
@@ -2864,6 +2867,7 @@ router.post('/resolve', async (c) => {
           if (hasExecId) { conditions.push('execution_id = $execution_id'); bindings.execution_id = gvlReadPointer.execution_id; }
           if (hasGoal) { conditions.push('goal = $goal'); bindings.goal = gvlReadPointer.goal; }
           if (hasActivityId) { conditions.push('activity_id = $activity_id'); bindings.activity_id = gvlReadPointer.activity_id; }
+          if (hasPurpose) { conditions.push('purpose = $purpose'); bindings.purpose = gvlReadPointer.purpose; }
           if (conditions.length > 0) whereClause = 'WHERE ' + conditions.join(' AND ');
 
           const sql = 'SELECT * FROM goal_verification_labels ' + whereClause + ' ORDER BY created_at DESC LIMIT $limit';
@@ -2958,6 +2962,7 @@ router.post('/resolve', async (c) => {
         const gvlG = gvlPointer as unknown as {
           asserted_at?: string; source?: string; probe?: string;
           expected?: string; observed?: string; evidence?: string;
+          purpose?: string; window_id?: string; sample_draw_id?: string;
         };
         // SurrealDB option<T> accepts NONE, NOT NULL — they are distinct values, and a bound JS
         // null arrives as NULL, so a SCHEMAFULL option field rejects the whole CREATE. Measured
@@ -3002,6 +3007,9 @@ router.post('/resolve', async (c) => {
               expected: IF $expected IS NULL THEN NONE ELSE $expected END,
               observed: IF $observed IS NULL THEN NONE ELSE $observed END,
               evidence: IF $evidence IS NULL THEN NONE ELSE $evidence END,
+              purpose: IF $purpose IS NULL THEN NONE ELSE $purpose END,
+              window_id: IF $window_id IS NULL THEN NONE ELSE $window_id END,
+              sample_draw_id: IF $sample_draw_id IS NULL THEN NONE ELSE $sample_draw_id END,
               grounded: $grounded,
               created_at: time::now()
             }`,
@@ -3021,6 +3029,13 @@ router.post('/resolve', async (c) => {
               observed: gvlNonEmpty(gvlG.observed) ? String(gvlG.observed).slice(0, 2000) : null,
               // Evidence is raw probe output; cap it so one pathological probe cannot bloat the corpus.
               evidence: gvlNonEmpty(gvlG.evidence) ? String(gvlG.evidence).slice(0, 4000) : null,
+              // CALIBRATION (migration 216). purpose 'calibration' marks a blind-calibration-sheet
+              // verdict that readers turning labels into overrides, gaps or credit must skip;
+              // window_id / sample_draw_id key the surface's calibration report. Stored as given,
+              // never validated against a list (an unknown purpose is stored, not rejected).
+              purpose: gvlNonEmpty(gvlG.purpose) ? String(gvlG.purpose).slice(0, 64) : null,
+              window_id: gvlNonEmpty(gvlG.window_id) ? String(gvlG.window_id).slice(0, 200) : null,
+              sample_draw_id: gvlNonEmpty(gvlG.sample_draw_id) ? String(gvlG.sample_draw_id).slice(0, 200) : null,
               grounded: gvlGrounded,
             },
           );
