@@ -49,6 +49,7 @@ let proc: Subprocess | null = null;
 let startError = '';
 let api: Hono | null = null;
 let restoreSurrealConfig: (() => void) | null = null;
+let restoreSurrealModule: (() => void) | null = null;
 
 async function sql(text: string): Promise<any[]> {
   const r = await fetch(`${URL_}/sql`, {
@@ -117,7 +118,16 @@ beforeAll(async () => {
     const saved = { ...config.surrealdb };
     restoreSurrealConfig = () => Object.assign(config.surrealdb, saved);
     Object.assign(config.surrealdb, { url: URL_, namespace: NS, database: DB, username: 'root', password: PASS, authEnabled: true });
-    await (await import('../src/db/surreal')).surrealDB.close();
+    // ~40 files in this suite mock.module('…/db/surreal') and Bun keeps a module mock for the rest of
+    // the process (a later mock.module does not re-point it), so in a full run the client the route
+    // holds may be some other file's stub. Load a REAL client under a distinct specifier and, while
+    // this file runs, route the held client's query() through it; restore the method afterwards.
+    const real = await import('../src/db/surreal.ts?trace-list-bounded-real');
+    await real.surrealDB.close();
+    const held = (await import('../src/db/surreal')).surrealDB as any;
+    const heldQuery = held.query;
+    held.query = (...args: any[]) => (real.surrealDB.query as any)(...args);
+    restoreSurrealModule = () => { held.query = heldQuery; };
     const traces = (await import('../src/routes/execution-traces')).default;
     // An API-key caller: identity validated upstream, org carried on jwtAuth, no JWT token, so the
     // handler takes its root-credential path with an explicit org_id filter (as node callers do).
@@ -134,7 +144,8 @@ beforeAll(async () => {
 }, 240_000);
 
 afterAll(async () => {
-  try { await (await import('../src/db/surreal')).surrealDB.close(); } catch { /* ignore */ }
+  try { await (await import('../src/db/surreal.ts?trace-list-bounded-real')).surrealDB.close(); } catch { /* ignore */ }
+  restoreSurrealModule?.();
   restoreSurrealConfig?.();
   proc?.kill();
 });
@@ -199,11 +210,14 @@ describe('trace list: same rows, bounded work', () => {
     }
     // The handler, each request a distinct page key so the page cache cannot answer it.
     const got: number[] = [];
+    const pages: Array<[number, string[]]> = [];
     for (const lim of [97, 98, 99]) {
       const t = performance.now();
-      await list(ORG, `limit=${lim}`);
+      pages.push([lim, await list(ORG, `limit=${lim}`)]);
       got.push(performance.now() - t);
     }
+    // Fast only counts if it is right: a handler that errors or returns nothing must not pass here.
+    for (const [lim, page] of pages) expect(page).toEqual(await truth(ORG, lim, 0));
     // Measured on 2.3.10: today ≈ 1× the reference; a narrow-first window ≈ 0.05×.
     expect(median(got)).toBeLessThan(median(ref) / 4);
   }, 120_000);
