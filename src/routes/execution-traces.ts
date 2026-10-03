@@ -4210,12 +4210,12 @@ app.get('/selection-outcomes', async (c) => {
     }
 
     if (startDate) {
-      selectionConditions.push('sel.selected_at >= type::datetime($start_date)');
+      selectionConditions.push('selected_at >= type::datetime($start_date)');
       params.start_date = startDate;
     }
 
     if (endDate) {
-      selectionConditions.push('sel.selected_at <= type::datetime($end_date)');
+      selectionConditions.push('selected_at <= type::datetime($end_date)');
       params.end_date = endDate;
     }
 
@@ -4223,7 +4223,12 @@ app.get('/selection-outcomes', async (c) => {
       ? `WHERE ${selectionConditions.join(' AND ')}`
       : '';
 
-    // Step 1: Get selections from thompson_selection_log
+    // Step 1: Get selections from thompson_selection_log.
+    // The date conditions name `selected_at` directly: the query has no `sel` alias, and the
+    // former `sel.selected_at` was NONE, so every start_date/end_date request returned zero rows.
+    // Filter INSIDE the subquery, sort + page OUTSIDE it: on SurrealDB 2.3.10 (also 2.4.1, 2.5.0)
+    // a range on idx_thompson_selection_time plus ORDER BY selected_at DESC plus LIMIT returns the
+    // LOWEST rows of the range. Pinned by test/selection-outcomes-date-window.test.ts.
     const selectionsQuery = `
       SELECT
         correlation_id,
@@ -4236,8 +4241,7 @@ app.get('/selection-outcomes', async (c) => {
         selected_at,
         org_id,
         <float> alpha / (<float> alpha + <float> beta) AS expected_success_rate
-      FROM thompson_selection_log
-      ${selectionWhereClause}
+      FROM (SELECT * FROM thompson_selection_log ${selectionWhereClause})
       ORDER BY selected_at DESC
       LIMIT $limit
       START $offset
