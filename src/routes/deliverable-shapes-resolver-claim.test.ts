@@ -1,0 +1,146 @@
+/**
+ * GET /v2/activities/deliverable-shapes — a learned composite's terminal is CLAIMED when every
+ * task's resolver is advertised, even if nothing advertises the terminal shape itself.
+ *
+ * Why this must hold (REALIGNMENT/WIRING step 1(a); WIRING-ADDENDUM C§1 R1):
+ *   B2 (2c91aaf) added this endpoint so goal->target inference could AIM a goal at a shape that
+ *   only learned composites produce (goal-host names `conceptDescription`). 77785f4 (V1) then
+ *   required a live discovery advertiser for the OUTPUT shape. A shape produced only by a
+ *   composite is by definition not advertised by any vessel, so V1 removed every such terminal:
+ *   the union into goal-host's fetchKnownShapes now adds zero names that /registry/shapes does
+ *   not already carry, and B2 is dead. V1 fixed a real hole (obsidian:write_note stayed aimable
+ *   after its vault left), but it tested the wrong thing. The narrow rule is RESOLVER-claim:
+ *   a composite's terminal is admitted when each of its tasks names a resolver that is live in
+ *   discovery. A task with no resolver claims nothing.
+ *
+ * "Advertised resolver" here: the task's `resolver` id (the field ias-executor dispatches on,
+ * engine.ts) is in discovery's /registry/shapes, the same single all-or-nothing read the handler
+ * already makes (7bec2ca). goal-host registers its cross-vessel proxy resolvers BY SHAPE NAME, so
+ * a resolver id is advertised exactly when that name is in the registry. Qualified
+ * (`vessel:shape`) and goal-host-builtin resolver ids are deliberately not exercised here.
+ *
+ * The reached-run half of the gate (goal_execution_paths.successful_executions > 0) is satisfied
+ * for every terminal in these fixtures so that only the advertisement half is under test.
+ *
+ * Seams: spyOn the real `surrealDB.query` export and a globalThis.fetch stub that answers only
+ * discovery's /registry/shapes; both restored after each test. No mock.module.
+ */
+import { describe, test, expect, spyOn, beforeEach, afterEach } from 'bun:test';
+import { Hono } from 'hono';
+import activitiesRouter from './activities';
+import { surrealDB } from '../db/surreal';
+
+const DISCOVERY = 'http://discovery-resolver-claim.test';
+
+const app = new Hono();
+app.route('/v2/activities', activitiesRouter);
+
+type Task = { id: string; inputShapes: string[]; outputShapes: string[]; resolver?: string };
+type TemplateRow = { id: string; tasks: Task[] };
+
+/** FLOOR is 5 distinct composites per terminal; give each terminal 6. */
+function composites(terminal: string, resolvers: [string | undefined, string | undefined], n = 6): TemplateRow[] {
+  return Array.from({ length: n }, (_, i) => {
+    const s1: Task = { id: 's1', inputShapes: ['goal'], outputShapes: [`mid${i}`] };
+    const s2: Task = { id: 's2', inputShapes: [`mid${i}`], outputShapes: [terminal] };
+    if (resolvers[0]) s1.resolver = resolvers[0];
+    if (resolvers[1]) s2.resolver = resolvers[1];
+    return { id: `learned-${terminal.replace(/[^a-zA-Z0-9]/g, '_')}-${i}`, tasks: [s1, s2] };
+  });
+}
+
+describe('deliverable-shapes: a composite terminal is claimed when every task resolver is advertised', () => {
+  const realFetch = globalThis.fetch;
+  const prevEndpoint = process.env.DISCOVERY_VESSEL_ENDPOINT;
+  let querySpy: ReturnType<typeof spyOn> | null = null;
+  let templateRows: TemplateRow[] = [];
+  let registryShapes: string[] = [];
+  let unexpectedFetches: string[] = [];
+
+  beforeEach(() => {
+    unexpectedFetches = [];
+    process.env.DISCOVERY_VESSEL_ENDPOINT = DISCOVERY;
+    querySpy = spyOn(surrealDB, 'query').mockImplementation((async (sql: string) => {
+      if (/FROM\s+goal_execution_paths/i.test(sql)) {
+        // Every terminal in these fixtures has a reached run.
+        const terminals = new Set<string>();
+        for (const r of templateRows) for (const t of r.tasks) for (const s of t.outputShapes) if (!/^mid\d+$/.test(s)) terminals.add(s);
+        return [...terminals].map((s) => ({ endpoint_output_shapes: [s], successful_executions: 3 }));
+      }
+      if (/FROM\s+activity\b/i.test(sql)) return templateRows.map((r) => ({ ...r }));
+      return [];
+    }) as any);
+    globalThis.fetch = (async (input: unknown) => {
+      const url = String(input instanceof Request ? input.url : input);
+      if (url.startsWith(DISCOVERY) && new URL(url).pathname === '/registry/shapes') {
+        return new Response(JSON.stringify({ shapes: registryShapes }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      unexpectedFetches.push(url);
+      throw new Error(`unexpected fetch in test: ${url}`);
+    }) as typeof fetch;
+  });
+
+  afterEach(() => {
+    querySpy?.mockRestore();
+    querySpy = null;
+    globalThis.fetch = realFetch;
+    if (prevEndpoint === undefined) delete process.env.DISCOVERY_VESSEL_ENDPOINT;
+    else process.env.DISCOVERY_VESSEL_ENDPOINT = prevEndpoint;
+  });
+
+  async function deliverables(): Promise<{ status: number; body: any }> {
+    const res = await app.request('/v2/activities/deliverable-shapes');
+    return { status: res.status, body: await res.json() };
+  }
+
+  test('CHECK: a terminal produced only by composites whose task resolvers are all advertised is admitted', async () => {
+    templateRows = [
+      ...composites('memoryNote_write', [undefined, undefined]),     // direct advertiser (guards a vacuous empty answer)
+      ...composites('conceptDescription', ['concept_search', 'llm_completion']),
+    ];
+    // conceptDescription itself has NO direct advertiser; both of its composites' resolvers do.
+    registryShapes = ['memoryNote_write', 'concept_search', 'llm_completion'];
+    const { status, body } = await deliverables();
+    expect(status).toBe(200);
+    expect(unexpectedFetches).toEqual([]);
+    expect(body.shapes).toContain('memoryNote_write');
+    expect(body.shapes).toContain('conceptDescription');
+  });
+
+  test('MUST-FAIL: a terminal whose composite has an unadvertised task resolver, or a task with no resolver, is not admitted', async () => {
+    templateRows = [
+      ...composites('memoryNote_write', [undefined, undefined]),
+      // obsidian:write_note: the vault left, so its resolver is gone; the llm step is still live.
+      ...composites('obsidian:write_note', ['llm_completion', 'obsidian:write_note']),
+      // a composite with resolver-less tasks claims nothing (no vacuous "every" over nothing).
+      ...composites('unclaimedTerminal', [undefined, undefined]),
+      // one live resolver and one resolver-less task: still not every task is claimed.
+      ...composites('halfClaimedTerminal', ['concept_search', undefined]),
+    ];
+    registryShapes = ['memoryNote_write', 'concept_search', 'llm_completion'];
+    const { status, body } = await deliverables();
+    expect(status).toBe(200);
+    expect(unexpectedFetches).toEqual([]);
+    expect(body.shapes).toContain('memoryNote_write'); // not the fail-open empty answer
+    expect(body.shapes).not.toContain('obsidian:write_note');
+    expect(body.shapes).not.toContain('unclaimedTerminal');
+    expect(body.shapes).not.toContain('halfClaimedTerminal');
+  });
+
+  test('CONTROL: a terminal with a direct live advertiser is admitted regardless of task resolvers', async () => {
+    templateRows = [
+      ...composites('memoryNote_write', [undefined, undefined]),
+      ...composites('traceAggregateReport', ['not_advertised_resolver', undefined]),
+    ];
+    registryShapes = ['memoryNote_write', 'traceAggregateReport'];
+    const { status, body } = await deliverables();
+    expect(status).toBe(200);
+    expect(body.shapes).toContain('memoryNote_write');
+    expect(body.shapes).toContain('traceAggregateReport');
+    // intermediates are still not deliverables
+    expect(body.shapes.some((s: string) => /^mid\d+$/.test(s))).toBe(false);
+  });
+});
