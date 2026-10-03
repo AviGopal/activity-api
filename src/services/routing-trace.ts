@@ -15,6 +15,7 @@
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
 import { accountIdScopedWhere } from '../routes/activities';
+import { newestFirstSql } from '../lib/newest-first-sql';
 
 // =============================================================================
 // TYPES
@@ -321,12 +322,14 @@ export class RoutingTraceService {
         whereConditions.push(`timestamp <= $endTime`);
       }
 
-      const query = `
-        SELECT * FROM routing_trace
-        WHERE ${whereConditions.join(' AND ')}
-        ORDER BY timestamp DESC
-        LIMIT ${params.limit || 100};
-      `;
+      // SurrealDB 2.3.10 returns the LOWEST rows for an indexed range ordered DESC with a LIMIT; newestFirstSql filters inside a subquery and sorts/limits outside it when the range is present.
+      const query = newestFirstSql({
+        fields: '*',
+        from: 'routing_trace',
+        where: whereConditions,
+        orderBy: 'timestamp',
+        limit: params.limit || 100,
+      }) + ';';
 
       const result = await surrealDB.query<RoutingTrace[]>(query, {
         org_id: params.org_id,

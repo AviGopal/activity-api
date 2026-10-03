@@ -51,6 +51,7 @@ import {
 } from '../services/discover-by-shapes';
 
 import { z } from 'zod';
+import { newestFirstSql } from '../lib/newest-first-sql';
 
 const router = new Hono();
 
@@ -1151,22 +1152,14 @@ router.post('/resolve', async (c) => {
           params.since = since;
         }
 
-        const whereClause = 'WHERE ' + conditions.join(' AND ');
-
-        // Query execution table
-        const query = `
-          SELECT
-            id,
-            activity_id,
-            success,
-            duration_ms,
-            cost_usd,
-            executed_at
-          FROM v_paradigm_execution_traces
-          ${whereClause}
-          ORDER BY executed_at DESC
-          LIMIT $limit
-        `;
+        // Query execution table. SurrealDB 2.3.10 returns the LOWEST rows for an indexed range ordered DESC with a LIMIT; newestFirstSql filters inside a subquery and sorts/limits outside it when the range is present.
+        const query = newestFirstSql({
+          fields: 'id, activity_id, success, duration_ms, cost_usd, executed_at',
+          from: 'v_paradigm_execution_traces',
+          where: conditions,
+          orderBy: 'executed_at',
+          limit: '$limit',
+        });
 
         const traces = await executeAsAuth<any>(jwtAuthCtx, query, params);
 
@@ -4216,13 +4209,14 @@ router.post('/resolve', async (c) => {
           // (execution_id, executed_at) keys so the metadata/tasks blobs never
           // enter the MemoryOrderedLimit sort; then hydrate full rows for the
           // chosen ids, re-applying ORDER BY over the bounded id set.
-          const idSql = `
-            SELECT execution_id, executed_at
-            FROM v_paradigm_execution_traces
-            WHERE ${whereClauses.join(' AND ')}
-            ORDER BY executed_at DESC
-            LIMIT $limit
-          `;
+          // SurrealDB 2.3.10 returns the LOWEST rows for an indexed range ordered DESC with a LIMIT; newestFirstSql filters inside a subquery and sorts/limits outside it when the range is present.
+          const idSql = newestFirstSql({
+            fields: 'execution_id, executed_at',
+            from: 'v_paradigm_execution_traces',
+            where: whereClauses,
+            orderBy: 'executed_at',
+            limit: '$limit',
+          });
           const idRows = (jwtAuthCtx.jwtToken
             ? await queryWithAuth<any>(jwtAuthCtx.jwtToken, idSql, params)
             : await surrealDB.query<any>(idSql, params)) as any[];

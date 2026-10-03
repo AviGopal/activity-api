@@ -9,6 +9,7 @@ import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
 import { inferShapesFromTemplate } from '../utils/shape-inference';
 import { accountIdScopedWhere } from '../routes/activities';
+import { newestFirstSql } from '../lib/newest-first-sql';
 
 /**
  * Extract pattern from an execution trace and upsert pattern record.
@@ -380,23 +381,17 @@ export async function queryPatterns(params: {
 
   whereClause += ' AND execution_count >= $minExecutions';
 
-  const orderByClause = `ORDER BY ${sortBy} DESC`;
-
-  const query = `
-    SELECT
-      input_shapes,
-      output_shapes,
-      activity_templates,
-      success_rate,
-      execution_count,
-      avg_cost_usd,
-      avg_duration_ms
-    FROM execution_pattern
-    ${whereClause}
-    ${orderByClause}
-    LIMIT $limit
-    START $offset
-  `;
+  // SurrealDB 2.3.10 returns the LOWEST rows for an indexed range ordered DESC with a LIMIT
+  // (sortBy=execution_count carries `execution_count >= $minExecutions`); newestFirstSql filters
+  // inside a subquery and sorts/pages outside it when the range is present.
+  const query = newestFirstSql({
+    fields: 'input_shapes, output_shapes, activity_templates, success_rate, execution_count, avg_cost_usd, avg_duration_ms',
+    from: 'execution_pattern',
+    where: [whereClause.replace(/^WHERE /, '')],
+    orderBy: sortBy,
+    limit: '$limit',
+    start: '$offset',
+  });
 
   const countQuery = `
     SELECT count() AS total FROM execution_pattern

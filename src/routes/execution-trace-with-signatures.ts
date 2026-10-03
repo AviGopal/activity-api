@@ -31,6 +31,7 @@
 import type { Surreal } from 'surrealdb';
 
 import { logger } from '../utils/logger';
+import { newestFirstSql } from '../lib/newest-first-sql';
 import {
   applyChainFallback,
   type CompositionChainCache,
@@ -570,13 +571,17 @@ async function queryExecutions(
   // `tasks` blob, so the ORDER BY executed_at path (execution_id absent) would
   // pull every matched blob row into MemoryOrderedLimit before LIMIT. Sort only
   // the narrow (execution_id, executed_at) keys, then hydrate the chosen ids.
-  const legacyIdSql = `
-    SELECT execution_id, executed_at
-    FROM v_paradigm_execution_traces
-    WHERE ${where.join(' AND ')}
-    ${input.execution_id ? '' : 'ORDER BY executed_at DESC'}
-    LIMIT $lim
-  `;
+  // Same 2.3.10 wrap as idSql above (via newestFirstSql) on the window path; the
+  // execution_id point lookup carries no range and no ORDER BY.
+  const legacyIdSql = input.execution_id
+    ? `SELECT execution_id, executed_at FROM v_paradigm_execution_traces WHERE ${where.join(' AND ')} LIMIT $lim`
+    : newestFirstSql({
+        fields: 'execution_id, executed_at',
+        from: 'v_paradigm_execution_traces',
+        where,
+        orderBy: 'executed_at',
+        limit: '$lim',
+      });
   const legacyHydrateSql = `
     SELECT
       execution_id AS id,
