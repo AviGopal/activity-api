@@ -2849,6 +2849,7 @@ router.post('/resolve', async (c) => {
           goal?: string;
           activity_id?: string;
           purpose?: string;
+          exclude_purpose?: string;
         };
         const limit = Math.min(Math.max(gvlReadPointer.limit ?? 20, 1), 100);
         const validVerdicts = ['achieved', 'not_achieved', 'partial'];
@@ -2858,6 +2859,12 @@ router.post('/resolve', async (c) => {
         const hasActivityId = typeof gvlReadPointer.activity_id === 'string' && gvlReadPointer.activity_id.length > 0;
         // purpose filter (migration 216): the blind-calibration report reads purpose:'calibration'.
         const hasPurpose = typeof gvlReadPointer.purpose === 'string' && gvlReadPointer.purpose.length > 0;
+        // exclude_purpose (migration 216): keep rows whose purpose is ABSENT or DIFFERS. goal-host's
+        // oracle-label consumer reads exclude_purpose:'calibration', limit 1, so any number of newer
+        // calibration rows cannot hide an ordinary verdict. `purpose != $x` alone is true for a NONE
+        // field on SurrealDB 2.3.10; the explicit IS NONE branch states the intent and does not
+        // depend on that.
+        const hasExcludePurpose = typeof gvlReadPointer.exclude_purpose === 'string' && gvlReadPointer.exclude_purpose.length > 0;
 
         try {
           let whereClause = '';
@@ -2868,6 +2875,7 @@ router.post('/resolve', async (c) => {
           if (hasGoal) { conditions.push('goal = $goal'); bindings.goal = gvlReadPointer.goal; }
           if (hasActivityId) { conditions.push('activity_id = $activity_id'); bindings.activity_id = gvlReadPointer.activity_id; }
           if (hasPurpose) { conditions.push('purpose = $purpose'); bindings.purpose = gvlReadPointer.purpose; }
+          if (hasExcludePurpose) { conditions.push('(purpose IS NONE OR purpose != $exclude_purpose)'); bindings.exclude_purpose = gvlReadPointer.exclude_purpose; }
           if (conditions.length > 0) whereClause = 'WHERE ' + conditions.join(' AND ');
 
           const sql = 'SELECT * FROM goal_verification_labels ' + whereClause + ' ORDER BY created_at DESC LIMIT $limit';
