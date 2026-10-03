@@ -92,9 +92,9 @@ describe('accelerator-flag-tick: SF_BLEND has an off path', () => {
   });
 
   // PINNED CURRENT BEHAVIOR, not a requirement: the row-count on-path is what the reach-graded
-  // A/B (WIRING-ADDENDUM section 5(a)) replaces. Superseded by SF_BLEND A/B gap <GAP_ID_PENDING>;
+  // A/B (WIRING-ADDENDUM section 5(a)) replaces. Superseded by SF_BLEND A/B gap sf-blend-has-no-reach-graded-a-b-so-nothing-writes-the-verdict-that-would-turn-it-off;
   // excluded from the gap's only_tests so the A/B fix may change it.
-  test('CONTROL (pinned current behavior; superseded by SF_BLEND A/B gap <GAP_ID_PENDING>): no verdict, rows >= 200, unset SF_BLEND is switched on', async () => {
+  test('CONTROL (pinned current behavior; superseded by SF_BLEND A/B gap sf-blend-has-no-reach-graded-a-b-so-nothing-writes-the-verdict-that-would-turn-it-off): no verdict, rows >= 200, unset SF_BLEND is switched on', async () => {
     const r = await tickSfBlend();
     expect(r.value).toBe(1);
     expect(r.flipped).toBe(true);
