@@ -404,7 +404,7 @@ export async function queryWithAuth<T = any>(
         namespace: config.surrealdb.namespace,
         database: config.surrealdb.database,
       });
-      const result = await session.db.query('SELECT id, name, description, content, created_at, updated_at FROM template', params);
+      const result = await session.db.query(sql, params);
       const firstResult = Array.isArray(result) && result.length > 0 ? result[0] : [];
       return firstResult as T[];
     } finally {
