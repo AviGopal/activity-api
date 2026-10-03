@@ -584,6 +584,7 @@ export async function insertTraceDigest(trace: any, body: any, jwtToken?: string
 
   const failureModeType = body.failure_mode?.type;
   if (failureModeType != null) { optFields.push('failure_mode_type: $failure_mode_type'); p.failure_mode_type = failureModeType; }
+  if (trace.yield_info !== undefined) { optFields.push('yield_info: $yield_info'); p.yield_info = trace.yield_info; }
   if (Array.isArray(trace.output_impulse_shapes) && trace.output_impulse_shapes.length > 0) {
     optFields.push('output_impulse_shapes: $output_impulse_shapes');
     p.output_impulse_shapes = trace.output_impulse_shapes;
