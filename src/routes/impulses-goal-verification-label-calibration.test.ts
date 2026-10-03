@@ -62,6 +62,13 @@ function runSql(sql: string, params: Record<string, unknown> = {}): Row[] {
       const ref = expr.match(/\$(\w+)/);
       if (!ref) continue;
       const v = params[ref[1]!];
+      // A BARE `$x` bound to JS null arrives as NULL, and an option<T> field rejects NULL (verified
+      // on SurrealDB 2.3.10 through the surrealdb 2.0.8 SDK against node 1's live field set:
+      // "Found NULL for field `notes` ... but expected a option<string>"). Only the
+      // `IF $x IS NULL THEN NONE ELSE $x END` idiom turns a null into NONE.
+      if (v === null && /^\$\w+$/.test(expr.trim())) {
+        throw new Error(`Found NULL for field \`${key}\`, with record \`${row.id}\`, but expected a option<string>`);
+      }
       if (v === null || v === undefined) continue; // NONE
       row[key] = v;
     }
@@ -225,6 +232,30 @@ describe('goal_verification_label: calibration fields round-trip', () => {
     } finally {
       skip216 = false;
     }
+  });
+
+  test('MUST-FAIL: a label written WITHOUT notes is stored (notes absent, not NULL)', async () => {
+    // node 1's live schema types notes option<string>; the route bound `notes ?? null`, so every
+    // caller that omits notes (the human-surface /api/grade passthrough forwards notes ?? null) got
+    // a 500 and no row. The fix names notes in the CREATE only when the caller supplied one.
+    const w = await resolve({ ...BASE, execution_id: 'exec-no-notes' });
+    expect(w.status).toBe(200);
+    const rows = await readByExec('exec-no-notes');
+    expect(rows).toHaveLength(1);
+    expect('notes' in rows[0]!).toBe(false);
+    // an explicit JSON null is treated the same as absent
+    const n = await resolve({ ...BASE, execution_id: 'exec-null-notes', notes: null });
+    expect(n.status).toBe(200);
+    expect(await readByExec('exec-null-notes')).toHaveLength(1);
+  });
+
+  test('CONTROL: a label written WITH notes keeps them; an empty string is kept as written', async () => {
+    await resolve({ ...BASE, execution_id: 'exec-with-notes', notes: 'human verdict: not_achieved' });
+    const rows = await readByExec('exec-with-notes');
+    expect(rows[0]!.notes).toBe('human verdict: not_achieved');
+    await resolve({ ...BASE, execution_id: 'exec-empty-notes', notes: '' });
+    const rows2 = await readByExec('exec-empty-notes');
+    expect(rows2[0]!.notes).toBe('');
   });
 
   test('the migration defines the fields as option<string> with no ASSERT', () => {
