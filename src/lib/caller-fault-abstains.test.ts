@@ -52,8 +52,23 @@ process.env.SURREALDB_DATABASE = 'learning_loop';
 const { computeDeltas } = await import('./posterior-update');
 const { failureClassOf, FAILURE_CLASSES } = await import('./failure-class');
 
-const PROXY_REASON =
-  "dev-vessel llm_completion_dispatch resolver returned structuredError (failure_mode=malformed_request): malformed_request: pointer must include a non-empty 'prompt' string";
+// ── CROSS-REPO CONTRACT FIXTURES ────────────────────────────────────────────────────────────────
+// Vessels cannot import the super-repo's packages/; these blocks are copied verbatim from each
+// string's emitter test so a super-repo check can compare the copies byte for byte.
+// CONTRACT-FIXTURE malformed_request BEGIN (emitter: development-vessel test/resolvers/llm-completion-dispatch-refuses-a-missing-prompt.test.ts)
+const MALFORMED_REQUEST = "malformed_request";
+// CONTRACT-FIXTURE malformed_request END
+// CONTRACT-FIXTURE malformed_request_carrier BEGIN (emitter: goal-host-vessel test/required-inputs-are-bound-before-a-producer-is-invoked.test.ts)
+const CARRIER_FORMAT = "dev-vessel <shape> resolver returned structuredError (failure_mode=<token>): <detail>";
+const formatCarrier = (shape: string, token: string, detail: string): string =>
+  CARRIER_FORMAT.replace("<shape>", () => shape).replace("<token>", () => token).replace("<detail>", () => detail);
+const carrierToken = (reason: string): string | null =>
+  /\bresolver returned structuredError \(failure_mode=([a-z0-9_]+)\)/.exec(reason)?.[1] ?? null;
+// CONTRACT-FIXTURE malformed_request_carrier END
+
+// The dispatcher's detail (development-vessel) wrapped in goal-host's carrier, as it reaches this store.
+const DISPATCHER_DETAIL = `${MALFORMED_REQUEST}: pointer must include a non-empty 'prompt' string`;
+const PROXY_REASON = formatCarrier("llm_completion_dispatch", MALFORMED_REQUEST, DISPATCHER_DETAIL);
 const w = (): string[] => [];
 
 describe('MUST-FAIL — a caller-fault failure gives no alpha and no beta', () => {
@@ -63,7 +78,7 @@ describe('MUST-FAIL — a caller-fault failure gives no alpha and no beta', () =
   });
 
   test('the bare dispatcher detail abstains too (same token, no proxy prefix)', () => {
-    expect(computeDeltas(false, { type: 'execution_error', reason: "malformed_request: pointer must include a non-empty 'prompt' string" } as never, w()))
+    expect(computeDeltas(false, { type: 'execution_error', reason: DISPATCHER_DETAIL } as never, w()))
       .toEqual({ alphaDelta: 0, betaDelta: 0 });
   });
 });
@@ -74,17 +89,25 @@ describe('MUST-FAIL — the caller fault is classified and attributed to the cal
       { type: 'execution_error', reason: PROXY_REASON },
       { tasks: [{ task_id: 'gather', success: true }, { task_id: 'format_answer', success: false }] },
     );
-    expect(fc).toEqual({ class: 'malformed_request', step: 'format_answer' });
+    expect(fc).toEqual({ class: MALFORMED_REQUEST, step: 'format_answer' });
   });
 
   test('malformed_request is a member of the closed failure-class vocabulary', () => {
-    expect(FAILURE_CLASSES.has('malformed_request')).toBe(true);
+    expect(FAILURE_CLASSES.has(MALFORMED_REQUEST)).toBe(true);
+  });
+});
+
+describe('CONTRACT CONFORMANCE (green at base) — the reason this store receives is the fixture carrier', () => {
+  test('the carrier parses back to the malformed_request token, and a non-carrier reason does not', () => {
+    expect(carrierToken(PROXY_REASON)).toBe(MALFORMED_REQUEST);
+    expect(PROXY_REASON.startsWith('dev-vessel llm_completion_dispatch resolver returned structuredError (failure_mode=malformed_request): ')).toBe(true);
+    expect(carrierToken('connect ECONNREFUSED 127.0.0.1:8090')).toBeNull();
   });
 });
 
 describe('CONTROL — real failures keep their blame and their class', () => {
   test('a resolver structuredError that is not a caller fault is still blamed (beta 1) and stays resolver_error', () => {
-    const reason = 'dev-vessel llm_completion_dispatch resolver returned structuredError (failure_mode=verifier_negative): LLM vessel returned error or resolved=false';
+    const reason = formatCarrier('llm_completion_dispatch', 'verifier_negative', 'LLM vessel returned error or resolved=false');
     expect(computeDeltas(false, { type: 'execution_error', reason } as never, w())).toEqual({ alphaDelta: 0, betaDelta: 1 });
     expect(failureClassOf({ type: 'execution_error', reason }, {}).class).toBe('resolver_error');
   });
