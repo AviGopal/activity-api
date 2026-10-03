@@ -2989,6 +2989,15 @@ router.post('/resolve', async (c) => {
           gvlNonEmpty(gvlG.expected) &&
           gvlNonEmpty(gvlG.observed);
 
+        // CALIBRATION (migration 216): name purpose / window_id / sample_draw_id in the CREATE only
+        // when the caller supplied them. A SCHEMAFULL table rejects a CREATE naming an undefined
+        // field EVEN WITH a NONE value (measured, SurrealDB 3.0.5 without 216), so naming them on
+        // every write would kill ALL label writes — the fire-and-forget oracle feed included —
+        // wherever 216 has not applied. Field names are fixed literals; values stay bound.
+        const gvlCalibrationContent = (['purpose', 'window_id', 'sample_draw_id'] as const)
+          .filter((k) => gvlNonEmpty(gvlG[k]))
+          .map((k) => `${k}: $${k},\n              `)
+          .join('');
         try {
           const created = await executeAsAuth<any>(
             jwtAuth,
@@ -3007,10 +3016,7 @@ router.post('/resolve', async (c) => {
               expected: IF $expected IS NULL THEN NONE ELSE $expected END,
               observed: IF $observed IS NULL THEN NONE ELSE $observed END,
               evidence: IF $evidence IS NULL THEN NONE ELSE $evidence END,
-              purpose: IF $purpose IS NULL THEN NONE ELSE $purpose END,
-              window_id: IF $window_id IS NULL THEN NONE ELSE $window_id END,
-              sample_draw_id: IF $sample_draw_id IS NULL THEN NONE ELSE $sample_draw_id END,
-              grounded: $grounded,
+              ${gvlCalibrationContent}grounded: $grounded,
               created_at: time::now()
             }`,
             {
