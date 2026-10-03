@@ -11,8 +11,9 @@
  *
  * SEAM COVERED. The real route handler (default export of ./execution-traces, mounted on a
  * bare Hono app, no server entry, no port) driving the REAL applyOutcomeToPosteriors and the
- * real coalescing aggregator. Only the DB (and the modules execution-traces.account-id.test.ts
- * already mocks) is replaced. The DB mock is a small fixture store: the pre-read of
+ * real coalescing aggregator. Only the DB (and the exports execution-traces.account-id.test.ts
+ * stubs) is replaced, by spies on the real exports that are restored afterwards. The DB stub is
+ * a small fixture store: the pre-read of
  * `type::thing('execution', $execution_id)` returns the fixture row PROJECTED onto the
  * columns the SELECT actually names, exactly as SurrealDB would. So the test covers the
  * dropped-metadata joint end to end: a repair has to both fetch the row's metadata and
@@ -31,7 +32,7 @@
  * unit of beta), exactly as they do today.
  */
 
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, spyOn, beforeEach, afterAll } from 'bun:test';
 import { Hono } from 'hono';
 
 process.env.SURREALDB_NAMESPACE ??= 'activity-system';
@@ -80,56 +81,70 @@ function answer(sql: string, params: any): any {
   return [];
 }
 
-mock.module('../db/surreal', () => ({
-  surrealDB: {
-    query: async (sql: string, params: any) => answer(sql, params),
-    getInstance: async () => ({}),
-  },
-  queryWithAuth: async (_token: string, sql: string, params: any) => answer(sql, params),
-  createAuthenticatedClient: async () => ({}),
-}));
+// NO mock.module here. bun applies a module replacement to the whole test process and it outlives
+// this file, so a factory that omits an export breaks every later file importing it
+// (mock-module-completeness.test.ts), and even a complete one swaps real singletons under other
+// files. Instead spy on the REAL exports this route reaches, with the same stub behaviour the
+// factories had, and put every one back in afterAll. Real modules are loaded with await import()
+// so they see the env set above.
+const surrealMod = await import('../db/surreal');
+const redisMod = await import('../db/redis');
+const broadcasterMod = await import('../websocket/broadcaster');
+const paradigmMod = await import('../db/paradigm');
+const variantCreatorMod = await import('../services/variant-creator');
 
-mock.module('../db/redis', () => ({
-  // Complete factory on purpose: mock.module replaces the module globally for the run.
-  get redis() { return this.RedisClient.getInstance(); },
-  RedisClient: {
-    getInstance: () => ({
-      del: async () => 0,
-      get: async () => null,
-      set: async () => 'OK',
-      sadd: async () => 0,
-      smembers: async () => [],
-      srem: async () => 0,
-      withLock: async (_l: unknown, _c: unknown, fn: () => Promise<unknown>) => fn(),
-      getClient: () => null,
-    }),
-  },
-}));
+const spies: Array<{ mockRestore(): void }> = [];
+/** Spy on `obj[key]` if it is a function there. In a full run an earlier file's mock.module may
+ *  have replaced the module with a factory lacking `key`; skipping keeps this file loadable. */
+function stub(obj: any, key: string, impl: (...args: any[]) => unknown): void {
+  if (obj == null || typeof obj[key] !== 'function') return;
+  spies.push(spyOn(obj, key).mockImplementation(impl as never));
+}
 
-mock.module('../websocket/broadcaster', () => ({ broadcaster: { emit: () => {} } }));
+// DB: the fixture store answers every query; a real connection is refused so nothing un-stubbed
+// (queryRaw) can reach a server.
+stub(surrealMod.surrealDB, 'query', async (sql: string, params: any) => answer(sql, params));
+stub(surrealMod.surrealDB, 'queryAll', async (sql: string, params: any) => answer(sql, params));
+stub(surrealMod.surrealDB, 'getInstance', async () => ({}));
+stub(surrealMod.surrealDB, 'connect', async () => { throw new Error('SurrealDB is not available in this test'); });
+stub(surrealMod, 'queryWithAuth', async (_token: string, sql: string, params: any) => answer(sql, params));
+stub(surrealMod, 'createAuthenticatedClient', async () => ({}));
 
-mock.module('../db/paradigm', () => ({
-  insertActivity: async () => null,
-  insertExecution: async () => null,
-  getActivityScores: async () => ({ data: [], path: 'legacy' as const }),
-  getShapeConditionedScores: async () => ({ data: [], path: 'legacy' as const }),
-  queryActivitiesByShapes: async () => ({ data: [], path: 'legacy' as const }),
-  queryActivitiesByFTS: async () => ({ data: [], path: 'legacy' as const }),
-  queryActivitiesByDense: async () => ({ data: [], path: 'legacy' as const }),
-  transformToLegacyTemplate: (t: any) => t,
-  isDualWriteEnabled: () => false,
-  getVariantFamily: async () => ({ data: [], path: 'legacy' as const }),
-  getVariantScores: async () => ({ data: [], path: 'legacy' as const }),
-  buildVariantTree: async () => null,
-  normalizeActivityId: (id: string) =>
-    id.replace(/^activity:/, '').replace(/[⟨⟩`]/g, ''),
-  updateShapeActivityScores: async () => null,
-}));
+// Redis: the prototype covers both the `redis` export and RedisClient.getInstance().
+const redisProto = redisMod.RedisClient?.prototype;
+stub(redisProto, 'del', async () => 0);
+stub(redisProto, 'get', async () => null);
+stub(redisProto, 'set', async () => 'OK');
+stub(redisProto, 'sadd', async () => 0);
+stub(redisProto, 'smembers', async () => []);
+stub(redisProto, 'srem', async () => 0);
+stub(redisProto, 'withLock', async (_l: unknown, _c: unknown, fn: () => Promise<unknown>) => fn());
+stub(redisProto, 'getClient', () => null);
 
-mock.module('../services/variant-creator', () => ({
-  autoCreateVariantIfNeeded: async () => null,
-  checkAndRetireTemplate: async () => false,
-}));
+stub(broadcasterMod.broadcaster, 'emit', () => {});
+
+stub(paradigmMod, 'insertActivity', async () => null);
+stub(paradigmMod, 'insertExecution', async () => null);
+stub(paradigmMod, 'getActivityScores', async () => ({ data: [], path: 'legacy' as const }));
+stub(paradigmMod, 'getShapeConditionedScores', async () => ({ data: [], path: 'legacy' as const }));
+stub(paradigmMod, 'queryActivitiesByShapes', async () => ({ data: [], path: 'legacy' as const }));
+stub(paradigmMod, 'queryActivitiesByFTS', async () => ({ data: [], path: 'legacy' as const }));
+stub(paradigmMod, 'queryActivitiesByDense', async () => ({ data: [], path: 'legacy' as const }));
+stub(paradigmMod, 'transformToLegacyTemplate', (t: any) => t);
+stub(paradigmMod, 'isDualWriteEnabled', () => false);
+stub(paradigmMod, 'getVariantFamily', async () => ({ data: [], path: 'legacy' as const }));
+stub(paradigmMod, 'getVariantScores', async () => ({ data: [], path: 'legacy' as const }));
+stub(paradigmMod, 'buildVariantTree', async () => null);
+stub(paradigmMod, 'normalizeActivityId', (id: string) =>
+  id.replace(/^activity:/, '').replace(/[⟨⟩`]/g, ''));
+stub(paradigmMod, 'updateShapeActivityScores', async () => null);
+
+stub(variantCreatorMod, 'autoCreateVariantIfNeeded', async () => null);
+stub(variantCreatorMod, 'checkAndRetireTemplate', async () => false);
+
+afterAll(() => {
+  for (const s of spies.splice(0)) s.mockRestore();
+});
 
 const executionTracesRouter = (await import('./execution-traces')).default;
 const { flushPosteriors } = await import('../lib/posterior-aggregator');
