@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { spawn, type Subprocess } from 'bun';
+import { createScratchSurreal } from '../src/test-utils/scratch-surreal';
 
 /**
  * THE INSERT-PATH CONTEXT WRITE MUST USE AN INDEX, WITHOUT LOSING OR MERGING CELLS.
@@ -42,14 +42,13 @@ import { spawn, type Subprocess } from 'bun';
 
 const ROOT = new URL('..', import.meta.url).pathname;
 const read = (p: string) => readFileSync(ROOT + p, 'utf8');
-const PORT = 19_000 + Math.floor(Math.random() * 900);
-const URL_ = `http://127.0.0.1:${PORT}`;
-const PASS = crypto.randomUUID(); // per-run credential for the throwaway instance
+const ENGINE = createScratchSurreal(); // own throwaway instance: random 19xxx port, per-run credential
+const URL_ = ENGINE.url;
+const PASS = ENGINE.pass;
 const MIGRATIONS = ['088-context-thompson-scores', '095-account-id-additive', '099-account-id-permissions', '130-state-space-signature'];
 // Record ids are random, so which index the planner picks varies by copy; the read checks run
 // against DBS independent copies of the fixture.
 const DBS = 10;
-let proc: Subprocess | null = null;
 let startError = '';
 
 async function sql(text: string, db = 'd0'): Promise<any[]> {
@@ -153,24 +152,17 @@ let writeDb = 0;
 async function freshDb(): Promise<string> { const db = `w${writeDb++}`; await seed(db, true); return db; }
 
 beforeAll(async () => {
-  const hardStop = setTimeout(() => proc?.kill(), 180_000); // never outlive a wedged run
-  (hardStop as any).unref?.();
   try {
-    proc = spawn(['surreal', 'start', 'memory', '--bind', `127.0.0.1:${PORT}`, '--user', 'root', '--pass', PASS, '--log', 'none'], { stdout: 'ignore', stderr: 'ignore' });
-    let up = false;
-    for (let i = 0; i < 60 && !up; i++) {
-      try { up = (await fetch(`${URL_}/health`)).ok; } catch { /* not up yet */ }
-      if (!up) await Bun.sleep(100);
-    }
-    if (!up) throw new Error('surreal did not answer /health within 6 s');
+    const err = await ENGINE.start();
+    if (err) throw new Error(err);
     for (let d = 0; d < DBS; d++) await seed(`d${d}`);
   } catch (e) {
     startError = `cannot spawn surreal: ${e instanceof Error ? e.message : String(e)}`;
-    proc?.kill();
+    ENGINE.stop();
   }
 }, 120_000);
 
-afterAll(() => { proc?.kill(); });
+afterAll(() => { ENGINE.stop(); });
 
 describe('context_thompson_scores insert-path write', () => {
   it('the instrument is live: surreal started, the real migrations defined the indexes and account_id', async () => {
