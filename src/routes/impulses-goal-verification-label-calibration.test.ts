@@ -71,6 +71,9 @@ mock.module('../db/surreal', () => ({
   surrealDB: { query: async (sql: string, params?: Record<string, unknown>) => runSql(sql, params) },
   queryWithAuth: async (_t: string, sql: string, params?: Record<string, unknown>) => runSql(sql, params),
   createAuthenticatedClient: async () => ({}),
+  // every real export, so the global mock cannot break a later file's import
+  getDbStats: () => ({}),
+  dbStats: { snapshot: () => ({}) },
 }));
 
 const impulsesRoutes = (await import('./impulses')).default;
