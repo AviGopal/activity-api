@@ -36,9 +36,11 @@ function definedLabelFields(): Set<string> {
 type Row = Record<string, unknown>;
 const store: Row[] = [];
 let seq = 0;
+const createSql: string[] = [];
 
 function runSql(sql: string, params: Record<string, unknown> = {}): Row[] {
   if (/^\s*CREATE goal_verification_labels CONTENT/.test(sql)) {
+    createSql.push(sql);
     const schema = definedLabelFields();
     const row: Row = { id: `goal_verification_labels:${++seq}` };
     const body = sql.slice(sql.indexOf('{') + 1, sql.lastIndexOf('}'));
@@ -144,6 +146,23 @@ describe('goal_verification_label: calibration fields round-trip', () => {
   test('CONTROL: an unrecognised purpose is stored, never rejected (a fire-and-forget writer must not 500)', async () => {
     const w = await resolve({ ...BASE, execution_id: 'exec-other', purpose: 'something-new' });
     expect(w.status).toBe(200);
+  });
+
+  test('MUST-FAIL: a plain label\'s CREATE never names the calibration fields (writes survive a missing 216)', async () => {
+    // Measured on a local SurrealDB 3.0.5 with migrations 101/183/192 and NOT 216: a CREATE that
+    // names `purpose` is rejected ("no such field exists") EVEN WHEN the value is NONE. If the
+    // CREATE always named the fields, every label write — the fire-and-forget oracle feed
+    // included — would die until 216 applied. Only a label that carries the fields may name them.
+    createSql.length = 0;
+    const w = await resolve({ ...BASE, execution_id: 'exec-plain-sql' });
+    expect(w.status).toBe(200);
+    expect(createSql).toHaveLength(1);
+    expect(createSql[0]).not.toMatch(/\b(purpose|window_id|sample_draw_id)\b/);
+    createSql.length = 0;
+    await resolve({ ...BASE, execution_id: 'exec-cal-sql', purpose: 'calibration', window_id: 'w', sample_draw_id: 'd' });
+    expect(createSql[0]).toMatch(/\bpurpose\b/);
+    expect(createSql[0]).toMatch(/\bwindow_id\b/);
+    expect(createSql[0]).toMatch(/\bsample_draw_id\b/);
   });
 
   test('the migration defines the fields as option<string> with no ASSERT', () => {
