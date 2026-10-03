@@ -3002,6 +3002,14 @@ router.post('/resolve', async (c) => {
         // field EVEN WITH a NONE value (measured, SurrealDB 3.0.5 without 216), so naming them on
         // every write would kill ALL label writes — the fire-and-forget oracle feed included —
         // wherever 216 has not applied. Field names are fixed literals; values stay bound.
+        // NOTES: named only when the caller supplied a value. `notes` is option<string>, and a bound
+        // JS null arrives as NULL, which an option field REJECTS ("Found NULL for field `notes`"),
+        // measured on SurrealDB 2.3.10 through the surrealdb 2.0.8 SDK against node 1's live field
+        // set. Binding `notes ?? null` made every label written without notes a 500. A non-null
+        // value is still named and typed by the table as before (an empty string is kept).
+        const gvlNotesContent = gvlPointer.notes !== undefined && gvlPointer.notes !== null
+          ? `notes: $notes,\n              `
+          : '';
         const gvlCalibrationKeys = (['purpose', 'window_id', 'sample_draw_id'] as const)
           .filter((k) => gvlNonEmpty(gvlG[k]));
         const gvlCalibrationContent = gvlCalibrationKeys
@@ -3028,8 +3036,7 @@ router.post('/resolve', async (c) => {
               activity_id: $activity_id,
               verdict: $verdict,
               confidence: $confidence,
-              notes: $notes,
-              labeler: $labeler,
+              ${gvlNotesContent}labeler: $labeler,
               asserted_at: IF $asserted_at IS NULL THEN NONE ELSE $asserted_at END,
               source: IF $source IS NULL THEN NONE ELSE $source END,
               probe: IF $probe IS NULL THEN NONE ELSE $probe END,
