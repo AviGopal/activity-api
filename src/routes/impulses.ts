@@ -3002,14 +3002,26 @@ router.post('/resolve', async (c) => {
         // field EVEN WITH a NONE value (measured, SurrealDB 3.0.5 without 216), so naming them on
         // every write would kill ALL label writes — the fire-and-forget oracle feed included —
         // wherever 216 has not applied. Field names are fixed literals; values stay bound.
-        const gvlCalibrationContent = (['purpose', 'window_id', 'sample_draw_id'] as const)
-          .filter((k) => gvlNonEmpty(gvlG[k]))
+        const gvlCalibrationKeys = (['purpose', 'window_id', 'sample_draw_id'] as const)
+          .filter((k) => gvlNonEmpty(gvlG[k]));
+        const gvlCalibrationContent = gvlCalibrationKeys
           .map((k) => `${k}: $${k},\n              `)
           .join('');
+        // REFUSE, DON'T DEGRADE. Measured on SurrealDB 2.3.10 (the fleet version) without 216: the
+        // SCHEMAFULL table SILENTLY DROPS undefined fields and the CREATE succeeds, leaving a row
+        // indistinguishable from an ordinary human label — which goal-host would then apply as a
+        // reach override. A label carrying calibration fields is therefore written as ONE statement
+        // that checks the stored row and THROWs when a field did not land; a THROW inside the
+        // statement rolls the CREATE back (verified on 2.3.10: zero rows after the throw). Plain
+        // labels keep the bare CREATE and are unaffected wherever 216 has not applied.
+        const gvlGuard = gvlCalibrationKeys.map((k) => `$c[0].${k} != $${k}`).join(' OR ');
+        const gvlWrap = (createSql: string): string => gvlCalibrationKeys.length === 0
+          ? createSql
+          : `{ LET $c = (${createSql}); IF ${gvlGuard} { THROW "calibration fields were not stored on goal_verification_labels (migration 216 not applied)" }; RETURN $c; }`;
         try {
           const created = await executeAsAuth<any>(
             jwtAuth,
-            `CREATE goal_verification_labels CONTENT {
+            gvlWrap(`CREATE goal_verification_labels CONTENT {
               org_id: $org_id,
               goal: $goal,
               execution_id: $execution_id,
@@ -3026,7 +3038,7 @@ router.post('/resolve', async (c) => {
               evidence: IF $evidence IS NULL THEN NONE ELSE $evidence END,
               ${gvlCalibrationContent}grounded: $grounded,
               created_at: time::now()
-            }`,
+            }`),
             {
               org_id: jwtAuth.orgId,
               goal: gvlPointer.goal,
