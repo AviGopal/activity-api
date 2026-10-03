@@ -34,6 +34,8 @@ const generateJwtTokenImpl = mock(async (_ctx: unknown) => 'eyJ.real-jwt.signatu
 mock.module('../services/auth', () => ({
   validateApiKeyWithFallback: validateApiKeyWithFallbackImpl,
   generateJwtToken: generateJwtTokenImpl,
+  // The on-behalf-of Bearer path is not exercised here; refuse rather than invent behaviour.
+  validateBearerViaIdentity: async () => ({ authenticated: false, reason: 'not used by this test' }),
 }));
 
 mock.module('../db/surreal', () => ({

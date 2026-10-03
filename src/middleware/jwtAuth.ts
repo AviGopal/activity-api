@@ -27,9 +27,10 @@
  */
 
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { hostname } from 'node:os';
 import { Context, Next } from 'hono';
 import { createAuthenticatedClient } from '../db/surreal';
-import { validateApiKeyWithFallback, generateJwtToken } from '../services/auth';
+import { validateApiKeyWithFallback, generateJwtToken, validateBearerViaIdentity } from '../services/auth';
 import { logger } from '../utils/logger';
 import { getOrFetchValidatedApiKey, isTransientlyUnavailable } from './auth-cache';
 
@@ -68,6 +69,12 @@ export interface JwtAuthContext {
   role?: string;
   // Scopes from the token
   scopes?: string[];
+  /**
+   * Set when the caller arrived through a federation ingress with an on-behalf-of
+   * token: the node and the one shape it was granted, and the ingress (actor) that
+   * obtained it. The caller's own identity is in orgId/userId/keyId.
+   */
+  obo?: { node: string; shape: string; actorKeyId?: string };
 }
 
 /**
@@ -406,6 +413,221 @@ async function denyBearerUnlessPublic(c: Context, next: Next, reason: string): P
   );
 }
 
+type SessionClaims = {
+  id: string;
+  org_id?: string;
+  account_id?: string;
+  user_id?: string;
+  scopes?: string[];
+  project_ids?: string[];
+  project_id?: string;
+  instance_id?: string;
+  role?: string;
+};
+
+/**
+ * Open a SurrealDB session with `token` and read the tenant claims it carries. The
+ * session is the one PERMISSIONS judge: a token SurrealDB will not accept throws here.
+ */
+async function readSessionClaims(token: string): Promise<SessionClaims | null> {
+  const db = await createAuthenticatedClient(token);
+
+  // Query $auth to get claims
+  // NOTE: SELECT * FROM $auth doesn't work in SurrealDB - must use RETURN with explicit fields
+  // Phase A: also pull $token.account_id (JWT claim, separate from $auth row).
+  // SurrealDB binds JWT claims to $token; the access method may or may not
+  // populate $auth.account_id depending on the access definition. Reading
+  // both lets Phase B handlers consult $token.account_id directly via the
+  // returned context without re-querying.
+  // Read tenant claims from $token (JWT claims) AND $auth (SurrealDB
+  // auth record), preferring $token. The apikey_token ACCESS schema
+  // has no AUTHENTICATE clause that loads a record into $auth, so for
+  // JWTs minted by identity-vessel `$auth` is NONE and only $token
+  // carries the claims (org_id, user_id, role, project_ids). For
+  // JWTs that DO populate $auth (legacy session-bound flows), $auth
+  // wins because it can carry more recent revocation/role state.
+  const result = await db.query<[SessionClaims]>(`RETURN {
+      id: $auth.id ?? $token.id,
+      org_id: $auth.org_id ?? $token.org_id,
+      account_id: $auth.account_id ?? $token.account_id,
+      user_id: $auth.user_id ?? $token.user_id,
+      scopes: $auth.scopes ?? $token.scopes,
+      project_ids: $auth.project_ids ?? $token.project_ids,
+      project_id: $auth.project_id ?? $token.project_id,
+      instance_id: $auth.instance_id ?? $token.instance_id,
+      role: $auth.role ?? $token.role
+    }`);
+  const auth = result[0] || null;
+
+  await db.close();
+  return auth;
+}
+
+function contextFromSessionClaims(token: string, auth: SessionClaims): JwtAuthContext {
+  // Extract claims, handling SurrealDB record ID format (organizations:xyz -> xyz)
+  // MiniBob instances have project_id (singular), API key users have project_ids (array)
+  // The 'id' claim contains the keyId for API key-generated JWTs
+  return {
+    jwtToken: token,
+    orgId: String(auth.org_id || '').replace(/^organizations:/, ''),
+    // Phase A: account_id is optional during the rollout. Strip the
+    // record-id prefix if present (e.g. "accounts:abc" -> "abc"); leave
+    // undefined when the JWT claim is missing so Phase B handlers can
+    // fall back to org_id.
+    accountId: auth.account_id
+      ? String(auth.account_id).replace(/^accounts:/, '')
+      : undefined,
+    // MiniBob instances: singular project assignment
+    projectId: auth.project_id ? String(auth.project_id).replace(/^projects:/, '') : undefined,
+    // API key users: array of accessible projects from project_members
+    projectIds: Array.isArray(auth.project_ids)
+      ? auth.project_ids.map((p: unknown) => String(p).replace(/^projects:/, ''))
+      : undefined,
+    instanceId: auth.instance_id,
+    // For API key-generated JWTs, 'id' contains the keyId
+    keyId: auth.id ? String(auth.id) : undefined,
+    // Extract user_id if present
+    userId: auth.user_id ? String(auth.user_id).replace(/^users:/, '') : undefined,
+    authType: 'jwt',
+    // Role and scopes from JWT claims (used for admin-only operations)
+    role: auth.role ? String(auth.role) : undefined,
+    scopes: Array.isArray(auth.scopes) ? auth.scopes.map(String) : undefined,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Federation on-behalf-of (OBO) Bearer tokens
+// ---------------------------------------------------------------------------
+
+const OBO_TYP = 'obo';
+
+/** Decode a JWT payload WITHOUT verifying it. Used only to choose a validator. */
+function unverifiedJwtPayload(token: string): Record<string, unknown> | null {
+  try {
+    const part = token.split('.')[1];
+    if (!part) return null;
+    const v = JSON.parse(Buffer.from(part, 'base64url').toString('utf8')) as unknown;
+    return v && typeof v === 'object' ? (v as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The node this vessel serves as, named the way the federation transport names it
+ * when it asks identity for an on-behalf-of token (FED_SUBSTRATE_ID, else hostname),
+ * so the audience identity checks is the audience the token was minted for.
+ */
+function thisNode(): string {
+  return process.env['FED_SUBSTRATE_ID'] || hostname();
+}
+
+/**
+ * The shape this request resolves, from any envelope the fleet sends: flat
+ * `{ type }`, `{ pointer: { type } }`, `{ impulse: { type } }` and the impulse-contract
+ * `{ impulse: { pointer: { type } } }`. Hono caches the parsed body, so the route
+ * handler's own `c.req.json()` still works. null when the request names no shape.
+ */
+async function requestedShape(c: Context): Promise<string | null> {
+  if (c.req.method !== 'POST') return null;
+  let body: any;
+  try {
+    body = await c.req.json();
+  } catch {
+    return null;
+  }
+  if (!body || typeof body !== 'object') return null;
+  const candidates = [body.impulse?.pointer?.type, body.pointer?.type, body.impulse?.type, body.type];
+  const shape = candidates.find((v) => typeof v === 'string' && v.length > 0);
+  return (shape as string | undefined) ?? null;
+}
+
+// Validated OBO callers, keyed by a HASH of the token plus the audience, held until
+// shortly before the token's own expiry (never longer than OBO_CACHE_MAX_MS). The
+// ingress reuses one token for a burst of resolves; without this every one of them is
+// an identity round trip, all from this process and so all in one rate-limit bucket.
+const OBO_CACHE_MAX_MS = 60_000;
+const OBO_CACHE_MAX_ENTRIES = 1024;
+const oboCache = new Map<string, { ctx: JwtAuthContext; until: number }>();
+
+/** Test hook: forget validated OBO callers. */
+export function _resetOboCacheForTest(): void {
+  oboCache.clear();
+}
+
+/**
+ * Admit a caller that presents a federation on-behalf-of token.
+ *
+ * Identity validates it against the audience this request needs (this node + the
+ * requested shape). The request then runs on a DB session opened with the database
+ * token identity minted for that caller, which keeps the OBO's audience and expiry and
+ * carries the caller's org_id, so PERMISSIONS on $token.org_id scope every query. The
+ * context is `authType: 'jwt'`: that is what routes executeAsAuth and friends to
+ * queryWithAuth. There is NO path from here to root credentials and none to a locally
+ * minted general session; every failure is a refusal.
+ */
+async function authenticateOboBearer(c: Context, next: Next, token: string): Promise<Response | void> {
+  const shape = await requestedShape(c);
+  if (!shape) {
+    return denyBearerUnlessPublic(c, next, 'an on-behalf-of token is valid only for resolving the shape it names');
+  }
+  const node = thisNode();
+  const cacheKey = createHash('sha256').update(token).digest('hex') + '\u0000' + node + '/' + shape;
+  const hit = oboCache.get(cacheKey);
+  if (hit && hit.until > Date.now()) {
+    c.set('jwtAuth', hit.ctx);
+    noteAuthenticatedRequest(c, hit.ctx);
+    return next();
+  }
+
+  const verdict = await validateBearerViaIdentity(token, { node, shape });
+  if (!verdict.authenticated) {
+    if (verdict.transient) {
+      logger.warn('On-behalf-of validation unavailable (transient upstream failure)', { path: c.req.path });
+      return c.json(
+        { error: { code: 'IDENTITY_UNAVAILABLE', message: 'Bearer could not be validated: identity-vessel is rate-limiting or unavailable; retry' } },
+        503,
+      );
+    }
+    return denyBearerUnlessPublic(c, next, 'on-behalf-of token refused by identity');
+  }
+  // Identity must have classified it as on-behalf-of AND for exactly this audience. An
+  // identity that predates audience checks would otherwise validate it as a plain session.
+  if (!verdict.obo || verdict.obo.node !== node || verdict.obo.shape !== shape) {
+    return denyBearerUnlessPublic(c, next, 'identity did not confirm the on-behalf-of token for this node and shape');
+  }
+  if (!verdict.jwt || !verdict.orgId) {
+    return denyBearerUnlessPublic(c, next, 'identity returned no database session for the on-behalf-of caller');
+  }
+
+  let claims: SessionClaims | null;
+  try {
+    claims = await readSessionClaims(verdict.jwt);
+  } catch (error) {
+    logger.warn('On-behalf-of DB session refused', { error: (error as Error)?.message ?? String(error) });
+    return denyBearerUnlessPublic(c, next, 'on-behalf-of database session refused');
+  }
+  const ctx = claims ? contextFromSessionClaims(verdict.jwt, claims) : null;
+  if (!ctx || !ctx.orgId || ctx.orgId !== String(verdict.orgId).replace(/^organizations:/, '')) {
+    return denyBearerUnlessPublic(c, next, 'on-behalf-of database session does not carry the caller\'s org');
+  }
+  ctx.keyId = verdict.keyId ?? ctx.keyId;
+  ctx.userId = ctx.userId ?? verdict.userId;
+  ctx.obo = { node, shape, actorKeyId: verdict.obo.actor_key_id };
+
+  const expiresAt = Date.parse(String(verdict.obo.expires_at ?? verdict.jwtExpiresAt ?? ''));
+  const until = Math.min(Number.isFinite(expiresAt) ? expiresAt - 5_000 : 0, Date.now() + OBO_CACHE_MAX_MS);
+  if (until > Date.now()) {
+    if (oboCache.size >= OBO_CACHE_MAX_ENTRIES) oboCache.clear();
+    oboCache.set(cacheKey, { ctx, until });
+  }
+
+  logger.debug('On-behalf-of caller authenticated', { orgId: ctx.orgId, node, shape });
+  c.set('jwtAuth', ctx);
+  noteAuthenticatedRequest(c, ctx);
+  return next();
+}
+
 export async function jwtAuthMiddleware(c: Context, next: Next) {
   const authHeader = c.req.header('Authorization');
   logger.debug('Auth middleware called', {
@@ -560,84 +782,25 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
     return denyBearerUnlessPublic(c, next, 'Malformed JWT token structure');
   }
 
+  // A federation on-behalf-of token carries no database access claims, so a
+  // SurrealDB sign-in can never accept it: identity is its validator. The payload is
+  // DECODED here only to choose that validator; the signature is verified by identity
+  // (and every other Bearer's by SurrealDB), so a forged `typ` buys nothing but a refusal.
+  if (unverifiedJwtPayload(token)?.typ === OBO_TYP) {
+    return authenticateOboBearer(c, next, token);
+  }
+
   try {
     logger.info('JWT auth: attempting to validate token', { tokenLength: token.length });
     // Validate token by attempting to authenticate with SurrealDB
-    const db = await createAuthenticatedClient(token);
-
-    // Query $auth to get claims
-    // NOTE: SELECT * FROM $auth doesn't work in SurrealDB - must use RETURN with explicit fields
-    // Phase A: also pull $token.account_id (JWT claim, separate from $auth row).
-    // SurrealDB binds JWT claims to $token; the access method may or may not
-    // populate $auth.account_id depending on the access definition. Reading
-    // both lets Phase B handlers consult $token.account_id directly via the
-    // returned context without re-querying.
-    // Read tenant claims from $token (JWT claims) AND $auth (SurrealDB
-    // auth record), preferring $token. The apikey_token ACCESS schema
-    // has no AUTHENTICATE clause that loads a record into $auth, so for
-    // JWTs minted by identity-vessel `$auth` is NONE and only $token
-    // carries the claims (org_id, user_id, role, project_ids). For
-    // JWTs that DO populate $auth (legacy session-bound flows), $auth
-    // wins because it can carry more recent revocation/role state.
-    const result = await db.query<[{
-      id: string;
-      org_id?: string;
-      account_id?: string;
-      user_id?: string;
-      scopes?: string[];
-      project_ids?: string[];
-      project_id?: string;
-      instance_id?: string;
-      role?: string;
-    }]>(`RETURN {
-      id: $auth.id ?? $token.id,
-      org_id: $auth.org_id ?? $token.org_id,
-      account_id: $auth.account_id ?? $token.account_id,
-      user_id: $auth.user_id ?? $token.user_id,
-      scopes: $auth.scopes ?? $token.scopes,
-      project_ids: $auth.project_ids ?? $token.project_ids,
-      project_id: $auth.project_id ?? $token.project_id,
-      instance_id: $auth.instance_id ?? $token.instance_id,
-      role: $auth.role ?? $token.role
-    }`);
-    const auth = result[0] || null;
-
-    await db.close();
+    const auth = await readSessionClaims(token);
 
     if (!auth) {
       logger.warn('JWT valid but no auth claims found');
       return denyBearerUnlessPublic(c, next, 'JWT valid but no auth claims found');
     }
 
-    // Extract claims, handling SurrealDB record ID format (organizations:xyz -> xyz)
-    // MiniBob instances have project_id (singular), API key users have project_ids (array)
-    // The 'id' claim contains the keyId for API key-generated JWTs
-    const jwtAuth: JwtAuthContext = {
-      jwtToken: token,
-      orgId: String(auth.org_id || '').replace(/^organizations:/, ''),
-      // Phase A: account_id is optional during the rollout. Strip the
-      // record-id prefix if present (e.g. "accounts:abc" -> "abc"); leave
-      // undefined when the JWT claim is missing so Phase B handlers can
-      // fall back to org_id.
-      accountId: auth.account_id
-        ? String(auth.account_id).replace(/^accounts:/, '')
-        : undefined,
-      // MiniBob instances: singular project assignment
-      projectId: auth.project_id ? String(auth.project_id).replace(/^projects:/, '') : undefined,
-      // API key users: array of accessible projects from project_members
-      projectIds: Array.isArray(auth.project_ids)
-        ? auth.project_ids.map((p: unknown) => String(p).replace(/^projects:/, ''))
-        : undefined,
-      instanceId: auth.instance_id,
-      // For API key-generated JWTs, 'id' contains the keyId
-      keyId: auth.id ? String(auth.id) : undefined,
-      // Extract user_id if present
-      userId: auth.user_id ? String(auth.user_id).replace(/^users:/, '') : undefined,
-      authType: 'jwt',
-      // Role and scopes from JWT claims (used for admin-only operations)
-      role: auth.role ? String(auth.role) : undefined,
-      scopes: Array.isArray(auth.scopes) ? auth.scopes.map(String) : undefined,
-    };
+    const jwtAuth = contextFromSessionClaims(token, auth);
 
     logger.debug('JWT authentication successful', {
       orgId: jwtAuth.orgId,

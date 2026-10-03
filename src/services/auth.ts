@@ -232,6 +232,21 @@ export async function generateJwtToken(context: {
  */
 
 /**
+ * Where identity-vessel is asked: the configured (internal) URL first, the public
+ * endpoint only as a fallback for a transient failure of the first.
+ */
+function identityVesselUrls(): { primaryUrl: string; fallbackUrl: string } {
+  return {
+    primaryUrl:
+      process.env.IDENTITY_VESSEL_URL ||
+      'http://identity-vessel.activity-system.svc.cluster.local:8080',
+    fallbackUrl:
+      process.env.IDENTITY_VESSEL_EXTERNAL_URL ||
+      'https://identity.metabob.com',
+  };
+}
+
+/**
  * Validate API key via identity-vessel
  *
  * Tries the configured URL first, then falls back to external URL if internal fails.
@@ -239,15 +254,7 @@ export async function generateJwtToken(context: {
 export async function validateApiKeyViaIdentityVessel(
   apiKey: string
 ): Promise<AuthContext> {
-  // Try primary (internal) URL first
-  const primaryUrl =
-    process.env.IDENTITY_VESSEL_URL ||
-    'http://identity-vessel.activity-system.svc.cluster.local:8080';
-
-  // External fallback URL (public endpoint)
-  const fallbackUrl =
-    process.env.IDENTITY_VESSEL_EXTERNAL_URL ||
-    'https://identity.metabob.com';
+  const { primaryUrl, fallbackUrl } = identityVesselUrls();
 
   // Try primary URL
   const primaryResult = await tryIdentityVesselValidation(apiKey, primaryUrl);
@@ -552,6 +559,112 @@ async function validateApiKeyViaDiscovery(apiKey: string): Promise<AuthContext> 
     return {
       authenticated: false,
       reason: error instanceof Error ? error.message : 'Discovery failed',
+    };
+  }
+}
+
+// =============================================================================
+// Bearer validation by identity (federation on-behalf-of tokens)
+// =============================================================================
+
+/** The node and shape a validator serves: what an on-behalf-of token must be bound to. */
+export interface IdentityAudience {
+  node: string;
+  shape: string;
+}
+
+/** Identity's verdict on a Bearer, plus the database token it minted for that caller. */
+export interface BearerIdentityResult extends AuthContext {
+  /** Present only when identity classified the token as on-behalf-of and held it to the audience. */
+  obo?: { node: string; shape: string; actor_key_id?: string; expires_at?: string };
+  /**
+   * The SurrealDB token identity minted inline for this caller. For an on-behalf-of
+   * caller it keeps the OBO's audience and expiry and carries the caller's org_id, so a
+   * session opened with it is scoped by PERMISSIONS on $token.org_id.
+   */
+  jwt?: string;
+  jwtExpiresAt?: string;
+}
+
+/**
+ * Validate a Bearer token with identity-vessel, stating the audience this vessel
+ * serves for the request (`pointer.audience` and `X-Auth-Audience: <node>/<shape>`).
+ * Identity refuses an on-behalf-of token minted for any other node or shape.
+ *
+ * Only the configured identity is asked, never the public fallback the API-key path
+ * uses: an on-behalf-of token is minted by this substrate's identity for this node, so
+ * no other identity can validate it, and sending it elsewhere only spreads it.
+ */
+export async function validateBearerViaIdentity(
+  token: string,
+  audience: IdentityAudience,
+): Promise<BearerIdentityResult> {
+  const { primaryUrl } = identityVesselUrls();
+  try {
+    const response = await fetch(`${primaryUrl}/v1/auth/resolve`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Auth-Audience': `${audience.node}/${audience.shape}`,
+      },
+      body: JSON.stringify({
+        impulse: {
+          type: 'authentication',
+          pointer: { type: 'session', token, audience },
+        },
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!response.ok) {
+      logger.warn('[auth] Identity vessel refused Bearer', { url: primaryUrl, status: response.status, audience });
+      return {
+        authenticated: false,
+        reason: `Identity vessel returned ${response.status}`,
+        transient: response.status === 429 || response.status >= 500,
+      };
+    }
+
+    const result = (await response.json()) as {
+      success?: boolean;
+      data?: {
+        authenticated?: boolean;
+        orgId?: string;
+        accountId?: string;
+        userId?: string;
+        keyId?: string;
+        scopes?: string[];
+        reason?: string;
+        obo?: { node: string; shape: string; actor_key_id?: string; expires_at?: string };
+        jwt?: string;
+        jwt_expires_at?: string;
+      };
+    };
+    const d = result.data;
+    if (!result.success || !d?.authenticated) {
+      return { authenticated: false, reason: d?.reason || 'Validation failed' };
+    }
+    return {
+      authenticated: true,
+      orgId: d.orgId,
+      accountId: d.accountId,
+      userId: d.userId,
+      keyId: d.keyId,
+      scopes: d.scopes,
+      obo: d.obo,
+      jwt: d.jwt,
+      jwtExpiresAt: d.jwt_expires_at,
+      authMethod: 'identity-vessel',
+    };
+  } catch (error) {
+    logger.error('[auth] Identity vessel Bearer validation error', {
+      url: primaryUrl,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      authenticated: false,
+      reason: error instanceof Error ? error.message : 'Network error',
+      transient: true,
     };
   }
 }
