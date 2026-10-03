@@ -28,11 +28,22 @@
  *   - failureClassOf names class `malformed_request` (closed vocabulary) and its step is the
  *     calling task, so the fault is recorded against the step that sent the bad request.
  *
+ * THE SECOND WRITE SITE. propagateCreditAlongChain (posterior-update.ts) also writes
+ * thompson_alpha/_beta — to every ANCESTOR in the leaf's composition_chain (the walk threads one:
+ * runTemplate(..., { compositionChain })). Its only failure exemption is failure_mode.type ===
+ * 'cascading', so a caller-fault leaf still blames each prior step's arm: retirement evidence for
+ * templates that did nothing wrong. Pinned below through a child bun (POSTERIOR_COALESCE=0 so
+ * ancestor deltas go through the injected db, SURREALDB_URL on a closed local port so nothing
+ * real is reached; the module-level coalesce flag cannot be reset in-process).
+ *
  * SCOPE. Only the caller-fault token abstains. "unbindable required input: <name>" — the walk
  * declining to invoke a producer it could not bind — stays blamed: after the binding gate, a
  * template that still cannot bind a required input carries a broken config of its own.
  */
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // config.ts throws at import without these and posterior-update imports it transitively.
 process.env.SURREALDB_NAMESPACE = 'activity-system';
@@ -87,5 +98,51 @@ describe('CONTROL — real failures keep their blame and their class', () => {
     expect(computeDeltas(false, { type: 'execution_error', reason: 'connect ECONNREFUSED 127.0.0.1:8090' } as never, w()))
       .toEqual({ alphaDelta: 0, betaDelta: 0 });
     expect(computeDeltas(true, null, w())).toEqual({ alphaDelta: 1, betaDelta: 0 });
+  });
+});
+
+/** Run propagateCreditAlongChain in a child bun with a recording fake db; return its ancestor writes. */
+function ancestorWrites(failureMode: unknown): { coalesce: boolean; writes: Array<Record<string, unknown>> } {
+  const dir = mkdtempSync(join(tmpdir(), 'caller-fault-chain-'));
+  try {
+    const probe = join(dir, 'probe.ts');
+    writeFileSync(probe, `
+      const { propagateCreditAlongChain } = await import(${JSON.stringify(join(import.meta.dir, 'posterior-update.ts'))});
+      const { posteriorCoalesceEnabled } = await import(${JSON.stringify(join(import.meta.dir, 'posterior-aggregator.ts'))});
+      const writes = [];
+      const db = { query: async (sql, vars) => { if (/UPDATE variant_performance_metrics/.test(sql)) writes.push(vars); return []; } };
+      await propagateCreditAlongChain({ composition_chain: ['exec-gather', 'exec-plan'], success: false, failure_mode: JSON.parse(process.env.FM), activity_id: 'leaf' }, db, 'org-1');
+      console.log('RESULT ' + JSON.stringify({ coalesce: posteriorCoalesceEnabled(), writes }));
+      process.exit(0);
+    `);
+    const r = Bun.spawnSync(['bun', probe], {
+      env: {
+        HOME: process.env.HOME ?? '', PATH: process.env.PATH ?? '',
+        POSTERIOR_COALESCE: '0', SURREALDB_URL: 'http://127.0.0.1:9', TD_LAMBDA: '0.5',
+        SURREALDB_NAMESPACE: 'activity-system', SURREALDB_DATABASE: 'learning_loop',
+        FM: JSON.stringify(failureMode),
+      },
+      stdout: 'pipe', stderr: 'pipe',
+    });
+    const line = r.stdout.toString().split('\n').find((l) => l.startsWith('RESULT '));
+    expect(line, `probe produced no result: ${r.stderr.toString().slice(0, 400)}`).toBeDefined();
+    return JSON.parse(line!.slice('RESULT '.length));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe('ancestor chain credit (the second posterior write site)', () => {
+  test('CONTROL: a plain failed leaf still blames its ancestors (instrument proven through the same address)', () => {
+    const r = ancestorWrites({ type: 'verifier_negative' });
+    expect(r.coalesce).toBe(false);
+    expect(r.writes.map((w) => w.activity_id)).toEqual(['exec-plan', 'exec-gather']);
+    expect(r.writes.every((w) => (w.beta_delta as number) > 0)).toBe(true);
+  });
+
+  test('MUST-FAIL: a caller-fault leaf writes no alpha or beta to any ancestor', () => {
+    const r = ancestorWrites({ type: 'execution_error', reason: PROXY_REASON });
+    expect(r.coalesce).toBe(false);
+    expect(r.writes).toEqual([]);
   });
 });
