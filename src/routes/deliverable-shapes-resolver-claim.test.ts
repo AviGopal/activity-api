@@ -13,11 +13,12 @@
  *   a composite's terminal is admitted when each of its tasks names a resolver that is live in
  *   discovery. A task with no resolver claims nothing.
  *
- * "Advertised resolver" here: the task's `resolver` id (the field ias-executor dispatches on,
+ * "Claimed resolver" here: the id is a goal-host BUILTIN (BUILTIN_RESOLVER_IDS, see below), or the
+ * task's `resolver` id (the field ias-executor dispatches on,
  * engine.ts) is in discovery's /registry/shapes, the same single all-or-nothing read the handler
  * already makes (7bec2ca). goal-host registers its cross-vessel proxy resolvers BY SHAPE NAME, so
  * a resolver id is advertised exactly when that name is in the registry. Qualified
- * (`vessel:shape`) and goal-host-builtin resolver ids are deliberately not exercised here.
+ * (`vessel:shape`) resolver ids are deliberately not exercised here.
  *
  * The reached-run half of the gate (goal_execution_paths.successful_executions > 0) is satisfied
  * for every terminal in these fixtures so that only the advertisement half is under test.
@@ -27,8 +28,25 @@
  */
 import { describe, test, expect, spyOn, beforeEach, afterEach } from 'bun:test';
 import { Hono } from 'hono';
-import activitiesRouter from './activities';
+import * as activitiesModule from './activities';
 import { surrealDB } from '../db/surreal';
+
+const activitiesRouter = activitiesModule.default;
+
+/**
+ * Builtin resolver ids: resolvers goal-host registers in-process (ias-executor GoalHost plus
+ * goal-host-vessel builtins), which discovery never advertises. The engine's own list is runtime
+ * state (ResolverRegistry.list() on the host), not reachable from activity-api, so the ONE
+ * activity-api source is the set the promote gate already keeps inline (activities.ts
+ * `builtInResolvers`). The fix exports it as BUILTIN_RESOLVER_IDS and both gates read that one
+ * set. Read through a namespace import so its absence today fails only the tests that need it.
+ */
+function builtinResolverIds(): string[] {
+  const raw = (activitiesModule as Record<string, unknown>).BUILTIN_RESOLVER_IDS;
+  if (raw instanceof Set) return [...raw].filter((x): x is string => typeof x === 'string');
+  if (Array.isArray(raw)) return raw.filter((x): x is string => typeof x === 'string');
+  return [];
+}
 
 const DISCOVERY = 'http://discovery-resolver-claim.test';
 
@@ -128,6 +146,37 @@ describe('deliverable-shapes: a composite terminal is claimed when every task re
     expect(body.shapes).not.toContain('obsidian:write_note');
     expect(body.shapes).not.toContain('unclaimedTerminal');
     expect(body.shapes).not.toContain('halfClaimedTerminal');
+  });
+
+  test('CHECK: a composite whose task uses a BUILTIN resolver (not advertised in discovery) counts as claimed', async () => {
+    const builtins = builtinResolverIds();
+    expect(builtins.length).toBeGreaterThan(0); // BUILTIN_RESOLVER_IDS exported by ./activities
+    const builtin = builtins.find((b) => b !== 'compose' && b !== 'compose_parallel') ?? builtins[0]!;
+    templateRows = [
+      ...composites('memoryNote_write', [undefined, undefined]),
+      ...composites('builtinClaimedTerminal', [builtin, 'concept_search']),
+    ];
+    registryShapes = ['memoryNote_write', 'concept_search']; // the builtin id is NOT in the registry
+    expect(registryShapes).not.toContain(builtin);
+    const { status, body } = await deliverables();
+    expect(status).toBe(200);
+    expect(unexpectedFetches).toEqual([]);
+    expect(body.shapes).toContain('memoryNote_write');
+    expect(body.shapes).toContain('builtinClaimedTerminal');
+  });
+
+  test('MUST-FAIL: a resolver id that is neither builtin nor advertised is not claimed', async () => {
+    const unknown = 'no_such_resolver_xyzzy';
+    expect(builtinResolverIds()).not.toContain(unknown);
+    templateRows = [
+      ...composites('memoryNote_write', [undefined, undefined]),
+      ...composites('unknownResolverTerminal', [unknown, 'concept_search']),
+    ];
+    registryShapes = ['memoryNote_write', 'concept_search'];
+    const { status, body } = await deliverables();
+    expect(status).toBe(200);
+    expect(body.shapes).toContain('memoryNote_write');
+    expect(body.shapes).not.toContain('unknownResolverTerminal');
   });
 
   test('CONTROL: a terminal with a direct live advertiser is admitted regardless of task resolvers', async () => {
