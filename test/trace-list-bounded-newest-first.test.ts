@@ -223,11 +223,27 @@ describe('trace list: same rows, bounded work', () => {
   }, 120_000);
 
   it('THE DEFECT: Cache-Control: no-cache is never served from the page cache', async () => {
-    const q = 'limit=10&activity_id=a5';
-    const before = await list(ORG, q);
-    await sql(`CREATE type::thing('execution', 'fresh1') CONTENT { activity_id: 'a5', input_impulses: [], output_impulses: [], success: true, duration_ms: 10, cost_usd: 0.0, tokens_in: 0, tokens_out: 0, org_id: '${ORG}', executed_at: time::now(), created_at: time::now() };`);
-    const after = await list(ORG, q, { 'Cache-Control': 'no-cache' });
-    expect(before[0]).not.toBe('fresh1');
-    expect(after[0]).toBe('fresh1');
-  }, 60_000);
+    // The page cache lives 10 s. On a slow machine the entry can expire between the read that
+    // fills it and the bypass read, and an expired entry would let today's handler pass. So the
+    // bypass read must start within 5 s of the fill; a slower attempt proves nothing and is
+    // retried with a fresh key; three slow attempts fail as an instrument problem, never pass.
+    let verdict: string[] | null = null;
+    let freshId = '';
+    for (let attempt = 0; attempt < 3 && verdict === null; attempt++) {
+      const act = `cache${attempt}`;
+      freshId = `fresh${attempt}`;
+      // An explicit start_date: with none, the key carries now-24h bucketed to 10 s, so two reads
+      // straddling a bucket boundary miss each other and a stale page is never served to detect.
+      const q = `limit=10&activity_id=${act}&start_date=${encodeURIComponent(new Date(Date.now() - 2 * 3_600_000).toISOString())}`;
+      await sql(`CREATE type::thing('execution', 'old${attempt}') CONTENT { activity_id: '${act}', input_impulses: [], output_impulses: [], success: true, duration_ms: 10, cost_usd: 0.0, tokens_in: 0, tokens_out: 0, org_id: '${ORG}', executed_at: time::now() - 1h, created_at: time::now() };`);
+      const before = await list(ORG, q);
+      const filled = performance.now();
+      expect(before).toEqual([`old${attempt}`]);
+      await sql(`CREATE type::thing('execution', '${freshId}') CONTENT { activity_id: '${act}', input_impulses: [], output_impulses: [], success: true, duration_ms: 10, cost_usd: 0.0, tokens_in: 0, tokens_out: 0, org_id: '${ORG}', executed_at: time::now(), created_at: time::now() };`);
+      if (performance.now() - filled > 5_000) continue;
+      verdict = await list(ORG, q, { 'Cache-Control': 'no-cache' });
+    }
+    expect(verdict).not.toBeNull();
+    expect(verdict![0]).toBe(freshId);
+  }, 120_000);
 });
