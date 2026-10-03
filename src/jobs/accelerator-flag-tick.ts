@@ -57,7 +57,10 @@ async function evaluateSfBlend(): Promise<FlagResult> {
   const evidence = `sf_rows=${count}`;
   const desired = count >= 200 ? 1 : 0;
   const current = await getTuningParam(flag, undefined, 0);
-  const next = current === 1 ? 1 : desired;
+  // OFF verdict path: if SF_BLEND_VERDICT=0, force off and keep it off
+  const verdictFlag = 'SF_BLEND_VERDICT';
+  const verdict = await getTuningParam(verdictFlag, undefined, -1);
+  const next = verdict === 0 ? 0 : (current === 1 ? 1 : desired);
   let flipped = false;
   if (next !== current) {
     await writeTuningParam(flag, next);
