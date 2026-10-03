@@ -40,26 +40,80 @@
  * and every must-fail test also requires one audit row per row actually removed, so a silent event
  * cannot make "no uncompacted protected delete" pass vacuously.
  *
- * Runs against a THROWAWAY SurrealDB named by SCRATCH_SURREALDB_URL (same guard as
- * trace-retention.drain.test.ts: loopback only, never the substrate's DB ports, its own database);
- * SKIPPED without it.
+ * The ENGINE is a throwaway SurrealDB: the one named by SCRATCH_SURREALDB_URL (same guard as
+ * trace-retention.drain.test.ts: loopback only, never the substrate's DB ports), otherwise this
+ * file's OWN engine (src/test-utils/scratch-surreal.ts: memory storage, random 19xxx port, generated
+ * password, killed in afterAll and by a hard timer). Always its own database. NEVER SKIPPED: if no
+ * engine can start, every test fails and the ENGINE test names the cause ("cannot start engine").
+ *
+ * POLLUTED PROCESS. `bun test` runs every file in one process, so by the time this file loads, another
+ * file may already have resolved the client config (default URL) or mock.module'd ../db/surreal. The
+ * file then cannot address its engine in-process. Instead of skipping or failing for that reason, it
+ * re-runs ITSELF in a clean child `bun test` (own engine, own PID, bounded by a timer) and each test
+ * here asserts that the same-named test passed in the child, carrying the child's failure text. The
+ * child never re-spawns: polluted inside the child means fail closed.
  */
+import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { readFileSync } from 'fs';
+import { createScratchSurreal } from '../test-utils/scratch-surreal';
+
 const SCRATCH = process.env.SCRATCH_SURREALDB_URL ?? '';
 const TEST_DB = 'retention_evidence_compaction_test';
-if (SCRATCH) {
-  const u = new URL(SCRATCH);
+const OWN = SCRATCH ? null : createScratchSurreal();
+const ENGINE_URL = SCRATCH || OWN!.url;
+{
+  const u = new URL(ENGINE_URL);
   if (!['127.0.0.1', 'localhost'].includes(u.hostname) || ['8000', '18000'].includes(u.port)) {
-    throw new Error(`refusing non-scratch SurrealDB for a destructive test: ${SCRATCH}`);
+    throw new Error(`refusing non-scratch SurrealDB for a destructive test: ${ENGINE_URL}`);
   }
-  process.env.SURREALDB_URL = SCRATCH;
+  // Set before the client config is first imported (beforeAll imports it dynamically).
+  process.env.SURREALDB_URL = ENGINE_URL;
   process.env.SURREALDB_NAMESPACE = 'activity-system';
   process.env.SURREALDB_DATABASE = TEST_DB;
   process.env.SURREALDB_USERNAME = 'root';
-  process.env.SURREALDB_PASSWORD = process.env.SCRATCH_SURREALDB_PASS ?? 'root';
+  process.env.SURREALDB_PASSWORD = SCRATCH ? (process.env.SCRATCH_SURREALDB_PASS ?? 'root') : OWN!.pass;
+}
+/** '' once the engine and client are usable; the fail-closed reason otherwise. */
+let engineError = '';
+const IS_CHILD = process.env.EVIDENCE_RETENTION_CLEAN_CHILD === '1';
+/** Set when this process is polluted and the file ran in a clean child: test name -> outcome. */
+let childResults: Map<string, { ok: boolean; detail: string }> | null = null;
+const SELF = new URL(import.meta.url).pathname;
+const REPO = new URL('../..', import.meta.url).pathname;
+
+/** Run this file in a clean `bun test` child and collect its per-test outcomes. */
+async function runInCleanChild(): Promise<Map<string, { ok: boolean; detail: string }>> {
+  const env: Record<string, string> = { HOME: process.env.HOME ?? '', PATH: process.env.PATH ?? '', EVIDENCE_RETENTION_CLEAN_CHILD: '1' };
+  if (SCRATCH) { env['SCRATCH_SURREALDB_URL'] = SCRATCH; env['SCRATCH_SURREALDB_PASS'] = process.env.SCRATCH_SURREALDB_PASS ?? 'root'; }
+  const child = Bun.spawn([process.execPath, 'test', SELF], { cwd: REPO, env, stdout: 'pipe', stderr: 'pipe' });
+  const timer = setTimeout(() => child.kill(), 150_000); // only this child's PID
+  const [out, err] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  await child.exited;
+  clearTimeout(timer);
+  const text = (out + '\n' + err).replace(/\x1b\[[0-9;]*m/g, '');
+  const results = new Map<string, { ok: boolean; detail: string }>();
+  const lines = text.split('\n');
+  let block: string[] = [];
+  for (const line of lines) {
+    const m = line.match(/^\((pass|fail)\) .*? > (EVIDENCE-RETENTION .*?)(?: \[[0-9.]+m?s\])?$/);
+    if (m) { results.set(m[2]!, { ok: m[1] === 'pass', detail: block.slice(-40).join('\n') }); block = []; } else block.push(line);
+  }
+  if (results.size === 0) throw new Error(`clean child reported no results (exit ${child.exitCode}):\n${text.slice(-4000)}`);
+  return results;
 }
 
-import { describe, test, expect, beforeAll, beforeEach } from 'bun:test';
-import { readFileSync } from 'fs';
+/** Register a test that runs here, or — in a polluted process — asserts the clean child's verdict. */
+function check(name: string, fn: () => Promise<void>): void {
+  test(name, async () => {
+    if (childResults) {
+      const r = childResults.get(name);
+      expect(r, `clean child has no result for: ${name}`).toBeDefined();
+      if (!r!.ok) throw new Error(`failed in the clean child:\n${r!.detail}`);
+      return;
+    }
+    await fn();
+  }, 160_000);
+}
 
 const mig = (f: string) => readFileSync(new URL(`../../sql/migrations/${f}`, import.meta.url), 'utf8');
 const COUNTER_MIGRATION = mig('213-shape-score-counter.surql');
@@ -68,8 +122,6 @@ const LABEL_MIGRATIONS = [
   mig('183-relax-goal-verification-labeler-assert.surql'),
   mig('192-grounded-assertion-fields.surql'),
 ];
-
-const run = SCRATCH ? describe : describe.skip;
 
 type Mod = typeof import('./trace-retention');
 let M: Mod;
@@ -194,23 +246,38 @@ function strataCfg(activities: string[], cap: number) {
 }
 const cut = () => new Date(Date.now() - HOT_MS).toISOString();
 
-run('retention compacts graded/labelled evidence before any delete (real SurrealDB)', () => {
+describe('retention compacts graded/labelled evidence before any delete (real SurrealDB)', () => {
   beforeAll(async () => {
+    // Can this process address the engine at all? (See POLLUTED PROCESS above.)
+    let polluted = '';
     const { config } = await import('../config');
-    if (config.surrealdb.url !== SCRATCH || config.surrealdb.database !== TEST_DB) {
-      throw new Error(`client resolved ${config.surrealdb.url}/${config.surrealdb.database}, not the scratch DB — refusing`);
+    if (config.surrealdb.url !== ENGINE_URL || config.surrealdb.database !== TEST_DB) {
+      polluted = `client resolved ${config.surrealdb.url}/${config.surrealdb.database}, not the scratch DB`;
     }
-    M = await import('./trace-retention');
-    db = (await import('../db/surreal')).surrealDB;
-    if (typeof (db as { queryAll?: unknown }).queryAll !== 'function') {
-      throw new Error('../db/surreal is mocked in this process — run this file on its own');
+    const dbMod = await import('../db/surreal');
+    if (!polluted && typeof (dbMod.surrealDB as { queryAll?: unknown }).queryAll !== 'function') polluted = '../db/surreal is mocked in this process';
+    if (polluted) {
+      if (IS_CHILD) { engineError = `engine unusable in this process: ${polluted}`; return; }
+      try { childResults = await runInCleanChild(); } catch (e) { engineError = `engine unusable in this process (${polluted}) and the clean child failed: ${e instanceof Error ? e.message : String(e)}`; }
+      return;
     }
-    const TP = await import('../lib/tuning-params');
-    const TC = await import('../lib/telemetry-class');
-    clearTuning = () => { TP.__clearTuningParamCache(); TP.__clearTuningParamListCache(); TC.__clearTelemetryClassCache(); };
-  });
+    if (OWN) engineError = await OWN.start();
+    if (engineError) return;
+    try {
+      M = await import('./trace-retention');
+      db = dbMod.surrealDB;
+      const TP = await import('../lib/tuning-params');
+      const TC = await import('../lib/telemetry-class');
+      clearTuning = () => { TP.__clearTuningParamCache(); TP.__clearTuningParamListCache(); TC.__clearTelemetryClassCache(); };
+    } catch (e) {
+      engineError = `engine unusable: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  }, 170_000);
+  afterAll(() => { OWN?.stop(); });
 
   beforeEach(async () => {
+    if (engineError) throw new Error(engineError); // fail closed, never skip
+    if (childResults) return; // the tests read the clean child's verdicts
     protectedIds = new Set();
     await q([
       'execution', 'execution_observation', 'retention_audit', 'goal_verification_labels', 'trace_evidence_ref',
@@ -230,16 +297,21 @@ run('retention compacts graded/labelled evidence before any delete (real Surreal
     M.__resetStrataCursorForTest();
   });
 
+  check('EVIDENCE-RETENTION ENGINE: a throwaway SurrealDB is running and the client points at it (else: cannot start engine)', async () => {
+    expect(engineError).toBe('');
+    expect(await total()).toBe(0);
+  });
+
   // ── The instrument, both polarities (green at base) ─────────────────────────────────────────────
 
-  test('EVIDENCE-RETENTION INSTRUMENT: a protected row deleted with no observation record is audited had_obs=false', async () => {
+  check('EVIDENCE-RETENTION INSTRUMENT: a protected row deleted with no observation record is audited had_obs=false', async () => {
     const [id] = await seed('graded_reached', 1, { prefix: 'ia', ageDays: 3 });
     const r = await measured(() => q('DELETE type::thing("execution", $e) RETURN NONE', { e: id }));
     expect(r.removed).toBe(1);
     expect(r.uncompacted).toEqual([id!]);
   });
 
-  test('EVIDENCE-RETENTION INSTRUMENT: a record written first in the SAME transaction is audited had_obs=true; one written after is not', async () => {
+  check('EVIDENCE-RETENTION INSTRUMENT: a record written first in the SAME transaction is audited had_obs=true; one written after is not', async () => {
     const [a, b] = await seed('labelled', 2, { prefix: 'ib', ageDays: 3 });
     const r = await measured(() => db.queryAll(
       `BEGIN TRANSACTION;
@@ -256,7 +328,7 @@ run('retention compacts graded/labelled evidence before any delete (real Surreal
 
   // ── MUST-FAIL today ─────────────────────────────────────────────────────────────────────────────
 
-  test('EVIDENCE-RETENTION STRATUM: the reservoir deletes no graded row whose observation record was not written first; ungraded rows are still sampled and deleted', async () => {
+  check('EVIDENCE-RETENTION STRATUM: the reservoir deletes no graded row whose observation record was not written first; ungraded rows are still sampled and deleted', async () => {
     // One stratum (mixed-act / success), 200 cold rows, half graded, cap 10: at base the uniform
     // sample deletes ~95% of the graded half uncompacted.
     const ungraded = await seed('ungraded', 100, { prefix: 'su', activity: 'mixed-act', ageDays: 4 });
@@ -268,7 +340,7 @@ run('retention compacts graded/labelled evidence before any delete (real Surreal
     expect(r.deleted.filter((e) => ungradedSet.has(e)).length).toBeGreaterThan(0);
   });
 
-  test('EVIDENCE-RETENTION COMPACTION: every graded or labelled row a phase deletes has {execution_id, observation, instrument, horizon, code_version, at} written BEFORE its delete', async () => {
+  check('EVIDENCE-RETENTION COMPACTION: every graded or labelled row a phase deletes has {execution_id, observation, instrument, horizon, code_version, at} written BEFORE its delete', async () => {
     // An all-evidence stratum over its cap: the trace bodies may go, the observations may not.
     // Non-vacuous by construction: the reservoir must still bound this stratum (the trace store is
     // not the archive), so rows ARE deleted, and each one must have been compacted first.
@@ -288,11 +360,14 @@ run('retention compacts graded/labelled evidence before any delete (real Surreal
       expect(typeof o!['instrument']).toBe('string');
       expect(String(o!['instrument']).length).toBeGreaterThan(0);
       for (const k of ['horizon', 'code_version', 'at']) expect(Object.keys(o!)).toContain(k);
+      // No execution carries a code version today: the record says so explicitly, not by a silent null.
+      expect(o!['code_version']).toBeNull();
+      expect(o!['code_version_status']).toBe('unknown');
       expect(o!['at'] ?? null).not.toBeNull();
     }
   });
 
-  test('EVIDENCE-RETENTION VALVE: over the cap with old gradable rows and newer telemetry, telemetry and other non-gradable rows go first and NO gradable row is deleted', async () => {
+  check('EVIDENCE-RETENTION VALVE: over the cap with old gradable rows and newer telemetry, telemetry and other non-gradable rows go first and NO gradable row is deleted', async () => {
     const graded = await seed('graded_reached', 50, { prefix: 'vg', ageDays: 5 }); // oldest
     await seed('ungraded', 100, { prefix: 'vu', ageDays: 3 });
     await seed('telemetry', 100, { prefix: 'vt', ageDays: 1 }); // newest cold
@@ -305,7 +380,7 @@ run('retention compacts graded/labelled evidence before any delete (real Surreal
     expect(await total()).toBe(100); // the cap is still reached, from non-gradable rows only
   });
 
-  test('EVIDENCE-RETENTION VALVE: over the cap with ONLY gradable cold rows, the valve deletes nothing and reports the protected surplus (stoppedBy protected_only)', async () => {
+  check('EVIDENCE-RETENTION VALVE: over the cap with ONLY gradable cold rows, the valve deletes nothing and reports the protected surplus (stoppedBy protected_only)', async () => {
     await seed('graded_reached', 80, { prefix: 'og', ageDays: 4 });
     await seed('graded_not_reached', 70, { prefix: 'on', ageDays: 3 });
     const r = await measured(() => M.runCeilingDrainTick(cfgFor(100)));
@@ -314,7 +389,7 @@ run('retention compacts graded/labelled evidence before any delete (real Surreal
     expect(M.getLastCeilingOutcome()).toMatchObject({ remaining: 50, stoppedBy: 'protected_only' });
   });
 
-  test('EVIDENCE-RETENTION DRAINS: the range drain deletes no graded or labelled row without compaction', async () => {
+  check('EVIDENCE-RETENTION DRAINS: the range drain deletes no graded or labelled row without compaction', async () => {
     await seed('graded_reached', 20, { prefix: 'rg', ageDays: 5 });
     await seed('labelled', 20, { prefix: 'rl', ageDays: 4 });
     await seed('ungraded', 40, { prefix: 'ru', ageDays: 3 });
@@ -324,7 +399,7 @@ run('retention compacts graded/labelled evidence before any delete (real Surreal
     expect(r.uncompacted).toEqual([]);
   });
 
-  test('EVIDENCE-RETENTION DRAINS: the telemetry drain deletes no graded or labelled row without compaction', async () => {
+  check('EVIDENCE-RETENTION DRAINS: the telemetry drain deletes no graded or labelled row without compaction', async () => {
     // A declared telemetry id (no counter rows, no VPM credit, so the class guard accepts it) whose
     // cold tail also holds a reach-graded not-reached row, a labelled row, and rows an open gap and
     // the attempt ledger cite.
@@ -345,7 +420,7 @@ run('retention compacts graded/labelled evidence before any delete (real Surreal
 
   for (const kind of ['labelled', 'gap_ref', 'ledger_ref'] as const) {
     const label = { labelled: 'goal_verification_labels', gap_ref: 'an OPEN gap (trace_evidence_ref source gap)', ledger_ref: 'the attempt ledger (trace_evidence_ref source attempt_ledger)' }[kind];
-    test(`EVIDENCE-RETENTION PROTECTED: a cold row referenced by ${label} survives the valve while non-gradable rows remain`, async () => {
+    check(`EVIDENCE-RETENTION PROTECTED: a cold row referenced by ${label} survives the valve while non-gradable rows remain`, async () => {
       const [ref] = await seed(kind, 1, { prefix: `p${kind[0]}`, ageDays: 5 }); // the oldest row in the store
       await seed('ungraded', 60, { prefix: 'pu', ageDays: 3 });
       const r = await measured(() => M.runCeilingDrainTick(cfgFor(51))); // surplus 10
@@ -357,7 +432,7 @@ run('retention compacts graded/labelled evidence before any delete (real Surreal
 
   // ── CONTROLS (green at base, must stay green under the fix) ─────────────────────────────────────
 
-  test('EVIDENCE-RETENTION CONTROL: a telemetry-only store over the cap is trimmed exactly to the cap', async () => {
+  check('EVIDENCE-RETENTION CONTROL: a telemetry-only store over the cap is trimmed exactly to the cap', async () => {
     await seed('telemetry', 300, { prefix: 'ct', ageDays: 2 });
     await declare(TELE);
     const r = await measured(() => M.runTraceRetentionSweep(cfgFor(200)));
@@ -365,7 +440,7 @@ run('retention compacts graded/labelled evidence before any delete (real Surreal
     expect(await total()).toBe(200);
   });
 
-  test('EVIDENCE-RETENTION CONTROL: ungraded, unlabelled cold rows are deleted as before (stratum reservoir, then valve)', async () => {
+  check('EVIDENCE-RETENTION CONTROL: ungraded, unlabelled cold rows are deleted as before (stratum reservoir, then valve)', async () => {
     await seed('ungraded', 100, { prefix: 'cu', activity: 'plain-act', ageDays: 3 });
     const s = await measured(() => M.runTraceRetentionSweep(strataCfg(['plain-act'], 10)));
     expect(s.removed).toBe(90);
@@ -376,7 +451,7 @@ run('retention compacts graded/labelled evidence before any delete (real Surreal
     expect(await total()).toBe(4);
   });
 
-  test('EVIDENCE-RETENTION CONTROL: observation records survive a full sweep (incl. the orphan reap) and a refold query reads them by execution id', async () => {
+  check('EVIDENCE-RETENTION CONTROL: observation records survive a full sweep (incl. the orphan reap) and a refold query reads them by execution id', async () => {
     // Records compacted by an earlier sweep: their executions are already gone.
     const gone = ['old00001', 'old00002', 'old00003'];
     for (const e of gone) {
