@@ -83,7 +83,7 @@ jobs:
 
       - name: Install SurrealDB (engine version the substrate runs; DB-backed tests spawn it in memory)
         run: |
-          curl -sSfL https://github.com/surrealdb/surrealdb/releases/download/v2.3.3/surreal-v2.3.3.linux-amd64.tgz -o "$RUNNER_TEMP/surreal.tgz"
+          curl -sSfL https://github.com/surrealdb/surrealdb/releases/download/v2.3.10/surreal-v2.3.10.linux-amd64.tgz -o "$RUNNER_TEMP/surreal.tgz"
           sudo tar xzf "$RUNNER_TEMP/surreal.tgz" -C /usr/local/bin surreal
           surreal version
 
