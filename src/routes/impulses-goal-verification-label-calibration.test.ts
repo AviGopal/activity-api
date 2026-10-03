@@ -21,10 +21,14 @@ import { join } from 'node:path';
 
 const MIGRATIONS_DIR = join(import.meta.dir, '../../sql/migrations');
 
+/** Simulates an engine where migration 216 has NOT applied (set per test). */
+let skip216 = false;
+
 function definedLabelFields(): Set<string> {
   const fields = new Set<string>(['id']);
   for (const f of readdirSync(MIGRATIONS_DIR)) {
     if (!f.endsWith('.surql')) continue;
+    if (skip216 && f.startsWith('216-')) continue;
     const sql = readFileSync(join(MIGRATIONS_DIR, f), 'utf8');
     for (const m of sql.matchAll(/DEFINE FIELD (?:OVERWRITE |IF NOT EXISTS )?(\w+)\s+ON (?:TABLE )?goal_verification_labels\b/g)) {
       fields.add(m[1]!);
@@ -39,11 +43,16 @@ let seq = 0;
 const createSql: string[] = [];
 
 function runSql(sql: string, params: Record<string, unknown> = {}): Row[] {
-  if (/^\s*CREATE goal_verification_labels CONTENT/.test(sql)) {
+  // A guarded write is one statement — `{ LET $c = (CREATE …); IF $c[0].f != $p … { THROW … }; RETURN $c; }`
+  // — so a THROW rolls the CREATE back (verified on SurrealDB 2.3.10). Emulated here.
+  const guarded = /^\s*\{\s*LET \$c = \(CREATE goal_verification_labels CONTENT/.test(sql);
+  if (guarded || /^\s*CREATE goal_verification_labels CONTENT/.test(sql)) {
     createSql.push(sql);
     const schema = definedLabelFields();
     const row: Row = { id: `goal_verification_labels:${++seq}` };
-    const body = sql.slice(sql.indexOf('{') + 1, sql.lastIndexOf('}'));
+    const start = sql.indexOf('CONTENT {') + 'CONTENT {'.length;
+    const end = guarded ? sql.indexOf('})') : sql.lastIndexOf('}');
+    const body = sql.slice(start, end);
     for (const line of body.split('\n')) {
       const m = line.match(/^\s*(\w+):\s*(.+?),?\s*$/);
       if (!m) continue;
@@ -55,6 +64,12 @@ function runSql(sql: string, params: Record<string, unknown> = {}): Row[] {
       const v = params[ref[1]!];
       if (v === null || v === undefined) continue; // NONE
       row[key] = v;
+    }
+    if (guarded) {
+      for (const m of sql.matchAll(/\$c\[0\]\.(\w+) != \$(\w+)/g)) {
+        // SurrealDB: an absent field is NONE, and NONE != 'x' is true.
+        if (row[m[1]!] !== params[m[2]!]) throw new Error('An error occurred: ' + (sql.match(/THROW "([^"]*)"/)?.[1] ?? 'thrown'));
+      }
     }
     store.push(row);
     return [row];
@@ -191,6 +206,25 @@ describe('goal_verification_label: calibration fields round-trip', () => {
     // an empty exclude_purpose is ignored, not turned into a filter
     const rows2 = await readByExec('exec-unfiltered', { limit: 1, exclude_purpose: '' });
     expect(rows2[0]!.purpose).toBe('calibration');
+  });
+
+  test('MUST-FAIL: where 216 has not applied, a calibration label is REFUSED, never stored as an ordinary human verdict', async () => {
+    // Measured on SurrealDB 2.3.10 without 216: the SCHEMAFULL table SILENTLY DROPS the undefined
+    // purpose/window_id/sample_draw_id and the CREATE succeeds — the row is then indistinguishable
+    // from an ordinary human label, and goal-host would consume it as a reach override.
+    skip216 = true;
+    try {
+      const w = await resolve({ ...BASE, execution_id: 'exec-pre216', purpose: 'calibration', window_id: 'w', sample_draw_id: 'd' });
+      expect(w.status).not.toBe(200);
+      expect(w.body.success).toBe(false);
+      expect(await readByExec('exec-pre216')).toHaveLength(0);
+      // CONTROL: a plain label still writes on the same engine
+      const p = await resolve({ ...BASE, execution_id: 'exec-pre216-plain' });
+      expect(p.status).toBe(200);
+      expect(await readByExec('exec-pre216-plain')).toHaveLength(1);
+    } finally {
+      skip216 = false;
+    }
   });
 
   test('the migration defines the fields as option<string> with no ASSERT', () => {
