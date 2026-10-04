@@ -239,7 +239,11 @@ export async function getTuningParamList(name: string): Promise<string[]> {
     }
   } catch (err) {
     logger.warn('tuning-param list read failed', { name, error: err });
-    return listLastGood.get(name) || [];
+    const lastGood = listLastGood.get(name);
+    if (lastGood) {
+      listCache.set(name, { value: lastGood, expiresAt: now + CACHE_TTL_MS });
+    }
+    return lastGood ?? [];
   }
   if (value.length === 0 && listLastGood.has(name)) {
     return listLastGood.get(name)!;
