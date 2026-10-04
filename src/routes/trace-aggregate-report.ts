@@ -47,7 +47,9 @@ export interface TraceAggregateReportInput {
   metric?: string;
   window_hours?: number;
   limit?: number;
-  order?: string;
+    order?: string;
+  failure_class?: string;
+  reason_contains?: string;
 }
 
 export interface TraceAggregateAuthContext {
@@ -76,7 +78,7 @@ export interface TraceAggregateReport {
   query_ms: number;
 }
 
-const GROUP_FIELDS = new Set(['activity_id', 'status', 'variant_id']);
+const GROUP_FIELDS = new Set(['activity_id', 'status', 'variant_id', 'failure_class']);
 const METRICS = new Set(['count', 'failure_count', 'success_count', 'cost_sum']);
 
 function clampInt(v: unknown, def: number, min: number, max: number): number {
@@ -114,7 +116,17 @@ export async function runTraceAggregateReport(
   // success_count / failure_count pre-filter on the indexed `success` column so
   // the GROUP BY only touches matching rows (idx_aet_activity_success_time).
   if (metric === 'failure_count') where.push('success = false');
-  else if (metric === 'success_count') where.push('success = true');
+    else if (metric === 'success_count') where.push('success = true');
+
+  // Filter by failure class and reason text if provided.
+  if (typeof input.failure_class === 'string' && input.failure_class) {
+    where.push('failure_class = $failure_class');
+    params.failure_class = input.failure_class;
+  }
+  if (typeof input.reason_contains === 'string' && input.reason_contains) {
+    where.push('reason CONTAINS $reason_contains');
+    params.reason_contains = input.reason_contains;
+  }
 
   // API-key callers can't pass SurrealDB PERMISSIONS (self-signed JWT); apply an
   // app-side tenant filter. INDEX-AWARE: scope by `org_id` (covered by the
