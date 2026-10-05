@@ -41,7 +41,7 @@ export function createScratchSurreal(opts: { hardStopMs?: number; readyMs?: numb
       const hardStop = setTimeout(stop, opts.hardStopMs ?? 180_000); // never outlive a wedged run
       (hardStop as { unref?: () => void }).unref?.();
       try {
-        proc = spawn([bin, 'start', 'memory', '--bind', `127.0.0.1:${port}`, '--user', 'root', '--pass', pass, '--log', 'none'], { stdout: 'ignore', stderr: 'ignore' });
+        proc = spawn([bin, 'start', 'memory', '--bind', `127.0.0.1:${port}`, '--log', 'none'], { env: { ...process.env, SURREAL_USER: 'root', SURREAL_PASS: pass }, stdout: 'ignore', stderr: 'ignore' });
         const tries = Math.ceil((opts.readyMs ?? 6_000) / 100);
         let up = false;
         for (let i = 0; i < tries && !up; i++) {

@@ -67,7 +67,7 @@ beforeAll(async () => {
   const hardStop = setTimeout(() => proc?.kill(), 180_000);
   (hardStop as any).unref?.();
   try {
-    proc = spawn(['surreal', 'start', 'memory', '--bind', `127.0.0.1:${PORT}`, '--user', 'root', '--pass', PASS, '--log', 'none'], { stdout: 'ignore', stderr: 'ignore' });
+    proc = spawn(['surreal', 'start', 'memory', '--bind', `127.0.0.1:${PORT}`, '--log', 'none'], { env: { ...process.env, SURREAL_USER: 'root', SURREAL_PASS: PASS }, stdout: 'ignore', stderr: 'ignore' });
     let up = false;
     for (let i = 0; i < 60 && !up; i++) {
       try { up = (await fetch(`${URL_}/health`)).ok; } catch { /* not up yet */ }

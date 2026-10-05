@@ -68,7 +68,7 @@ export async function startRealSurreal(): Promise<RealSurreal> {
   };
 
   try {
-    proc = spawn(['surreal', 'start', 'memory', '--bind', `127.0.0.1:${port}`, '--user', 'root', '--pass', pass, '--log', 'none'], { stdout: 'ignore', stderr: 'ignore' });
+    proc = spawn(['surreal', 'start', 'memory', '--bind', `127.0.0.1:${port}`, '--log', 'none'], { env: { ...process.env, SURREAL_USER: 'root', SURREAL_PASS: pass }, stdout: 'ignore', stderr: 'ignore' });
   } catch (e) {
     throw new Error(`the surreal binary is not on PATH: ${e instanceof Error ? e.message : String(e)}`);
   }
