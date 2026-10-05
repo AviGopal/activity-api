@@ -192,6 +192,22 @@ describe('trace list: same rows, bounded work', () => {
     expect(await list(SPARSE, 'limit=100')).toEqual(want);
   }, 60_000);
 
+  it('no dates, pages a narrow first window cannot hold: filtered deep pages, the sparse tenant with an offset, the window\'s last rows', async () => {
+    // A window that starts narrow must widen until it holds offset+limit MATCHING rows. A fix that
+    // narrows without widening (or widens only for offset 0, or only for unfiltered requests) is
+    // right on the dense first page and wrong here. success=false is 1 row in 5, activity_id 1 in 7.
+    expect(await list(ORG, 'limit=100&offset=1500&success=false')).toEqual(await truth(ORG, 100, 1500, 'AND success = false'));
+    expect(await list(ORG, 'limit=40&offset=900&activity_id=a5')).toEqual(await truth(ORG, 40, 900, "AND activity_id = 'a5'"));
+    expect(await list(SPARSE, 'limit=5&offset=7')).toEqual(await truth(SPARSE, 5, 7));
+    // The oldest rows of the 24 h window: only a window widened to the full 24 h holds them.
+    const n = (await sql(`SELECT count() AS n FROM execution WITH NOINDEX WHERE org_id = '${ORG}' AND executed_at >= time::now() - 24h GROUP ALL;`))[0].result[0].n as number;
+    const tail = await list(ORG, `limit=100&offset=${n - 150}`);
+    const want = await truth(ORG, 100, n - 150);
+    // Rows age out of the window between the two reads; the handler may lag truth by a row or two at the edge.
+    expect(tail.slice(0, 90)).toEqual(want.slice(0, 90));
+    expect(tail.length).toBeGreaterThanOrEqual(95);
+  }, 120_000);
+
   it('explicit dates keep today\'s semantics exactly (window-dependent callers)', async () => {
     const since = new Date(Date.now() - 30 * 3_600_000).toISOString();
     const until = new Date(Date.now() - 2 * 3_600_000).toISOString();
@@ -218,6 +234,11 @@ describe('trace list: same rows, bounded work', () => {
     }
     // Fast only counts if it is right: a handler that errors or returns nothing must not pass here.
     for (const [lim, page] of pages) expect(page).toEqual(await truth(ORG, lim, 0));
+    // Fast only counts if it is right for EVERY page, not just the dense first one: a narrow window
+    // that never widens is fast and right at offset 0 and wrong for a deep page or a sparse tenant.
+    expect(await list(ORG, 'limit=100&offset=1900')).toEqual(await truth(ORG, 100, 1900));
+    expect(await list(ORG, 'limit=60&offset=700&success=false')).toEqual(await truth(ORG, 60, 700, 'AND success = false'));
+    expect(await list(SPARSE, 'limit=100')).toEqual(await truth(SPARSE, 100, 0));
     // Measured on 2.3.10: today ≈ 1× the reference; a narrow-first window ≈ 0.05×.
     expect(median(got)).toBeLessThan(median(ref) / 4);
   }, 120_000);
