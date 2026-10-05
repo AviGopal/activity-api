@@ -167,3 +167,59 @@ describe('trace aggregate c1 (real schema): group expressions per dimension', ()
     expect(r.truncated).toBe(true);
   }, 60_000);
 });
+
+describe('trace aggregate c3 (real schema): bound filters on the real fields', () => {
+  it('a failure_class filter counts exactly the rows of that class, wherever the class is stored', async () => {
+    // group_by activity_id keeps this independent of the failure_class GROUP dimension (c1).
+    const late = await runTraceAggregateReport(db, { group_by: 'activity_id', failure_class: K_VERDICT, limit: 50 }, AUTH);
+    expect(keyed(late)).toEqual({ 'agg-late': 4 }); // metadata.verdict_class, failure_mode NONE
+    const insert = await runTraceAggregateReport(db, { group_by: 'activity_id', failure_class: K_INSERT, limit: 50 }, AUTH);
+    expect(keyed(insert)).toEqual({ 'agg-insert': 3, [UNTIL_ACTIVITY]: 1 }); // failure_mode.class
+    const wins = await runTraceAggregateReport(db, { group_by: 'activity_id', failure_class: K_BOTH_VERDICT, limit: 50 }, AUTH);
+    expect(keyed(wins)).toEqual({ 'agg-both': 2 });
+    // The late verdict wins: rows whose verdict is another class are not counted under their insert class.
+    const loses = await runTraceAggregateReport(db, { group_by: 'activity_id', failure_class: K_BOTH_INSERT, limit: 50 }, AUTH);
+    expect(keyed(loses)).toEqual({ 'agg-loses-alone': 1 });
+  }, 60_000);
+
+  it('control: an injected failure_class value is bound as a parameter, matches nothing and never reaches the SQL text', async () => {
+    rs!.calls.length = 0;
+    const evil = `${K_VERDICT}' OR true --`;
+    const r = await runTraceAggregateReport(db, { group_by: 'activity_id', failure_class: evil, limit: 50 }, AUTH);
+    expect(sumRows(r)).toBe(0);
+    expect(rs!.calls.length).toBeGreaterThan(0);
+    for (const c of rs!.calls) expect(c.sql).not.toContain('OR true --');
+    expect(rs!.calls.some((c) => Object.values(c.params ?? {}).includes(evil))).toBe(true);
+  }, 60_000);
+
+  it('a reason_contains filter counts the rows whose insert-time failure reason carries the text, and only those', async () => {
+    rs!.calls.length = 0;
+    const r = await runTraceAggregateReport(db, { group_by: 'activity_id', reason_contains: REASON_TEXT, limit: 50 }, AUTH);
+    expect(keyed(r)).toEqual({ 'agg-insert': 3 });
+    expect(rs!.calls.some((c) => Object.values(c.params ?? {}).includes(REASON_TEXT))).toBe(true);
+    for (const c of rs!.calls) expect(c.sql).not.toContain(REASON_TEXT);
+    // A text no reason carries counts nothing; rows with no failure_mode do not make the query fail.
+    const none = await runTraceAggregateReport(db, { group_by: 'activity_id', reason_contains: `absent ${word()}`, limit: 50 }, AUTH);
+    expect(sumRows(none)).toBe(0);
+    expect(none.query_ms).toBeGreaterThanOrEqual(0);
+  }, 60_000);
+
+  it('the two filters compose: failure_class and reason_contains together count their intersection', async () => {
+    const both = await runTraceAggregateReport(db, { group_by: 'activity_id', failure_class: K_BOTH_INSERT, reason_contains: 'resolver said', limit: 50 }, AUTH);
+    expect(keyed(both)).toEqual({ 'agg-loses-alone': 1 });
+    const disjoint = await runTraceAggregateReport(db, { group_by: 'activity_id', failure_class: K_VERDICT, reason_contains: REASON_TEXT, limit: 50 }, AUTH);
+    expect(sumRows(disjoint)).toBe(0);
+  }, 60_000);
+
+  it('until_hours_ago bounds the window from above over stored rows and is echoed on the report', async () => {
+    // Rows of UNTIL_ACTIVITY sit at now-1h, now-50h and now-100h; two agg-late rows sit at now-30h and
+    // every other fixture row at now-1h. [now-72h, now-24h] holds exactly the now-50h and now-30h rows.
+    const r = await runTraceAggregateReport(db, { group_by: 'activity_id', window_hours: 48, until_hours_ago: 24, limit: 50 }, AUTH);
+    expect(keyed(r)).toEqual({ [UNTIL_ACTIVITY]: 1, 'agg-late': 2 });
+    expect((r as any).until_hours_ago).toBe(24);
+    // control: with no upper bound the same 48 h window holds the now-1h row too.
+    const open = await runTraceAggregateReport(db, { group_by: 'activity_id', window_hours: 48, limit: 50 }, AUTH);
+    expect(keyed(open)[UNTIL_ACTIVITY]).toBe(1);
+    expect(keyed(open)['agg-late']).toBe(6);
+  }, 60_000);
+});
