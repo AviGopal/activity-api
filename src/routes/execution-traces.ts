@@ -1128,7 +1128,7 @@ app.get('/', async (c) => {
       : null;
     if (cacheKey) {
       const hit = traceListCache.get(cacheKey);
-      if (hit && hit.expiresAt > Date.now()) {
+      if (hit && hit.expiresAt > Date.now() && !c.req.header('Cache-Control')?.includes('no-cache')) {
         logger.info('execution traces served from cache', {
           event: 'trace_list_cache_hit',
           org_id: effectiveOrgId,
