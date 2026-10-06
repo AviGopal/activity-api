@@ -67,7 +67,7 @@ export function successorFeaturesEnabled(): boolean {
 }
 
 export function successorFeaturesDiscount(): number {
-  return SF_DISCOUNT;
+  return parseFloat(process.env.SF_DISCOUNT ?? '0.9');
 }
 
 // ---------------------------------------------------------------------------
@@ -109,7 +109,7 @@ export interface TraceForSuccessorFeatures {
  */
 export function computeTraceOccupancy(
   trace: TraceForSuccessorFeatures,
-  discount: number = SF_DISCOUNT,
+  discount: number = successorFeaturesDiscount(),
 ): SparseVector {
   const vec: SparseVector = {};
   const add = (shapes: unknown, weight: number) => {
@@ -177,7 +177,8 @@ export async function updateSuccessorFeatures(
   const templateId = normalizeActivityId(trace.activity_id);
   if (!templateId) return;
 
-  const sample = computeTraceOccupancy(trace, SF_DISCOUNT);
+    const discount = successorFeaturesDiscount();
+  const sample = computeTraceOccupancy(trace, discount);
   const sampleKeys = Object.keys(sample);
   if (sampleKeys.length === 0) return; // nothing produced — no ψ signal
 
@@ -247,7 +248,7 @@ export async function updateSuccessorFeatures(
         tid: templateId,
         scope,
         org: orgId,
-        discount: SF_DISCOUNT,
+        discount: discount,
         vector,
         count: n + 1,
       },
