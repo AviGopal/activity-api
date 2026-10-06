@@ -29,7 +29,7 @@ import { enqueueVariantDelta, installPosteriorFlushOnShutdown } from './posterio
 import { embedSignatureForShapes } from '../jobs/signature-embed-backfill';
 import { applyClusterPosterior } from './cluster-posterior';
 import { getTuningParam } from './tuning-params';
-import { classifyReach } from './reach-classify';
+import { classifyReach, isReachInapplicable } from './reach-classify';
 import { countShapeOutcome } from './shape-score-counter';
 import { recordDecisionOutcome, recordExecutionDecisionOutcome } from './decision-credit';
 
@@ -1069,7 +1069,10 @@ export async function applyOutcomeToPosteriors(
   });
   const ungraded = reachVerdict === 'ungraded';
 
-  const failedByTask = ungraded && trace.success === false && (((trace as any).failure_count ?? 0) > 0 || ((trace as any).task_count ?? 0) === 0);
+  // The ungraded-failure arm (be6b5cd) blames an ungraded run whose tasks failed, so a template whose
+  // tasks throw cannot hide behind "ungraded". A reach-INAPPLICABLE run (telemetry:/declined:) is
+  // ungraded for a different reason — it was never attempting a goal — and is neither credited nor blamed.
+  const failedByTask = ungraded && !isReachInapplicable(trace) && trace.success === false && (((trace as any).failure_count ?? 0) > 0 || ((trace as any).task_count ?? 0) === 0);
   const effectiveSuccess = reachVerdict === 'reached';
   const { alphaDelta, betaDelta } = (ungraded && !failedByTask)
     ? { alphaDelta: 0, betaDelta: 0 }
