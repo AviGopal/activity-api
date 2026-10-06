@@ -68,6 +68,8 @@ export interface TraceForPosterior {
     resolver?: string;
     /** LLM-prompt marker; treated as stochastic by the classifier when resolver is absent. */
     prompt?: unknown;
+    /** Data-flow provenance of the impulses this task consumed (normalizePersistedTask). */
+    consumed_provenance?: Array<{ impulse_id: string; producer_execution_id: string | null; origin?: string }>;
   }>;
   org_id?: string;
   cost_usd?: number;
@@ -228,6 +230,32 @@ export interface ExecutionForChainCredit {
    * vertical-compose trace is unaffected).
    */
   sibling_group_size?: number;
+  /**
+   * Execution ids whose output a task of the leaf consumed (consumedProducersOf). When DEFINED, the
+   * trace declared its data flow and ancestor credit follows it: only a consumed producer in the chain
+   * is credited (reach) or blamed (failure). Undefined ⇒ no provenance was declared ⇒ call-lineage
+   * credit as before.
+   */
+  consumed_producers?: string[];
+}
+
+/**
+ * The producers whose output this trace consumed, from its tasks' consumed_provenance.
+ * undefined when no task declares provenance (the poster sent none, so data flow is unknown);
+ * [] when provenance was declared and nothing was produced by an execution. The trace's own
+ * execution is never returned: a leaf cannot credit itself through its own provenance.
+ */
+export function consumedProducersOf(trace: { execution_id?: string; tasks?: TraceForPosterior['tasks'] }): string[] | undefined {
+  const tasks = Array.isArray(trace.tasks) ? trace.tasks : [];
+  if (!tasks.some((t) => Array.isArray(t?.consumed_provenance))) return undefined;
+  const out = new Set<string>();
+  for (const t of tasks) {
+    for (const p of t?.consumed_provenance ?? []) {
+      const id = p?.producer_execution_id;
+      if (typeof id === 'string' && id.length > 0 && id !== trace.execution_id) out.add(id);
+    }
+  }
+  return [...out];
 }
 
 export interface UpdateSummary {
@@ -775,6 +803,8 @@ export async function propagateCreditAlongChain(
   const excludedAncestors = await resolveCreditPropagationExclusions(db);
 
   const isCascading = !success && failure_mode?.type === 'cascading';
+  // Declared data flow (consumedProducersOf); undefined ⇒ call-lineage credit as before.
+  const consumed = Array.isArray(execution.consumed_producers) ? new Set(execution.consumed_producers) : null;
 
   // composition_chain is root-first: [A, B, C, D].
   // The leaf (D, the executed activity) is NOT in composition_chain — it was
@@ -851,7 +881,14 @@ export async function propagateCreditAlongChain(
     let alphaDelta = 0;
     let betaDelta = 0;
 
-    if (success) {
+    if (consumed) {
+      // CREDIT FROM USE: the trace declared what it consumed. An ancestor whose output was not
+      // consumed did not contribute to this outcome and is neither credited nor blamed; a consumed
+      // producer takes the consumer's outcome whatever the call depth or failure type.
+      if (!consumed.has(ancestorExecId)) continue;
+      if (success) alphaDelta = decayFactor / siblingDivisor;
+      else betaDelta = decayFactor / siblingDivisor;
+    } else if (success) {
       alphaDelta = decayFactor / siblingDivisor;
     } else if (isCascading) {
       // For cascading: propagate β only to the direct parent (depth 1).
@@ -1385,6 +1422,7 @@ export async function applyOutcomeToPosteriors(
         success: effectiveSuccess,
         failure_mode: trace.failure_mode,
         sibling_group_size: trace.sibling_group_size,
+        consumed_producers: consumedProducersOf(trace),
       },
       db,
       orgId,

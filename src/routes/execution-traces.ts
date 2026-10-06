@@ -245,6 +245,7 @@ export function normalizePersistedTask(task: any): {
   success?: boolean;
   cost_usd?: number;
   consumed_from_task_ids?: string[];
+  consumed_provenance?: Array<{ impulse_id: string; producer_execution_id: string | null; origin?: string }>;
   child_activity_id?: string;
   input_shapes?: string[];
   output_shapes?: string[];
@@ -292,6 +293,23 @@ export function normalizePersistedTask(task: any): {
   }
   if (typeof task?.child_activity_id === 'string' && task.child_activity_id.length > 0) {
     out.child_activity_id = task.child_activity_id;
+  }
+  // Data-flow provenance (credit from use): which execution produced each impulse this task
+  // consumed, as goal-host records it (consumedProvenance). Chain credit reads it so a producer is
+  // credited or blamed by its consumer's outcome, not by having been called. Kept even when empty:
+  // an empty array DECLARES that nothing was consumed, which differs from an absent field.
+  const _prov = task?.consumed_provenance ?? task?.consumedProvenance;
+  if (Array.isArray(_prov)) {
+    out.consumed_provenance = _prov
+      .filter((p: any) => p && typeof (p.impulse_id ?? p.impulseId) === 'string')
+      .map((p: any) => {
+        const producer = p.producer_execution_id ?? p.producerExecutionId;
+        return {
+          impulse_id: String(p.impulse_id ?? p.impulseId),
+          producer_execution_id: typeof producer === 'string' && producer.length > 0 ? producer : null,
+          ...(typeof p.origin === 'string' ? { origin: p.origin } : {}),
+        };
+      });
   }
   // Per-task SHAPES (2026-08-13): preserve the shape sequence into the stored task
   // so a composite trace does NOT read ∅ → ∅ back — the ribosome's
