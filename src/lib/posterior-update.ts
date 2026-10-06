@@ -544,9 +544,15 @@ export function computeDeltas(
 // Impulse-relevance side-write for verifier_negative
 // ---------------------------------------------------------------------------
 
-const RELEVANCE_SINK_ENDPOINT =
-  process.env.RELEVANCE_SINK_ENDPOINT ?? "http://127.0.0.1:8255";
+/** Bootstrap endpoint, read at use (not frozen at import) so the configured value is the one used. */
+const relevanceSinkEndpoint = (): string => process.env.RELEVANCE_SINK_ENDPOINT ?? "http://127.0.0.1:8255";
+const RELEVANCE_PENALTY_TIMEOUT_MS = 5_000;
 
+/**
+ * Send the shaped penalty and report the rows the sink says it wrote. Every way the write can fail
+ * to land — an error status, a write that matched no row, an unreachable sink — is logged and
+ * reported as 0, so the penalty path cannot fail silently while its count claims success.
+ */
 export async function writeImpulseRelevancePenalty(
   trace: TraceForPosterior,
   db: DBQueryable,
@@ -567,15 +573,29 @@ export async function writeImpulseRelevancePenalty(
   // (impulseRelevancePenalty_write) on the vessel's standard resolve surface,
   // not a bespoke /penalty REST verb. Endpoint is bootstrap config; the SHAPE
   // is what discovery routes and the learning loop can grade.
-  fetch(`${RELEVANCE_SINK_ENDPOINT}/v2/impulses/resolve`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ impulse: { pointer: { type: "impulseRelevancePenalty_write", impulse_ids: uniqueIds, org_id: orgId } } }),
-  }).catch(() => {
-    // swallow errors; penalty writes are best-effort
-  });
-
-  return uniqueIds.length;
+  const apiKey = process.env.METABOB_API_KEY;
+  try {
+    const res = await fetch(`${relevanceSinkEndpoint()}/v2/impulses/resolve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `ApiKey ${apiKey}` } : {}) },
+      body: JSON.stringify({ impulse: { pointer: { type: "impulseRelevancePenalty_write", impulse_ids: uniqueIds, org_id: orgId } } }),
+      signal: AbortSignal.timeout(RELEVANCE_PENALTY_TIMEOUT_MS),
+    });
+    const payload = (await res.json().catch(() => null)) as { body?: { written?: unknown } } | null;
+    const written = typeof payload?.body?.written === "number" ? payload.body.written : 0;
+    if (!res.ok || written === 0) {
+      logger.warn("impulse-relevance penalty did not land", {
+        status: res.status, requested: uniqueIds.length, written, org_id: orgId, activity_id: trace.activity_id,
+      });
+    }
+    return res.ok ? written : 0;
+  } catch (err) {
+    logger.warn("impulse-relevance penalty write failed", {
+      requested: uniqueIds.length, org_id: orgId, activity_id: trace.activity_id,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return 0;
+  }
 }
 
 // ---------------------------------------------------------------------------
