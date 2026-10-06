@@ -825,6 +825,13 @@ export async function propagateCreditAlongChain(
   const isCascading = !success && failure_mode?.type === 'cascading';
   // Declared data flow (consumedProducersOf); undefined ⇒ call-lineage credit as before.
   const consumed = Array.isArray(execution.consumed_producers) ? new Set(execution.consumed_producers) : null;
+  // A consumed producer shares the consumer's failure only when the failure is the consumer's own to
+  // carry — the SAME classification the leaf is graded by (computeDeltas): an environmental failure, a
+  // victim (cascading) or a user abort blames no producer, a half-penalty class blames by half. A
+  // budget ceiling is the consumer's own resource limit, never the producer's output: no producer β.
+  const consumerBlame = success || failure_mode?.type === 'budget_exhausted'
+    ? 0
+    : computeDeltas(false, failure_mode, []).betaDelta;
 
   // composition_chain is root-first: [A, B, C, D].
   // The leaf (D, the executed activity) is NOT in composition_chain — it was
@@ -907,7 +914,7 @@ export async function propagateCreditAlongChain(
       // producer takes the consumer's outcome whatever the call depth or failure type.
       if (!consumed.has(ancestorExecId)) continue;
       if (success) alphaDelta = decayFactor / siblingDivisor;
-      else betaDelta = decayFactor / siblingDivisor;
+      else betaDelta = (decayFactor * consumerBlame) / siblingDivisor;
     } else if (success) {
       alphaDelta = decayFactor / siblingDivisor;
     } else if (isCascading) {
