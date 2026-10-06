@@ -87,11 +87,13 @@ describe('MUST-FAIL — ancestor credit follows the data flow when the trace dec
     expect(ws[0]!.alpha_delta).toBe(0);
   });
 
-  test('(a) a cascading failure still reaches a consumed producer two steps up (the call-depth heuristic does not decide blame)', () => {
-    const ws = ancestorWrites({ activity_id: 'leaf', composition_chain: CHAIN, success: false, failure_mode: { type: 'cascading' }, consumed_producers: ['exec-gather'] });
+  test('(a) a content failure reaches a consumed producer two steps up (the call-depth heuristic does not decide blame)', () => {
+    const ws = ancestorWrites({ activity_id: 'leaf', composition_chain: CHAIN, success: false, failure_mode: { type: 'verifier_negative' }, consumed_producers: ['exec-gather'] });
     expect(touched(ws)).toEqual(['exec-gather']);
     expect(ws[0]!.beta_delta).toBeGreaterThan(0);
   });
+  // A victim (cascading) blames no consumed producer: superseded 10-06 (qa), see
+  // consumer-failure-class-gates-producer-blame.test.ts.
 
   test('a declared-empty provenance (nothing consumed) credits and blames no ancestor', () => {
     expect(ancestorWrites({ activity_id: 'leaf', composition_chain: CHAIN, success: true, consumed_producers: [] })).toEqual([]);
