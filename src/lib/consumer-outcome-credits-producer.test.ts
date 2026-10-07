@@ -45,7 +45,7 @@ function ancestorWrites(execution: Record<string, unknown>): Write[] {
     writeFileSync(probe, `
       const { propagateCreditAlongChain } = await import(${JSON.stringify(join(import.meta.dir, 'posterior-update.ts'))});
       const writes = [];
-      const db = { query: async (sql, vars) => { if (/UPDATE variant_performance_metrics/.test(sql)) writes.push({ activity_id: vars.activity_id, alpha_delta: vars.alpha_delta, beta_delta: vars.beta_delta }); if (/FROM execution WHERE id IN/.test(sql)) return Object.keys(vars ?? {}).filter((k) => k.startsWith('a_')).map((k) => ({ execution_id: vars[k], variant_id: vars[k] })); return []; } };
+      const db = { query: async (sql, vars) => { if (/UPDATE variant_performance_metrics/.test(sql)) writes.push({ activity_id: vars.activity_id, alpha_delta: vars.alpha_delta, beta_delta: vars.beta_delta }); if (/FROM execution WHERE id IN/.test(sql)) return Object.keys(vars ?? {}).filter((k) => k.startsWith('a_')).map((k) => ({ execution_id: vars[k], variant_id: vars[k], org_id: 'org-1' })); return []; } };
       await propagateCreditAlongChain(JSON.parse(process.env.EXEC), db, 'org-1');
       console.log('RESULT ' + JSON.stringify(writes));
       process.exit(0);
@@ -140,7 +140,7 @@ function appliedAncestorWrites(trace: Record<string, unknown>): Write[] {
     writeFileSync(probe, `
       const { applyOutcomeToPosteriors } = await import(${JSON.stringify(join(import.meta.dir, 'posterior-update.ts'))});
       const writes = [];
-      const db = { query: async (sql, vars) => { if (/UPDATE variant_performance_metrics/.test(sql) && vars && typeof vars.activity_id === 'string' && vars.activity_id.startsWith('exec-')) writes.push({ activity_id: vars.activity_id, alpha_delta: vars.alpha_delta, beta_delta: vars.beta_delta }); if (/FROM execution WHERE id IN/.test(sql)) return Object.keys(vars ?? {}).filter((k) => k.startsWith('a_')).map((k) => ({ execution_id: vars[k], variant_id: vars[k] })); return []; }, queryAll: async () => [] };
+      const db = { query: async (sql, vars) => { if (/UPDATE variant_performance_metrics/.test(sql) && vars && typeof vars.activity_id === 'string' && vars.activity_id.startsWith('exec-')) writes.push({ activity_id: vars.activity_id, alpha_delta: vars.alpha_delta, beta_delta: vars.beta_delta }); if (/FROM execution WHERE id IN/.test(sql)) return Object.keys(vars ?? {}).filter((k) => k.startsWith('a_')).map((k) => ({ execution_id: vars[k], variant_id: vars[k], org_id: 'org-1' })); return []; }, queryAll: async () => [] };
       await applyOutcomeToPosteriors(JSON.parse(process.env.TRACE), db, 'org-1');
       await new Promise((r) => setTimeout(r, 300));
       console.log('RESULT ' + JSON.stringify(writes));

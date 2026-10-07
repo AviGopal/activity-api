@@ -25,7 +25,7 @@ import type { FailureMode } from '../models/schemas';
 import { seedPriorFromConcepts } from './prior-seed';
 import { lookupEmbeddingForSignature } from './embedding-lookup-cache';
 import { classifyTemplateTiers, type ResolverTier } from '../services/tier-classifier';
-import { enqueueVariantDelta, installPosteriorFlushOnShutdown, posteriorDeltasDroppedNoRow } from './posterior-aggregator';
+import { enqueueVariantDelta, installPosteriorFlushOnShutdown, posteriorDeltasDroppedNoRow, posteriorDeltasDroppedNoRowByKind, recentAncestorDeltas, recentNoRowDrops, recordAncestorDelta, recordNoRowDrop, type AncestorDeltaRecord, type NoRowDropRecord } from './posterior-aggregator';
 import { embedSignatureForShapes } from '../jobs/signature-embed-backfill';
 import { applyClusterPosterior } from './cluster-posterior';
 import { getTuningParam } from './tuning-params';
@@ -691,8 +691,13 @@ async function writeAncestorDelta(
   orgId: string,
   signature: string | null,
   signatureVersion: number = 1,
+  trail: { ancestorExecutionId?: string; leafActivityId?: string } = {},
 ): Promise<void> {
   if (alphaDelta === 0 && betaDelta === 0) return;
+  const record = recordAncestorDelta({
+    variant_id: ancestorId, org_id: orgId, alpha: alphaDelta, beta: betaDelta,
+    ancestor_execution_id: trail.ancestorExecutionId, leaf_activity_id: trail.leafActivityId,
+  });
 
   // Route the ancestor VPM delta through the coalescing aggregator just like the
   // leaf write (applyOutcomeToPosteriors). Chain-credit fans out to ≤4 ancestor
@@ -701,8 +706,8 @@ async function writeAncestorDelta(
   // was built to remove. enqueueVariantDelta folds them into Σδ; it returns false
   // only when coalescing is disabled, in which case we fall back to the sync UPDATE.
   try {
-    if (!enqueueVariantDelta(ancestorId, orgId, alphaDelta, betaDelta)) {
-      await db.query(
+    if (!enqueueVariantDelta(ancestorId, orgId, alphaDelta, betaDelta, 'ancestor', record)) {
+      const updated = await db.query(
         `
         UPDATE variant_performance_metrics
         SET
@@ -719,6 +724,14 @@ async function writeAncestorDelta(
           beta_delta: betaDelta,
         },
       );
+      // The synchronous fallback counts a zero-row UPDATE exactly as the coalesced flush does.
+      const rowsAffected = Array.isArray(updated) ? updated.length : (updated == null ? 0 : 1);
+      if (rowsAffected === 0) {
+        record.status = 'dropped_no_row';
+        await recordNoRowDrop(db as never, ancestorId, orgId, ['ancestor'], alphaDelta, betaDelta);
+      } else {
+        record.status = 'written';
+      }
     }
   } catch (err) {
     logger.warn('posterior-update: chain credit write to variant_performance_metrics failed', {
@@ -818,6 +831,8 @@ let chainCreditHits = 0;
 export function chainCreditAncestorHits(): number {
   return chainCreditHits;
 }
+/** Chain ancestors with a delta to write whose own execution row carries no org: nothing written (module lifetime). */
+let chainCreditOrgUnresolved = 0;
 
 /**
  * THE READER (2026-10-07). The chain-credit miss counter and the aggregator's no-row drop counter had no reader, so
@@ -825,12 +840,23 @@ export function chainCreditAncestorHits(): number {
  * misses a ratio. Served as /health checks.posterior_credit and as the shape posteriorCreditCounters, which
  * detectors and the learning loop read at use time.
  */
-export type PosteriorCreditCounters = { chain_ancestor_hits: number; chain_ancestor_misses: number; deltas_dropped_no_row: number };
+export type PosteriorCreditCounters = {
+  chain_ancestor_hits: number; chain_ancestor_misses: number; chain_ancestor_org_unresolved: number;
+  deltas_dropped_no_row: number; deltas_dropped_no_row_leaf: number; deltas_dropped_no_row_ancestor: number;
+};
+/** Scalars only: this is /health checks.posterior_credit. The rings ride on the shape below. */
 export function posteriorCreditCounters(): PosteriorCreditCounters {
-  return { chain_ancestor_hits: chainCreditHits, chain_ancestor_misses: chainCreditMisses, deltas_dropped_no_row: posteriorDeltasDroppedNoRow() };
+  const byKind = posteriorDeltasDroppedNoRowByKind();
+  return {
+    chain_ancestor_hits: chainCreditHits, chain_ancestor_misses: chainCreditMisses, chain_ancestor_org_unresolved: chainCreditOrgUnresolved,
+    deltas_dropped_no_row: posteriorDeltasDroppedNoRow(), deltas_dropped_no_row_leaf: byKind.leaf, deltas_dropped_no_row_ancestor: byKind.ancestor,
+  };
 }
-export function resolvePosteriorCreditCounters(): { shape: "posteriorCreditCounters"; body: PosteriorCreditCounters & { since: string } } {
-  return { shape: "posteriorCreditCounters", body: { ...posteriorCreditCounters(), since: COUNTERS_SINCE } };
+export function resolvePosteriorCreditCounters(): {
+  shape: "posteriorCreditCounters";
+  body: PosteriorCreditCounters & { since: string; recent_ancestor_deltas: AncestorDeltaRecord[]; recent_drops: NoRowDropRecord[] };
+} {
+  return { shape: "posteriorCreditCounters", body: { ...posteriorCreditCounters(), since: COUNTERS_SINCE, recent_ancestor_deltas: recentAncestorDeltas(), recent_drops: recentNoRowDrops() } };
 }
 const COUNTERS_SINCE = new Date().toISOString(); // counters are per process: a reader compares across restarts by this
 
@@ -872,7 +898,7 @@ export async function propagateCreditAlongChain(
   const siblingDivisor = Math.max(1, execution.sibling_group_size ?? 1);
 
   // Batch-resolve execution IDs to variant IDs.
-  type AncestorMeta = { variant_id: string; signature?: string; signature_version?: number };
+  type AncestorMeta = { variant_id: string; org_id?: string; signature?: string; signature_version?: number };
   let ancestorMetaByExecId: Map<string, AncestorMeta> = new Map();
   try {
     const limited = ancestors.slice(0, CREDIT_PROPAGATION_MAX_DEPTH);
@@ -889,8 +915,11 @@ export async function propagateCreditAlongChain(
     const things = limited.map((_, i) => `type::thing('execution', $a_${i})`).join(', ');
     const params: Record<string, unknown> = {};
     limited.forEach((id, i) => { params[`a_${i}`] = id; });
-    const rows = limited.length === 0 ? [] : await db.query<{ execution_id: string; variant_id: string; signature?: string; signature_version?: number }>(
-      `SELECT meta::id(id) AS execution_id, (variant_id ?? activity_id) AS variant_id, signature, signature_version
+    // org_id: the PRODUCER's own org. Its variant row is keyed by the org of its own trace, which is not always
+    // the consumer's (a consumer posted with no org lands under the 'public' fallback; producers under the
+    // substrate org), so crediting under the consumer's org updated no row.
+    const rows = limited.length === 0 ? [] : await db.query<{ execution_id: string; variant_id: string; org_id?: string; signature?: string; signature_version?: number }>(
+      `SELECT meta::id(id) AS execution_id, (variant_id ?? activity_id) AS variant_id, org_id, signature, signature_version
        FROM execution WHERE id IN [${things}]`,
       params,
     );
@@ -898,6 +927,7 @@ export async function propagateCreditAlongChain(
       if (row.execution_id && row.variant_id) {
         ancestorMetaByExecId.set(row.execution_id, {
           variant_id: row.variant_id,
+          org_id: typeof row.org_id === 'string' && row.org_id.length > 0 ? row.org_id : undefined,
           signature: typeof row.signature === 'string' ? row.signature : undefined,
           signature_version: typeof row.signature_version === 'number' ? row.signature_version : undefined,
         });
@@ -975,8 +1005,21 @@ export async function propagateCreditAlongChain(
       betaDelta = decayFactor / siblingDivisor;
     }
 
-    if (alphaDelta !== 0 || betaDelta !== 0) chainCreditHits++;
-    await writeAncestorDelta(ancestorId, alphaDelta, betaDelta, db, orgId, ancestorSig, ancestorSigVersion);
+    if (alphaDelta === 0 && betaDelta === 0) continue;
+    // NO DEFAULT ORG: a producer whose own row carries no org has no knowable variant row. Write nothing and
+    // count it; any fallback (the consumer's org, a 'public' default) would aim the delta at a guessed row.
+    if (!meta.org_id) {
+      chainCreditOrgUnresolved++;
+      logger.warn('posterior-update: chain ancestor execution row has no org_id; no credit written', {
+        ancestor_execution_id: ancestorExecId,
+        leaf_activity_id: execution.activity_id,
+        org_unresolved_total: chainCreditOrgUnresolved,
+      });
+      continue;
+    }
+    chainCreditHits++;
+    await writeAncestorDelta(ancestorId, alphaDelta, betaDelta, db, meta.org_id, ancestorSig, ancestorSigVersion,
+      { ancestorExecutionId: ancestorExecId, leafActivityId: execution.activity_id });
   }
 
   if (noSigCount > 0) {

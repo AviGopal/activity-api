@@ -51,7 +51,7 @@ function probe(execution: Record<string, unknown>): Probe {
       const db = { query: async (sql, vars) => {
         if (/UPDATE variant_performance_metrics/.test(sql)) writes.push({ activity_id: vars.activity_id, alpha_delta: vars.alpha_delta, beta_delta: vars.beta_delta });
         if (/FROM execution WHERE id IN/.test(sql)) return Object.keys(vars ?? {}).filter((k) => k.startsWith('a_')).map((k) => vars[k]).filter((id) => TABLE[id])
-          .map((id) => ({ execution_id: id, variant_id: TABLE[id].variant_id ?? TABLE[id].activity_id }));
+          .map((id) => ({ execution_id: id, variant_id: TABLE[id].variant_id ?? TABLE[id].activity_id, org_id: 'org-1' }));
         return [];
       } };
       const m0 = typeof PU.chainCreditAncestorMisses === 'function' ? PU.chainCreditAncestorMisses() : null;
