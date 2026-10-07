@@ -133,7 +133,7 @@ function ancestorWrites(failureMode: unknown): { coalesce: boolean; writes: Arra
       const { propagateCreditAlongChain } = await import(${JSON.stringify(join(import.meta.dir, 'posterior-update.ts'))});
       const { posteriorCoalesceEnabled } = await import(${JSON.stringify(join(import.meta.dir, 'posterior-aggregator.ts'))});
       const writes = [];
-      const db = { query: async (sql, vars) => { if (/UPDATE variant_performance_metrics/.test(sql)) writes.push(vars); return []; } };
+      const db = { query: async (sql, vars) => { if (/UPDATE variant_performance_metrics/.test(sql)) writes.push(vars); if (/FROM execution WHERE id IN/.test(sql)) return Object.keys(vars ?? {}).filter((k) => k.startsWith('a_')).map((k) => ({ execution_id: vars[k], variant_id: vars[k] })); return []; } };
       await propagateCreditAlongChain({ composition_chain: ['exec-gather', 'exec-plan'], success: false, failure_mode: JSON.parse(process.env.FM), activity_id: 'leaf' }, db, 'org-1');
       console.log('RESULT ' + JSON.stringify({ coalesce: posteriorCoalesceEnabled(), writes }));
       process.exit(0);

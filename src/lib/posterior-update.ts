@@ -808,6 +808,12 @@ async function writeAncestorDelta(
  *
  * This function is fire-and-forget safe: it never throws.
  */
+/** Chain ancestors skipped because their execution row could not be read (module lifetime). */
+let chainCreditMisses = 0;
+export function chainCreditAncestorMisses(): number {
+  return chainCreditMisses;
+}
+
 export async function propagateCreditAlongChain(
   execution: ExecutionForChainCredit,
   db: DBQueryable,
@@ -856,10 +862,17 @@ export async function propagateCreditAlongChain(
     // scans the entire org partition (~2s on 160K rows vs ~27ms point lookup —
     // EXPLAIN-verified 2026-06-21). The $ids come from THIS execution's own
     // composition_chain, so they are already org-scoped by provenance.
-    const rows = await db.query<{ execution_id: string; variant_id: string; signature?: string; signature_version?: number }>(
-      `SELECT execution_id, variant_id, signature, signature_version FROM v_paradigm_execution_traces
-       WHERE execution_id IN $ids`,
-      { ids: limited },
+    // POINT LOOKUP ON `execution` BY RECORD ID, not v_paradigm_execution_traces. That view is a
+    // materialized copy built out of band (migration 212); when it stopped following writes
+    // (2026-09-28) every lookup here missed and every chain credit was dropped. variant_id is
+    // derived exactly as the view derives it.
+    const things = limited.map((_, i) => `type::thing('execution', $a_${i})`).join(', ');
+    const params: Record<string, unknown> = {};
+    limited.forEach((id, i) => { params[`a_${i}`] = id; });
+    const rows = limited.length === 0 ? [] : await db.query<{ execution_id: string; variant_id: string; signature?: string; signature_version?: number }>(
+      `SELECT meta::id(id) AS execution_id, (variant_id ?? activity_id) AS variant_id, signature, signature_version
+       FROM execution WHERE id IN [${things}]`,
+      params,
     );
     for (const row of Array.isArray(rows) ? rows : []) {
       if (row.execution_id && row.variant_id) {
@@ -871,7 +884,7 @@ export async function propagateCreditAlongChain(
       }
     }
   } catch (err) {
-    logger.warn('posterior-update: chain exec→variant lookup failed, using chain entries as variant IDs', {
+    logger.warn('posterior-update: chain exec→variant lookup failed; no ancestor credit this trace', {
       error: err instanceof Error ? err.message : String(err),
     });
   }
@@ -881,10 +894,20 @@ export async function propagateCreditAlongChain(
   for (let i = 0; i < Math.min(ancestors.length, CREDIT_PROPAGATION_MAX_DEPTH); i++) {
     const ancestorExecId = ancestors[i];
     const meta = ancestorMetaByExecId.get(ancestorExecId);
-    // Resolve to variant_id; fall back to ancestorExecId itself (unit test compat).
+    // An ancestor whose execution row cannot be read has no known variant: write NOTHING and count
+    // it. Falling back to the execution id sent the delta to a row that cannot exist, a silent drop.
+    if (!meta) {
+      chainCreditMisses++;
+      logger.warn('posterior-update: chain ancestor has no execution row; no credit written', {
+        ancestor_execution_id: ancestorExecId,
+        leaf_activity_id: execution.activity_id,
+        misses_total: chainCreditMisses,
+      });
+      continue;
+    }
     // Normalize to strip the `activity:` prefix so the WHERE clause matches the
     // normalized form stored in variant_performance_metrics.
-    const ancestorId = normalizeActivityId(meta?.variant_id ?? ancestorExecId);
+    const ancestorId = normalizeActivityId(meta.variant_id);
     // Marginal-attribution (law 12): a shaped exclusion list removes named ubiquitous/infra
     // arms from ancestor credit so their posterior reflects only their own leaf outcomes,
     // instead of converging to the global chain rate.
@@ -896,7 +919,7 @@ export async function propagateCreditAlongChain(
     // When absent (transition period), skip the conditional write for this ancestor.
     const sigEntry = execution.ancestor_signatures?.[ancestorExecId];
     // Fall back to the ancestor's OWN recorded v1 signature (from its trace row, exposed
-    // on v_paradigm_execution_traces by migration 158) when the caller did not thread an
+    // on its execution row, read by the lookup above) when the caller did not thread an
     // explicit ancestor_signatures override. ancestor_signatures has NO populating caller,
     // so WITHOUT this fallback the signature-conditioned chain-credit write in
     // writeAncestorDelta was dead for every composition — composed pathways could never

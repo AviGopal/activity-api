@@ -33,7 +33,7 @@ function ancestorWrites(failure_mode: unknown): Write[] {
     writeFileSync(probe, `
       const { propagateCreditAlongChain } = await import(${JSON.stringify(join(import.meta.dir, 'posterior-update.ts'))});
       const writes = [];
-      const db = { query: async (sql, vars) => { if (/UPDATE variant_performance_metrics/.test(sql)) writes.push({ activity_id: vars.activity_id, alpha_delta: vars.alpha_delta, beta_delta: vars.beta_delta }); return []; } };
+      const db = { query: async (sql, vars) => { if (/UPDATE variant_performance_metrics/.test(sql)) writes.push({ activity_id: vars.activity_id, alpha_delta: vars.alpha_delta, beta_delta: vars.beta_delta }); if (/FROM execution WHERE id IN/.test(sql)) return Object.keys(vars ?? {}).filter((k) => k.startsWith('a_')).map((k) => ({ execution_id: vars[k], variant_id: vars[k] })); return []; } };
       await propagateCreditAlongChain({ activity_id: 'leaf', composition_chain: ['exec-gather', 'exec-plan'], success: false, failure_mode: JSON.parse(process.env.FM), consumed_producers: ['exec-gather'] }, db, 'org-1');
       console.log('RESULT ' + JSON.stringify(writes));
       process.exit(0);

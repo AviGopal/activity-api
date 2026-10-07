@@ -26,6 +26,9 @@ function makeDb(): { db: DBQueryable; calls: Array<{ sql: string; params: Record
   const db: DBQueryable = {
     async query(sql, params = {}) {
       calls.push({ sql, params });
+      // The chain-credit ancestor lookup (FROM execution WHERE id IN [...]): each ancestor's own row,
+      // with variant_id = its execution id, so the ancestor writes stay keyed as these cases name them.
+      if (/FROM execution WHERE id IN/.test(sql)) return Object.keys(params).filter((k) => k.startsWith('a_')).map((k) => ({ execution_id: params[k], variant_id: params[k] })) as any;
       return [];
     },
   };
@@ -40,6 +43,7 @@ function makeDbWithTraces(ancestorRows: AncestorRow[]): { db: DBQueryable; calls
     async query(sql, params = {}) {
       calls.push({ sql, params });
       if (sql.includes('activity_execution_traces')) return ancestorRows as any;
+      if (/FROM execution WHERE id IN/.test(sql)) { const ids = new Set(Object.keys(params).filter((k) => k.startsWith('a_')).map((k) => params[k])); return ancestorRows.filter((r) => ids.has(r.execution_id)) as any; }
       return [];
     },
   };
