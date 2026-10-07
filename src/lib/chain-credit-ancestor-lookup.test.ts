@@ -14,7 +14,7 @@
  *
  * The fake `execution` table below answers only the point lookup, maps each execution id to a
  * DIFFERENTLY named variant, and has no row for the ghost. The same query against the real schema is
- * checked by chain-credit-ancestor-lookup.real-schema.check.ts (run by name: it needs a real
+ * checked by test/lib/chain-credit-ancestor-lookup.real-schema.check.ts (run by path: it needs a real
  * SurrealDB, which this suite's gate cannot start).
  *
  * Child bun probe (same harness as consumer-outcome-credits-producer.test.ts): POSTERIOR_COALESCE=0 so

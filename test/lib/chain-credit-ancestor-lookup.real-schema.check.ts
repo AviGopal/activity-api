@@ -3,10 +3,10 @@ process.env.SURREALDB_NAMESPACE ??= 'activity-system';
 process.env.SURREALDB_DATABASE ??= 'learning_loop';
 
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
-import { startRealSurreal, type RealSurreal } from '../../test/support/real-surreal';
+import { startRealSurreal, type RealSurreal } from '../support/real-surreal';
 
-const pu = await import('./posterior-update');
-const agg = await import('./posterior-aggregator');
+const pu = await import('../../src/lib/posterior-update');
+const agg = await import('../../src/lib/posterior-aggregator');
 
 /**
  * CHAIN CREDIT MUST REACH THE ANCESTOR'S VARIANT ROW, checked against a REAL SurrealDB carrying the
@@ -28,10 +28,12 @@ const agg = await import('./posterior-aggregator');
  * Needs the `surreal` binary on PATH (present in the substrate image); if it is missing every test
  * FAILS rather than skipping.
  *
- * NOT IN TEST DISCOVERY (named .check.ts, run by path: `bun test ./src/lib/chain-credit-ancestor-lookup.real-schema.check.ts`).
+ * NOT IN TEST DISCOVERY (named .check.ts, run by path: `bun test ./test/lib/chain-credit-ancestor-lookup.real-schema.check.ts`).
+ * It lives under test/, outside tsconfig's include (src/**): under src/ it pulled test/support into the src rootDir
+ * and broke `tsc --noEmit` (TS6059/TS2339/TS2307).
  * The pull-sync gate cannot start a real SurrealDB (the instruments of every real-schema file sit in
  * its failing baseline), so in the corpus these tests would be new red the gate refuses. The gated
- * check of the same rule is chain-credit-ancestor-lookup.test.ts; this file is the evidence that
+ * check of the same rule is src/lib/chain-credit-ancestor-lookup.test.ts; this file is the evidence that
  * the lookup query is valid against the real schema, which a fake db cannot give.
  */
 
@@ -75,7 +77,7 @@ async function resetBetas(): Promise<void> {
 async function failedComposite(chain: string[], consumed: string[]): Promise<void> {
   await pu.propagateCreditAlongChain(
     { activity_id: `leaf-${W}`, composition_chain: chain, success: false, failure_mode: { type: 'verifier_negative' }, consumed_producers: consumed } as any,
-    rs!.moduleClient as any,
+    (rs as any).moduleClient,
     ORG,
   );
   await agg.flushPosteriors();
