@@ -25,7 +25,7 @@ import type { FailureMode } from '../models/schemas';
 import { seedPriorFromConcepts } from './prior-seed';
 import { lookupEmbeddingForSignature } from './embedding-lookup-cache';
 import { classifyTemplateTiers, type ResolverTier } from '../services/tier-classifier';
-import { enqueueVariantDelta, installPosteriorFlushOnShutdown } from './posterior-aggregator';
+import { enqueueVariantDelta, installPosteriorFlushOnShutdown, posteriorDeltasDroppedNoRow } from './posterior-aggregator';
 import { embedSignatureForShapes } from '../jobs/signature-embed-backfill';
 import { applyClusterPosterior } from './cluster-posterior';
 import { getTuningParam } from './tuning-params';
@@ -813,6 +813,26 @@ let chainCreditMisses = 0;
 export function chainCreditAncestorMisses(): number {
   return chainCreditMisses;
 }
+/** Chain ancestors that resolved to a variant and were written a non-zero delta (module lifetime). */
+let chainCreditHits = 0;
+export function chainCreditAncestorHits(): number {
+  return chainCreditHits;
+}
+
+/**
+ * THE READER (2026-10-07). The chain-credit miss counter and the aggregator's no-row drop counter had no reader, so
+ * neither whether chain credit lands nor how often it is lost was observable (the hollow-write class). Hits make the
+ * misses a ratio. Served as /health checks.posterior_credit and as the shape posteriorCreditCounters, which
+ * detectors and the learning loop read at use time.
+ */
+export type PosteriorCreditCounters = { chain_ancestor_hits: number; chain_ancestor_misses: number; deltas_dropped_no_row: number };
+export function posteriorCreditCounters(): PosteriorCreditCounters {
+  return { chain_ancestor_hits: chainCreditHits, chain_ancestor_misses: chainCreditMisses, deltas_dropped_no_row: posteriorDeltasDroppedNoRow() };
+}
+export function resolvePosteriorCreditCounters(): { shape: "posteriorCreditCounters"; body: PosteriorCreditCounters & { since: string } } {
+  return { shape: "posteriorCreditCounters", body: { ...posteriorCreditCounters(), since: COUNTERS_SINCE } };
+}
+const COUNTERS_SINCE = new Date().toISOString(); // counters are per process: a reader compares across restarts by this
 
 export async function propagateCreditAlongChain(
   execution: ExecutionForChainCredit,
@@ -897,6 +917,9 @@ export async function propagateCreditAlongChain(
     // An ancestor whose execution row cannot be read has no known variant: write NOTHING and count
     // it. Falling back to the execution id sent the delta to a row that cannot exist, a silent drop.
     if (!meta) {
+      // Only an ancestor this trace would have credited is a miss: under declared data flow an unconsumed ancestor
+      // is neither credited nor blamed, so its missing row loses nothing (counting it inflated the misses).
+      if (consumed && !consumed.has(ancestorExecId)) continue;
       chainCreditMisses++;
       logger.warn('posterior-update: chain ancestor has no execution row; no credit written', {
         ancestor_execution_id: ancestorExecId,
@@ -952,6 +975,7 @@ export async function propagateCreditAlongChain(
       betaDelta = decayFactor / siblingDivisor;
     }
 
+    if (alphaDelta !== 0 || betaDelta !== 0) chainCreditHits++;
     await writeAncestorDelta(ancestorId, alphaDelta, betaDelta, db, orgId, ancestorSig, ancestorSigVersion);
   }
 

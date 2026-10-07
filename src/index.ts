@@ -148,6 +148,12 @@ app.get('/health', async (c) => {
     // Pool stats are advisory; never fail the health check on them.
   }
 
+  // Chain-credit hits/misses and posterior deltas dropped for want of a row (advisory; never fails the check).
+  try {
+    const { posteriorCreditCounters } = await import('./lib/posterior-update');
+    healthStatus.checks.posterior_credit = posteriorCreditCounters();
+  } catch { /* advisory */ }
+
   let allHealthy = true;
 
   // Check Redis connectivity

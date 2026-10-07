@@ -896,6 +896,12 @@ router.post('/resolve', async (c) => {
     let content: string;
 
     switch (pointer.type) {
+      case 'posteriorCreditCounters': {
+        // Chain-credit hits/misses and the aggregator's no-row drops, read at use time (posterior-update THE READER).
+        const { resolvePosteriorCreditCounters } = await import('../lib/posterior-update');
+        const r = resolvePosteriorCreditCounters();
+        return c.json({ success: true, shape: r.shape, body: r.body, content: JSON.stringify(r.body) } as unknown as ImpulseResolveResponse);
+      }
       case 'activityExecutionTrace': {
         if (!pointer.executionId) {
           return c.json({
