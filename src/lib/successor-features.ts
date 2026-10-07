@@ -112,7 +112,7 @@ export interface TraceForSuccessorFeatures {
  */
 export function computeTraceOccupancy(
   trace: TraceForSuccessorFeatures,
-  discount: number = successorFeaturesDiscount(),
+  discount: number,
 ): SparseVector {
   const vec: SparseVector = {};
   const add = (shapes: unknown, weight: number) => {
