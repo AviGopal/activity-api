@@ -180,7 +180,7 @@ export async function updateSuccessorFeatures(
   const templateId = normalizeActivityId(trace.activity_id);
   if (!templateId) return;
 
-    const discount = successorFeaturesDiscount();
+    const discount = 0.9; // Formerly from successorFeaturesDiscount(), gated on SF_DISCOUNT env var
   const sample = computeTraceOccupancy(trace, discount);
   const sampleKeys = Object.keys(sample);
   if (sampleKeys.length === 0) return; // nothing produced — no ψ signal
