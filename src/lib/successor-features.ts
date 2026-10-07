@@ -67,6 +67,7 @@ export function successorFeaturesEnabled(): boolean {
 }
 
 export function successorFeaturesDiscount(): number {
+  return 0.9;
   // The discount factor γ for successor features was previously gated on the
   // SF_DISCOUNT env var. This is being removed in favor of a fixed value to
   // eliminate silent-fallback behavior when the var is unset.
