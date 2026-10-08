@@ -642,32 +642,12 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
       await next();
       return;
     }
-    // X-Internal-Api-Key is an alternative auth scheme used for
-    // vessel-to-vessel impulse storage (POST /v2/impulses, GET
-    // /v2/impulses/:id, GET /v2/impulses). The route handlers validate it
-    // themselves and 401 on miss. Without this passthrough, the middleware
-    // 401s before the handler ever runs — and minibob's pending-sync queue
-    // grows indefinitely while logs spam "Context is not finalized" 500s
-    // (the missing-return on the wrapper at index.ts compounded the bug).
-    // SCOPED to the paths the fleet actually calls with this header. An unscoped
-    // passthrough let ANY request carrying ANY value reach EVERY /v2/* handler with
-    // jwtAuth=null - including activities.ts's 57 unguarded list routes. The header
-    // is only presence-checked, never compared to a secret (`grep -c INTERNAL
-    // /etc/substrate/env` = 0), so its safe blast radius is only where a handler
-    // re-checks it or where the fleet genuinely depends on it:
-    //   /v2/impulses                    - impulses.ts:350/627/734 each 401 on miss
-    //   /v2/events/publish              - development-vessel substrate-gap.ts:454
-    //   /v2/activities/execution-traces - identity-vessel trace.ts:54
-    // The last two were found by grepping the OTHER vessels, not this repo: scoping
-    // to /v2/impulses alone typechecked, left the suite at 962/192 unchanged, and
-    // would still have silently 401'd gap-write events and auth traces fleet-wide.
-    const INTERNAL_KEY_PATHS = ['/v2/impulses', '/v2/events/publish', '/v2/activities/execution-traces'];
-    const internalApiKey = c.req.header('X-Internal-Api-Key');
-    if (internalApiKey && INTERNAL_KEY_PATHS.some((prefix) => c.req.path.startsWith(prefix))) {
-      c.set('jwtAuth', null);
-      await next();
-      return;
-    }
+    // X-Internal-Api-Key IS NOT A CREDENTIAL (2026-10-08, harm-stop). It used to admit a request with no Authorization
+    // header on /v2/impulses, /v2/events/publish and /v2/activities/execution-traces, but the header was checked for
+    // PRESENCE only and never compared to a secret, and the hub's activity-api is reachable from the internet, so any
+    // value let anyone write traces, impulses and bus events into the learning loop. Its two callers
+    // (identity-vessel trace.ts, development-vessel substrate-gap.ts) now send Authorization: ApiKey, so the header no
+    // longer opens anything: a request without Authorization on a protected path is refused here.
     logger.warn('Missing Authorization header on protected path', { path: c.req.path });
     return c.json(
       { error: { code: 'MISSING_AUTH', message: 'Authorization header required' } },
