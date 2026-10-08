@@ -200,16 +200,19 @@ describe('fail-closed admission (regression guards for the auth fall-through)', 
     return app;
   }
 
-  // The three paths the fleet genuinely calls with X-Internal-Api-Key. If any of
-  // these starts 401ing, gap-write events (development-vessel substrate-gap.ts)
-  // or auth traces (identity-vessel trace.ts) stop flowing fleet-wide.
+  // HARM-STOP (2026-10-08): X-Internal-Api-Key was checked for PRESENCE only, never against a secret, and the hub's
+  // activity-api is reachable from the internet, so a header with ANY value let anyone write traces, impulses and bus
+  // events. Its two callers (identity-vessel trace.ts, development-vessel substrate-gap.ts) now send
+  // Authorization: ApiKey. The header alone must be refused on all three paths it used to open.
   for (const path of ['/v2/impulses', '/v2/events/publish', '/v2/activities/execution-traces']) {
-    test(`X-Internal-Api-Key is still admitted on ${path}`, async () => {
+    test(`MUST-FAIL: X-Internal-Api-Key alone is refused on ${path} (401 MISSING_AUTH, handler not reached)`, async () => {
       const res = await appWithPaths().request(path, {
         method: 'POST',
-        headers: { 'X-Internal-Api-Key': 'development-vessel' },
+        headers: { 'X-Internal-Api-Key': 'anything-at-all' },
       });
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(401);
+      const body = await res.json() as { error?: { code?: string } };
+      expect(body.error?.code).toBe('MISSING_AUTH');
     });
   }
 

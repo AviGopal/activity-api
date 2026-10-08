@@ -45,7 +45,9 @@ function appWithMiddleware(): Hono {
 }
 
 describe('jwtAuthMiddleware context finalization', () => {
-  test('passes through X-Internal-Api-Key requests with jwtAuth=null', async () => {
+  test('MUST-FAIL: an X-Internal-Api-Key request without Authorization is refused 401, not passed through (2026-10-08)', async () => {
+    // The header was presence-checked only (any value admitted) on an internet-reachable hub; its callers now send
+    // Authorization: ApiKey, so the header alone is no longer a credential.
     const app = appWithMiddleware();
     const res = await app.request('/v2/impulses', {
       method: 'POST',
@@ -55,10 +57,7 @@ describe('jwtAuthMiddleware context finalization', () => {
       },
       body: JSON.stringify({ impulse_id: 'x', impulse_data: { type: 'memo' } }),
     });
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.ok).toBe(true);
-    expect(body.jwtAuth).toBeNull();
+    expect(res.status).toBe(401);
   });
 
   test('returns 401 (not 500 unfinalized-context) when no auth header at all', async () => {
