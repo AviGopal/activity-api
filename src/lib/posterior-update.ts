@@ -77,6 +77,13 @@ export interface TraceForPosterior {
   execution_id?: string;
   /** Which grading this call is: at trace insert, or a late POST /execution-traces/reach verdict. Keys the shape counter's idempotency. */
   grading_occasion?: 'insert' | 'reach';
+  /**
+   * The trace's org is a DEFAULT (no org was supplied; it was stored under 'public'). Nothing keyed on a guessed org
+   * may be learned: the leaf variant_performance_metrics delta and the leaf signature (context_thompson_scores) write
+   * are skipped and counted (leaf_skipped_default_org). Chain credit still runs: each producer is credited under the
+   * org on its OWN execution row.
+   */
+  org_defaulted?: boolean;
   /** Trace tags carrying the walk's persisted reach verdict ('reached:true'/'reached:false'/'dispatcher_used:goal-host'). Absent => legacy success-based (fail-open). */
   tags?: string[];
   /**
@@ -833,6 +840,11 @@ export function chainCreditAncestorHits(): number {
 }
 /** Chain ancestors with a delta to write whose own execution row carries no org: nothing written (module lifetime). */
 let chainCreditOrgUnresolved = 0;
+/** Traces whose leaf posterior delta was skipped because their org was a default, not a known org (module lifetime). */
+let leafSkippedDefaultOrg = 0;
+export function learningSkippedDefaultOrg(): number {
+  return leafSkippedDefaultOrg;
+}
 
 /**
  * THE READER (2026-10-07). The chain-credit miss counter and the aggregator's no-row drop counter had no reader, so
@@ -842,6 +854,7 @@ let chainCreditOrgUnresolved = 0;
  */
 export type PosteriorCreditCounters = {
   chain_ancestor_hits: number; chain_ancestor_misses: number; chain_ancestor_org_unresolved: number;
+  leaf_skipped_default_org: number;
   deltas_dropped_no_row: number; deltas_dropped_no_row_leaf: number; deltas_dropped_no_row_ancestor: number;
 };
 /** Scalars only: this is /health checks.posterior_credit. The rings ride on the shape below. */
@@ -849,6 +862,7 @@ export function posteriorCreditCounters(): PosteriorCreditCounters {
   const byKind = posteriorDeltasDroppedNoRowByKind();
   return {
     chain_ancestor_hits: chainCreditHits, chain_ancestor_misses: chainCreditMisses, chain_ancestor_org_unresolved: chainCreditOrgUnresolved,
+    leaf_skipped_default_org: leafSkippedDefaultOrg,
     deltas_dropped_no_row: posteriorDeltasDroppedNoRow(), deltas_dropped_no_row_leaf: byKind.leaf, deltas_dropped_no_row_ancestor: byKind.ancestor,
   };
 }
@@ -898,6 +912,7 @@ export async function propagateCreditAlongChain(
   const siblingDivisor = Math.max(1, execution.sibling_group_size ?? 1);
 
   // Batch-resolve execution IDs to variant IDs.
+  // org_id is undefined when the producer's own org is unknown: absent on its row, or recorded there as a default.
   type AncestorMeta = { variant_id: string; org_id?: string; signature?: string; signature_version?: number };
   let ancestorMetaByExecId: Map<string, AncestorMeta> = new Map();
   try {
@@ -918,8 +933,10 @@ export async function propagateCreditAlongChain(
     // org_id: the PRODUCER's own org. Its variant row is keyed by the org of its own trace, which is not always
     // the consumer's (a consumer posted with no org lands under the 'public' fallback; producers under the
     // substrate org), so crediting under the consumer's org updated no row.
-    const rows = limited.length === 0 ? [] : await db.query<{ execution_id: string; variant_id: string; org_id?: string; signature?: string; signature_version?: number }>(
-      `SELECT meta::id(id) AS execution_id, (variant_id ?? activity_id) AS variant_id, org_id, signature, signature_version
+    // org_defaulted: a producer posted with no org was stored under the 'public' default and marked so
+    // (metadata.org_defaulted). Its org is a guess, exactly like a missing one, so it is read as unresolved.
+    const rows = limited.length === 0 ? [] : await db.query<{ execution_id: string; variant_id: string; org_id?: string; org_defaulted?: boolean; signature?: string; signature_version?: number }>(
+      `SELECT meta::id(id) AS execution_id, (variant_id ?? activity_id) AS variant_id, org_id, metadata.org_defaulted AS org_defaulted, signature, signature_version
        FROM execution WHERE id IN [${things}]`,
       params,
     );
@@ -927,7 +944,7 @@ export async function propagateCreditAlongChain(
       if (row.execution_id && row.variant_id) {
         ancestorMetaByExecId.set(row.execution_id, {
           variant_id: row.variant_id,
-          org_id: typeof row.org_id === 'string' && row.org_id.length > 0 ? row.org_id : undefined,
+          org_id: row.org_defaulted !== true && typeof row.org_id === 'string' && row.org_id.length > 0 ? row.org_id : undefined,
           signature: typeof row.signature === 'string' ? row.signature : undefined,
           signature_version: typeof row.signature_version === 'number' ? row.signature_version : undefined,
         });
@@ -1006,8 +1023,9 @@ export async function propagateCreditAlongChain(
     }
 
     if (alphaDelta === 0 && betaDelta === 0) continue;
-    // NO DEFAULT ORG: a producer whose own row carries no org has no knowable variant row. Write nothing and
-    // count it; any fallback (the consumer's org, a 'public' default) would aim the delta at a guessed row.
+    // NO DEFAULT ORG: a producer whose own row carries no org (or only a defaulted one) has no knowable variant
+    // row. Write nothing and count it; any fallback (the consumer's org, a 'public' default) would aim the delta
+    // at a guessed row.
     if (!meta.org_id) {
       chainCreditOrgUnresolved++;
       logger.warn('posterior-update: chain ancestor execution row has no org_id; no credit written', {
@@ -1175,6 +1193,11 @@ export async function applyOutcomeToPosteriors(
     ? { alphaDelta: 0, betaDelta: 0 }
     : computeDeltas(effectiveSuccess, trace.failure_mode, warnings, trace, yieldRefs);
   const failureModeType = trace.failure_mode?.type ?? null;
+  // NO LEARNING WRITE TO A DEFAULT ORG. The trace's org is a guess (no org was supplied; it was stored under
+  // 'public'), so every leaf write keyed on it is skipped, never redirected: the VPM delta, the signature row, the
+  // shape counter paired with them, the decision_outcome row and the impulse-relevance penalty. Chain credit is NOT
+  // skipped: producers are credited under the org on their own execution rows.
+  const orgDefaulted = trace.org_defaulted === true;
 
   // Decision-level outcome capture (law 12), best-effort + NON-BLOCKING. This is
   // the additive consumer of the selection→outcome join: it persists a durable
@@ -1194,7 +1217,7 @@ export async function applyOutcomeToPosteriors(
         success: trace.success,
         reached: ungraded ? null : effectiveSuccess,
       });
-    } else if (!ungraded && trace.execution_id && activityId) {
+    } else if (!ungraded && !orgDefaulted && trace.execution_id && activityId) {
       // Universal capture: the substrate mostly executes via walks and pathway-reuse
       // (producers picked through discover-by-shapes, which writes no selection log),
       // so most executions carry no correlation tag to join. But a reach-GRADED
@@ -1241,6 +1264,18 @@ export async function applyOutcomeToPosteriors(
     }),
   });
   const skipVariantUpdate = tierClass === 'all_deterministic' || trace.metadata?.information_yield === 'idle';
+  // Defaulted org (see orgDefaulted above): counted once per trace, where the leaf delta would have been written.
+  if (orgDefaulted && !skipVariantUpdate && (alphaDelta !== 0 || betaDelta !== 0)) {
+    leafSkippedDefaultOrg++;
+    logger.warn('posterior-update: leaf delta skipped, trace org was defaulted (no org supplied)', {
+      activity_id: activityId,
+      execution_id: trace.execution_id,
+      org_id: orgId,
+      alpha_delta: alphaDelta,
+      beta_delta: betaDelta,
+      leaf_skipped_default_org_total: leafSkippedDefaultOrg,
+    });
+  }
   if (skipVariantUpdate || (ungraded && !failedByTask) || (alphaDelta === 0 && betaDelta === 0)) {
     logger.info('posterior variant update SKIPPED', {
       activity_id: activityId,
@@ -1277,7 +1312,7 @@ export async function applyOutcomeToPosteriors(
   // classifyReach verdict, same deltas — so the counter and VPM grade the same events, including a
   // late regrade arriving through POST /execution-traces/reach (occasion 'reach'). Idempotent per
   // (execution, occasion). Never fails the credit path.
-  if (!skipVariantUpdate && (alphaDelta !== 0 || betaDelta !== 0) && trace.execution_id) {
+  if (!skipVariantUpdate && !orgDefaulted && (alphaDelta !== 0 || betaDelta !== 0) && trace.execution_id) {
     try {
       // Telemetry-class ids (the same data-declared set retention drains first) are never counted:
       // they are not gradable executions. Today they also carry no input shapes, so this is the
@@ -1299,6 +1334,7 @@ export async function applyOutcomeToPosteriors(
 
   if (
     !skipVariantUpdate &&
+    !orgDefaulted &&
     (alphaDelta !== 0 || betaDelta !== 0) &&
     !enqueueVariantDelta(activityId, orgId, alphaDelta, betaDelta)
   ) {
@@ -1381,6 +1417,7 @@ export async function applyOutcomeToPosteriors(
   // variant_performance_metrics UPDATE above.
   if (
     !skipVariantUpdate &&
+    !orgDefaulted &&
     !HOOK_SUBSCRIBER_PATTERN.test(activityId) &&
     ((alphaDelta !== 0 || betaDelta !== 0) && !trace.signature
       ? (logger.warn('posterior-update: non-zero delta dropped, execution carries no signature key so no posterior row can be written', { activity_id: activityId, alpha_delta: alphaDelta, beta_delta: betaDelta }), false)
@@ -1513,6 +1550,7 @@ export async function applyOutcomeToPosteriors(
   let impulseRelevanceWrites = 0;
   const isVerifierFailure =
     !ungraded &&
+    !orgDefaulted &&
     !trace.success &&
     (failureModeType === 'verifier_negative' || failureModeType === null);
 

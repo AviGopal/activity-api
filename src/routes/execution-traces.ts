@@ -28,6 +28,7 @@ import { resolveLearningTrack, type LearningTrack } from '../lib/learning-track'
 import { incrementExemplarBurstCounter } from '../services/exemplar-selector';
 import { incrementTraceStoreCounter } from '../lib/trace-store-counters';
 import { applyOutcomeToPosteriors } from '../lib/posterior-update';
+import { resolveTraceOrg } from '../lib/trace-org';
 import { classifyReach } from '../lib/reach-classify';
 import { failureClassOf } from '../lib/failure-class';
 import { updateSuccessorFeatures } from '../lib/successor-features';
@@ -2452,7 +2453,15 @@ app.post('/', async (c) => {
 
     // FIX: Use org_id from request body if provided, otherwise fall back to JWT/session
     // This allows MiniBob to explicitly set org_id when sending traces
-    const traceOrgId = body.org_id || jwtAuth?.orgId || session?.org_id || 'public';
+    // NO LEARNING WRITE TO A DEFAULT ORG. With no org supplied the trace is still STORED under 'public'
+    // (execution.org_id is a required string), but that org is a guess: traceOrgDefaulted gates every
+    // org-keyed learning write below (skip, never redirect), and the stored row records metadata.org_defaulted
+    // so later readers (POST /reach, chain credit to this execution as a producer) treat it as org-unresolved.
+    const { org: traceOrgId, defaulted: traceOrgDefaulted } = resolveTraceOrg({
+      bodyOrg: body.org_id,
+      jwtOrg: jwtAuth?.orgId,
+      sessionOrg: session?.org_id,
+    });
     const traceProjectId = body.project_id || jwtAuth?.projectId || session?.project_id || null;
     // Phase B2: account_id from JWT auth context (sessions don't carry one).
     // Schema is option<string>; null is acceptable when caller has no claim.
@@ -2463,6 +2472,7 @@ app.post('/', async (c) => {
       jwt_org_id: jwtAuth?.orgId,
       session_org_id: session?.org_id,
       final_org_id: traceOrgId,
+      org_defaulted: traceOrgDefaulted,
     });
 
     // Denormalize composition_chain when client didn't.
@@ -2593,6 +2603,10 @@ app.post('/', async (c) => {
       // Classification tags (e.g. "intent:topology_discovery", "intent:boredom_source").
       ...(Array.isArray(body.tags) && body.tags.length > 0 ? { tags: body.tags } : {}),
     };
+    // Recorded on the stored row (AET metadata and execution.metadata both read trace.metadata below).
+    if (traceOrgDefaulted) {
+      trace.metadata = { ...((trace.metadata as Record<string, unknown> | undefined) ?? {}), org_defaulted: true };
+    }
 
     // ========================================================================
     // TASK #3: Activity Shape Validation
@@ -2750,7 +2764,7 @@ app.post('/', async (c) => {
     // (inserted before failure-mode sig block; prior_repair_signature comes from caller metadata)
     const _priorRepairSigRaw = (meta as any)?.prior_repair_signature ?? (trace as any)?.metadata?.prior_repair_signature;
     const _priorRepairSig = validRepairSignature(_priorRepairSigRaw);
-    if (_priorRepairSig && body.template_id) {
+    if (_priorRepairSig && body.template_id && !traceOrgDefaulted) {
       try {
         const _successForRepair = body.status === 'completed' || body.status === 'success' || body.success === true;
         const _repairDelta = priorRepairDelta(_successForRepair);
@@ -2881,14 +2895,8 @@ app.post('/', async (c) => {
       }
     `;
 
-    // Ensure org_id is always a non-null string (schema requirement)
-    if (!trace.org_id || typeof trace.org_id !== 'string') {
-      logger.info('Fixing org_id for execution trace', {
-        original_org_id: trace.org_id,
-        org_id_type: typeof trace.org_id
-      });
-      trace.org_id = 'public';
-    }
+    // org_id is always a non-empty string here (schema requirement): resolveTraceOrg returns one, defaulting to
+    // 'public' with traceOrgDefaulted set, and nothing reassigns trace.org_id before this point.
 
     logger.debug('Executing trace query', {
       execution_id: trace.execution_id,
@@ -2983,7 +2991,7 @@ app.post('/', async (c) => {
     // The compose resolver stamps parent_execution_id on nested child traces,
     // but nothing turned those pairs into activity_composition_graph edges —
     // the graph had frozen. Best-effort + detached, like the chain backfill.
-    if (body.parent_execution_id) {
+    if (body.parent_execution_id && !traceOrgDefaulted) {
       void deriveCompositionEdgeFromParent(
         trace.activity_id as string | undefined,
         body.parent_execution_id as string | undefined,
@@ -3476,10 +3484,12 @@ app.post('/', async (c) => {
           failure_delta: trace.success ? 0 : 1,
         };
 
-        // Use JWT auth if available for RBAC enforcement
-        const updateResult = jwtAuth?.jwtToken
-          ? await queryWithAuth(jwtAuth.jwtToken, updateQuery, updateParams)
-          : await surrealDB.query(updateQuery, updateParams);
+        // Use JWT auth if available for RBAC enforcement. A defaulted org names no knowable template row: skip.
+        const updateResult = traceOrgDefaulted
+          ? null
+          : jwtAuth?.jwtToken
+            ? await queryWithAuth(jwtAuth.jwtToken, updateQuery, updateParams)
+            : await surrealDB.query(updateQuery, updateParams);
 
         const combinedResult = (updateResult && updateResult.length > 0) ? updateResult : null;
 
@@ -3595,6 +3605,8 @@ app.post('/', async (c) => {
           cost_usd: trace.cost_usd as number,
           ...(typeof trace.execution_id === 'string' ? { execution_id: trace.execution_id as string } : {}),
           grading_occasion: 'insert',
+          // Skips ONLY the leaf (org-keyed) writes inside; chain credit to producers still runs under their own orgs.
+          ...(traceOrgDefaulted ? { org_defaulted: true } : {}),
           ...(Array.isArray((trace as any).tags) && (trace as any).tags.length > 0 ? { tags: (trace as any).tags as string[] } : {}),
           ...(resolvedCompositionChain.length > 0 ? { composition_chain: resolvedCompositionChain } : {}),
           ...(v1Sig ? { signature: v1Sig, signature_version: v1SigVersion } : {}),
@@ -3632,7 +3644,7 @@ app.post('/', async (c) => {
       // deliberate rate-limiting, not caution for its own sake: an arm can only retire on the tick
       // where it freshly earns blame, so retirement trickles instead of sweeping. Fire-and-forget,
       // like every other side effect in this cluster; it must never delay trace ingest.
-      if (!reachUngraded && !reachEffectiveSuccess) {
+      if (!reachUngraded && !reachEffectiveSuccess && !traceOrgDefaulted) {
         void import('../services/variant-creator')
           .then(({ checkAndRetireByPosterior }) =>
             checkAndRetireByPosterior(trace.variant_id as string, trace.org_id as string, traceAccountId),
@@ -3668,7 +3680,7 @@ app.post('/', async (c) => {
       // ADDITIVE, env-flagged (SUCCESSOR_FEATURES, default ON), fire-and-forget —
       // mirrors the chain-credit path. Keyed on the same v1 signature the
       // conditional Thompson posterior uses, so ψ rides one-to-one alongside R.
-      if (v1Sig && !reachUngraded) {   // ungraded: trace's claimed output shapes are untrustworthy; do not accumulate psi
+      if (v1Sig && !reachUngraded && !traceOrgDefaulted) {   // defaulted org: no knowable psi row; ungraded: trace's claimed output shapes are untrustworthy; do not accumulate psi
         // Use the RAW execution_trace.tasks (which carry per-task
         // output_impulse_shapes / outputShapes) for the discounted occupancy
         // walk — the normalized `trace.tasks` projection drops shape arrays.
@@ -3726,7 +3738,9 @@ app.post('/', async (c) => {
     const ctxUngraded = ctxReach === 'ungraded';
     const ctxEffectiveSuccess = ctxReach === 'reached';
 
-    if (isValidBucket(rawContextBucket) && !ctxUngraded) {
+    if (traceOrgDefaulted) {
+      // No context-bucket write (primary or re-derived) under a guessed org.
+    } else if (isValidBucket(rawContextBucket) && !ctxUngraded) {
       try {
         const ctxAlphaDelta = ctxEffectiveSuccess ? 1 : 0;
         const ctxBetaDelta  = ctxEffectiveSuccess ? 0 : 1;
@@ -3894,7 +3908,10 @@ app.post('/', async (c) => {
     // names a real dispatched template in metadata.template_id, the dispatched
     // template's metrics row also needs the failure recorded — otherwise its
     // beta never moves.
-    try {
+    //
+    // Skipped whole for a defaulted org: the INSERT would create a 'public' row, and the find-existing match is
+    // keyed on (variant_id, account_id) with no org, so an UPDATE hit is a row whose org cannot be confirmed.
+    if (!traceOrgDefaulted) try {
       // Phase E: route the duplicate detection through a deterministic
       // record-id slug keyed on (variant_id, account_id) so different
       // accounts in the same org get separate posteriors. The id is bound
@@ -4051,7 +4068,7 @@ app.post('/', async (c) => {
       || (trace.metadata as any)?.input_shapes
       || [];
 
-    if (inputShapes.length > 0 && trace.variant_id && traceOrgId) {
+    if (inputShapes.length > 0 && trace.variant_id && traceOrgId && !traceOrgDefaulted) {
       // Fire and forget - don't block the response.
       // Phase B-followup: thread accountId so dual-write fires.
       updateShapeActivityScores(
@@ -4944,7 +4961,7 @@ app.post('/reach', async (c) => {
     let preReadOk = false;
     try {
       const preRes = await surrealDB.query<any>(
-        `SELECT variant_id, activity_id, success, tags, cost_usd, org_id, signature, signature_version, composition_chain, failure_mode, resolver_tier, trace.tasks AS tasks FROM type::thing('execution', $execution_id)`,
+        `SELECT variant_id, activity_id, success, tags, cost_usd, org_id, metadata.org_defaulted AS org_defaulted, signature, signature_version, composition_chain, failure_mode, resolver_tier, trace.tasks AS tasks FROM type::thing('execution', $execution_id)`,
         { execution_id: String(execId) },
       );
       preRow = Array.isArray(preRes) && preRes.length > 0
@@ -5072,6 +5089,8 @@ app.post('/reach', async (c) => {
             execution_id: String(execId),
             tags: gradedTags,
             grading_occasion: 'reach',
+            // The stored row's org is a default (or absent): grade no leaf row under it; chain credit still runs.
+            ...(preRow.org_defaulted === true || typeof preRow.org_id !== 'string' ? { org_defaulted: true } : {}),
             ...(Array.isArray(preRow.composition_chain) && preRow.composition_chain.length > 0
               ? { composition_chain: preRow.composition_chain as string[] }
               : {}),
@@ -5105,7 +5124,7 @@ app.post('/reach', async (c) => {
       });
     }
     const updatedTrace: any = Array.isArray(res) && Array.isArray(res[0]) && res[0].length > 0 ? res[0][0] : null;
-    if (updatedTrace && updatedTrace.signature) {
+    if (updatedTrace && updatedTrace.signature && updatedTrace.metadata?.org_defaulted !== true) {
       import('../lib/successor-features').then(({ updateSuccessorFeatures }) => {
         updateSuccessorFeatures(
           {
