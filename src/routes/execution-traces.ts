@@ -5090,7 +5090,11 @@ app.post('/reach', async (c) => {
             tags: gradedTags,
             grading_occasion: 'reach',
             // The stored row's org is a default (or absent): grade no leaf row under it; chain credit still runs.
-            ...(preRow.org_defaulted === true || typeof preRow.org_id !== 'string' ? { org_defaulted: true } : {}),
+            // A bare 'public' is the default too, flagged or not: rows stored before the poster fix carry the
+            // fallback literal (`... || 'public'`) and no metadata.org_defaulted. Bare 'public' is only ever that
+            // fallback (identity issues record-form orgs; no producer sends it). 'organizations:public' is NOT
+            // matched: identity's signup derives organizations:<slug> with no reserved slugs, so it can be a tenant.
+            ...(preRow.org_defaulted === true || typeof preRow.org_id !== 'string' || preRow.org_id === 'public' ? { org_defaulted: true } : {}),
             ...(Array.isArray(preRow.composition_chain) && preRow.composition_chain.length > 0
               ? { composition_chain: preRow.composition_chain as string[] }
               : {}),

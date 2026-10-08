@@ -121,6 +121,10 @@ export type NoRowDropRecord = {
   /** null when the lookup itself failed (unknown, not "none"). */
   orgs_present: string[] | null;
   kinds: DeltaKind[];
+  /** The executions whose deltas were folded into the dropped write: the first EXECUTION_IDS_MAX distinct ids. */
+  execution_ids: string[];
+  /** How many more distinct executions were folded in beyond execution_ids. */
+  execution_ids_overflow: number;
 };
 
 interface PendingVariant {
@@ -130,6 +134,17 @@ interface PendingVariant {
   beta: number;
   kinds: Set<DeltaKind>;
   ancestorRecords: AncestorDeltaRecord[];
+  /** Distinct executions folded into this Σδ, bounded (EXECUTION_IDS_MAX); the rest are only counted. */
+  executionIds: string[];
+  executionIdsOverflow: number;
+}
+
+/** A dropped write names at most this many of the executions folded into it; the rest are counted, not listed. */
+const EXECUTION_IDS_MAX = 5;
+function noteExecution(e: Pick<PendingVariant, 'executionIds' | 'executionIdsOverflow'>, id: string | undefined): void {
+  if (!id || e.executionIds.includes(id)) return;
+  if (e.executionIds.length < EXECUTION_IDS_MAX) e.executionIds.push(id);
+  else e.executionIdsOverflow += 1;
 }
 
 const pendingVariant = new Map<string, PendingVariant>();
@@ -157,7 +172,7 @@ export function recentAncestorDeltas(): AncestorDeltaRecord[] {
 }
 /** The last no-row drops (newest last), each with the orgs its variant does have rows under. */
 export function recentNoRowDrops(): NoRowDropRecord[] {
-  return dropRing.map((r) => ({ ...r, orgs_present: r.orgs_present ? [...r.orgs_present] : null, kinds: [...r.kinds] }));
+  return dropRing.map((r) => ({ ...r, orgs_present: r.orgs_present ? [...r.orgs_present] : null, kinds: [...r.kinds], execution_ids: [...r.execution_ids] }));
 }
 /** Record an issued ancestor delta in the ring; the returned record's status is updated when it is written or dropped. */
 export function recordAncestorDelta(rec: Omit<AncestorDeltaRecord, 'at' | 'status'>): AncestorDeltaRecord {
@@ -172,7 +187,7 @@ type Queryable = { query: <T = unknown>(sql: string, vars?: Record<string, unkno
  * (no range, so the 2.3.10 indexed-count defect does not apply). Shared by the flush and by the synchronous
  * fallback write in posterior-update. Never throws.
  */
-export async function recordNoRowDrop(db: Queryable, variantId: string, orgId: string, kinds: DeltaKind[], alpha: number, beta: number): Promise<void> {
+export async function recordNoRowDrop(db: Queryable, variantId: string, orgId: string, kinds: DeltaKind[], alpha: number, beta: number, executionIds: string[] = [], executionIdsOverflow = 0): Promise<void> {
   droppedNoRow += 1;
   for (const k of kinds) droppedNoRowByKind[k] += 1;
   let orgsPresent: string[] | null = null;
@@ -183,7 +198,7 @@ export async function recordNoRowDrop(db: Queryable, variantId: string, orgId: s
     );
     orgsPresent = [...new Set((Array.isArray(rows) ? rows : []).map((o) => String(o ?? 'NONE')))];
   } catch { /* unknown, recorded as null */ }
-  pushBounded(dropRing, { at: new Date().toISOString(), variant_id: variantId, org_tried: orgId, orgs_present: orgsPresent, kinds: [...kinds] });
+  pushBounded(dropRing, { at: new Date().toISOString(), variant_id: variantId, org_tried: orgId, orgs_present: orgsPresent, kinds: [...kinds], execution_ids: [...executionIds], execution_ids_overflow: executionIdsOverflow });
   logger.warn(
     'posterior delta DROPPED — no variant_performance_metrics row to update; this arm learns nothing from these executions',
     {
@@ -192,6 +207,10 @@ export async function recordNoRowDrop(db: Queryable, variantId: string, orgId: s
       org_id: orgId,
       orgs_present: orgsPresent,
       kinds,
+      // Which executions this delta came from (bounded; a coalesced flush folds several), so a drop is attributed
+      // by id rather than by the journal line that happens to precede it.
+      execution_ids: executionIds,
+      execution_ids_overflow: executionIdsOverflow,
       alpha_delta: alpha,
       beta_delta: beta,
       dropped_total: droppedNoRow,
@@ -229,6 +248,7 @@ export function enqueueVariantDelta(
   betaDelta: number,
   kind: DeltaKind = 'leaf',
   ancestorRecord?: AncestorDeltaRecord,
+  executionId?: string,
 ): boolean {
   if (!posteriorCoalesceEnabled()) return false;
   if (alphaDelta === 0 && betaDelta === 0) return true;
@@ -239,8 +259,11 @@ export function enqueueVariantDelta(
     existing.beta += betaDelta;
     existing.kinds.add(kind);
     if (ancestorRecord) existing.ancestorRecords.push(ancestorRecord);
+    noteExecution(existing, executionId);
   } else {
-    pendingVariant.set(key, { variantId, orgId, alpha: alphaDelta, beta: betaDelta, kinds: new Set([kind]), ancestorRecords: ancestorRecord ? [ancestorRecord] : [] });
+    const e: PendingVariant = { variantId, orgId, alpha: alphaDelta, beta: betaDelta, kinds: new Set([kind]), ancestorRecords: ancestorRecord ? [ancestorRecord] : [], executionIds: [], executionIdsOverflow: 0 };
+    noteExecution(e, executionId);
+    pendingVariant.set(key, e);
   }
   ensureTimer();
   return true;
@@ -314,7 +337,7 @@ export async function flushPosteriors(): Promise<void> {
         const rowsAffected = Array.isArray(updated) ? updated.length : (updated == null ? 0 : 1);
         if (rowsAffected === 0) {
           for (const r of e.ancestorRecords) r.status = 'dropped_no_row';
-          await recordNoRowDrop(surrealDB, e.variantId, e.orgId, [...e.kinds], e.alpha, e.beta);
+          await recordNoRowDrop(surrealDB, e.variantId, e.orgId, [...e.kinds], e.alpha, e.beta, e.executionIds, e.executionIdsOverflow);
         } else {
           for (const r of e.ancestorRecords) r.status = 'written';
         }
@@ -329,6 +352,8 @@ export async function flushPosteriors(): Promise<void> {
           cur.beta += e.beta;
           for (const k of e.kinds) cur.kinds.add(k);
           cur.ancestorRecords.push(...e.ancestorRecords);
+          for (const id of e.executionIds) noteExecution(cur, id);
+          cur.executionIdsOverflow += e.executionIdsOverflow;
         } else {
           pendingVariant.set(key, e);
         }

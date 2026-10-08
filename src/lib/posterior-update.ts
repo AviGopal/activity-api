@@ -713,7 +713,7 @@ async function writeAncestorDelta(
   // was built to remove. enqueueVariantDelta folds them into Σδ; it returns false
   // only when coalescing is disabled, in which case we fall back to the sync UPDATE.
   try {
-    if (!enqueueVariantDelta(ancestorId, orgId, alphaDelta, betaDelta, 'ancestor', record)) {
+    if (!enqueueVariantDelta(ancestorId, orgId, alphaDelta, betaDelta, 'ancestor', record, trail.ancestorExecutionId)) {
       const updated = await db.query(
         `
         UPDATE variant_performance_metrics
@@ -735,7 +735,7 @@ async function writeAncestorDelta(
       const rowsAffected = Array.isArray(updated) ? updated.length : (updated == null ? 0 : 1);
       if (rowsAffected === 0) {
         record.status = 'dropped_no_row';
-        await recordNoRowDrop(db as never, ancestorId, orgId, ['ancestor'], alphaDelta, betaDelta);
+        await recordNoRowDrop(db as never, ancestorId, orgId, ['ancestor'], alphaDelta, betaDelta, trail.ancestorExecutionId ? [trail.ancestorExecutionId] : []);
       } else {
         record.status = 'written';
       }
@@ -1187,7 +1187,13 @@ export async function applyOutcomeToPosteriors(
   // The ungraded-failure arm (be6b5cd) blames an ungraded run whose tasks failed, so a template whose
   // tasks throw cannot hide behind "ungraded". A reach-INAPPLICABLE run (telemetry:/declined:) is
   // ungraded for a different reason — it was never attempting a goal — and is neither credited nor blamed.
-  const failedByTask = ungraded && !isReachInapplicable(trace) && trace.success === false && (((trace as any).failure_count ?? 0) > 0 || ((trace as any).task_count ?? 0) === 0);
+  // ABSENT IS NOT ZERO. The arm needs task EVIDENCE: a failure_count/task_count, or a `tasks` field. The trace POST
+  // always passes `tasks` (null when none were posted — a real "no tasks", which be6b5cd blames). A caller that omits
+  // the field entirely (POST /v2/goal-paths and POST /executions send only a synthetic goal-host tag) has said nothing
+  // about tasks, and reading that absence as "zero tasks" blamed every such failure beta 1 although the walk is
+  // AWAITING its reach verdict, ungraded in both directions (reach-classify.ts). With evidence the arm is unchanged.
+  const hasTaskEvidence = typeof (trace as any).failure_count === 'number' || typeof (trace as any).task_count === 'number' || 'tasks' in trace;
+  const failedByTask = ungraded && hasTaskEvidence && !isReachInapplicable(trace) && trace.success === false && (((trace as any).failure_count ?? 0) > 0 || ((trace as any).task_count ?? 0) === 0);
   const effectiveSuccess = reachVerdict === 'reached';
   const { alphaDelta, betaDelta } = (ungraded && !failedByTask)
     ? { alphaDelta: 0, betaDelta: 0 }
@@ -1336,7 +1342,7 @@ export async function applyOutcomeToPosteriors(
     !skipVariantUpdate &&
     !orgDefaulted &&
     (alphaDelta !== 0 || betaDelta !== 0) &&
-    !enqueueVariantDelta(activityId, orgId, alphaDelta, betaDelta)
+    !enqueueVariantDelta(activityId, orgId, alphaDelta, betaDelta, 'leaf', undefined, trace.execution_id)
   ) {
     try {
       // Read current Thompson counts and apply decay before writing

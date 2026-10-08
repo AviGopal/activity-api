@@ -26,6 +26,9 @@ import {
   type RecommendedPath,
 } from '../models/schemas';
 import { applyOutcomeToPosteriors } from '../lib/posterior-update';
+import { resolveTraceOrg } from '../lib/trace-org';
+import { getJwtAuthFromContext } from '../middleware/jwtAuth';
+import type { SessionData } from '../models/schemas';
 
 const app = new Hono();
 
@@ -409,6 +412,16 @@ app.post('/', async (c) => {
   try {
     const body = await c.req.json();
     const validated = PathRecordRequestSchema.parse(body);
+    // The org, resolved exactly as the trace POST resolves it (body, then JWT, then session; non-empty strings only).
+    // With none it is the 'public' DEFAULT and `pathOrgDefaulted` is true: the path row is still stored under it (no
+    // reader keys learning on goal_execution_paths.org_id; dropping the record would be its own harm), but no leaf
+    // posterior may be learned under a guessed org (see the applyOutcomeToPosteriors call below).
+    const session = ((c.get as any)('session') as SessionData | undefined) || { session_id: 'internal', org_id: null, project_id: null, api_key: null, latest_job_id: null };
+    const { org: pathOrgId, defaulted: pathOrgDefaulted } = resolveTraceOrg({
+      bodyOrg: (body as any).org_id,
+      jwtOrg: getJwtAuthFromContext(c)?.orgId,
+      sessionOrg: session?.org_id,
+    });
     for (const k of ["expected_output_shapes", "endpoint_output_shapes"] as const) { const v = (validated as Record<string, unknown>)[k]; if (Array.isArray(v)) (validated as Record<string, unknown>)[k] = [...new Set(v.map(String))]; }
 
     const goalHash = hashGoal(validated.goal_text);
@@ -702,7 +715,7 @@ app.post('/', async (c) => {
 
       const created = await surrealDB.query<GoalExecutionPath[]>(createQuery, {
         goal_hash: goalHash,
-        org_id: (body as any).org_id ?? 'public',
+        org_id: pathOrgId,
         expected_output_shapes: validated.expected_output_shapes ?? null,
         state_signature: validated.state_signature ?? undefined,
         goal_text: validated.goal_text,
@@ -772,13 +785,19 @@ app.post('/', async (c) => {
         failure_mode: null,
         cost_usd: validated.cost_usd,
         // Honest-reach floor: goal-host does not (yet) emit a reach verdict on this
-        // body, so an exit-status completion is UNGRADED, not credit. Synthetic
-        // goal-host tag => classifyReach => 'ungraded' => SKIP (learn nothing, never
-        // mis-credit). Remove once goal-host emits reach tags on this path.
+        // body, so an exit-status outcome is UNGRADED, not credit or blame. Synthetic
+        // goal-host tag => classifyReach => 'ungraded'; this call carries no tasks and no
+        // task counts, so the ungraded-failure arm (failedByTask) has no task evidence and
+        // does not fire => {0,0}, SKIP for success AND failure. (Until that arm required
+        // evidence it read the absent task_count as zero tasks, so every failed goal path
+        // took beta 1.) Remove once goal-host emits reach tags on this path.
         tags: ['dispatcher_used:goal-host'],
+        // A guessed org: skip (never redirect) the leaf org-keyed writes, counted as
+        // leaf_skipped_default_org when a nonzero leaf delta is skipped. Chain credit is unaffected.
+        ...(pathOrgDefaulted ? { org_defaulted: true } : {}),
       },
       surrealDB,
-      (body as any).org_id ?? 'public',
+      pathOrgId,
     ).catch((err) => {
       logger.warn('[18.3.3] applyOutcomeToPosteriors failed (non-blocking, goal-paths)', {
         goal_hash: goalHash,
