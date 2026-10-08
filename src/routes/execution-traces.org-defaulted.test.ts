@@ -238,7 +238,7 @@ describe('POST /execution-traces with no known org stores the trace and writes n
 });
 
 describe('POST /reach on a stored org_defaulted execution grades no leaf posterior', () => {
-  function storeExecution(executionId: string, metadata: Row): void {
+  function storeExecution(executionId: string, metadata: Row, orgId = 'public'): void {
     executionRows.set(executionId, {
       id: `execution:${executionId}`,
       activity_id: TEMPLATE,
@@ -247,7 +247,7 @@ describe('POST /reach on a stored org_defaulted execution grades no leaf posteri
       status: 'completed',
       tags: [],
       cost_usd: 0.001,
-      org_id: 'public',
+      org_id: orgId,
       trace: { tasks: [{ task_id: 't1', resolver: 'llm', resolver_tier: 'llm', status: 'completed' }] },
       metadata,
     });
@@ -265,12 +265,16 @@ describe('POST /reach on a stored org_defaulted execution grades no leaf posteri
     .filter((q) => /UPDATE\s+variant_performance_metrics[\s\S]*thompson_alpha\s*=\s*\$new_alpha/i.test(q.sql))
     .filter((q) => q.params?.activity_id === TEMPLATE);
 
-  test("CONTROL: a stored row under a real 'public' org is graded", async () => {
-    storeExecution('exec-reach-public-1', { information_yield: 'productive' });
+  // Was "a stored row under a real 'public' org is graded". A bare 'public' is never a real org: it is only the
+  // fallback literal (identity issues record-form orgs, no producer sends it), and rows stored before the poster fix
+  // carry it with no org_defaulted flag. POST /reach now treats it as defaulted
+  // (execution-traces.reach-default-org.test.ts); the control is a row under a real org.
+  test('CONTROL: a stored row under a real org is graded under it', async () => {
+    storeExecution('exec-reach-public-1', { information_yield: 'productive' }, 'organizations:substrate');
     const res = await postReach('exec-reach-public-1');
     expect(res.status).toBe(200);
     expect(leafVpm()).toHaveLength(1);
-    expect(leafVpm()[0]!.params.org_id).toBe('public');
+    expect(leafVpm()[0]!.params.org_id).toBe('organizations:substrate');
   });
 
   test('MUST-FAIL: a stored row carrying metadata.org_defaulted writes no leaf posterior', async () => {
