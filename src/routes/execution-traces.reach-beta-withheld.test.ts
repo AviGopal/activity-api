@@ -11,6 +11,11 @@
  *   MUST-FAIL: beta_withheld:true, reached:false ⇒ no leaf write; the verdict mirror is still written; one log line.
  *   CONTROLS: genuine not-reached ⇒ β+1; explicit beta_withheld:false ⇒ β+1; reached:true ignores the field ⇒ α;
  *             a satisfier satellite ⇒ no write either way.
+ *   MUST-FAIL (withheld is final): a withheld verdict, then a second /reach for the SAME execution without the flag
+ *             (an automated retry) ⇒ still no posterior change; reach_withheld:true survives the verdict mirror.
+ *   CONTROL: a different execution, not withheld ⇒ graded normally.
+ * The recorder keeps each row's tags and applies the route's array::union tag writes, so a second call's pre-read
+ * sees what the first call wrote.
  */
 process.env.SURREALDB_NAMESPACE ??= 'activity-system';
 process.env.SURREALDB_DATABASE ??= 'learning_loop';
@@ -29,6 +34,10 @@ const rows: Record<string, Record<string, unknown>> = {};
 const leafWrites: LeafWrite[] = [];
 const mirrors: Array<{ execution_id: unknown; reached: unknown }> = [];
 const infos: Array<{ msg: string; meta: Record<string, unknown> }> = [];
+const addTag = (execId: string, tag: string) => {
+  const r = rows[execId];
+  if (r) r.tags = [...new Set([...((r.tags as string[]) ?? []), tag])];
+};
 let ET: { request: (path: string, init?: RequestInit) => Response | Promise<Response> };
 
 beforeAll(async () => {
@@ -42,8 +51,14 @@ beforeAll(async () => {
       leafWrites.push({ activity_id: vars.activity_id, new_alpha: Number(vars.new_alpha), new_beta: Number(vars.new_beta) });
       return [{ id: 'variant_performance_metrics:x' }];
     }
+    const tagUnion = sql.match(/^\s*UPDATE type::thing\('execution', \$execution_id\) SET tags = array::union\(tags \?\? \[\], \['([^']+)'\]\)\s*$/);
+    if (tagUnion) {
+      addTag(String(vars?.execution_id), tagUnion[1]!);
+      return [[{ id: `execution:${String(vars?.execution_id)}` }]];
+    }
     if (/^\s*UPDATE type::thing\('execution', \$execution_id\) SET reached = \$reached/.test(sql)) {
       mirrors.push({ execution_id: vars?.execution_id, reached: vars?.reached });
+      addTag(String(vars?.execution_id), vars?.reached === true ? 'reached:true' : 'reached:false');
       return [[{ id: `execution:${String(vars?.execution_id)}` }]];
     }
     return [];
@@ -60,13 +75,13 @@ beforeAll(async () => {
 });
 
 async function post(execId: string, body: Record<string, unknown>, activityId = `act-${execId}`) {
-  rows[execId] = { activity_id: activityId, success: true, tags: ['dispatcher_used:goal-host'], cost_usd: 0, org_id: ORG, failure_mode: null };
+  rows[execId] ??= { activity_id: activityId, success: true, tags: ['dispatcher_used:goal-host'], cost_usd: 0, org_id: ORG, failure_mode: null };
   const before = { writes: leafWrites.length, mirrors: mirrors.length, infos: infos.length };
   const res = await ET.request('/reach', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ execution_id: execId, ...body }) });
   expect(res.status).toBe(200);
   // The credit call is fire-and-forget: wait (bounded) for a leaf write, or for the withheld line.
   const withheldLogged = () => infos.slice(before.infos).some((i) => i.msg.includes('[reach] β WITHHELD by caller'));
-  for (let i = 0; i < 25 && leafWrites.length === before.writes && !withheldLogged(); i++) await new Promise((r) => setTimeout(r, 20));
+  for (let i = 0; i < 15 && leafWrites.length === before.writes && !withheldLogged(); i++) await new Promise((r) => setTimeout(r, 20));
   return {
     writes: leafWrites.slice(before.writes),
     mirrors: mirrors.slice(before.mirrors),
@@ -112,5 +127,28 @@ describe('CONTROLS — today\'s behaviour', () => {
     const r = await post('walk-satisfier-x', { reached: false }, 'satisfier:x');
     expect(r.writes).toEqual([]);
     expect(r.mirrors).toEqual([{ execution_id: 'walk-satisfier-x', reached: false }]);
+  });
+});
+
+describe('MUST-FAIL — a withheld verdict is final', () => {
+  test('withheld, then an automated /reach for the SAME execution without the flag ⇒ no posterior change', async () => {
+    const first = await post('exec-final', { reached: false, beta_withheld: true, beta_withheld_reason: 'non-deterministic' });
+    expect(first.writes).toEqual([]);
+    expect(first.withheld.length).toBe(1);
+    const again = await post('exec-final', { reached: false });
+    expect(again.writes).toEqual([]);
+    expect(again.mirrors).toEqual([{ execution_id: 'exec-final', reached: false }]);
+    // The withheld tag survives the verdict mirror (a union, never a replace).
+    expect(rows['exec-final']!.tags).toEqual(expect.arrayContaining(['reach_withheld:true', 'reached:false', 'dispatcher_used:goal-host']));
+    expect(rows['exec-final']!.tags).not.toContain('reach_graded:true');
+  });
+});
+
+describe('CONTROL — withheld-is-final is per execution', () => {
+  test('a different execution, not withheld ⇒ β+1 on not-reached', async () => {
+    const r = await post('exec-other', { reached: false });
+    expect(r.writes).toEqual([{ activity_id: 'act-exec-other', new_alpha: 1, new_beta: 2 }]);
+    expect(rows['exec-other']!.tags).toEqual(expect.arrayContaining(['reach_graded:true', 'reached:false']));
+    expect(rows['exec-other']!.tags).not.toContain('reach_withheld:true');
   });
 });
