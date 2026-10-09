@@ -2607,6 +2607,23 @@ app.post('/', async (c) => {
     if (traceOrgDefaulted) {
       trace.metadata = { ...((trace.metadata as Record<string, unknown> | undefined) ?? {}), org_defaulted: true };
     }
+    // A β THE CALLER WITHHELD IS WITHHELD HERE TOO. goal-host withholds β for a not-reached walk it cannot fairly
+    // blame (no oracle, or α was structurally unreachable) and persists the trace failed and untagged. That trace is
+    // ungraded, yet applyOutcomeToPosteriors' ungraded-failure arm blamed it β=1 at insert. The flag arrives as body
+    // fields or, from a trace sink that forwards only tags and metadata, as `beta_withheld:true` /
+    // `beta_withheld_reason:<r>` tags. A not-reached withheld trace gets no α/β (skipped below) and the SAME
+    // reach_withheld:true marker POST /reach writes, so a later unflagged /reach for it also grades nothing.
+    const insertTags: string[] = Array.isArray((trace as any).tags) ? ((trace as any).tags as string[]) : [];
+    const betaWithheldAtInsert =
+      (body.beta_withheld === true || insertTags.includes('beta_withheld:true')) &&
+      !insertTags.includes('reached:true') && body.reached !== true &&
+      (trace.success === false || insertTags.includes('reached:false') || body.reached === false);
+    const betaWithheldReason: string | null = typeof body.beta_withheld_reason === 'string'
+      ? body.beta_withheld_reason
+      : (insertTags.find((t) => typeof t === 'string' && t.startsWith('beta_withheld_reason:'))?.slice('beta_withheld_reason:'.length) ?? null);
+    if (betaWithheldAtInsert && !insertTags.includes('reach_withheld:true')) {
+      (trace as any).tags = [...insertTags, 'reach_withheld:true'];
+    }
 
     // ========================================================================
     // TASK #3: Activity Shape Validation
@@ -2764,7 +2781,7 @@ app.post('/', async (c) => {
     // (inserted before failure-mode sig block; prior_repair_signature comes from caller metadata)
     const _priorRepairSigRaw = (meta as any)?.prior_repair_signature ?? (trace as any)?.metadata?.prior_repair_signature;
     const _priorRepairSig = validRepairSignature(_priorRepairSigRaw);
-    if (_priorRepairSig && body.template_id && !traceOrgDefaulted) {
+    if (_priorRepairSig && body.template_id && !traceOrgDefaulted && !betaWithheldAtInsert) {
       try {
         const _successForRepair = body.status === 'completed' || body.status === 'success' || body.success === true;
         const _repairDelta = priorRepairDelta(_successForRepair);
@@ -3590,10 +3607,17 @@ app.post('/', async (c) => {
         activity_id: trace.variant_id as string,
         tags: Array.isArray((trace as any).tags) ? ((trace as any).tags as string[]) : undefined,
       });
-      const reachUngraded = reachVerdict === 'ungraded';
+      // A caller-withheld verdict is ungraded on every sink in this cluster (posterior, retirement, psi).
+      const reachUngraded = reachVerdict === 'ungraded' || betaWithheldAtInsert;
       const reachEffectiveSuccess = reachVerdict === 'reached';
 
-      applyOutcomeToPosteriors(
+      if (betaWithheldAtInsert) {
+        logger.info('[insert] β WITHHELD by caller — no posterior delta', {
+          execution_id: trace.execution_id,
+          activity_id: trace.variant_id,
+          reason: betaWithheldReason,
+        });
+      } else applyOutcomeToPosteriors(
         {
           activity_id: trace.variant_id as string,
           success: trace.success as boolean,
