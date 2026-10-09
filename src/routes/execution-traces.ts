@@ -5054,7 +5054,7 @@ app.post('/reach', async (c) => {
       ? (preRow.variant_id as string)
       : (typeof preRow?.activity_id === 'string' ? (preRow.activity_id as string) : '');
     const preIsSatellite = String(execId).startsWith('walk-satisfier-') || preActivityId.startsWith('satisfier:');
-    if (preReadOk && preRow && preActivityId && !preIsSatellite && !preTags.includes('reach_graded:true') && !betaWithheld) {
+    if (preReadOk && preRow && preActivityId && !preIsSatellite && !preTags.includes('reach_graded:true') && !preTags.includes('reach_withheld:true') && !betaWithheld) {
       const preVerdict = classifyReach({
         success: preRow.success === true,
         execution_id: String(execId),
@@ -5131,11 +5131,27 @@ app.post('/reach', async (c) => {
         activity_id: preActivityId,
       });
     } else if (preReadOk && preRow && preActivityId && betaWithheld && !preTags.includes('reach_graded:true')) {
-      // No α, no β, and no reach_graded:true marker: nothing was credited, so a later verdict may still grade it.
+      // No α, no β, and no reach_graded:true marker: nothing was credited. WITHHELD IS FINAL: the
+      // reach_withheld:true marker makes the grading block above skip this row on any later /reach (an
+      // automated retry or spool drain without the flag), as reach_graded:true does. Tags are only ever
+      // unioned (here and in the verdict mirror below), so the marker survives the mirror.
+      try {
+        await surrealDB.query(
+          `UPDATE type::thing('execution', $execution_id) SET tags = array::union(tags ?? [], ['reach_withheld:true'])`,
+          { execution_id: String(execId) },
+        );
+      } catch (e) {
+        logger.warn('[reach-patch] reach_withheld marker write failed', { error: e instanceof Error ? e.message : String(e) });
+      }
       logger.info('[reach] β WITHHELD by caller — no posterior delta', {
         execution_id: String(execId),
         activity_id: preActivityId,
         reason: typeof body.beta_withheld_reason === 'string' ? body.beta_withheld_reason : null,
+      });
+    } else if (preReadOk && preRow && preTags.includes('reach_withheld:true')) {
+      logger.info('[reach-patch] posterior grading skipped; the caller withheld this verdict earlier (reach_withheld:true)', {
+        execution_id: String(execId),
+        activity_id: preActivityId,
       });
     }
     const updatedTrace: any = Array.isArray(res) && Array.isArray(res[0]) && res[0].length > 0 ? res[0][0] : null;
