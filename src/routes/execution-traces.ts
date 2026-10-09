@@ -4937,6 +4937,10 @@ app.post('/reach', async (c) => {
     const missing: string[] = Array.isArray(body.missing)
       ? body.missing.map(String)
       : [];
+    // The caller (goal-host) may WITHHOLD β for a not-reached walk it judged not creditable (a
+    // non-deterministic verdict with no consumed chain). Only for reached === false: a reached
+    // verdict ignores the field. The verdict itself is still persisted below; only grading is skipped.
+    const betaWithheld = body.beta_withheld === true && body.reached === false;
     // AUTHORITATIVE PRE-READ — must precede the UPDATE below. It captures the row
     // exactly as it stood BEFORE this patch, which is the only way to know what the
     // INSERT path (app.post('/'), applyOutcomeToPosteriors) already did with this
@@ -5050,7 +5054,7 @@ app.post('/reach', async (c) => {
       ? (preRow.variant_id as string)
       : (typeof preRow?.activity_id === 'string' ? (preRow.activity_id as string) : '');
     const preIsSatellite = String(execId).startsWith('walk-satisfier-') || preActivityId.startsWith('satisfier:');
-    if (preReadOk && preRow && preActivityId && !preIsSatellite && !preTags.includes('reach_graded:true')) {
+    if (preReadOk && preRow && preActivityId && !preIsSatellite && !preTags.includes('reach_graded:true') && !betaWithheld) {
       const preVerdict = classifyReach({
         success: preRow.success === true,
         execution_id: String(execId),
@@ -5125,6 +5129,13 @@ app.post('/reach', async (c) => {
       logger.info('[reach-patch] posterior grading skipped; structural satisfier satellite (never graded by design)', {
         execution_id: String(execId),
         activity_id: preActivityId,
+      });
+    } else if (preReadOk && preRow && preActivityId && betaWithheld && !preTags.includes('reach_graded:true')) {
+      // No α, no β, and no reach_graded:true marker: nothing was credited, so a later verdict may still grade it.
+      logger.info('[reach] β WITHHELD by caller — no posterior delta', {
+        execution_id: String(execId),
+        activity_id: preActivityId,
+        reason: typeof body.beta_withheld_reason === 'string' ? body.beta_withheld_reason : null,
       });
     }
     const updatedTrace: any = Array.isArray(res) && Array.isArray(res[0]) && res[0].length > 0 ? res[0][0] : null;
