@@ -232,57 +232,29 @@ export async function generateJwtToken(context: {
  */
 
 /**
- * Where identity-vessel is asked: the configured (internal) URL first, the public
- * endpoint only as a fallback for a transient failure of the first.
+ * Where identity-vessel is asked: the configured in-fleet URL only. There is no
+ * fallback to a host outside the fleet; when this identity cannot answer, the
+ * caller may try the identity discovery locates, and otherwise refuses.
  */
-function identityVesselUrls(): { primaryUrl: string; fallbackUrl: string } {
+function identityVesselUrls(): { primaryUrl: string } {
   return {
     primaryUrl:
       process.env.IDENTITY_VESSEL_URL ||
       'http://identity-vessel.activity-system.svc.cluster.local:8080',
-    fallbackUrl:
-      process.env.IDENTITY_VESSEL_EXTERNAL_URL ||
-      'https://identity.metabob.com',
   };
 }
 
 /**
- * Validate API key via identity-vessel
+ * Validate API key via the configured identity-vessel.
  *
- * Tries the configured URL first, then falls back to external URL if internal fails.
+ * Fails closed: if identity-vessel cannot answer, the result is unauthenticated
+ * (marked transient for an availability failure) and no other host is asked.
  */
 export async function validateApiKeyViaIdentityVessel(
   apiKey: string
 ): Promise<AuthContext> {
-  const { primaryUrl, fallbackUrl } = identityVesselUrls();
-
-  // Try primary URL
-  const primaryResult = await tryIdentityVesselValidation(apiKey, primaryUrl);
-  if (primaryResult.authenticated) {
-    return primaryResult;
-  }
-
-  // If primary failed due to network error, try external fallback
-  const isNetworkError = isTransientIdentityFailure(primaryResult.reason);
-
-  if (isNetworkError && primaryUrl !== fallbackUrl) {
-    logger.info('[auth] Primary identity-vessel unavailable, trying external URL', {
-      primaryUrl,
-      fallbackUrl,
-      reason: primaryResult.reason,
-    });
-
-    const fallbackResult = await tryIdentityVesselValidation(apiKey, fallbackUrl);
-    if (fallbackResult.authenticated) {
-      return fallbackResult;
-    }
-
-    // Both failed - return the fallback error (more likely to be meaningful)
-    return fallbackResult;
-  }
-
-  // Primary returned a definitive error (not network), return as-is
-  return primaryResult;
+  const { primaryUrl } = identityVesselUrls();
+  return tryIdentityVesselValidation(apiKey, primaryUrl);
 }
 
 /**
@@ -591,9 +563,9 @@ export interface BearerIdentityResult extends AuthContext {
  * serves for the request (`pointer.audience` and `X-Auth-Audience: <node>/<shape>`).
  * Identity refuses an on-behalf-of token minted for any other node or shape.
  *
- * Only the configured identity is asked, never the public fallback the API-key path
- * uses: an on-behalf-of token is minted by this substrate's identity for this node, so
- * no other identity can validate it, and sending it elsewhere only spreads it.
+ * Only the configured identity is asked: an on-behalf-of token is minted by this
+ * substrate's identity for this node, so no other identity can validate it, and
+ * sending it elsewhere only spreads it.
  */
 export async function validateBearerViaIdentity(
   token: string,
