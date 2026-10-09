@@ -4989,7 +4989,7 @@ app.post('/reach', async (c) => {
     let preReadOk = false;
     try {
       const preRes = await surrealDB.query<any>(
-        `SELECT variant_id, activity_id, success, tags, cost_usd, org_id, metadata.org_defaulted AS org_defaulted, signature, signature_version, composition_chain, failure_mode, resolver_tier, trace.tasks AS tasks FROM type::thing('execution', $execution_id)`,
+        `SELECT variant_id, activity_id, success, tags, cost_usd, org_id, metadata.org_defaulted AS org_defaulted, signature, signature_version, composition_chain, failure_mode, resolver_tier, trace.tasks AS tasks, metadata FROM type::thing('execution', $execution_id)`,
         { execution_id: String(execId) },
       );
       preRow = Array.isArray(preRes) && preRes.length > 0
@@ -5117,6 +5117,7 @@ app.post('/reach', async (c) => {
             execution_id: String(execId),
             tags: gradedTags,
             grading_occasion: 'reach',
+            ...(preRow.metadata ? { metadata: preRow.metadata as any } : {}),
             // The stored row's org is a default (or absent): grade no leaf row under it; chain credit still runs.
             // A bare 'public' is the default too, flagged or not: rows stored before the poster fix carry the
             // fallback literal (`... || 'public'`) and no metadata.org_defaulted. Bare 'public' is only ever that

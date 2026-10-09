@@ -105,6 +105,12 @@ export interface Config {
     hotWindowDays: number;      // TRACE_STORE_HOT_WINDOW_DAYS, default 14
     reservoirPerActivity: number; // TRACE_STORE_RESERVOIR_PER_ACTIVITY, default 25
     /** Activity-id substrings whose SUCCESSFUL traces are sampled. TRACE_STORE_SUCCESS_SAMPLE_ACTIVITIES. */
+    shapes: [
+      'executionTraceWithSignatures',
+      'traceAggregateReport',
+      'groupedExecutionStats',
+      'posteriorCreditCounters'
+    ],
     successSampleActivities: string[];
     /** Fraction of successes to keep for those families, 0..1. TRACE_STORE_SUCCESS_SAMPLE_RATE, default 1 (= keep all). */
     successSampleRate: number;
@@ -474,6 +480,12 @@ export function loadConfig(): Config {
       cap: parseEnvInt('TRACE_STORE_CAP', 50_000),
       hotWindowDays: parseEnvInt('TRACE_STORE_HOT_WINDOW_DAYS', 14),
       reservoirPerActivity: parseEnvInt('TRACE_STORE_RESERVOIR_PER_ACTIVITY', 25),
+      shapes: [
+        "executionTraceWithSignatures",
+        "traceAggregateReport",
+        "groupedExecutionStats",
+        "posteriorCreditCounters"
+      ],
       // DEFAULTS ARE A NO-OP. rate 1 keeps every success, so a deployment that says
       // nothing behaves exactly as before and this can only reduce writes where an
       // operator has deliberately turned it on.
