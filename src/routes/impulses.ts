@@ -5256,6 +5256,21 @@ router.post('/resolve', async (c) => {
         return c.json(result.body as ImpulseResolveResponse, result.status as any);
       }
 
+      case 'posteriorCompensation': {
+        // β-leak replay, one frozen-list pair by { ledger_key } only. Operator-only; the module derives
+        // variant/org/amount from the sha-pinned shipped list and refuses everything else.
+        const { resolvePosteriorCompensation } = await import('../lib/posterior-compensation');
+        const result = await resolvePosteriorCompensation(pointer as Record<string, unknown>, jwtAuthCtx);
+        return c.json(result.body as unknown as ImpulseResolveResponse, result.status as any);
+      }
+
+      case 'posteriorCompensationReplay': {
+        // The posterior_compensation_replay activity's resolver: dry_run (default) | arms | apply | verify.
+        const { resolvePosteriorCompensationReplay } = await import('../lib/posterior-compensation');
+        const result = await resolvePosteriorCompensationReplay(pointer as Record<string, unknown>, jwtAuthCtx);
+        return c.json(result.body as unknown as ImpulseResolveResponse, result.status as any);
+      }
+
       case 'edge_liveness_report': {
         // ADVERTISED IS A CLAIM; DEMONSTRATED IS A FACT (2026-08-09).
         //

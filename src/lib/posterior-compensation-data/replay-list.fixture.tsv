@@ -1,0 +1,8 @@
+node	path	withheld_ts	arm_kind	arm_id	route	exec_id	applied_ts	beta_delta	status	lag_s	method	note	applied_src	org_hint
+fx-node	P1	2026-10-03T23:59:00.000000	activity	fx-arm-a	/run-goal	exec_fx_a1	2026-10-04T00:00:00.000000	1	CLEAN	1.0	B	fixture	late	organizations:substrate
+fx-node	P1	2026-10-06T11:59:00.000000	activity	fx-arm-a	/run-goal	exec_fx_a2	2026-10-06T12:00:00.000000	1	CLEAN	1.0	B	fixture	late	organizations:substrate
+fx-node	P1	2026-10-03T23:59:00.000000	activity	fx-arm-b	/run-goal	exec_fx_b1	2026-10-04T00:00:00.000000	1	CLEAN	1.0	B	fixture	late	organizations:substrate
+fx-node	P1	2026-10-03T23:59:00.000000	activity	fx-arm-c	/run-goal	exec_fx_c1	2026-10-04T00:00:00.000000	1	CLEAN	1.0	B	fixture	late	organizations:substrate
+fx-node	P1	2026-10-03T23:58:00.000000	activity	fx-arm-c	/run-goal	exec_fx_c2	2026-10-04T00:00:00.000000	1	AMBIGUOUS	1.0	B	fixture	late	organizations:substrate
+fx-node	P1	2026-10-03T23:59:00.000000	activity	fx-arm-d	/run-goal	exec_fx_d1	2026-10-04T00:00:00.000000	1	CLEAN	1.0	B	fixture	late	organizations:substrate
+fx-node	P1	2026-10-03T23:59:00.000000	activity	fx-arm-e	/run-goal	exec_fx_e1	2026-10-04T00:00:00.000000	1	CLEAN	1.0	B	fixture	late	organizations:substrate

@@ -1,0 +1,6 @@
+arm_id	org_id	candidate_rows	eligible	note
+fx-arm-a	organizations:substrate	1	1	fixture: one row under the hinted org
+fx-arm-b	organizations:substrate	2	0	fixture: two candidate rows, excluded (never guessed)
+fx-arm-c	organizations:substrate	1	1	fixture: one row; carries an AMBIGUOUS pair too
+fx-arm-d	organizations:substrate	1	1	fixture: reset-since-leak row
+fx-arm-e	organizations:substrate	1	1	fixture: floor row

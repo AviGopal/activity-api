@@ -1,0 +1,92 @@
+{
+  "id": "posterior_compensation_replay",
+  "name": "Posterior compensation replay (beta-leak)",
+  "description": "Undo, once, the beta that withheld executions leaked into variant_performance_metrics, for exactly the CLEAN pairs of eligible arms in activity-api's shipped, sha256-pinned frozen list. Deterministic: every task is an impulse-resolve call to activity-api's posteriorCompensationReplay shape (no LLM). mode=dry_run (the default) writes nothing and emits the per-arm plan (k, beta before, expected residue, beta after the floor, reset arms, excluded arms). mode=apply goes ONE ARM PER WRITE: an iteration over the eligible arm ids, each body one apply call for that arm; the resolver spaces arm writes (rate_limit_ms, default 5000, floor 1000) and each arm's record carries its ledger keys, (alpha, beta) before the first and after the last write from the transaction's own reads, nominal vs applied sums and written/floored/reset/already counts. mode=verify is the post-boot re-read: live (alpha, beta) against each arm's recorded AFTER (plus logged genuine deltas when supplied); a mismatch is a flag. Operator-only: the shape refuses non-admin callers, refuses every call when a pinned file's sha mismatches, and is inert (replay_complete) once every eligible pair has a ledger row.",
+  "category": "meta",
+  "version": "0.1.0",
+  "tags": ["meta", "posterior", "remediation", "beta-leak", "write.gated", "operator-only", "iteration"],
+  "input_shapes": [],
+  "output_shapes": ["posteriorCompensationPlan", "posteriorCompensationReplayResult", "posteriorCompensationVerify"],
+  "variables": [
+    {
+      "name": "mode",
+      "type": "string",
+      "required": false,
+      "default": "dry_run",
+      "description": "dry_run (default; writes nothing) | apply (one arm per write, rate-limited) | verify (post-boot re-read)."
+    },
+    {
+      "name": "rateLimitMs",
+      "type": "number",
+      "required": false,
+      "default": 5000,
+      "description": "Minimum spacing between two arms' writes (the resolver floors it at 1000)."
+    }
+  ],
+  "tasks": [
+    {
+      "id": "plan",
+      "description": "The per-arm plan from the frozen list: k, beta before, expected residue, beta after the floor. Writes nothing.",
+      "resolver": "impulse-resolve",
+      "config": { "pointer": { "type": "posteriorCompensationReplay", "mode": "dry_run" } },
+      "outputShapes": ["posteriorCompensationPlan"],
+      "outputImpulses": ["replay_plan"]
+    },
+    {
+      "id": "list_arms",
+      "description": "The eligible arm ids, as a bare list for the per-arm iteration.",
+      "resolver": "impulse-resolve",
+      "config": { "pointer": { "type": "posteriorCompensationReplay", "mode": "arms" } },
+      "dependencies": ["plan"],
+      "conditional": { "expression": "{{variables.mode}} == 'apply'" },
+      "outputShapes": ["posteriorCompensationArms"],
+      "outputImpulses": ["replay_arms"]
+    },
+    {
+      "id": "apply_per_arm",
+      "description": "ONE ARM PER WRITE: one apply call per eligible arm, sequential; the first arm with a pending, refused or ambiguous pair stops the run at that arm boundary.",
+      "resolver": "iteration",
+      "config": {
+        "over": "{{impulse:replay_arms}}",
+        "elementVar": "arm",
+        "body": {
+          "resolver": "impulse-resolve",
+          "config": {
+            "pointer": {
+              "type": "posteriorCompensationReplay",
+              "mode": "apply",
+              "arm_ids": ["{{arm}}"],
+              "rate_limit_ms": "{{variables.rateLimitMs}}"
+            }
+          }
+        },
+        "aggregateAs": "list",
+        "stopOnError": true,
+        "outputShape": "posteriorCompensationReplayResult"
+      },
+      "dependencies": ["list_arms"],
+      "inputImpulses": ["replay_arms"],
+      "conditional": { "expression": "{{variables.mode}} == 'apply'" },
+      "outputShapes": ["posteriorCompensationReplayResult"],
+      "outputImpulses": ["replay_results"]
+    },
+    {
+      "id": "verify",
+      "description": "Post-boot re-read of every compensated row against its recorded AFTER; flags carry arm, expected, observed and the boot time.",
+      "resolver": "impulse-resolve",
+      "config": { "pointer": { "type": "posteriorCompensationReplay", "mode": "verify" } },
+      "dependencies": ["plan"],
+      "conditional": { "expression": "{{variables.mode}} == 'verify'" },
+      "outputShapes": ["posteriorCompensationVerify"],
+      "outputImpulses": ["replay_verify"]
+    }
+  ],
+  "metadata": {
+    "embedded": true,
+    "bootstrapTemplate": false,
+    "readOnly": false,
+    "writeGated": true,
+    "servedBy": "activity-api (posteriorCompensation, posteriorCompensationReplay on POST /v2/impulses/resolve)",
+    "registration": "Definition only: it is not yet in ias-executor-ts src/templates/index.ts (SHARED_TEMPLATES), which bootstrap-seeder seeds."
+  }
+}
