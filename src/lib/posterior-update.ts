@@ -1303,10 +1303,16 @@ export async function applyOutcomeToPosteriors(
       leaf_skipped_default_org_total: leafSkippedDefaultOrg,
     });
   }
-  if (skipVariantUpdate || (ungraded && !failedByTask) || (alphaDelta === 0 && betaDelta === 0)) {
+  // HONEST OUTCOME LINE. A leaf delta that will be handed to the VPM path is logged AFTER both leaf writes are
+  // decided (below the signature-row write), naming what actually happened to each. Only a decision that writes
+  // nothing for the leaf is logged here, as SKIPPED — including a defaulted org, whose leaf writes are all skipped.
+  if (skipVariantUpdate || (ungraded && !failedByTask) || (alphaDelta === 0 && betaDelta === 0) || orgDefaulted) {
     logger.info('posterior variant update SKIPPED', {
       activity_id: activityId,
-      reason: skipVariantUpdate ? (tierClass === 'all_deterministic' ? 'all_deterministic' : 'information_yield_idle') : ((ungraded && !failedByTask) ? 'reach_ungraded' : 'zero_deltas'),
+      execution_id: trace.execution_id ?? null,
+      reason: skipVariantUpdate ? (tierClass === 'all_deterministic' ? 'all_deterministic' : 'information_yield_idle') : ((ungraded && !failedByTask) ? 'reach_ungraded' : ((alphaDelta === 0 && betaDelta === 0) ? 'zero_deltas' : 'org_defaulted')),
+      vpm: orgDefaulted ? 'skipped_org_defaulted' : 'skipped',
+      signature_row: orgDefaulted ? 'skipped_org_defaulted' : 'skipped',
       reach_verdict: reachVerdict,
       tier_class: tierClass,
       alpha_delta: alphaDelta,
@@ -1314,15 +1320,12 @@ export async function applyOutcomeToPosteriors(
       has_tags: Array.isArray(trace.tags) && trace.tags.length > 0,
       task_count: Array.isArray(trace.tasks) ? trace.tasks.length : 0,
     });
-  } else {
-    logger.info('posterior variant update APPLIED', {
-      activity_id: activityId,
-      reach_verdict: reachVerdict,
-      tier_class: tierClass,
-      alpha_delta: alphaDelta,
-      beta_delta: betaDelta,
-    });
   }
+  // The leaf VPM delta goes to the VPM path exactly when the SKIPPED line above did not fire.
+  const leafWrite = !skipVariantUpdate && !orgDefaulted && (alphaDelta !== 0 || betaDelta !== 0);
+  // 'enqueued': the coalescing aggregator accepted it (written or dropped_no_row at its flush, which it counts).
+  // 'written': the synchronous fallback UPDATE ran without error (no row-count check). 'write_failed': it threw.
+  let vpmOutcome: 'enqueued' | 'written' | 'write_failed' | 'skipped' = leafWrite ? 'enqueued' : 'skipped';
 
   // Atomic UPDATE — mirrors the pattern in execution-traces.ts:2235
   // Uses variant_performance_metrics (not activity_template) to avoid the
@@ -1360,11 +1363,10 @@ export async function applyOutcomeToPosteriors(
 
 
   if (
-    !skipVariantUpdate &&
-    !orgDefaulted &&
-    (alphaDelta !== 0 || betaDelta !== 0) &&
+    leafWrite &&
     !enqueueVariantDelta(activityId, orgId, alphaDelta, betaDelta, 'leaf', undefined, trace.execution_id)
   ) {
+    vpmOutcome = 'written';
     try {
       // Read current Thompson counts and apply decay before writing
       const selectResult = await db.query<{
@@ -1426,6 +1428,7 @@ export async function applyOutcomeToPosteriors(
         { new_alpha: newAlpha, new_beta: newBeta, activity_id: activityId, org_id: orgId },
       );
     } catch (err) {
+      vpmOutcome = 'write_failed';
       const msg = `posterior-update DB write failed: ${err instanceof Error ? err.message : String(err)}`;
       warnings.push(msg);
       logger.warn('posterior-update: variant_performance_metrics update failed', {
@@ -1442,13 +1445,21 @@ export async function applyOutcomeToPosteriors(
   // M4: skip the v1 conditional write for all-deterministic templates as well;
   // it shares the same degenerate-posterior justification as the unconditional
   // variant_performance_metrics UPDATE above.
+  // What happens to the leaf's signature row, decided before the write; 'write_failed' is set if it throws.
+  // 'written' means the row script ran without error: a new bucket past the cardinality cap is not distinguished.
+  let signatureRow: 'written' | 'write_failed' | 'dropped_no_signature' | 'skipped_hook_subscriber' | 'skipped_no_signature_version' | 'skipped' =
+    !leafWrite ? 'skipped'
+      : HOOK_SUBSCRIBER_PATTERN.test(activityId) ? 'skipped_hook_subscriber'
+      : !trace.signature ? 'dropped_no_signature'
+      : typeof trace.signature_version !== 'number' ? 'skipped_no_signature_version'
+      : 'written';
+  if (signatureRow === 'dropped_no_signature') {
+    countSignatureRowDroppedNoSignature(trace.execution_id, activityId, orgId, alphaDelta, betaDelta);
+  }
   if (
     !skipVariantUpdate &&
     !orgDefaulted &&
     !HOOK_SUBSCRIBER_PATTERN.test(activityId) &&
-    ((alphaDelta !== 0 || betaDelta !== 0) && !trace.signature
-      ? (countSignatureRowDroppedNoSignature(trace.execution_id, activityId, orgId, alphaDelta, betaDelta), false)
-      : true) &&
     trace.signature &&
     typeof trace.signature_version === 'number' &&
     (alphaDelta !== 0 || betaDelta !== 0)
@@ -1535,6 +1546,7 @@ export async function applyOutcomeToPosteriors(
         prior_seed_neighbors: seed.neighbor_count ?? 0,
       });
     } catch (v1Err) {
+      signatureRow = 'write_failed';
       logger.warn('posterior-update: context_thompson_scores v1 write failed (non-blocking)', {
         activity_id: activityId,
         error: v1Err instanceof Error ? v1Err.message : String(v1Err),
@@ -1568,6 +1580,27 @@ export async function applyOutcomeToPosteriors(
         trace.input_impulse_shapes,
       );
     }
+  }
+
+  if (leafWrite) {
+    // ENQUEUED: the aggregator holds the VPM delta. APPLIED: the VPM UPDATE ran AND the signature row was written
+    // (or does not apply: hook subscriber). PARTIAL: the VPM UPDATE ran but the signature row did not. FAILED: the
+    // VPM UPDATE threw. The fields say which write did what; consumers that summed the old pre-write APPLIED line
+    // count ENQUEUED|APPLIED|PARTIAL (each is a delta handed to the VPM path).
+    const sigOk = signatureRow === 'written' || signatureRow === 'skipped_hook_subscriber';
+    const verdict = vpmOutcome === 'enqueued' ? 'ENQUEUED'
+      : vpmOutcome === 'write_failed' ? 'FAILED'
+      : sigOk ? 'APPLIED' : 'PARTIAL';
+    logger.info(`posterior variant update ${verdict}`, {
+      activity_id: activityId,
+      execution_id: trace.execution_id ?? null,
+      vpm: vpmOutcome,
+      signature_row: signatureRow,
+      reach_verdict: reachVerdict,
+      tier_class: tierClass,
+      alpha_delta: alphaDelta,
+      beta_delta: betaDelta,
+    });
   }
 
   // Impulse-relevance side-write for verifier_negative (and null→verifier fallback)
