@@ -1,49 +1,58 @@
 #!/bin/bash
-# write-replay-authorization.sh — USER-RUN, once, on node1's host: authorize the β-leak replay's writes.
+# write-replay-authorization.sh — USER-RUN, once per node: authorize the β-leak replay's writes on this node.
 #
-# Writes the trust-root pool record posteriorReplayAuthorization through development-vessel's
-# poolImpulse_write with the OPERATOR (admin) key, then reads it back. dev-vessel stamps and signs it
-# (attested.by = operator); activity-api's writeGate (src/lib/posterior-compensation.ts) accepts it only
-# when this node's dev-vessel reports attested_verified: true and the body names exactly this node and
-# the shipped pins below. activity-api never holds the attestation key.
+# 1. Asks this node's activity-api for a posteriorCompensationReplay dry_run and takes the node identity and
+#    the list / eligibility shas from its answer (refuses if the node is missing, or differs from NODE when given).
+# 2. Writes the trust-root pool record posteriorReplayAuthorization via development-vessel's poolImpulse_write
+#    with the OPERATOR (admin) key. dev-vessel stamps and signs it.
+# 3. Reads back the NEWEST open row of the shape (exactly the row activity-api's writeGate selects) and prints
+#    PASS only if it is the row just written, stamped attested.by=operator and attested_verified=true.
 #
-# Before running: run posteriorCompensationReplay dry_run and confirm its `node`, `list` and
-# `eligibility` match NODE, LIST_SHA256 and ELIGIBILITY_SHA256 here.
-#
-# usage: write-replay-authorization.sh "<reason>" <review_by ISO-8601>
+# usage: write-replay-authorization.sh "<reason>" <review_by ISO-8601> [NODE]
+#        NODE (optional): the node you expect; the script refuses if the dry_run reports a different one.
 # env:   CONTAINER (default substrate-live)
 #        ADMIN_KEY_FILE (default ~/.config/substrate/operator-admin-key.json, key at .body.data.key)
 # The key goes to curl on stdin (-K -), never on a command line or into a file.
 set -euo pipefail
 
-NODE="local-dev-spoke"   # node1's FED_SUBSTRATE_ID (the dry_run's `node`)
-LIST_SHA256="30e475036ecd95426dff1cfccf3b970e4fc2dd4f503318838a42ac8bd333dc8a"
-ELIGIBILITY_SHA256="3e1ccc1014d14fa3701e9bb6c6d273314ed7c758003dc9a225b14d2e6b9bfbce"
-ID="posterior-replay-authorization-$NODE"
-
-reason="${1:?usage: $0 \"<reason>\" <review_by ISO-8601>}"
-review_by="${2:?usage: $0 \"<reason>\" <review_by ISO-8601>}"
+reason="${1:?usage: $0 \"<reason>\" <review_by ISO-8601> [NODE]}"
+review_by="${2:?usage: $0 \"<reason>\" <review_by ISO-8601> [NODE]}"
+expect_node="${3:-}"
 C="${CONTAINER:-substrate-live}"
 KEYFILE="${ADMIN_KEY_FILE:-$HOME/.config/substrate/operator-admin-key.json}"
 
-body=$(jq -n --arg id "$ID" --arg node "$NODE" --arg l "$LIST_SHA256" --arg e "$ELIGIBILITY_SHA256" \
+# POST a JSON body (stdin) to an in-container URL with the operator key; the key reaches curl only on stdin.
+post_with_key() {
+  local url="$1" n="replay-auth-$$-$RANDOM.json"
+  docker exec -i "$C" sh -c "cat > /tmp/$n"
+  local K; K=$(jq -r .body.data.key "$KEYFILE")
+  printf 'header = "Authorization: ApiKey %s"\nheader = "content-type: application/json"\n' "$K" \
+    | docker exec -i "$C" sh -c "curl -s -m120 -K - -X POST $url -d @/tmp/$n; rm -f /tmp/$n"
+}
+
+# 1. The node and pins, from the dry_run (no arms planned: arm_ids []).
+plan=$(echo '{"impulse":{"type":"posteriorCompensationReplay","mode":"dry_run","arm_ids":[]}}' | post_with_key 127.0.0.1:8080/v2/impulses/resolve)
+NODE=$(jq -r '.body.node // empty' <<<"$plan")
+LIST_SHA256=$(jq -r '.body.list_sha // empty' <<<"$plan")
+ELIGIBILITY_SHA256=$(jq -r '.body.eligibility_sha // empty' <<<"$plan")
+echo "dry_run: node=$NODE list=$(jq -r '.body.list // "-"' <<<"$plan") eligibility=$(jq -r '.body.eligibility // "-"' <<<"$plan")"
+[ -n "$NODE" ] && [ -n "$LIST_SHA256" ] && [ -n "$ELIGIBILITY_SHA256" ] || { echo "FAIL: the dry_run named no node or pins: $(jq -c '{refused: .refused, detail: .detail}' <<<"$plan")"; exit 1; }
+[ -z "$expect_node" ] || [ "$expect_node" = "$NODE" ] || { echo "FAIL: dry_run node '$NODE' is not the expected '$expect_node'"; exit 1; }
+ID="posterior-replay-authorization-$NODE"
+
+# 2. The write.
+jq -n --arg id "$ID" --arg node "$NODE" --arg l "$LIST_SHA256" --arg e "$ELIGIBILITY_SHA256" \
   --arg by "operator:${USER:-unknown}" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg reason "$reason" --arg rb "$review_by" \
   '{impulse: {type: "poolImpulse_write", id: $id, shape: "posteriorReplayAuthorization", status: "open", source: "operator",
-    body: {node: $node, list_sha256: $l, eligibility_sha256: $e, by: $by, at: $at, reason: $reason, review_by: $rb}}}')
-n="replay-auth-$$-$RANDOM.json"
-printf '%s' "$body" | docker exec -i "$C" sh -c "cat > /tmp/$n"
+    body: {node: $node, list_sha256: $l, eligibility_sha256: $e, by: $by, at: $at, reason: $reason, review_by: $rb}}}' \
+  | post_with_key 127.0.0.1:8090/v2/impulses/resolve | jq -c '{write: (.body // .)}'
 
-K=$(jq -r .body.data.key "$KEYFILE")
-printf 'header = "Authorization: ApiKey %s"\nheader = "content-type: application/json"\n' "$K" \
-  | docker exec -i "$C" sh -c "curl -s -m60 -K - -X POST 127.0.0.1:8090/v2/impulses/resolve -d @/tmp/$n; rm -f /tmp/$n" \
-  | jq -c '{write: (.body // .)}'
-unset K
-
-# Read back (reads are not credentialed): PASS only if the newest open row is operator-attested AND verified.
+# 3. Read back (pool reads are not credentialed): the newest open row of the shape, as activity-api selects it.
 docker exec "$C" curl -s -m30 -X POST 127.0.0.1:8090/v2/impulses/resolve -H 'content-type: application/json' \
   -d '{"impulse":{"type":"poolImpulse","shape":"posteriorReplayAuthorization","status":"open"}}' \
-  | jq -e --arg id "$ID" --arg node "$NODE" --arg l "$LIST_SHA256" --arg e "$ELIGIBILITY_SHA256" '
-      [.body.impulses[] | select(.id == $id)] | sort_by(.updated_at) | last
-      | {id, attested_by: .attested.by, attested_verified, body}
-      | ., (if .attested_by == "operator" and .attested_verified == true and .body.node == $node
-              and .body.list_sha256 == $l and .body.eligibility_sha256 == $e then "PASS" else error("FAIL") end)'
+  | jq -r --arg id "$ID" --arg node "$NODE" --arg l "$LIST_SHA256" --arg e "$ELIGIBILITY_SHA256" '
+      [.body.impulses[]? | select(.shape == "posteriorReplayAuthorization" and .status == "open")] | sort_by(.updated_at) | last
+      | ({id, attested_by: .attested.by, attested_verified, body} | tojson),
+        (if . != null and .id == $id and .attested.by == "operator" and .attested_verified == true
+            and .body.node == $node and .body.list_sha256 == $l and .body.eligibility_sha256 == $e then "PASS" else "FAIL" end)' \
+  | tee /dev/stderr | tail -1 | grep -qx PASS

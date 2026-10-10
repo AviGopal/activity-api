@@ -121,6 +121,8 @@ export interface FrozenPair {
   applied_ts: string;
   leak_at_ms: number;
   status: string;
+  /** The org the same execution was observed under (the list's org_hint; empty when none was observed). */
+  org_hint: string;
 }
 export interface FrozenArm {
   arm_id: string;
@@ -200,7 +202,7 @@ export function loadFrozenInputs(src: FrozenSources): FrozenInputs {
   const eligSha = createHash('sha256').update(eligBytes).digest('hex');
   if (eligSha !== src.eligibilitySha) return { ok: false, refused: 'eligibility_sha_mismatch', detail: `eligibility sha256 ${eligSha} != pinned ${src.eligibilitySha}` };
 
-  const list = readTsv(listBytes.toString('utf8'), ['node', 'path', 'withheld_ts', 'arm_kind', 'arm_id', 'exec_id', 'applied_ts', 'beta_delta', 'status']);
+  const list = readTsv(listBytes.toString('utf8'), ['node', 'path', 'withheld_ts', 'arm_kind', 'arm_id', 'exec_id', 'applied_ts', 'beta_delta', 'status', 'org_hint']);
   if (list.error) return { ok: false, refused: 'frozen_input_invalid', detail: `list: ${list.error}` };
   const elig = readTsv(eligBytes.toString('utf8'), ['arm_id', 'org_id', 'candidate_rows', 'eligible']);
   if (elig.error) return { ok: false, refused: 'frozen_input_invalid', detail: `eligibility: ${elig.error}` };
@@ -223,7 +225,7 @@ export function loadFrozenInputs(src: FrozenSources): FrozenInputs {
     const p: FrozenPair = {
       ledger_key: ledgerKeyOf(r as Parameters<typeof ledgerKeyOf>[0]), node: r.node, path: r.path, withheld_ts: r.withheld_ts,
       arm_id: r.arm_kind === 'satisfier' ? `satisfier:${r.arm_id}` : r.arm_id, exec_id: r.exec_id,
-      applied_ts: r.applied_ts, leak_at_ms: parseUtc(r.applied_ts), status: r.status,
+      applied_ts: r.applied_ts, leak_at_ms: parseUtc(r.applied_ts), status: r.status, org_hint: r.org_hint,
     };
     if (pairs.has(p.ledger_key)) return { ok: false, refused: 'frozen_input_invalid', detail: `list: duplicate pair ${p.ledger_key}` };
     if (p.status === 'CLEAN') {
@@ -236,7 +238,9 @@ export function loadFrozenInputs(src: FrozenSources): FrozenInputs {
   const keysByArm = new Map<string, string[]>();
   for (const armId of [...new Set([...pairs.values()].map((p) => p.arm_id))].sort()) {
     if (!arms.get(armId)?.eligible) continue;
-    const keys = [...pairs.values()].filter((p) => p.arm_id === armId && p.status === 'CLEAN').map((p) => p.ledger_key);
+    // A pair is compensated only if its org_hint IS the arm's eligible org: the leak's flush matched (variant, org),
+    // so a pair observed under no org (or another) may never have touched that row. Excluded, never guessed.
+    const keys = [...pairs.values()].filter((p) => p.arm_id === armId && p.status === 'CLEAN' && p.org_hint === arms.get(armId)!.org_id).map((p) => p.ledger_key);
     if (keys.length > 0) keysByArm.set(armId, keys);
   }
   return {
@@ -369,6 +373,7 @@ export type RefusalCode =
   | 'replay_complete'
   | 'not_in_frozen_list'
   | 'arm_not_eligible'
+  | 'org_hint_mismatch'
   | 'unexpected_field'
   | 'bad_request';
 
@@ -460,6 +465,7 @@ function membership(inputs: Extract<FrozenInputs, { ok: true }>, key: string): {
   if (pair.status !== 'CLEAN') return { refused: 'not_in_frozen_list', detail: `pair is ${pair.status}, only CLEAN pairs are compensated` };
   const arm = inputs.arms.get(pair.arm_id);
   if (!arm?.eligible) return { refused: 'arm_not_eligible', detail: `arm ${pair.arm_id} is not eligible (${arm ? `${arm.candidate_rows} candidate rows` : 'not in the eligibility file'})` };
+  if (pair.org_hint !== arm.org_id) return { refused: 'org_hint_mismatch', detail: `pair org_hint '${pair.org_hint}' is not the arm's org ${arm.org_id}` };
   return { pair, org_id: arm.org_id };
 }
 
@@ -675,9 +681,13 @@ function selectArms(pointer: Record<string, unknown>, inputs: Extract<FrozenInpu
     const keys = [...inputs.pairs.values()].filter((p) => p.arm_id === a && p.status === 'CLEAN').map((p) => p.ledger_key);
     return { arm_id: a, eligible: false, org_id: arm?.org_id ?? null, candidate_rows: arm?.candidate_rows ?? null, note: arm?.note ?? 'not in the eligibility file', keys, k: keys.length };
   });
+  // CLEAN pairs on eligible arms that are excluded because their org_hint is not the arm's org.
+  const excludedPairs = [...inputs.pairs.values()]
+    .filter((p) => p.status === 'CLEAN' && inputs.arms.get(p.arm_id)?.eligible && p.org_hint !== inputs.arms.get(p.arm_id)!.org_id)
+    .map((p) => ({ ledger_key: p.ledger_key, arm_id: p.arm_id, org_hint: p.org_hint }));
   const common = {
     node: inputs.node, list: inputs.list_label, eligibility: inputs.eligibility_label,
-    list_sha: inputs.list_sha, eligibility_sha: inputs.eligibility_sha, excluded_arms: excluded, unknown_arms: unknownArms,
+    list_sha: inputs.list_sha, eligibility_sha: inputs.eligibility_sha, excluded_arms: excluded, excluded_pairs: excludedPairs, unknown_arms: unknownArms,
   };
   return { armIds, common };
 }

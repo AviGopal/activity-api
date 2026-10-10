@@ -546,7 +546,7 @@ if (ISOLATED) {
     t.deps.inputs = () => t.PC.loadNodeInputs(t.PC.nodeIdentity({ FED_SUBSTRATE_ID: N1 }));
     const inp = t.deps.inputs() as AnyRec;
     // An eligible arm of kind `activity` whose row lives under ORG (what FakeDb.seed writes), and one CLEAN key on it.
-    const pair = [...inp.pairs.values()].find((p: AnyRec) => p.status === 'CLEAN' && !p.arm_id.startsWith('satisfier:') && inp.arms.get(p.arm_id)?.eligible && inp.arms.get(p.arm_id).org_id === ORG) as AnyRec;
+    const pair = [...inp.pairs.values()].find((p: AnyRec) => p.status === 'CLEAN' && p.org_hint === ORG && !p.arm_id.startsWith('satisfier:') && inp.arms.get(p.arm_id)?.eligible && inp.arms.get(p.arm_id).org_id === ORG) as AnyRec;
     const body = { node: N1, list_sha256: inp.list_sha, eligibility_sha256: inp.eligibility_sha, by: 'avi', at: NOW_ISO, reason: 'test', review_by: NOW_ISO };
     const record = (o: AnyRec = {}): AnyRec => ({ id: 'posterior-replay-authorization', shape: 'posteriorReplayAuthorization', status: 'open', updated_at: NOW_ISO, source: 'operator', body, attested: { by: 'operator', key_id: 'k', at: NOW_ISO, sig: 'f'.repeat(64) }, attested_verified: true, ...o });
     t.db.seed(pair.arm_id, { thompson_alpha: 3, thompson_beta: 5 });
@@ -564,7 +564,7 @@ if (ISOLATED) {
   }
 
   describe('β-leak replay — per-node frozen lists and the authorization record', () => {
-    test('node1 dry_run reads its FROZEN list: 166 eligible arms, 1054 CLEAN keys, 11 ineligible arms', async () => {
+    test('node1 dry_run reads its FROZEN list: 166 eligible arms, 1043 CLEAN keys (11 hintless pairs excluded), 11 ineligible arms', async () => {
       const { t, inp } = await node1();
       const { readFileSync } = await import('node:fs');
       const { createHash } = await import('node:crypto');
@@ -576,7 +576,17 @@ if (ISOLATED) {
       expect(head).toContain('ea685ca3a78d60158b0c08d470db3b6903bc3f33f52b8919c6930d7669434480');
       expect(inp.ok).toBe(true);
       expect([...inp.arms.values()].filter((a: AnyRec) => a.eligible).length).toBe(166);
-      expect(inp.eligibleKeys.length).toBe(1054);
+      expect(inp.eligibleKeys.length).toBe(1043);
+      // The 11 CLEAN pairs on eligible arms with no organizations:substrate hint are excluded pair by pair; their
+      // arms stay eligible with their hinted keys.
+      const hintless = [...inp.pairs.values()].filter((p: AnyRec) => p.status === 'CLEAN' && inp.arms.get(p.arm_id)?.eligible && p.org_hint !== ORG);
+      const byArm: AnyRec = {};
+      for (const p of hintless as AnyRec[]) byArm[p.arm_id] = (byArm[p.arm_id] ?? 0) + 1;
+      expect(byArm).toEqual({ 'auto-bridge-fs_edit': 9, 'learned-satisfier-goal-execution': 1, 'satisfier:memoryNote_write': 1 });
+      for (const [a, n] of [['auto-bridge-fs_edit', 3], ['learned-satisfier-goal-execution', 2], ['satisfier:memoryNote_write', 14]] as const) expect(inp.keysByArm.get(a)?.length).toBe(n);
+      for (const p of hintless as AnyRec[]) expect(inp.eligibleKeys).not.toContain(p.ledger_key);
+      const r = await t.PC.unauthorizedApply.key({ type: 'posteriorCompensation', ledger_key: (hintless[0] as AnyRec).ledger_key }, t.deps as any);
+      expect((r.body as AnyRec).refused).toBe('org_hint_mismatch');
       // Satisfier arms are keyed by their VPM variant id; the ledger key stays over the list's own columns.
       const sat = [...inp.pairs.values()].find((p: AnyRec) => p.arm_id.startsWith('satisfier:')) as AnyRec;
       expect(sat.ledger_key).toBe(t.PC.ledgerKeyOf({ ...sat, arm_id: sat.arm_id.slice('satisfier:'.length) }));
@@ -585,7 +595,8 @@ if (ISOLATED) {
       expect(plan.list).toBe(`FROZEN (replay-list.local-dev-spoke.tsv, sha256 ${src.listSha})`);
       expect(plan.eligibility).toBe(`FROZEN (eligibility.local-dev-spoke.tsv, sha256 ${src.eligibilitySha})`);
       // Excluded: the 11 ineligible arms of the eligibility file, plus 4 arms whose every pair is AMBIGUOUS (no CLEAN key).
-      expect({ arms: plan.totals.arms, keys: plan.totals.keys, excluded_arms: plan.totals.excluded_arms }).toEqual({ arms: 166, keys: 1054, excluded_arms: 15 });
+      expect({ arms: plan.totals.arms, keys: plan.totals.keys, excluded_arms: plan.totals.excluded_arms }).toEqual({ arms: 166, keys: 1043, excluded_arms: 15 });
+      expect(plan.excluded_pairs.length).toBe(11);
       expect(plan.excluded_arms.filter((a: AnyRec) => a.k > 0).length).toBe(11);
       expect(t.db.writes).toEqual([]);
     });
