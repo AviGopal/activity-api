@@ -365,6 +365,7 @@ export function isOperatorCaller(auth: JwtAuthContext | null | undefined): boole
 export type RefusalCode =
   | 'not_operator'
   | 'apply_requires_authorization'
+  | 'authorization_expired'
   | 'no_list_for_node'
   | 'list_sha_mismatch'
   | 'eligibility_sha_mismatch'
@@ -402,9 +403,13 @@ const isLoopbackUrl = (u: string): boolean => {
  * authorized, else why not. FAILS CLOSED: a non-loopback route, an unreadable answer, no open row, a row not
  * stamped by an operator, attested_verified anything but true (an older dev-vessel that does not report it
  * included), or a body whose node / list_sha256 / eligibility_sha256 differs from this node's pins.
+ * EXPIRES: body.review_by must be a parseable time not yet passed (authorization_expired otherwise; no hold or
+ * grant is indefinite). Checked on EVERY write call, against deps.nowMs(), since the record is re-read each call.
  */
-export async function checkAuthorization(deps: CompensationDeps, inputs: Extract<FrozenInputs, { ok: true }>): Promise<string | null> {
-  if (!isLoopbackUrl(deps.poolResolveUrl)) return `the authorization is read only from this node's development-vessel; ${deps.poolResolveUrl} is not loopback`;
+export type AuthorizationDenial = { code: 'apply_requires_authorization' | 'authorization_expired'; why: string };
+export async function checkAuthorization(deps: CompensationDeps, inputs: Extract<FrozenInputs, { ok: true }>): Promise<AuthorizationDenial | null> {
+  const deny = (why: string): AuthorizationDenial => ({ code: 'apply_requires_authorization', why });
+  if (!isLoopbackUrl(deps.poolResolveUrl)) return deny(`the authorization is read only from this node's development-vessel; ${deps.poolResolveUrl} is not loopback`);
   let rows: Array<Record<string, any>>;
   try {
     const res = await deps.fetch(deps.poolResolveUrl, {
@@ -414,19 +419,22 @@ export async function checkAuthorization(deps: CompensationDeps, inputs: Extract
       signal: AbortSignal.timeout(10_000),
     });
     const j = (await res.json()) as { body?: { impulses?: unknown } };
-    if (!res.ok || !Array.isArray(j?.body?.impulses)) return `authorization unreadable (HTTP ${res.status})`;
+    if (!res.ok || !Array.isArray(j?.body?.impulses)) return deny(`authorization unreadable (HTTP ${res.status})`);
     rows = j.body!.impulses as Array<Record<string, any>>;
   } catch (err) {
-    return `authorization unreadable (${err instanceof Error ? err.message : String(err)})`;
+    return deny(`authorization unreadable (${err instanceof Error ? err.message : String(err)})`);
   }
   const row = rows.filter((r) => r?.shape === AUTHORIZATION_SHAPE && r?.status === 'open')
     .sort((a, b) => String(b.updated_at ?? '').localeCompare(String(a.updated_at ?? '')))[0];
-  if (!row) return 'no open posteriorReplayAuthorization record';
-  if (row.attested?.by !== 'operator') return 'the record is not operator-attested';
-  if (row.attested_verified !== true) return 'development-vessel did not verify the record\'s operator attestation';
+  if (!row) return deny('no open posteriorReplayAuthorization record');
+  if (row.attested?.by !== 'operator') return deny('the record is not operator-attested');
+  if (row.attested_verified !== true) return deny('development-vessel did not verify the record\'s operator attestation');
   const b = (row.body ?? {}) as Record<string, unknown>;
-  if (b.node !== inputs.node) return `the record names node '${String(b.node)}', this node is '${String(inputs.node)}'`;
-  if (b.list_sha256 !== inputs.list_sha || b.eligibility_sha256 !== inputs.eligibility_sha) return 'the record\'s list / eligibility sha256 do not match this node\'s pins';
+  if (b.node !== inputs.node) return deny(`the record names node '${String(b.node)}', this node is '${String(inputs.node)}'`);
+  if (b.list_sha256 !== inputs.list_sha || b.eligibility_sha256 !== inputs.eligibility_sha) return deny('the record\'s list / eligibility sha256 do not match this node\'s pins');
+  const reviewMs = typeof b.review_by === 'string' ? Date.parse(b.review_by) : NaN;
+  if (!Number.isFinite(reviewMs)) return { code: 'authorization_expired', why: `the record's review_by '${String(b.review_by)}' is missing or unparseable` };
+  if (deps.nowMs() > reviewMs) return { code: 'authorization_expired', why: `the record's review_by ${String(b.review_by)} has passed` };
   return null;
 }
 
@@ -436,10 +444,10 @@ async function writeGate(shape: string, auth: JwtAuthContext | null | undefined,
   if (denied) return denied;
   const inputs = deps.inputs();
   if (!inputs.ok) return refuse(422, inputs.refused, inputs.detail);
-  const why = await checkAuthorization(deps, inputs);
-  if (why === null) return null;
-  logger.warn('posterior compensation REFUSED: write without authorization', { event: 'posterior_compensation_refused', refused: 'apply_requires_authorization', shape, why, key_id: auth?.keyId ?? null, user_id: auth?.userId ?? null });
-  return refuse(403, 'apply_requires_authorization', why);
+  const denial = await checkAuthorization(deps, inputs);
+  if (denial === null) return null;
+  logger.warn('posterior compensation REFUSED: write without authorization', { event: 'posterior_compensation_refused', refused: denial.code, shape, why: denial.why, key_id: auth?.keyId ?? null, user_id: auth?.userId ?? null });
+  return refuse(403, denial.code, denial.why);
 }
 
 type InputsGate = { ok: true; inputs: Extract<FrozenInputs, { ok: true }> } | { ok: false; result: ResolverResult };

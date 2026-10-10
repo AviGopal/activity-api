@@ -8,16 +8,18 @@
 # 3. Reads back the NEWEST open row of the shape (exactly the row activity-api's writeGate selects) and prints
 #    PASS only if it is the row just written, stamped attested.by=operator and attested_verified=true.
 #
-# usage: write-replay-authorization.sh "<reason>" <review_by ISO-8601> [NODE]
+# usage: write-replay-authorization.sh "<reason>" [review_by ISO-8601] [NODE]
+#        review_by (optional, default now + 7 days): activity-api refuses every write after it (authorization_expired).
 #        NODE (optional): the node you expect; the script refuses if the dry_run reports a different one.
 # env:   CONTAINER (default substrate-live)
 #        ADMIN_KEY_FILE (default ~/.config/substrate/operator-admin-key.json, key at .body.data.key)
 # The key goes to curl on stdin (-K -), never on a command line or into a file.
 set -euo pipefail
 
-reason="${1:?usage: $0 \"<reason>\" <review_by ISO-8601> [NODE]}"
-review_by="${2:?usage: $0 \"<reason>\" <review_by ISO-8601> [NODE]}"
+reason="${1:?usage: $0 \"<reason>\" [review_by ISO-8601] [NODE]}"
+review_by="${2:-$(date -u -d '+7 days' +%Y-%m-%dT%H:%M:%SZ)}"
 expect_node="${3:-}"
+[ "$(date -u -d "$review_by" +%s 2>/dev/null || echo 0)" -gt "$(date -u +%s)" ] || { echo "FAIL: review_by '$review_by' is not a future time"; exit 1; }
 C="${CONTAINER:-substrate-live}"
 KEYFILE="${ADMIN_KEY_FILE:-$HOME/.config/substrate/operator-admin-key.json}"
 
@@ -39,6 +41,7 @@ echo "dry_run: node=$NODE list=$(jq -r '.body.list // "-"' <<<"$plan") eligibili
 [ -n "$NODE" ] && [ -n "$LIST_SHA256" ] && [ -n "$ELIGIBILITY_SHA256" ] || { echo "FAIL: the dry_run named no node or pins: $(jq -c '{refused: .refused, detail: .detail}' <<<"$plan")"; exit 1; }
 [ -z "$expect_node" ] || [ "$expect_node" = "$NODE" ] || { echo "FAIL: dry_run node '$NODE' is not the expected '$expect_node'"; exit 1; }
 ID="posterior-replay-authorization-$NODE"
+echo "review_by: $review_by (writes are refused after this)"
 
 # 2. The write.
 jq -n --arg id "$ID" --arg node "$NODE" --arg l "$LIST_SHA256" --arg e "$ELIGIBILITY_SHA256" \

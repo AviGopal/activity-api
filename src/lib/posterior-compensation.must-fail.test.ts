@@ -19,7 +19,7 @@
 import { describe, expect, test, afterEach } from 'bun:test';
 import { join as pathJoin, relative as pathRelative } from 'node:path';
 
-const CASES = 55;
+const CASES = 56;
 const ISOLATED_ENV = 'ACTIVITY_API_ISOLATED_TEST';
 const ISOLATED = process.env[ISOLATED_ENV] === import.meta.path;
 if (!ISOLATED) {
@@ -547,14 +547,14 @@ if (ISOLATED) {
     const inp = t.deps.inputs() as AnyRec;
     // An eligible arm of kind `activity` whose row lives under ORG (what FakeDb.seed writes), and one CLEAN key on it.
     const pair = [...inp.pairs.values()].find((p: AnyRec) => p.status === 'CLEAN' && p.org_hint === ORG && !p.arm_id.startsWith('satisfier:') && inp.arms.get(p.arm_id)?.eligible && inp.arms.get(p.arm_id).org_id === ORG) as AnyRec;
-    const body = { node: N1, list_sha256: inp.list_sha, eligibility_sha256: inp.eligibility_sha, by: 'avi', at: NOW_ISO, reason: 'test', review_by: NOW_ISO };
+    const body = { node: N1, list_sha256: inp.list_sha, eligibility_sha256: inp.eligibility_sha, by: 'avi', at: NOW_ISO, reason: 'test', review_by: new Date(NOW + 7 * DAY).toISOString() };
     const record = (o: AnyRec = {}): AnyRec => ({ id: 'posterior-replay-authorization', shape: 'posteriorReplayAuthorization', status: 'open', updated_at: NOW_ISO, source: 'operator', body, attested: { by: 'operator', key_id: 'k', at: NOW_ISO, sig: 'f'.repeat(64) }, attested_verified: true, ...o });
     t.db.seed(pair.arm_id, { thompson_alpha: 3, thompson_beta: 5 });
     /** Every write path, each expected to refuse with `code`; nothing may reach the store. */
     const allWritesRefused = async (code: string, detail?: RegExp) => {
       const rs = [await t.route1(pair.ledger_key), await t.replay({ mode: 'apply', arm_ids: [pair.arm_id] }), await t.replay({ mode: 'apply' })];
       for (const r of rs) {
-        expect({ status: r.status, refused: (r.body as AnyRec).refused }).toEqual({ status: code === 'apply_requires_authorization' ? 403 : 422, refused: code });
+        expect({ status: r.status, refused: (r.body as AnyRec).refused }).toEqual({ status: ['apply_requires_authorization', 'authorization_expired'].includes(code) ? 403 : 422, refused: code });
         if (detail) expect(String((r.body as AnyRec).detail)).toMatch(detail);
       }
       expect(t.db.writes).toEqual([]);
@@ -653,6 +653,23 @@ if (ISOLATED) {
       await allWritesRefused('apply_requires_authorization', /names node 'hub-203.0.113.7'/);
       t.pool.splice(0, 1, record({ body: { ...body, node: 'node1' } }));
       await allWritesRefused('apply_requires_authorization', /names node 'node1'/);
+    });
+
+    test('review_by is enforced on EVERY write call: missing, unparseable or passed → authorization_expired', async () => {
+      const { t, record, body, pair, allWritesRefused } = await node1();
+      const { review_by: _r, ...noReview } = body;
+      t.pool.push(record({ body: noReview }));
+      await allWritesRefused('authorization_expired', /missing or unparseable/);
+      t.pool.splice(0, 1, record({ body: { ...body, review_by: 'next week' } }));
+      await allWritesRefused('authorization_expired', /missing or unparseable/);
+      t.pool.splice(0, 1, record({ body: { ...body, review_by: new Date(NOW - 1).toISOString() } }));
+      await allWritesRefused('authorization_expired', /has passed/);
+      // Re-checked per call: a record valid at one call is refused at the next once the clock passes review_by.
+      t.pool.splice(0, 1, record({ body: { ...body, review_by: new Date(NOW + 1_000).toISOString() } }));
+      expect((await t.route1(pair.ledger_key)).status).toBe(200);
+      t.deps.nowMs = () => NOW + 1_001;
+      const late = await t.replay({ mode: 'apply', arm_ids: [pair.arm_id] });
+      expect({ status: late.status, refused: (late.body as AnyRec).refused }).toEqual({ status: 403, refused: 'authorization_expired' });
     });
 
     test('a valid record → both write shapes are allowed and write (the fake DB path), read only from this node', async () => {
