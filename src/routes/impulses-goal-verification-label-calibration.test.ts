@@ -104,7 +104,8 @@ mock.module('../db/surreal', () => ({
 
 const impulsesRoutes = (await import('./impulses')).default;
 
-const AUTH = { orgId: 'org-test', authType: 'apikey' as const, jwtToken: 'test-jwt', keyId: 'k', scopes: ['read', 'write'] };
+// The calibration sheet writes HUMAN verdicts, which need the verdict:human scope (goal-verification-label-write.ts).
+const AUTH = { orgId: 'org-test', authType: 'apikey' as const, jwtToken: 'test-jwt', keyId: 'k', scopes: ['read', 'write', 'verdict:human'] };
 
 function app(): Hono {
   const a = new Hono();

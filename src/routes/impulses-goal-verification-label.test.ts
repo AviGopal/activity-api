@@ -57,6 +57,9 @@ const VALID_AUTH = {
   scopes: ['read', 'write'],
 };
 
+// labeler "human" needs a credential issued with the verdict:human scope (goal-verification-label-write.ts).
+const HUMAN_VERDICT_AUTH = { ...VALID_AUTH, scopes: ['read', 'write', 'verdict:human'] };
+
 async function callResolve(app: Hono, pointer: Record<string, unknown>) {
   const res = await app.request('/v2/impulses/resolve', {
     method: 'POST',
@@ -83,7 +86,7 @@ const VALID_PAYLOAD = {
 describe('POST /v2/impulses/resolve → goal_verification_label_write', () => {
   test('valid payload returns 200 with record id', async () => {
     nextQueryResult = [{ id: 'goal_verification_labels:abc' }];
-    const app = buildApp(VALID_AUTH);
+    const app = buildApp(HUMAN_VERDICT_AUTH);
     const { status, body } = await callResolve(app, VALID_PAYLOAD);
 
     expect(status).toBe(200);

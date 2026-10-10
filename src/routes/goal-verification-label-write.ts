@@ -19,8 +19,70 @@ export type ExecuteAsAuth = <T>(jwtAuth: JwtAuthContext, sql: string, params: Re
 
 /** What the route sends back: the HTTP status and the response body. */
 export interface LabelWriteResult {
-  status: 200 | 400 | 401 | 500;
+  status: 200 | 400 | 401 | 403 | 500;
   body: ImpulseResolveResponse;
+}
+
+/**
+ * WHO MAY WRITE A HUMAN VERDICT.
+ *
+ * goal-host's oracle-label consumer turns a `labeler:"human"` row into a reach override and files a
+ * `source:"human_reported"` disagreement gap. Until this check, `labeler` was whatever the caller
+ * sent, and any authenticated key could send "human": a goal walk resolving this shape with
+ * goal-host's own fleet key passes requireAuthenticated exactly as the operator does. Measured by
+ * deployment: the cockpit key and the node keys are different keys of the SAME principal (same
+ * user_id and org, role "user", scopes [read, write]). Only the SCOPES the credential was issued
+ * with separate an operator from the walk, so that is the one thing this reads.
+ *
+ * isHumanVerdictPrincipal reads exactly these JwtAuthContext fields, all set by the auth middleware
+ * (middleware/jwtAuth.ts) from the server-side validation of the request's credential, never from
+ * the pointer:
+ *   - scopes: identity-vessel's validation answer for an ApiKey (its api_key row's scopes), or the
+ *     verified JWT's `$auth.scopes ?? $token.scopes`. A human verdict needs HUMAN_VERDICT_SCOPE, or
+ *     ADMIN_SCOPE as the interim fallback until a verdict-scoped operator key is issued.
+ *   - keyId: the verdict must be attributable, so a credential without a server-derived key id is
+ *     refused (it is what labeled_by_principal names).
+ *   - obo: a caller that arrived through a federation ingress with an on-behalf-of token is never a
+ *     human verdict here. identity's obo exchange strips "admin" but not other scopes, and a peer
+ *     node's grant is not the operator at this node. Revisit if cross-node operator feedback is
+ *     wanted.
+ * It does NOT read role or userId: both are identical for the operator and the walk (deployment,
+ * above). There is no key-id allow-list and no env or constant gate (law 1): who holds the verdict
+ * scope is decided where keys are issued (identity-vessel), and changes there take effect here.
+ * Unknown, missing or malformed means NOT a human-verdict principal (fail closed).
+ *
+ * Non-human labelers (automated, deterministic) are unaffected: any authenticated caller may still
+ * write them, as before.
+ */
+export const HUMAN_VERDICT_SCOPE = 'verdict:human';
+export const ADMIN_SCOPE = 'admin';
+
+export function isHumanVerdictPrincipal(ctx: JwtAuthContext | null | undefined): boolean {
+  if (!ctx) return false;
+  if (ctx.obo) return false;
+  if (typeof ctx.keyId !== 'string' || ctx.keyId.trim().length === 0) return false;
+  const scopes = Array.isArray(ctx.scopes) ? ctx.scopes : [];
+  return scopes.includes(HUMAN_VERDICT_SCOPE) || scopes.includes(ADMIN_SCOPE);
+}
+
+/**
+ * The principal stamped on a human label, built from the server-validated context only. A
+ * `labeled_by_principal` the caller puts on the pointer is never read: the CREATE names its fields
+ * explicitly and binds this object. goal-host's consumer acts on a human label only when this stamp
+ * carries the verdict scope (or admin).
+ */
+export interface LabeledByPrincipal {
+  key_id: string;
+  auth_type: string;
+  scopes: string[];
+}
+
+export function labeledByPrincipal(ctx: JwtAuthContext): LabeledByPrincipal {
+  return {
+    key_id: String(ctx.keyId),
+    auth_type: ctx.authType ?? 'unknown',
+    scopes: (Array.isArray(ctx.scopes) ? ctx.scopes : []).map(String),
+  };
 }
 
 export async function resolveGoalVerificationLabelWrite(
@@ -66,6 +128,23 @@ export async function resolveGoalVerificationLabelWrite(
       error: `labeler must be one of: ${validLabelers.join(', ')}`,
     } as ImpulseResolveResponse };
   }
+
+  // A HUMAN verdict needs a human-verdict principal (isHumanVerdictPrincipal above); refused 403
+  // otherwise, with nothing written. The refusal names the scope needed, not the caller's key.
+  const gvlHuman = gvlPointer.labeler === 'human';
+  if (gvlHuman && !isHumanVerdictPrincipal(jwtAuth)) {
+    logger.warn('goal_verification_label_write REFUSED: labeler "human" from a credential without the human-verdict scope', {
+      key_id: jwtAuth.keyId ?? null,
+      auth_type: jwtAuth.authType ?? null,
+      obo: jwtAuth.obo ? true : false,
+      execution_id: gvlPointer.execution_id,
+    });
+    return { status: 403, body: {
+      success: false,
+      error: `labeler "human" requires a credential issued with the "${HUMAN_VERDICT_SCOPE}" scope (or "${ADMIN_SCOPE}"), attributable by key id and not on-behalf-of a peer node`,
+    } as ImpulseResolveResponse };
+  }
+  const gvlPrincipal = gvlHuman ? labeledByPrincipal(jwtAuth) : null;
 
   // GROUNDING (migration 192). A label recorded only a conclusion — verdict, confidence,
   // labeler — never the evidence behind it, so a self-confirming verdict was
@@ -155,9 +234,22 @@ export async function resolveGoalVerificationLabelWrite(
   // statement rolls the CREATE back (verified on 2.3.10: zero rows after the throw). Plain
   // labels keep the bare CREATE and are unaffected wherever 216 has not applied.
   const gvlGuard = gvlCalibrationKeys.map((k) => `$c[0].${k} != $${k}`).join(' OR ');
-  const gvlWrap = (createSql: string): string => gvlCalibrationKeys.length === 0
+  // PRINCIPAL (migration 219): named in the CREATE only on a human label, so the automated and
+  // deterministic feeds write exactly the statement they wrote before. The same refuse-don't-degrade
+  // rule as the calibration fields: a human label whose principal did not land (219 not applied, the
+  // field silently dropped on 2.3.10) would be indistinguishable from a pre-fix row, so it THROWs
+  // and the CREATE rolls back.
+  const gvlPrincipalContent = gvlPrincipal ? `labeled_by_principal: $labeled_by_principal,\n        ` : '';
+  const gvlChecks: string[] = [];
+  if (gvlCalibrationKeys.length > 0) {
+    gvlChecks.push(`IF ${gvlGuard} { THROW "calibration fields were not stored on goal_verification_labels (migration 216 not applied)" };`);
+  }
+  if (gvlPrincipal) {
+    gvlChecks.push(`IF $c[0].labeled_by_principal.key_id != $principal_key_id { THROW "labeled_by_principal was not stored on goal_verification_labels (migration 219 not applied)" };`);
+  }
+  const gvlWrap = (createSql: string): string => gvlChecks.length === 0
     ? createSql
-    : `{ LET $c = (${createSql}); IF ${gvlGuard} { THROW "calibration fields were not stored on goal_verification_labels (migration 216 not applied)" }; RETURN $c; }`;
+    : `{ LET $c = (${createSql}); ${gvlChecks.join(' ')} RETURN $c; }`;
   try {
     const created = await executeAsAuth<any>(
       jwtAuth,
@@ -175,7 +267,7 @@ export async function resolveGoalVerificationLabelWrite(
         expected: IF $expected IS NULL THEN NONE ELSE $expected END,
         observed: IF $observed IS NULL THEN NONE ELSE $observed END,
         evidence: IF $evidence IS NULL THEN NONE ELSE $evidence END,
-        ${gvlCalibrationContent}grounded: $grounded,
+        ${gvlCalibrationContent}${gvlPrincipalContent}grounded: $grounded,
         created_at: time::now()
       }`),
       {
@@ -202,6 +294,7 @@ export async function resolveGoalVerificationLabelWrite(
         window_id: gvlNonEmpty(gvlG.window_id) ? String(gvlG.window_id).slice(0, 200) : null,
         sample_draw_id: gvlNonEmpty(gvlG.sample_draw_id) ? String(gvlG.sample_draw_id).slice(0, 200) : null,
         grounded: gvlGrounded,
+        ...(gvlPrincipal ? { labeled_by_principal: gvlPrincipal, principal_key_id: gvlPrincipal.key_id } : {}),
       },
     );
 
