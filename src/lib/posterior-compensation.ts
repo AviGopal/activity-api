@@ -447,6 +447,8 @@ function armRecord(armId: string, orgId: string, keys: string[], results: KeyRes
  * applied delta is 2.7e-7. 1e-6 covers a few such skews with margin; anything a caller wants looser is a flag.
  */
 export const VERIFY_TOLERANCE_REL = 1e-6;
+/** A row's updated_at later than now by more than this (clock skew between app and DB) is flagged, never trusted. */
+export const VERIFY_CLOCK_SKEW_MS = 60_000;
 
 /** Minimum spacing between two arms' writes, across calls. */
 const MIN_ARM_SPACING_MS = 1_000;
@@ -550,7 +552,9 @@ export interface VerifyFlag {
     // ...and verify never passes on a request that checks nothing or carries an unusable expectation.
     | 'no_arms_checked' | 'unknown_arm' | 'bad_expectation' | 'ledger_read_empty'
     // ...nor on a written row it could not read in full, an arm it never compared, or a loosened tolerance.
-    | 'ledger_row_incomplete' | 'arm_unchecked' | 'tolerance_too_loose';
+    | 'ledger_row_incomplete' | 'arm_unchecked' | 'tolerance_too_loose'
+    // ...nor on caller deltas it cannot trust, or a row stamped in the future.
+    | 'bad_genuine_delta' | 'updated_at_in_future';
   expected: Record<string, number> | null;
   observed: Record<string, number> | null;
   boot_at: string;
@@ -745,25 +749,41 @@ export async function resolvePosteriorCompensationReplay(
     }
     const row = rows[0];
     const observed = { alpha: Number(row.thompson_alpha ?? 1), beta: Number(row.thompson_beta ?? 1) };
-    const u = Math.max(atMs, tsMs(row.updated_at_s));
+    const rowUpdatedMs = tsMs(row.updated_at_s);
+    if (rowUpdatedMs > deps.nowMs() + VERIFY_CLOCK_SKEW_MS) {
+      flags.push({ arm_id: a, org_id: org, kind: 'updated_at_in_future', expected: { updated_at_max_ms: deps.nowMs() + VERIFY_CLOCK_SKEW_MS }, observed: { updated_at_ms: rowUpdatedMs }, boot_at: bootAt });
+    }
+    const u = Math.max(atMs, rowUpdatedMs);
     const decayedAfter = decayedThompsonCounts(recAfter.alpha, recAfter.beta, atMs, u);
     if (observed.alpha === Number(row.successful_executions ?? NaN) + 1 && observed.beta === Number(row.failed_executions ?? NaN) + 1) {
       flags.push({ arm_id: a, org_id: org, kind: 're_reset', expected: recAfter, observed, boot_at: bootAt });
     } else if (logged) {
+      // Caller-supplied deltas are VALIDATED, never trusted: genuine α/β deltas are ≥ 0 and finite, and only a
+      // delta inside (ledger at, row updated_at] can have reached this row. Anything else is bad_genuine_delta
+      // and is NOT applied — so a fabricated negative delta cannot cancel an overwrite.
       let ea = decayedAfter.alpha;
       let eb = decayedAfter.beta;
       for (const d of logged.filter((x) => String(x.arm_id) === a)) {
         const t = tsMs(String(d.at ?? ''));
-        if (t <= atMs || t > u) continue;
+        const da = d.alpha === undefined ? 0 : d.alpha;
+        const db = d.beta === undefined ? 0 : d.beta;
+        const valid = typeof da === 'number' && Number.isFinite(da) && da >= 0
+          && typeof db === 'number' && Number.isFinite(db) && db >= 0
+          && t > atMs && t <= rowUpdatedMs;
+        if (!valid) {
+          flags.push({ arm_id: a, org_id: org, kind: 'bad_genuine_delta', expected: { at_after_ms: atMs, at_max_ms: rowUpdatedMs, delta_min: 0 }, observed: { at_ms: t, alpha: Number(da), beta: Number(db) }, boot_at: bootAt });
+          continue;
+        }
         const f = decayedThompsonCounts(2, 2, t, u).alpha - 1; // the kernel's factor from t to u
-        ea += Number(d.alpha ?? 0) * f;
-        eb += Number(d.beta ?? 0) * f;
+        ea += da * f;
+        eb += db * f;
       }
       if (Math.abs(observed.alpha - ea) > tol(ea) || Math.abs(observed.beta - eb) > tol(eb)) {
         flags.push({ arm_id: a, org_id: org, kind: 'mismatch_with_logged_deltas', expected: { alpha: ea, beta: eb }, observed, boot_at: bootAt });
       }
-    } else if (observed.beta < decayedAfter.beta - tol(decayedAfter.beta)) {
-      flags.push({ arm_id: a, org_id: org, kind: 'below_recorded_after', expected: { beta_min: decayedAfter.beta }, observed, boot_at: bootAt });
+    } else if (observed.alpha < decayedAfter.alpha - tol(decayedAfter.alpha) || observed.beta < decayedAfter.beta - tol(decayedAfter.beta)) {
+      // Both counts may only have risen since the write (decay toward 1 plus non-negative genuine deltas).
+      flags.push({ arm_id: a, org_id: org, kind: 'below_recorded_after', expected: { alpha_min: decayedAfter.alpha, beta_min: decayedAfter.beta }, observed, boot_at: bootAt });
     }
     checked.push({ arm_id: a, org_id: org, recorded_after: recAfter, recorded_at: last.at_s, observed, updated_at: row.updated_at_s ?? null });
   }

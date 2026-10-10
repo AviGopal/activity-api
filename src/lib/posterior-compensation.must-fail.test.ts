@@ -19,7 +19,7 @@
 import { describe, expect, test, afterEach } from 'bun:test';
 import { join as pathJoin, relative as pathRelative } from 'node:path';
 
-const CASES = 41;
+const CASES = 44;
 const ISOLATED_ENV = 'ACTIVITY_API_ISOLATED_TEST';
 const ISOLATED = process.env[ISOLATED_ENV] === import.meta.path;
 if (!ISOLATED) {
@@ -824,6 +824,53 @@ if (ISOLATED) {
       const r = (await t.replay({ mode: 'verify', arm_ids: ['fx-arm-a'], expected_written: { 'fx-arm-a': 2 }, genuine_deltas: [], tolerance: 1e9 })).body as AnyRec;
       expect(r.success).toBe(false);
       expect(r.body.flags.map((f: AnyRec) => [f.arm_id, f.kind])).toEqual([['fx-arm-a', 'mismatch_with_logged_deltas'], ['*', 'tolerance_too_loose']]);
+    });
+
+    test('qa probe 12: complete, α overwritten to 1 with β untouched → success:false (α has the same decayed lower bound)', async () => {
+      const t = await setup();
+      seedAll(t.db);
+      await t.applyArms();
+      t.db.row('fx-arm-c').thompson_alpha = 1;
+      const r = (await t.replay({ mode: 'verify' })).body as AnyRec;
+      expect(r.success).toBe(false);
+      expect(r.body.flags.map((f: AnyRec) => [f.arm_id, f.kind])).toEqual([['fx-arm-c', 'below_recorded_after']]);
+      expect(r.body.flags[0].expected.alpha_min).toBe(3);
+    });
+
+    test('qa probe 14: a fabricated NEGATIVE genuine β delta cannot cancel an overwrite; out-of-window deltas are refused too', async () => {
+      const t = await setup();
+      seedAll(t.db);
+      await t.applyArms({ arm_ids: ['fx-arm-a'] }); // ledger at = NOW
+      const row = t.db.row('fx-arm-a');
+      const after = { alpha: row.thompson_alpha, beta: row.thompson_beta };
+      const u = NOW + 3_600_000;
+      row.updated_at_s = new Date(u).toISOString();
+      row.thompson_beta = 1; // the overwrite
+      t.deps.nowMs = () => u;
+      const dAt = NOW + 1_800_000;
+      const f = t.PU.decayedThompsonCounts(2, 2, dAt, u).alpha - 1;
+      const db = t.PU.decayedThompsonCounts(after.alpha, after.beta, NOW, u);
+      const cancel = (1 - db.beta) / f; // exactly the negative β that would make expected β == 1
+      expect(cancel).toBeLessThan(0);
+      const base = { mode: 'verify', arm_ids: ['fx-arm-a'], expected_written: { 'fx-arm-a': 2 } };
+      const r = (await t.replay({ ...base, genuine_deltas: [{ arm_id: 'fx-arm-a', at: new Date(dAt).toISOString(), alpha: 0, beta: cancel }] })).body as AnyRec;
+      expect(r.success).toBe(false);
+      expect(r.body.flags.map((x: AnyRec) => [x.arm_id, x.kind])).toEqual([['fx-arm-a', 'bad_genuine_delta'], ['fx-arm-a', 'mismatch_with_logged_deltas']]);
+      // A positive delta outside (at, updated_at], or a non-finite one, is refused and never applied either.
+      for (const d of [{ at: new Date(NOW - 1000).toISOString(), beta: 1 }, { at: new Date(u + 1000).toISOString(), beta: 1 }, { at: new Date(dAt).toISOString(), beta: Number.NaN }, { at: new Date(dAt).toISOString(), beta: '1' }]) {
+        const x = (await t.replay({ ...base, genuine_deltas: [{ arm_id: 'fx-arm-a', alpha: 0, ...d }] })).body as AnyRec;
+        expect(x.body.flags.some((g: AnyRec) => g.kind === 'bad_genuine_delta')).toBe(true);
+      }
+    });
+
+    test('a row stamped in the future (beyond the clock-skew window) → updated_at_in_future', async () => {
+      const t = await setup();
+      seedAll(t.db);
+      await t.applyArms();
+      t.db.row('fx-arm-a').updated_at_s = new Date(NOW + t.PC.VERIFY_CLOCK_SKEW_MS + 1000).toISOString();
+      const r = (await t.replay({ mode: 'verify' })).body as AnyRec;
+      expect(r.success).toBe(false);
+      expect(r.body.flags.map((f: AnyRec) => [f.arm_id, f.kind])).toEqual([['fx-arm-a', 'updated_at_in_future']]);
     });
 
     test('a ledger row read that returns ANOTHER org\'s reset row is re-checked in app: dropped, the pair is not settled reset', async () => {
