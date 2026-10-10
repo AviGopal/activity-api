@@ -244,9 +244,14 @@ function satisfierBody(executionId: string, extra: Row = {}): Row {
 }
 
 type Delta = { alpha: number; beta: number; lines: number };
-/** Sum of the α/β deltas the credit path APPLIED to `arm` since `from` (an index into infos). */
+/**
+ * Sum of the α/β deltas the credit path handed to the VPM path for `arm` since `from` (an index into infos). The
+ * outcome line is ENQUEUED (coalescing), APPLIED or PARTIAL (synchronous write ran; PARTIAL = signature row not
+ * written); each carries the deltas. Matching APPLIED alone would read zero under coalescing or for an unsigned trace.
+ */
+const HANDED_TO_VPM = new Set(['posterior variant update APPLIED', 'posterior variant update ENQUEUED', 'posterior variant update PARTIAL']);
 function appliedTo(arm: string, from: number): Delta {
-  const lines = infos.slice(from).filter((i) => i.msg === 'posterior variant update APPLIED' && i.meta.activity_id === arm);
+  const lines = infos.slice(from).filter((i) => HANDED_TO_VPM.has(i.msg) && i.meta.activity_id === arm);
   return {
     alpha: lines.reduce((s, i) => s + Number(i.meta.alpha_delta ?? 0), 0),
     beta: lines.reduce((s, i) => s + Number(i.meta.beta_delta ?? 0), 0),
