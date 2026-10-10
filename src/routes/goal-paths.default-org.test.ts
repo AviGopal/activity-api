@@ -83,7 +83,7 @@ if (ISOLATED) {
       const decisions: Array<{ msg: string; ctx: Record<string, unknown> }> = [];
       const origInfo = logger.info.bind(logger);
       (logger as unknown as { info: unknown }).info = (msg: string, ctx?: Record<string, unknown>) => {
-        if (/posterior variant update (SKIPPED|APPLIED)/.test(msg) && ctx?.activity_id === LEAF) decisions.push({ msg, ctx });
+        if (/posterior variant update (SKIPPED|APPLIED|ENQUEUED|PARTIAL|FAILED)/.test(msg) && ctx?.activity_id === LEAF) decisions.push({ msg, ctx });
         origInfo(msg, ctx);
       };
       try {
