@@ -33,7 +33,7 @@ post_with_key() {
 }
 
 # 1. The node and pins, from the dry_run (no arms planned: arm_ids []).
-plan=$(echo '{"impulse":{"type":"posteriorCompensationReplay","mode":"dry_run","arm_ids":[]}}' | post_with_key 127.0.0.1:8080/v2/impulses/resolve)
+plan=$(echo '{"impulse":{"pointer":{"type":"posteriorCompensationReplay","mode":"dry_run","arm_ids":[]}}}' | post_with_key 127.0.0.1:8080/v2/impulses/resolve)
 NODE=$(jq -r '.body.node // empty' <<<"$plan")
 LIST_SHA256=$(jq -r '.body.list_sha // empty' <<<"$plan")
 ELIGIBILITY_SHA256=$(jq -r '.body.eligibility_sha // empty' <<<"$plan")
