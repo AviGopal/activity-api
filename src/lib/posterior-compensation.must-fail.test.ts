@@ -19,7 +19,7 @@
 import { describe, expect, test, afterEach } from 'bun:test';
 import { join as pathJoin, relative as pathRelative } from 'node:path';
 
-const CASES = 26;
+const CASES = 27;
 const ISOLATED_ENV = 'ACTIVITY_API_ISOLATED_TEST';
 const ISOLATED = process.env[ISOLATED_ENV] === import.meta.path;
 if (!ISOLATED) {
@@ -474,6 +474,30 @@ if (ISOLATED) {
       expect([...inputs.keysByArm.keys()]).toEqual(['fx-arm-a', 'fx-arm-c', 'fx-arm-d', 'fx-arm-e']);
       expect(inputs.eligibleKeys).toEqual(['exec_fx_a1', 'exec_fx_a2', 'exec_fx_c1', 'exec_fx_d1', 'exec_fx_e1'].map(t.key));
       expect(t.key('exec_fx_a1')).toBe(t.PC.ledgerKeyOf({ node: 'fx-node', path: 'P1', withheld_ts: '2026-10-03T23:59:00.000000', arm_id: 'fx-arm-a', exec_id: 'exec_fx_a1' }));
+    });
+
+    test('leading `#` lines before the header: the sha pin covers the whole bytes; parsing yields the same rows', async () => {
+      const t = await setup();
+      const { mkdtempSync, writeFileSync, readFileSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { createHash } = await import('node:crypto');
+      const sha = (p: string) => createHash('sha256').update(readFileSync(p)).digest('hex');
+      const dir = mkdtempSync(pathJoin(tmpdir(), 'pc-'));
+      const list = pathJoin(dir, 'list.tsv');
+      const elig = pathJoin(dir, 'elig.tsv');
+      writeFileSync(list, '# frozen 2026-10-09T22:58:31Z\n# source: hub journal\n' + readFileSync(t.PC.REPLAY_LIST_PATH, 'utf8'));
+      writeFileSync(elig, '# step-0 output\n' + readFileSync(t.PC.ELIGIBILITY_PATH, 'utf8'));
+      const plain = t.PC.loadFrozenInputs() as AnyRec;
+      // Pinned to the commented files' own bytes: accepted, and the same pairs/arms/keys as the plain files.
+      const commented = t.PC.loadFrozenInputs({ listPath: list, listSha: sha(list), eligibilityPath: elig, eligibilitySha: sha(elig) }) as AnyRec;
+      expect(commented.ok).toBe(true);
+      expect([...commented.pairs.keys()]).toEqual([...plain.pairs.keys()]);
+      expect([...commented.pairs.values()]).toEqual([...plain.pairs.values()]);
+      expect([...commented.arms.values()]).toEqual([...plain.arms.values()]);
+      expect(commented.eligibleKeys).toEqual(plain.eligibleKeys);
+      // The `#` lines are inside the pin: the plain files' pins refuse the commented bytes.
+      expect((t.PC.loadFrozenInputs({ ...t.PC.DEFAULT_SOURCES, listPath: list }) as AnyRec).refused).toBe('list_sha_mismatch');
+      expect((t.PC.loadFrozenInputs({ ...t.PC.DEFAULT_SOURCES, eligibilityPath: elig }) as AnyRec).refused).toBe('eligibility_sha_mismatch');
     });
 
     test('apply goes one arm per write, spaced by the rate limit, and records per-arm before/after and sums', async () => {

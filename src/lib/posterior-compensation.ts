@@ -114,8 +114,15 @@ function parseUtc(ts: string): number {
   return Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(t) ? t : `${t}Z`);
 }
 
+/**
+ * Parse a pinned TSV. Leading lines starting with `#` (comment/provenance headers some frozen lists carry)
+ * are skipped before the column header; the sha pin is always over the WHOLE file bytes, those lines included.
+ */
 function readTsv(text: string, required: string[]): { rows: Record<string, string>[]; error?: string } {
-  const lines = text.split('\n').filter((l, i, a) => !(i === a.length - 1 && l === ''));
+  const all = text.split('\n').filter((l, i, a) => !(i === a.length - 1 && l === ''));
+  let skip = 0;
+  while (skip < all.length && all[skip].startsWith('#')) skip++;
+  const lines = all.slice(skip);
   if (lines.length === 0) return { rows: [], error: 'empty file' };
   const header = lines[0].replace(/\r$/, '').split('\t');
   for (const c of required) if (!header.includes(c)) return { rows: [], error: `missing column ${c}` };
