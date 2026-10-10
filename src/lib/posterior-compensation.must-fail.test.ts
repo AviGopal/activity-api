@@ -19,7 +19,7 @@
 import { describe, expect, test, afterEach } from 'bun:test';
 import { join as pathJoin, relative as pathRelative } from 'node:path';
 
-const CASES = 38;
+const CASES = 41;
 const ISOLATED_ENV = 'ACTIVITY_API_ISOLATED_TEST';
 const ISOLATED = process.env[ISOLATED_ENV] === import.meta.path;
 if (!ISOLATED) {
@@ -777,6 +777,53 @@ if (ISOLATED) {
       expect(kinds(p3)).toEqual(['no_arms_checked', 'unknown_arm']);
       expect(p3.body.flags[1].arm_id).toBe('nope');
       for (const r of [p1, p2, p3, p4]) expect(r.body.ledger_rows_read).toBe(0);
+    });
+
+    test('qa probe 5: complete, β overwritten to 1, tolerance 1e9 → success:false (tolerance_too_loose, not a loosening)', async () => {
+      const t = await setup();
+      seedAll(t.db);
+      await t.applyArms();
+      t.db.row('fx-arm-c').thompson_beta = 1;
+      const r = (await t.replay({ mode: 'verify', tolerance: 1e9 })).body as AnyRec;
+      expect(r.success).toBe(false);
+      expect(r.body.tolerance_rel).toBe(t.PC.VERIFY_TOLERANCE_REL);
+      expect(r.body.flags.map((f: AnyRec) => [f.arm_id, f.kind])).toEqual([['fx-arm-c', 'below_recorded_after'], ['*', 'tolerance_too_loose']]);
+      // Anything above the constant, or not a finite non-negative number, is flagged; a tighter value is honoured.
+      for (const bad of [1e-5, -1, Number.NaN, Number.POSITIVE_INFINITY, '1e-9', null]) {
+        const x = (await t.replay({ mode: 'verify', tolerance: bad })).body as AnyRec;
+        expect({ bad, ok: x.success, loose: x.body.flags.some((f: AnyRec) => f.kind === 'tolerance_too_loose') }).toEqual({ bad, ok: false, loose: true });
+      }
+      t.db.row('fx-arm-c').thompson_beta = t.db.ledger.get(t.key('exec_fx_c1'))!.after.beta;
+      const tight = (await t.replay({ mode: 'verify', tolerance: 1e-9 })).body as AnyRec;
+      expect(tight.success).toBe(true);
+      expect(tight.body.tolerance_rel).toBe(1e-9);
+    });
+
+    test('qa probe 6: complete, `after` missing on every written row, fx-arm-c β = 1 → success:false (ledger_row_incomplete, arm_unchecked)', async () => {
+      const t = await setup();
+      seedAll(t.db);
+      await t.applyArms();
+      for (const l of t.db.ledger.values()) if (l.status === 'written') delete l.after;
+      t.db.row('fx-arm-c').thompson_beta = 1;
+      const r = (await t.replay({ mode: 'verify' })).body as AnyRec;
+      expect(r.success).toBe(false);
+      expect(r.body.ledger_rows_read).toBe(5);
+      expect(r.body.checked).toEqual([]);
+      const arms = ['fx-arm-a', 'fx-arm-c', 'fx-arm-d', 'fx-arm-e'];
+      expect(r.body.flags.map((f: AnyRec) => [f.arm_id, f.kind])).toEqual([
+        ...arms.map((a) => [a, 'ledger_row_incomplete']),
+        ...arms.map((a) => [a, 'arm_unchecked']),
+      ]);
+    });
+
+    test('qa probe 11: not complete, expectation met, genuine_deltas [], tolerance 1e9, β overwritten → success:false', async () => {
+      const t = await setup();
+      seedAll(t.db);
+      await t.applyArms({ arm_ids: ['fx-arm-a'] });
+      t.db.row('fx-arm-a').thompson_beta = 1;
+      const r = (await t.replay({ mode: 'verify', arm_ids: ['fx-arm-a'], expected_written: { 'fx-arm-a': 2 }, genuine_deltas: [], tolerance: 1e9 })).body as AnyRec;
+      expect(r.success).toBe(false);
+      expect(r.body.flags.map((f: AnyRec) => [f.arm_id, f.kind])).toEqual([['fx-arm-a', 'mismatch_with_logged_deltas'], ['*', 'tolerance_too_loose']]);
     });
 
     test('a ledger row read that returns ANOTHER org\'s reset row is re-checked in app: dropped, the pair is not settled reset', async () => {

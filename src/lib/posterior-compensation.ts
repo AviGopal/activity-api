@@ -439,6 +439,15 @@ function armRecord(armId: string, orgId: string, keys: string[], results: KeyRes
   return { arm_id: armId, org_id: orgId, k: keys.length, ledger_keys: keys, before, after, nominal_sum: keys.length, applied_sum: applied, counts };
 }
 
+/**
+ * verify's comparison tolerance, RELATIVE to max(1, |expected|). Derivation: the expectation and the stored value
+ * come from the same kernel, so float error is ~1e-15. The real slack is timing: the plain flush decays with the
+ * app clock but stamps updated_at with the DB clock, and logged genuine deltas carry their log time, not the
+ * flush time. The kernel moves (β − 1) by ln2 / (30 d) ≈ 2.7e-10 per ms, relative, so even 1 s of skew per
+ * applied delta is 2.7e-7. 1e-6 covers a few such skews with margin; anything a caller wants looser is a flag.
+ */
+export const VERIFY_TOLERANCE_REL = 1e-6;
+
 /** Minimum spacing between two arms' writes, across calls. */
 const MIN_ARM_SPACING_MS = 1_000;
 let lastArmWriteAt = 0;
@@ -539,7 +548,9 @@ export interface VerifyFlag {
     // The silent-zero guards: verify never passes on a ledger read that returned less than it must.
     | 'ledger_rows_missing' | 'written_rows_short' | 'no_expectation'
     // ...and verify never passes on a request that checks nothing or carries an unusable expectation.
-    | 'no_arms_checked' | 'unknown_arm' | 'bad_expectation' | 'ledger_read_empty';
+    | 'no_arms_checked' | 'unknown_arm' | 'bad_expectation' | 'ledger_read_empty'
+    // ...nor on a written row it could not read in full, an arm it never compared, or a loosened tolerance.
+    | 'ledger_row_incomplete' | 'arm_unchecked' | 'tolerance_too_loose';
   expected: Record<string, number> | null;
   observed: Record<string, number> | null;
   boot_at: string;
@@ -660,11 +671,20 @@ export async function resolvePosteriorCompensationReplay(
   //   With `genuine_deltas` ([{arm_id, at, alpha, beta}] from the APPLIED log since the run): the exact
   //   kernel composition must match within `tolerance` (default 1e-3) on both α and β.
   const bootAt = new Date(Date.now() - process.uptime() * 1000).toISOString();
-  const tolerance = Number.isFinite(Number(pointer.tolerance)) ? Number(pointer.tolerance) : 1e-3;
+  // TOLERANCE IS A CODE CONSTANT (VERIFY_TOLERANCE_REL, relative to max(1, |expected|)). A caller may TIGHTEN
+  // it; a larger, non-finite or negative value is never a loosening: it is flagged tolerance_too_loose.
+  let toleranceRel = VERIFY_TOLERANCE_REL;
+  const toleranceFlag = pointer.tolerance !== undefined && (() => {
+    const t = pointer.tolerance;
+    if (typeof t === 'number' && Number.isFinite(t) && t >= 0 && t <= VERIFY_TOLERANCE_REL) { toleranceRel = t; return false; }
+    return true;
+  })();
+  const tol = (expected: number): number => toleranceRel * Math.max(1, Math.abs(expected));
   const logged = Array.isArray(pointer.genuine_deltas) ? (pointer.genuine_deltas as Array<Record<string, unknown>>) : null;
   const flags: VerifyFlag[] = [];
   const checked: Array<Record<string, unknown>> = [];
   let ledgerRowsRead = 0;
+  const armsWithWritten: string[] = [];
   // WHAT VERIFY MUST FIND. A verify that reads nothing must not pass, so it needs an expectation:
   //   - the completion row: every eligible key then has a TERMINAL ledger row, so each arm must read back
   //     exactly its key count (fewer → ledger_rows_missing);
@@ -697,7 +717,16 @@ export async function resolvePosteriorCompensationReplay(
     const keys = inputs.keysByArm.get(a) ?? [];
     const ledger = await readLedger(deps, keys);
     ledgerRowsRead += ledger.size;
-    const written = [...ledger.values()].filter((l) => l.status === 'written' && l.after && l.at_s).sort((x, y) => tsMs(x.at_s) - tsMs(y.at_s));
+    // A `written` row must come back WHOLE (after.alpha, after.beta, at): a projection regression or a SCHEMAFULL
+    // drop of an undeclared field must not make the row vanish from the comparison.
+    const writtenAll = [...ledger.values()].filter((l) => l.status === 'written');
+    const isWhole = (l: LedgerRow) => !!l.after && Number.isFinite(Number(l.after.alpha)) && Number.isFinite(Number(l.after.beta))
+      && typeof l.at_s === 'string' && !Number.isNaN(Date.parse(l.at_s));
+    const written = writtenAll.filter(isWhole).sort((x, y) => tsMs(x.at_s) - tsMs(y.at_s));
+    if (written.length < writtenAll.length) {
+      flags.push({ arm_id: a, org_id: org, kind: 'ledger_row_incomplete', expected: { whole_written_rows: writtenAll.length }, observed: { whole_written_rows: written.length }, boot_at: bootAt });
+    }
+    if (writtenAll.length > 0) armsWithWritten.push(a);
     if (complete && ledger.size < keys.length) {
       flags.push({ arm_id: a, org_id: org, kind: 'ledger_rows_missing', expected: { rows: keys.length }, observed: { rows: ledger.size }, boot_at: bootAt });
     }
@@ -730,13 +759,21 @@ export async function resolvePosteriorCompensationReplay(
         ea += Number(d.alpha ?? 0) * f;
         eb += Number(d.beta ?? 0) * f;
       }
-      if (Math.abs(observed.alpha - ea) > tolerance || Math.abs(observed.beta - eb) > tolerance) {
+      if (Math.abs(observed.alpha - ea) > tol(ea) || Math.abs(observed.beta - eb) > tol(eb)) {
         flags.push({ arm_id: a, org_id: org, kind: 'mismatch_with_logged_deltas', expected: { alpha: ea, beta: eb }, observed, boot_at: bootAt });
       }
-    } else if (observed.beta < decayedAfter.beta - tolerance) {
+    } else if (observed.beta < decayedAfter.beta - tol(decayedAfter.beta)) {
       flags.push({ arm_id: a, org_id: org, kind: 'below_recorded_after', expected: { beta_min: decayedAfter.beta }, observed, boot_at: bootAt });
     }
     checked.push({ arm_id: a, org_id: org, recorded_after: recAfter, recorded_at: last.at_s, observed, updated_at: row.updated_at_s ?? null });
+  }
+  // Every arm with a written row must have been compared against its live row (or flagged on the way).
+  const checkedArms = new Set(checked.map((c) => String(c.arm_id)));
+  for (const a of armsWithWritten) {
+    if (!checkedArms.has(a)) flags.push({ arm_id: a, org_id: inputs.arms.get(a)!.org_id, kind: 'arm_unchecked', expected: null, observed: null, boot_at: bootAt });
+  }
+  if (toleranceFlag) {
+    flags.push({ arm_id: '*', org_id: '*', kind: 'tolerance_too_loose', expected: { tolerance_rel_max: VERIFY_TOLERANCE_REL }, observed: { tolerance: Number(pointer.tolerance) }, boot_at: bootAt });
   }
   if (ledgerRowsRead === 0 && armIds.length > 0 && (complete || expectedWritten.size > 0)) {
     flags.push({ arm_id: '*', org_id: '*', kind: 'ledger_read_empty', expected: { rows_min: 1 }, observed: { rows: 0 }, boot_at: bootAt });
@@ -748,7 +785,7 @@ export async function resolvePosteriorCompensationReplay(
       success: flags.length === 0,
       shape: 'posteriorCompensationVerify',
       // ledger_rows_read lets a reader tell "nothing compensated yet" from "the ledger read returned nothing".
-      body: { ...common, mode, boot_at: bootAt, replay_complete: complete, expected_written: Object.fromEntries(expectedWritten), checked_arms: armIds, with_logged_deltas: !!logged, ledger_rows_read: ledgerRowsRead, checked, flags },
+      body: { ...common, mode, boot_at: bootAt, replay_complete: complete, expected_written: Object.fromEntries(expectedWritten), checked_arms: armIds, with_logged_deltas: !!logged, tolerance_rel: toleranceRel, ledger_rows_read: ledgerRowsRead, checked, flags },
     },
   };
 }
