@@ -27,7 +27,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-type Counters = { chain_ancestor_hits?: number; chain_ancestor_misses?: number; deltas_dropped_no_row?: number };
+type Counters = { chain_ancestor_hits?: number; chain_ancestor_misses?: number; deltas_dropped_no_row?: number; chain_ancestor_alpha_hits?: number; chain_ancestor_beta_hits?: number };
 type Probe = { before: Counters | null; after: Counters | null; shaped: { shape?: string; body?: Counters } | null; writes: string[] };
 
 function probe(execution: Record<string, unknown>): Probe {
@@ -94,6 +94,24 @@ describe('chain-credit counters have a reader', () => {
     expect(impulses).toMatch(/case ['"]posteriorCreditCounters['"]/);
     const index = readFileSync(join(import.meta.dir, '../index.ts'), 'utf8');
     expect(index).toMatch(/posterior_credit/);
+  });
+
+  // DIRECTION (check-first): hits alone could not say whether chain credit was rewarding or blaming producers.
+  const dir = (r: Probe, k: 'chain_ancestor_alpha_hits' | 'chain_ancestor_beta_hits') => (r.after?.[k] ?? -1) - (r.before?.[k] ?? 0);
+  test('MUST-FAIL: a successful leaf with a consumed ancestor counts one alpha-direction hit, no beta', () => {
+    const r = probe({ ...ONE_HIT_ONE_MISS, success: true, failure_mode: null });
+    expect(r.writes).toEqual(['satisfier:gather-variant']);
+    expect(dir(r, 'chain_ancestor_alpha_hits')).toBe(1);
+    expect(dir(r, 'chain_ancestor_beta_hits')).toBe(0);
+    expect(r.shaped?.body?.chain_ancestor_alpha_hits).toBe(r.after!.chain_ancestor_alpha_hits);
+  });
+
+  test('MUST-FAIL: a failed leaf with a consumed ancestor counts one beta-direction hit, no alpha', () => {
+    const r = probe(ONE_HIT_ONE_MISS);
+    expect(r.writes).toEqual(['satisfier:gather-variant']);
+    expect(dir(r, 'chain_ancestor_beta_hits')).toBe(1);
+    expect(dir(r, 'chain_ancestor_alpha_hits')).toBe(0);
+    expect(r.shaped?.body?.chain_ancestor_beta_hits).toBe(r.after!.chain_ancestor_beta_hits);
   });
 
   test('CONTROL: an ancestor that was not consumed is neither a hit nor a miss', () => {

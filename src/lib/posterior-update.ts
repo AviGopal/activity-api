@@ -838,6 +838,9 @@ let chainCreditHits = 0;
 export function chainCreditAncestorHits(): number {
   return chainCreditHits;
 }
+/** Chain-credit hits by direction: an α (consumer reached) or a β (consumer failed) delta (module lifetime). */
+let chainCreditAlphaHits = 0;
+let chainCreditBetaHits = 0;
 /** Chain ancestors with a delta to write whose own execution row carries no org: nothing written (module lifetime). */
 let chainCreditOrgUnresolved = 0;
 /** Traces whose leaf posterior delta was skipped because their org was a default, not a known org (module lifetime). */
@@ -873,6 +876,7 @@ export function learningSkippedDefaultOrg(): number {
  */
 export type PosteriorCreditCounters = {
   chain_ancestor_hits: number; chain_ancestor_misses: number; chain_ancestor_org_unresolved: number;
+  chain_ancestor_alpha_hits: number; chain_ancestor_beta_hits: number;
   leaf_skipped_default_org: number;
   signature_row_dropped_no_signature: number;
   deltas_dropped_no_row: number; deltas_dropped_no_row_leaf: number; deltas_dropped_no_row_ancestor: number;
@@ -882,6 +886,7 @@ export function posteriorCreditCounters(): PosteriorCreditCounters {
   const byKind = posteriorDeltasDroppedNoRowByKind();
   return {
     chain_ancestor_hits: chainCreditHits, chain_ancestor_misses: chainCreditMisses, chain_ancestor_org_unresolved: chainCreditOrgUnresolved,
+    chain_ancestor_alpha_hits: chainCreditAlphaHits, chain_ancestor_beta_hits: chainCreditBetaHits,
     leaf_skipped_default_org: leafSkippedDefaultOrg,
     signature_row_dropped_no_signature: signatureRowDroppedNoSignature,
     deltas_dropped_no_row: posteriorDeltasDroppedNoRow(), deltas_dropped_no_row_leaf: byKind.leaf, deltas_dropped_no_row_ancestor: byKind.ancestor,
@@ -1057,6 +1062,9 @@ export async function propagateCreditAlongChain(
       continue;
     }
     chainCreditHits++;
+    // Direction of the hit: exactly one of the deltas is non-zero here (a zero/zero pair continued above).
+    if (alphaDelta > 0) chainCreditAlphaHits++;
+    if (betaDelta > 0) chainCreditBetaHits++;
     await writeAncestorDelta(ancestorId, alphaDelta, betaDelta, db, meta.org_id, ancestorSig, ancestorSigVersion,
       { ancestorExecutionId: ancestorExecId, leafActivityId: execution.activity_id });
   }
