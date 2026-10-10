@@ -5,18 +5,23 @@
  * NOT A GENERAL β-EDIT PRIMITIVE. Two resolver shapes on the existing POST /v2/impulses/resolve (no new
  * REST endpoint), both operator-only:
  *
- *   posteriorCompensation        the single-key write ({ ledger_key } only). REFUSES every call in this build
- *                                (apply_requires_authorization): admin scope is not an acceptable bound on a
- *                                posterior write, and the operator-attested posteriorReplayAuthorization record
- *                                that will be is not implemented yet.
- *   posteriorCompensationReplay  dry_run (default; writes nothing — the per-arm plan, with every arm's keys)
- *                                and verify (post-boot re-read: live (α, β) against the recorded AFTER). apply
- *                                refuses exactly like posteriorCompensation.
+ *   posteriorCompensation        the single-key write ({ ledger_key } only).
+ *   posteriorCompensationReplay  dry_run (default; writes nothing — the per-arm plan, with every arm's keys),
+ *                                verify (post-boot re-read: live (α, β) against the recorded AFTER), and apply.
  *
- * The write path (unauthorizedApply.key / .arms) is complete and tested but unreachable from any route: variant,
- * org and leak time are DERIVED from the shipped list (REPLAY_LIST_*) and the frozen eligibility file
- * (ELIGIBILITY_*), each pinned by a sha256 constant over the whole bytes and checked at load — a mismatch
- * refuses EVERYTHING; a key outside CLEAN ∩ ELIGIBLE is refused (not_in_frozen_list / arm_not_eligible).
+ * PER-NODE LISTS. Each activity-api graded its own walks, so each node has its own frozen list + eligibility
+ * (NODE_SOURCES), selected by this node's identity read at use time (nodeIdentity: FED_SUBSTRATE_ID, else
+ * SUBSTRATE_ID — the trace-origin identity). A node with no shipped list refuses everything (no_list_for_node).
+ * Variant, org and leak time are DERIVED from the list and the eligibility file, each pinned by a sha256 over the
+ * whole bytes and checked at load — a mismatch refuses EVERYTHING; a key outside CLEAN ∩ ELIGIBLE is refused
+ * (not_in_frozen_list / arm_not_eligible).
+ *
+ * WRITES NEED A RECORD, NOT A SCOPE. Admin scope is not a bound on a posterior write (the bootstrap and hub keys
+ * carry it). A write proceeds only when THIS NODE's development-vessel answers, for the trust-root pool shape
+ * posteriorReplayAuthorization, an open row stamped attested.by 'operator' with attested_verified === true and a
+ * body naming exactly this node, the list sha and the eligibility sha (checkAuthorization). The authorization
+ * verdict is trusted only from this node's dev-vessel (a fixed loopback URL, never discovery, never a peer row);
+ * activity-api never holds the attestation key: dev-vessel verifies its own signature and reports the verdict.
  *
  * THE WRITE is never done here. Each pair is queued with enqueueCompensation (posterior-aggregator.ts), whose
  * flush applies it in one transaction with the row's genuine Σδ and the ledger row (see that section's header
@@ -55,31 +60,62 @@ import {
   type CompensationStatus,
 } from './posterior-aggregator';
 
-// ─── The frozen inputs (commit 1 ships FIXTURES; the real frozen list + Step-0 eligibility replace them) ───
+// ─── The frozen inputs, per node ───
 
-export const REPLAY_LIST_PATH = fileURLToPath(new URL('./posterior-compensation-data/replay-list.fixture.tsv', import.meta.url));
-export const REPLAY_LIST_SHA256 = 'b6806d5112b79e9635a147add84e025f320b8e13c37d7a92482b6876596dfc01';
-export const ELIGIBILITY_PATH = fileURLToPath(new URL('./posterior-compensation-data/eligibility.fixture.tsv', import.meta.url));
-export const ELIGIBILITY_SHA256 = 'dac5431d6bd0e61a66b51ab503caffe7956fda0c6291c4386ec92802cd514398';
+const dataFile = (name: string): string => fileURLToPath(new URL(`./posterior-compensation-data/${name}`, import.meta.url));
 
 export interface FrozenSources {
+  /** The node these inputs belong to (an authorization record must name it). */
+  node?: string;
   listPath: string;
   listSha: string;
   eligibilityPath: string;
   eligibilitySha: string;
 }
-export const DEFAULT_SOURCES: FrozenSources = {
-  listPath: REPLAY_LIST_PATH,
-  listSha: REPLAY_LIST_SHA256,
-  eligibilityPath: ELIGIBILITY_PATH,
-  eligibilitySha: ELIGIBILITY_SHA256,
+
+/**
+ * The shipped lists, keyed by node identity. node1 (substrate-live) calls itself FED_SUBSTRATE_ID=local-dev-spoke.
+ * Its list is the frozen replay-list.tsv byte for byte; its eligibility TSV is derived from the Step-0
+ * eligibility.json by the one-liner in the file's own header (which names both source shas).
+ * The hub's list ships in a later commit; until then the hub refuses no_list_for_node.
+ */
+export const NODE_SOURCES: Readonly<Record<string, FrozenSources>> = {
+  'local-dev-spoke': {
+    node: 'local-dev-spoke',
+    listPath: dataFile('replay-list.local-dev-spoke.tsv'),
+    listSha: '30e475036ecd95426dff1cfccf3b970e4fc2dd4f503318838a42ac8bd333dc8a',
+    eligibilityPath: dataFile('eligibility.local-dev-spoke.tsv'),
+    eligibilitySha: '3e1ccc1014d14fa3701e9bb6c6d273314ed7c758003dc9a225b14d2e6b9bfbce',
+  },
 };
+
+/** FIXTURES, for tests only: selected by the test harness, never by any default. */
+export const FIXTURE_SOURCES: FrozenSources = {
+  node: 'fx-node',
+  listPath: dataFile('replay-list.fixture.tsv'),
+  listSha: 'b6806d5112b79e9635a147add84e025f320b8e13c37d7a92482b6876596dfc01',
+  eligibilityPath: dataFile('eligibility.fixture.tsv'),
+  eligibilitySha: 'dac5431d6bd0e61a66b51ab503caffe7956fda0c6291c4386ec92802cd514398',
+};
+
+/** This node's identity, read at use time: the trace-origin identity (FED_SUBSTRATE_ID, else SUBSTRATE_ID). No default. */
+export function nodeIdentity(env: Record<string, string | undefined> = process.env): string | null {
+  return (env.FED_SUBSTRATE_ID || env.SUBSTRATE_ID || '').trim() || null;
+}
+
+/** The inputs shipped for `node`; a node without a list refuses everything. */
+export function loadNodeInputs(node: string | null): FrozenInputs {
+  const src = node ? NODE_SOURCES[node] : undefined;
+  if (!src) return { ok: false, refused: 'no_list_for_node', detail: `no replay list is shipped for node '${node ?? '(no FED_SUBSTRATE_ID / SUBSTRATE_ID)'}'` };
+  return loadFrozenInputs(src);
+}
 
 export interface FrozenPair {
   ledger_key: string;
   node: string;
   path: string;
   withheld_ts: string;
+  /** The VPM variant_id: the list's arm_id, prefixed `satisfier:` when arm_kind is satisfier (replay.py key()). */
   arm_id: string;
   exec_id: string;
   applied_ts: string;
@@ -96,6 +132,7 @@ export interface FrozenArm {
 export type FrozenInputs =
   | {
       ok: true;
+      node: string | null;
       list_sha: string;
       eligibility_sha: string;
       /** e.g. `FIXTURE (replay-list.fixture.tsv, sha256 …)` or `FROZEN (replay-list.tsv, sha256 …)` — never ambiguous. */
@@ -107,9 +144,10 @@ export type FrozenInputs =
       keysByArm: Map<string, string[]>;
       eligibleKeys: string[];
     }
-  | { ok: false; refused: 'list_sha_mismatch' | 'eligibility_sha_mismatch' | 'frozen_input_invalid'; detail: string };
+  | { ok: false; refused: 'no_list_for_node' | 'list_sha_mismatch' | 'eligibility_sha_mismatch' | 'frozen_input_invalid'; detail: string };
 
-/** ledger_key = sha256(node|path|withheld_ts|arm_id|exec_id), hex. */
+/** ledger_key = sha256(node|path|withheld_ts|arm_id|exec_id), hex, over the list's OWN columns (arm_id as listed,
+ *  unprefixed), so a key can be recomputed from the frozen TSV alone. */
 export function ledgerKeyOf(p: Pick<FrozenPair, 'node' | 'path' | 'withheld_ts' | 'arm_id' | 'exec_id'>): string {
   return createHash('sha256').update(`${p.node}|${p.path}|${p.withheld_ts}|${p.arm_id}|${p.exec_id}`).digest('hex');
 }
@@ -148,7 +186,7 @@ function inputLabel(path: string, sha: string): string {
 }
 
 /** Read and verify both frozen files. Any mismatch or malformation refuses everything (never a partial list). */
-export function loadFrozenInputs(src: FrozenSources = DEFAULT_SOURCES): FrozenInputs {
+export function loadFrozenInputs(src: FrozenSources): FrozenInputs {
   let listBytes: Buffer;
   let eligBytes: Buffer;
   try {
@@ -162,7 +200,7 @@ export function loadFrozenInputs(src: FrozenSources = DEFAULT_SOURCES): FrozenIn
   const eligSha = createHash('sha256').update(eligBytes).digest('hex');
   if (eligSha !== src.eligibilitySha) return { ok: false, refused: 'eligibility_sha_mismatch', detail: `eligibility sha256 ${eligSha} != pinned ${src.eligibilitySha}` };
 
-  const list = readTsv(listBytes.toString('utf8'), ['node', 'path', 'withheld_ts', 'arm_id', 'exec_id', 'applied_ts', 'beta_delta', 'status']);
+  const list = readTsv(listBytes.toString('utf8'), ['node', 'path', 'withheld_ts', 'arm_kind', 'arm_id', 'exec_id', 'applied_ts', 'beta_delta', 'status']);
   if (list.error) return { ok: false, refused: 'frozen_input_invalid', detail: `list: ${list.error}` };
   const elig = readTsv(eligBytes.toString('utf8'), ['arm_id', 'org_id', 'candidate_rows', 'eligible']);
   if (elig.error) return { ok: false, refused: 'frozen_input_invalid', detail: `eligibility: ${elig.error}` };
@@ -181,11 +219,12 @@ export function loadFrozenInputs(src: FrozenSources = DEFAULT_SOURCES): FrozenIn
 
   const pairs = new Map<string, FrozenPair>();
   for (const r of list.rows) {
+    if (r.arm_kind !== 'activity' && r.arm_kind !== 'satisfier') return { ok: false, refused: 'frozen_input_invalid', detail: `list: arm_kind '${r.arm_kind}'` };
     const p: FrozenPair = {
-      ledger_key: '', node: r.node, path: r.path, withheld_ts: r.withheld_ts, arm_id: r.arm_id, exec_id: r.exec_id,
+      ledger_key: ledgerKeyOf(r as Parameters<typeof ledgerKeyOf>[0]), node: r.node, path: r.path, withheld_ts: r.withheld_ts,
+      arm_id: r.arm_kind === 'satisfier' ? `satisfier:${r.arm_id}` : r.arm_id, exec_id: r.exec_id,
       applied_ts: r.applied_ts, leak_at_ms: parseUtc(r.applied_ts), status: r.status,
     };
-    p.ledger_key = ledgerKeyOf(p);
     if (pairs.has(p.ledger_key)) return { ok: false, refused: 'frozen_input_invalid', detail: `list: duplicate pair ${p.ledger_key}` };
     if (p.status === 'CLEAN') {
       if (r.beta_delta !== '1') return { ok: false, refused: 'frozen_input_invalid', detail: `list: CLEAN pair ${p.ledger_key} has beta_delta ${r.beta_delta}` };
@@ -201,20 +240,23 @@ export function loadFrozenInputs(src: FrozenSources = DEFAULT_SOURCES): FrozenIn
     if (keys.length > 0) keysByArm.set(armId, keys);
   }
   return {
-    ok: true, list_sha: listSha, eligibility_sha: eligSha,
+    ok: true, node: src.node ?? null, list_sha: listSha, eligibility_sha: eligSha,
     list_label: inputLabel(src.listPath, listSha), eligibility_label: inputLabel(src.eligibilityPath, eligSha),
     pairs, arms, keysByArm, eligibleKeys: [...keysByArm.values()].flat(),
   };
 }
 
-let defaultInputs: FrozenInputs | null = null;
-/** Loaded once per process and pinned at that load. */
+const loadedInputs = new Map<string, FrozenInputs>();
+/** This node's inputs: the node is read on every call; each node's files are loaded once and pinned at that load. */
 function loadDefaultInputs(): FrozenInputs {
-  if (!defaultInputs) {
-    defaultInputs = loadFrozenInputs(DEFAULT_SOURCES);
-    if (!defaultInputs.ok) logger.error('posterior compensation: frozen inputs REFUSED — every call will be refused', { event: 'posterior_compensation_inputs_refused', refused: defaultInputs.refused, detail: defaultInputs.detail });
+  const node = nodeIdentity();
+  let inputs = loadedInputs.get(node ?? '');
+  if (!inputs) {
+    inputs = loadNodeInputs(node);
+    loadedInputs.set(node ?? '', inputs);
+    if (!inputs.ok) logger.error('posterior compensation: frozen inputs REFUSED — every call will be refused', { event: 'posterior_compensation_inputs_refused', node, refused: inputs.refused, detail: inputs.detail });
   }
-  return defaultInputs;
+  return inputs;
 }
 
 // ─── Dependencies (injected in tests) ───
@@ -236,7 +278,15 @@ export interface CompensationDeps {
   sleep: (ms: number) => Promise<void>;
   /** How long one call waits for its items to be decided before answering `pending` (they stay queued). */
   outcomeTimeoutMs: number;
+  /** THIS node's development-vessel resolve route (LOCAL_POOL_RESOLVE_URL); anything not loopback is refused. */
+  poolResolveUrl: string;
+  fetch: (url: string, init: RequestInit) => Promise<Response>;
 }
+
+/** The same-node dev-vessel route (the conservation-audit-emit precedent). Never discovery: a resolve routed by
+ *  discovery can land on a federated peer's producer, and the verdict it reports is trusted only from this node. */
+export const LOCAL_POOL_RESOLVE_URL = 'http://127.0.0.1:8090/v2/impulses/resolve';
+export const AUTHORIZATION_SHAPE = 'posteriorReplayAuthorization';
 
 export function defaultCompensationDeps(): CompensationDeps {
   return {
@@ -248,6 +298,8 @@ export function defaultCompensationDeps(): CompensationDeps {
     nowMs: () => Date.now(),
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     outcomeTimeoutMs: 30_000,
+    poolResolveUrl: LOCAL_POOL_RESOLVE_URL,
+    fetch: (url, init) => fetch(url, init),
   };
 }
 
@@ -298,9 +350,8 @@ async function maybeComplete(deps: CompensationDeps, inputs: Extract<FrozenInput
 
 /**
  * activity-api's existing admin predicate (activityTemplate_update/_deprecate), minus federation OBO callers.
- * It gates the READ modes only (dry_run, verify). It is NOT a bound on writes: the bootstrap key and hub keys
- * carry admin scope. Writes require an operator-attested, signed posteriorReplayAuthorization trust-root record
- * naming the list sha, the eligibility sha and the node — not implemented in this build, so every write refuses.
+ * It gates every mode. It is NOT a bound on writes: the bootstrap key and hub keys carry admin scope. Writes also
+ * need the posteriorReplayAuthorization record (checkAuthorization).
  */
 export function isOperatorCaller(auth: JwtAuthContext | null | undefined): boolean {
   if (!auth || auth.obo) return false;
@@ -310,6 +361,7 @@ export function isOperatorCaller(auth: JwtAuthContext | null | undefined): boole
 export type RefusalCode =
   | 'not_operator'
   | 'apply_requires_authorization'
+  | 'no_list_for_node'
   | 'list_sha_mismatch'
   | 'eligibility_sha_mismatch'
   | 'frozen_input_invalid'
@@ -336,11 +388,53 @@ function operatorGate(auth: JwtAuthContext | null | undefined, shape: string): R
   return refuse(403, 'not_operator', 'operator (admin) credentials required');
 }
 
-const APPLY_REFUSAL_DETAIL =
-  'writes require an operator-attested, signed posteriorReplayAuthorization trust-root record naming the list sha, the eligibility sha and the node; this build serves dry_run and verify only';
-function refuseWrite(shape: string, auth: JwtAuthContext | null | undefined): ResolverResult {
-  logger.warn('posterior compensation REFUSED: write without authorization', { event: 'posterior_compensation_refused', refused: 'apply_requires_authorization', shape, key_id: auth?.keyId ?? null, user_id: auth?.userId ?? null });
-  return refuse(403, 'apply_requires_authorization', APPLY_REFUSAL_DETAIL);
+const isLoopbackUrl = (u: string): boolean => {
+  try { return ['127.0.0.1', 'localhost', '[::1]'].includes(new URL(u).hostname); } catch { return false; }
+};
+
+/**
+ * Whether THIS node's development-vessel holds a posteriorReplayAuthorization for exactly these inputs. Null when
+ * authorized, else why not. FAILS CLOSED: a non-loopback route, an unreadable answer, no open row, a row not
+ * stamped by an operator, attested_verified anything but true (an older dev-vessel that does not report it
+ * included), or a body whose node / list_sha256 / eligibility_sha256 differs from this node's pins.
+ */
+export async function checkAuthorization(deps: CompensationDeps, inputs: Extract<FrozenInputs, { ok: true }>): Promise<string | null> {
+  if (!isLoopbackUrl(deps.poolResolveUrl)) return `the authorization is read only from this node's development-vessel; ${deps.poolResolveUrl} is not loopback`;
+  let rows: Array<Record<string, any>>;
+  try {
+    const res = await deps.fetch(deps.poolResolveUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ impulse: { type: 'poolImpulse', shape: AUTHORIZATION_SHAPE, status: 'open' } }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const j = (await res.json()) as { body?: { impulses?: unknown } };
+    if (!res.ok || !Array.isArray(j?.body?.impulses)) return `authorization unreadable (HTTP ${res.status})`;
+    rows = j.body!.impulses as Array<Record<string, any>>;
+  } catch (err) {
+    return `authorization unreadable (${err instanceof Error ? err.message : String(err)})`;
+  }
+  const row = rows.filter((r) => r?.shape === AUTHORIZATION_SHAPE && r?.status === 'open')
+    .sort((a, b) => String(b.updated_at ?? '').localeCompare(String(a.updated_at ?? '')))[0];
+  if (!row) return 'no open posteriorReplayAuthorization record';
+  if (row.attested?.by !== 'operator') return 'the record is not operator-attested';
+  if (row.attested_verified !== true) return 'development-vessel did not verify the record\'s operator attestation';
+  const b = (row.body ?? {}) as Record<string, unknown>;
+  if (b.node !== inputs.node) return `the record names node '${String(b.node)}', this node is '${String(inputs.node)}'`;
+  if (b.list_sha256 !== inputs.list_sha || b.eligibility_sha256 !== inputs.eligibility_sha) return 'the record\'s list / eligibility sha256 do not match this node\'s pins';
+  return null;
+}
+
+/** The write gate: operator caller, this node's inputs, then the authorization record. */
+async function writeGate(shape: string, auth: JwtAuthContext | null | undefined, deps: CompensationDeps): Promise<ResolverResult | null> {
+  const denied = operatorGate(auth, shape);
+  if (denied) return denied;
+  const inputs = deps.inputs();
+  if (!inputs.ok) return refuse(422, inputs.refused, inputs.detail);
+  const why = await checkAuthorization(deps, inputs);
+  if (why === null) return null;
+  logger.warn('posterior compensation REFUSED: write without authorization', { event: 'posterior_compensation_refused', refused: 'apply_requires_authorization', shape, why, key_id: auth?.keyId ?? null, user_id: auth?.userId ?? null });
+  return refuse(403, 'apply_requires_authorization', why);
 }
 
 type InputsGate = { ok: true; inputs: Extract<FrozenInputs, { ok: true }> } | { ok: false; result: ResolverResult };
@@ -354,7 +448,7 @@ async function inputsGate(deps: CompensationDeps, opts: { write: boolean }): Pro
   return { ok: true, inputs };
 }
 
-// ─── Applying keys (UNREACHABLE from any route in this build — see unauthorizedApply) ───
+// ─── Applying keys (reached from the routes only through writeGate) ───
 
 export type KeyResult =
   | { ledger_key: string; refused: RefusalCode; detail?: string }
@@ -501,22 +595,21 @@ async function applyArms(pointer: Record<string, unknown>, deps: CompensationDep
 }
 
 /**
- * THE WRITE PATHS, NOT REACHABLE FROM ANY ROUTE IN THIS BUILD. Both route shapes refuse every write with
- * apply_requires_authorization; these are exported only so the mechanism (queue, transaction, ledger, floor,
- * reset, CAS, ambiguity, completion) is exercised by tests now. The follow-up wires them behind a verified
- * posteriorReplayAuthorization record. They perform no caller check of their own.
+ * THE WRITE PATHS. They perform no caller or authorization check of their own: the routes reach them only
+ * through writeGate. Exported so the mechanism (queue, transaction, ledger, floor, reset, CAS, ambiguity,
+ * completion) is exercised by tests directly.
  */
 export const unauthorizedApply = { key: applyKey, arms: applyArms };
 
 // ─── Routes ───
 
-/** posteriorCompensation: the single-key write shape. Every call refuses in this build (no authorization path). */
+/** posteriorCompensation: the single-key write shape (writeGate, then the key). */
 export async function resolvePosteriorCompensation(
-  _pointer: Record<string, unknown>,
+  pointer: Record<string, unknown>,
   auth: JwtAuthContext | null | undefined,
-  _deps: CompensationDeps = defaultCompensationDeps(),
+  deps: CompensationDeps = defaultCompensationDeps(),
 ): Promise<ResolverResult> {
-  return operatorGate(auth, 'posteriorCompensation') ?? refuseWrite('posteriorCompensation', auth);
+  return (await writeGate('posteriorCompensation', auth, deps)) ?? applyKey(pointer, deps);
 }
 
 export interface ArmPlan {
@@ -583,7 +676,7 @@ function selectArms(pointer: Record<string, unknown>, inputs: Extract<FrozenInpu
     return { arm_id: a, eligible: false, org_id: arm?.org_id ?? null, candidate_rows: arm?.candidate_rows ?? null, note: arm?.note ?? 'not in the eligibility file', keys, k: keys.length };
   });
   const common = {
-    list: inputs.list_label, eligibility: inputs.eligibility_label,
+    node: inputs.node, list: inputs.list_label, eligibility: inputs.eligibility_label,
     list_sha: inputs.list_sha, eligibility_sha: inputs.eligibility_sha, excluded_arms: excluded, unknown_arms: unknownArms,
   };
   return { armIds, common };
@@ -624,7 +717,7 @@ async function planArm(deps: CompensationDeps, inputs: Extract<FrozenInputs, { o
   };
 }
 
-/** posteriorCompensationReplay: dry_run (default) and verify. Any write mode refuses in this build. */
+/** posteriorCompensationReplay: dry_run (default), verify, and apply (writeGate, then the arms). */
 export async function resolvePosteriorCompensationReplay(
   pointer: Record<string, unknown>,
   auth: JwtAuthContext | null | undefined,
@@ -633,8 +726,8 @@ export async function resolvePosteriorCompensationReplay(
   const denied = operatorGate(auth, 'posteriorCompensationReplay');
   if (denied) return denied;
   const mode = pointer.mode === undefined ? 'dry_run' : String(pointer.mode);
-  if (mode === 'apply') return refuseWrite('posteriorCompensationReplay', auth);
-  if (mode !== 'dry_run' && mode !== 'verify') return refuse(400, 'bad_request', `mode must be dry_run | verify, got ${mode}`);
+  if (mode === 'apply') return (await writeGate('posteriorCompensationReplay', auth, deps)) ?? applyArms(pointer, deps);
+  if (mode !== 'dry_run' && mode !== 'verify') return refuse(400, 'bad_request', `mode must be dry_run | verify | apply, got ${mode}`);
   const g = await inputsGate(deps, { write: false });
   if (!g.ok) return g.result;
   const inputs = g.inputs;

@@ -5257,16 +5257,16 @@ router.post('/resolve', async (c) => {
       }
 
       case 'posteriorCompensation': {
-        // β-leak replay, the single-key write. Refuses every call in this build (not_operator, else
-        // apply_requires_authorization): writes wait for an operator-attested posteriorReplayAuthorization.
+        // β-leak replay, the single-key write: operator caller AND this node's verified
+        // posteriorReplayAuthorization record (posterior-compensation.ts writeGate), else refused.
         const { resolvePosteriorCompensation } = await import('../lib/posterior-compensation');
         const result = await resolvePosteriorCompensation(pointer as Record<string, unknown>, jwtAuthCtx);
         return c.json(result.body as unknown as ImpulseResolveResponse, result.status as any);
       }
 
       case 'posteriorCompensationReplay': {
-        // β-leak replay, operator-only reads: dry_run (default, the per-arm plan) | verify (post-boot re-read).
-        // apply refuses with apply_requires_authorization in this build.
+        // β-leak replay, operator-only: dry_run (default, the per-arm plan) | verify (post-boot re-read) |
+        // apply (also needs this node's verified posteriorReplayAuthorization record).
         const { resolvePosteriorCompensationReplay } = await import('../lib/posterior-compensation');
         const result = await resolvePosteriorCompensationReplay(pointer as Record<string, unknown>, jwtAuthCtx);
         return c.json(result.body as unknown as ImpulseResolveResponse, result.status as any);

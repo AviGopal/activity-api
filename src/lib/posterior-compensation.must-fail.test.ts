@@ -19,7 +19,7 @@
 import { describe, expect, test, afterEach } from 'bun:test';
 import { join as pathJoin, relative as pathRelative } from 'node:path';
 
-const CASES = 44;
+const CASES = 55;
 const ISOLATED_ENV = 'ACTIVITY_API_ISOLATED_TEST';
 const ISOLATED = process.env[ISOLATED_ENV] === import.meta.path;
 if (!ISOLATED) {
@@ -171,17 +171,21 @@ if (ISOLATED) {
     const M = await mods();
     const db = new FakeDb(M);
     const sleeps: number[] = [];
+    // This node's dev-vessel pool, faked: every authorization read is recorded and answered from `pool`.
+    const pool: AnyRec[] = [];
+    const fetched: string[] = [];
     const deps = {
       ...M.PC.defaultCompensationDeps(),
       db,
-      inputs: () => M.PC.loadFrozenInputs(M.PC.DEFAULT_SOURCES),
+      inputs: () => M.PC.loadFrozenInputs(M.PC.FIXTURE_SOURCES),
       flush: () => M.AGG.flushPosteriors({ db, nowMs: NOW }),
       nowMs: () => NOW,
       sleep: async (ms: number) => { sleeps.push(ms); },
       outcomeTimeoutMs: 1_000,
+      fetch: async (url: string) => { fetched.push(url); return Response.json({ success: true, shape: 'poolImpulse', body: { impulses: pool, count: pool.length } }); },
       ...over,
     };
-    const inputs = M.PC.loadFrozenInputs(M.PC.DEFAULT_SOURCES) as AnyRec;
+    const inputs = M.PC.loadFrozenInputs(M.PC.FIXTURE_SOURCES) as AnyRec;
     const key = (exec: string): string => [...inputs.pairs.values()].find((p: AnyRec) => p.exec_id === exec)!.ledger_key;
     // The WRITE paths are unreachable from the routes in this build (apply_requires_authorization); the mechanism
     // is exercised through unauthorizedApply. The ROUTES are exercised for auth, refusal, dry_run and verify.
@@ -190,7 +194,7 @@ if (ISOLATED) {
     const route1 = (k: string, auth: AnyRec | null = OP, extra: AnyRec = {}) => M.PC.resolvePosteriorCompensation({ type: 'posteriorCompensation', ledger_key: k, ...extra }, auth as any, deps as any);
     const replay = (p: AnyRec, auth: AnyRec | null = OP) => M.PC.resolvePosteriorCompensationReplay({ type: 'posteriorCompensationReplay', ...p }, auth as any, deps as any);
     const residue = (leakMs: number) => M.PU.decayedThompsonCounts(1, 2, leakMs, NOW).beta - 1;
-    return { ...M, db, deps, sleeps, key, one, applyArms, route1, replay, residue, inputs };
+    return { ...M, db, deps, sleeps, key, one, applyArms, route1, replay, residue, inputs, pool, fetched };
   }
 
   /** Seed every eligible fixture arm with a row that will take its compensation without flooring. */
@@ -441,8 +445,8 @@ if (ISOLATED) {
       const { tmpdir } = await import('node:os');
       const dir = mkdtempSync(pathJoin(tmpdir(), 'pc-'));
       const tampered = pathJoin(dir, 'list.tsv');
-      writeFileSync(tampered, readFileSync(t.PC.REPLAY_LIST_PATH, 'utf8').replace('exec_fx_a1', 'exec_fx_aX'));
-      t.deps.inputs = () => t.PC.loadFrozenInputs({ ...t.PC.DEFAULT_SOURCES, listPath: tampered });
+      writeFileSync(tampered, readFileSync(t.PC.FIXTURE_SOURCES.listPath, 'utf8').replace('exec_fx_a1', 'exec_fx_aX'));
+      t.deps.inputs = () => t.PC.loadFrozenInputs({ ...t.PC.FIXTURE_SOURCES, listPath: tampered });
       seedAll(t.db);
       const k = t.key('exec_fx_a2'); // a key that would be valid under the pinned file
       expect((await t.one(k)).body.refused).toBe('list_sha_mismatch');
@@ -458,8 +462,8 @@ if (ISOLATED) {
       const { tmpdir } = await import('node:os');
       const dir = mkdtempSync(pathJoin(tmpdir(), 'pc-'));
       const tampered = pathJoin(dir, 'elig.tsv');
-      writeFileSync(tampered, readFileSync(t.PC.ELIGIBILITY_PATH, 'utf8').replace('fx-arm-b\torganizations:substrate\t2\t0', 'fx-arm-b\torganizations:substrate\t1\t1'));
-      t.deps.inputs = () => t.PC.loadFrozenInputs({ ...t.PC.DEFAULT_SOURCES, eligibilityPath: tampered });
+      writeFileSync(tampered, readFileSync(t.PC.FIXTURE_SOURCES.eligibilityPath, 'utf8').replace('fx-arm-b\torganizations:substrate\t2\t0', 'fx-arm-b\torganizations:substrate\t1\t1'));
+      t.deps.inputs = () => t.PC.loadFrozenInputs({ ...t.PC.FIXTURE_SOURCES, eligibilityPath: tampered });
       seedAll(t.db);
       expect((await t.one(t.key('exec_fx_b1'))).body.refused).toBe('eligibility_sha_mismatch');
       expect(t.db.writes).toEqual([]);
@@ -535,6 +539,171 @@ if (ISOLATED) {
     });
   });
 
+  // node1 (substrate-live) is FED_SUBSTRATE_ID=local-dev-spoke; its inputs are the REAL frozen list + eligibility.
+  const N1 = 'local-dev-spoke';
+  async function node1() {
+    const t = await setup();
+    t.deps.inputs = () => t.PC.loadNodeInputs(t.PC.nodeIdentity({ FED_SUBSTRATE_ID: N1 }));
+    const inp = t.deps.inputs() as AnyRec;
+    // An eligible arm of kind `activity` whose row lives under ORG (what FakeDb.seed writes), and one CLEAN key on it.
+    const pair = [...inp.pairs.values()].find((p: AnyRec) => p.status === 'CLEAN' && !p.arm_id.startsWith('satisfier:') && inp.arms.get(p.arm_id)?.eligible && inp.arms.get(p.arm_id).org_id === ORG) as AnyRec;
+    const body = { node: N1, list_sha256: inp.list_sha, eligibility_sha256: inp.eligibility_sha, by: 'avi', at: NOW_ISO, reason: 'test', review_by: NOW_ISO };
+    const record = (o: AnyRec = {}): AnyRec => ({ id: 'posterior-replay-authorization', shape: 'posteriorReplayAuthorization', status: 'open', updated_at: NOW_ISO, source: 'operator', body, attested: { by: 'operator', key_id: 'k', at: NOW_ISO, sig: 'f'.repeat(64) }, attested_verified: true, ...o });
+    t.db.seed(pair.arm_id, { thompson_alpha: 3, thompson_beta: 5 });
+    /** Every write path, each expected to refuse with `code`; nothing may reach the store. */
+    const allWritesRefused = async (code: string, detail?: RegExp) => {
+      const rs = [await t.route1(pair.ledger_key), await t.replay({ mode: 'apply', arm_ids: [pair.arm_id] }), await t.replay({ mode: 'apply' })];
+      for (const r of rs) {
+        expect({ status: r.status, refused: (r.body as AnyRec).refused }).toEqual({ status: code === 'apply_requires_authorization' ? 403 : 422, refused: code });
+        if (detail) expect(String((r.body as AnyRec).detail)).toMatch(detail);
+      }
+      expect(t.db.writes).toEqual([]);
+      expect(t.db.ledger.size).toBe(0);
+    };
+    return { t, inp, pair, body, record, allWritesRefused };
+  }
+
+  describe('β-leak replay — per-node frozen lists and the authorization record', () => {
+    test('node1 dry_run reads its FROZEN list: 166 eligible arms, 1054 CLEAN keys, 11 ineligible arms', async () => {
+      const { t, inp } = await node1();
+      const { readFileSync } = await import('node:fs');
+      const { createHash } = await import('node:crypto');
+      const src = t.PC.NODE_SOURCES[N1];
+      // The list is the frozen replay-list.tsv byte for byte; the eligibility header names both source shas.
+      expect(createHash('sha256').update(readFileSync(src.listPath)).digest('hex')).toBe('30e475036ecd95426dff1cfccf3b970e4fc2dd4f503318838a42ac8bd333dc8a');
+      const head = readFileSync(src.eligibilityPath, 'utf8').split('\n').filter((l: string) => l.startsWith('#')).join('\n');
+      expect(head).toContain('23d45ed204bafba61640870304ea7cba679b4d354419203466a9293f2d6785d5');
+      expect(head).toContain('ea685ca3a78d60158b0c08d470db3b6903bc3f33f52b8919c6930d7669434480');
+      expect(inp.ok).toBe(true);
+      expect([...inp.arms.values()].filter((a: AnyRec) => a.eligible).length).toBe(166);
+      expect(inp.eligibleKeys.length).toBe(1054);
+      // Satisfier arms are keyed by their VPM variant id; the ledger key stays over the list's own columns.
+      const sat = [...inp.pairs.values()].find((p: AnyRec) => p.arm_id.startsWith('satisfier:')) as AnyRec;
+      expect(sat.ledger_key).toBe(t.PC.ledgerKeyOf({ ...sat, arm_id: sat.arm_id.slice('satisfier:'.length) }));
+      const plan = ((await t.replay({})).body as AnyRec).body;
+      expect(plan.node).toBe(N1);
+      expect(plan.list).toBe(`FROZEN (replay-list.local-dev-spoke.tsv, sha256 ${src.listSha})`);
+      expect(plan.eligibility).toBe(`FROZEN (eligibility.local-dev-spoke.tsv, sha256 ${src.eligibilitySha})`);
+      // Excluded: the 11 ineligible arms of the eligibility file, plus 4 arms whose every pair is AMBIGUOUS (no CLEAN key).
+      expect({ arms: plan.totals.arms, keys: plan.totals.keys, excluded_arms: plan.totals.excluded_arms }).toEqual({ arms: 166, keys: 1054, excluded_arms: 15 });
+      expect(plan.excluded_arms.filter((a: AnyRec) => a.k > 0).length).toBe(11);
+      expect(t.db.writes).toEqual([]);
+    });
+
+    test('a node with no shipped list (the hub; no identity at all) → no_list_for_node on every call; no default node', async () => {
+      const { t, record } = await node1();
+      t.pool.push(record());
+      expect(t.PC.nodeIdentity({})).toBe(null);
+      expect(t.PC.nodeIdentity({ SUBSTRATE_ID: 'hub-x' })).toBe('hub-x');
+      for (const env of [{ FED_SUBSTRATE_ID: 'hub-203.0.113.7' }, {}]) {
+        t.deps.inputs = () => t.PC.loadNodeInputs(t.PC.nodeIdentity(env));
+        for (const r of [await t.replay({}), await t.replay({ mode: 'verify' }), await t.replay({ mode: 'apply' }), await t.route1('a'.repeat(64))]) {
+          expect((r.body as AnyRec).refused).toBe('no_list_for_node');
+        }
+      }
+      expect(t.db.writes).toEqual([]);
+    });
+
+    test('apply with no authorization record → apply_requires_authorization', async () => {
+      const { allWritesRefused } = await node1();
+      await allWritesRefused('apply_requires_authorization', /no open posteriorReplayAuthorization/);
+    });
+
+    test('a record not stamped by an operator (none; evaluator) → refused', async () => {
+      const { t, record, allWritesRefused } = await node1();
+      t.pool.push(record({ attested: undefined }));
+      await allWritesRefused('apply_requires_authorization', /not operator-attested/);
+      t.pool.splice(0, 1, record({ attested: { by: 'evaluator', key_id: null, at: NOW_ISO, sig: 'f'.repeat(64) } }));
+      await allWritesRefused('apply_requires_authorization', /not operator-attested/);
+    });
+
+    test('a record dev-vessel did not verify (bad sig: false; an older dev-vessel: field absent) → refused', async () => {
+      const { t, record, allWritesRefused } = await node1();
+      t.pool.push(record({ attested_verified: false }));
+      await allWritesRefused('apply_requires_authorization', /did not verify/);
+      const { attested_verified: _v, ...absent } = record();
+      t.pool.splice(0, 1, absent);
+      await allWritesRefused('apply_requires_authorization', /did not verify/);
+      t.pool.splice(0, 1, record({ attested_verified: 'true' }));
+      await allWritesRefused('apply_requires_authorization', /did not verify/);
+    });
+
+    test('a record whose list or eligibility sha differs from the pins → refused', async () => {
+      const { t, record, body, allWritesRefused } = await node1();
+      t.pool.push(record({ body: { ...body, list_sha256: 'b6806d5112b79e9635a147add84e025f320b8e13c37d7a92482b6876596dfc01' } }));
+      await allWritesRefused('apply_requires_authorization', /sha256 do not match/);
+      t.pool.splice(0, 1, record({ body: { ...body, eligibility_sha256: '0'.repeat(64) } }));
+      await allWritesRefused('apply_requires_authorization', /sha256 do not match/);
+    });
+
+    test('a record naming another node → refused', async () => {
+      const { t, record, body, allWritesRefused } = await node1();
+      t.pool.push(record({ body: { ...body, node: 'hub-203.0.113.7' } }));
+      await allWritesRefused('apply_requires_authorization', /names node 'hub-203.0.113.7'/);
+      t.pool.splice(0, 1, record({ body: { ...body, node: 'node1' } }));
+      await allWritesRefused('apply_requires_authorization', /names node 'node1'/);
+    });
+
+    test('a valid record → both write shapes are allowed and write (the fake DB path), read only from this node', async () => {
+      const { t, record, pair } = await node1();
+      // An older, unverified row and a retired one do not shadow the newest open verified row.
+      t.pool.push(record({ updated_at: '2026-10-08T00:00:00.000Z', attested_verified: false }), record({ status: 'retired', updated_at: '2026-10-10T00:00:00.000Z' }), record());
+      const r1 = await t.route1(pair.ledger_key);
+      expect(r1.status).toBe(200);
+      expect((r1.body as AnyRec).body.status).toBe('written');
+      expect(t.db.ledger.get(pair.ledger_key)?.status).toBe('written');
+      const r2 = await t.replay({ mode: 'apply', arm_ids: [pair.arm_id] });
+      expect(r2.status).toBe(200);
+      expect((r2.body as AnyRec).body.arms.map((a: AnyRec) => a.arm_id)).toEqual([pair.arm_id]);
+      expect(t.fetched.length).toBe(2);
+      for (const u of t.fetched) expect(u).toBe(t.PC.LOCAL_POOL_RESOLVE_URL);
+    });
+
+    test('the eligibility file differs from its pin → every call refused, even with a valid record', async () => {
+      const { t, record } = await node1();
+      t.pool.push(record());
+      const { mkdtempSync, writeFileSync, readFileSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const src = t.PC.NODE_SOURCES[N1];
+      const tampered = pathJoin(mkdtempSync(pathJoin(tmpdir(), 'pc-')), 'eligibility.local-dev-spoke.tsv');
+      writeFileSync(tampered, readFileSync(src.eligibilityPath, 'utf8').replace('no org hint for any pair', 'eligible after all'));
+      t.deps.inputs = () => t.PC.loadFrozenInputs({ ...src, eligibilityPath: tampered });
+      for (const r of [await t.replay({}), await t.replay({ mode: 'verify' }), await t.replay({ mode: 'apply' }), await t.route1('a'.repeat(64))]) {
+        expect((r.body as AnyRec).refused).toBe('eligibility_sha_mismatch');
+      }
+      expect(t.db.writes).toEqual([]);
+    });
+
+    test('the record is read only from a LOOPBACK dev-vessel: any other endpoint → refused without a read', async () => {
+      const { t, record, allWritesRefused } = await node1();
+      t.pool.push(record());
+      for (const url of ['http://10.0.0.5:8090/v2/impulses/resolve', 'http://syzygy.host:18090/v2/impulses/resolve', 'not a url']) {
+        t.deps.poolResolveUrl = url;
+        await allWritesRefused('apply_requires_authorization', /not loopback/);
+      }
+      expect(t.fetched).toEqual([]);
+    });
+
+    test('never discovery: a peer row offered by discovery is not consulted; the read goes to this node only', async () => {
+      const { t, record, pair } = await node1();
+      t.pool.push(record());
+      const { discoveryClient } = await import('../services/discovery-client');
+      const { spyOn } = await import('bun:test');
+      const spy = spyOn(discoveryClient, 'discoverVesselsForShape').mockImplementation((async () => ({
+        found: true,
+        vessels: [{ vesselId: 'development-vessel@peer', endpoint: 'http://10.9.9.9:8090', resolve_endpoint: 'http://10.9.9.9:8090/v2/impulses/resolve', origin: 'peer', shapes: ['poolImpulse'] }],
+      })) as never);
+      try {
+        expect(t.deps.poolResolveUrl).toBe(t.PC.LOCAL_POOL_RESOLVE_URL);
+        expect((await t.route1(pair.ledger_key)).status).toBe(200);
+        expect(t.fetched).toEqual([t.PC.LOCAL_POOL_RESOLVE_URL]);
+        expect(spy).not.toHaveBeenCalled();
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
+
   describe('β-leak replay — controls', () => {
     test('a fresh CLEAN pair on a fixture row → β lowered by exactly the residue; one ledger row `written`', async () => {
       const t = await setup();
@@ -597,7 +766,7 @@ if (ISOLATED) {
 
     test('the shipped fixture files match their pins; CLEAN ∩ ELIGIBLE is exactly the expected keys', async () => {
       const t = await setup();
-      const inputs = t.PC.loadFrozenInputs() as AnyRec;
+      const inputs = t.PC.loadFrozenInputs(t.PC.FIXTURE_SOURCES) as AnyRec;
       expect(inputs.ok).toBe(true);
       expect([...inputs.keysByArm.keys()]).toEqual(['fx-arm-a', 'fx-arm-c', 'fx-arm-d', 'fx-arm-e']);
       expect(inputs.eligibleKeys).toEqual(['exec_fx_a1', 'exec_fx_a2', 'exec_fx_c1', 'exec_fx_d1', 'exec_fx_e1'].map(t.key));
@@ -613,9 +782,9 @@ if (ISOLATED) {
       const dir = mkdtempSync(pathJoin(tmpdir(), 'pc-'));
       const list = pathJoin(dir, 'list.tsv');
       const elig = pathJoin(dir, 'elig.tsv');
-      writeFileSync(list, '# frozen 2026-10-09T22:58:31Z\n# source: hub journal\n' + readFileSync(t.PC.REPLAY_LIST_PATH, 'utf8'));
-      writeFileSync(elig, '# step-0 output\n' + readFileSync(t.PC.ELIGIBILITY_PATH, 'utf8'));
-      const plain = t.PC.loadFrozenInputs() as AnyRec;
+      writeFileSync(list, '# frozen 2026-10-09T22:58:31Z\n# source: hub journal\n' + readFileSync(t.PC.FIXTURE_SOURCES.listPath, 'utf8'));
+      writeFileSync(elig, '# step-0 output\n' + readFileSync(t.PC.FIXTURE_SOURCES.eligibilityPath, 'utf8'));
+      const plain = t.PC.loadFrozenInputs(t.PC.FIXTURE_SOURCES) as AnyRec;
       // Pinned to the commented files' own bytes: accepted, and the same pairs/arms/keys as the plain files.
       const commented = t.PC.loadFrozenInputs({ listPath: list, listSha: sha(list), eligibilityPath: elig, eligibilitySha: sha(elig) }) as AnyRec;
       expect(commented.ok).toBe(true);
@@ -624,8 +793,8 @@ if (ISOLATED) {
       expect([...commented.arms.values()]).toEqual([...plain.arms.values()]);
       expect(commented.eligibleKeys).toEqual(plain.eligibleKeys);
       // The `#` lines are inside the pin: the plain files' pins refuse the commented bytes.
-      expect((t.PC.loadFrozenInputs({ ...t.PC.DEFAULT_SOURCES, listPath: list }) as AnyRec).refused).toBe('list_sha_mismatch');
-      expect((t.PC.loadFrozenInputs({ ...t.PC.DEFAULT_SOURCES, eligibilityPath: elig }) as AnyRec).refused).toBe('eligibility_sha_mismatch');
+      expect((t.PC.loadFrozenInputs({ ...t.PC.FIXTURE_SOURCES, listPath: list }) as AnyRec).refused).toBe('list_sha_mismatch');
+      expect((t.PC.loadFrozenInputs({ ...t.PC.FIXTURE_SOURCES, eligibilityPath: elig }) as AnyRec).refused).toBe('eligibility_sha_mismatch');
     });
 
     test('apply goes one arm per write, spaced by the rate limit, and records per-arm before/after and sums', async () => {
@@ -695,8 +864,8 @@ if (ISOLATED) {
       const t = await setup();
       seedAll(t.db);
       const plan = ((await t.replay({})).body as AnyRec).body;
-      expect(plan.list).toBe(`FIXTURE (replay-list.fixture.tsv, sha256 ${t.PC.REPLAY_LIST_SHA256})`);
-      expect(plan.eligibility).toBe(`FIXTURE (eligibility.fixture.tsv, sha256 ${t.PC.ELIGIBILITY_SHA256})`);
+      expect(plan.list).toBe(`FIXTURE (replay-list.fixture.tsv, sha256 ${t.PC.FIXTURE_SOURCES.listSha})`);
+      expect(plan.eligibility).toBe(`FIXTURE (eligibility.fixture.tsv, sha256 ${t.PC.FIXTURE_SOURCES.eligibilitySha})`);
       const v = ((await t.replay({ mode: 'verify' })).body as AnyRec).body;
       expect(v.list).toBe(plan.list);
       // A non-fixture file name is labelled FROZEN.
@@ -705,9 +874,9 @@ if (ISOLATED) {
       const { createHash } = await import('node:crypto');
       const dir = mkdtempSync(pathJoin(tmpdir(), 'pc-'));
       const real = pathJoin(dir, 'replay-list.tsv');
-      writeFileSync(real, readFileSync(t.PC.REPLAY_LIST_PATH));
+      writeFileSync(real, readFileSync(t.PC.FIXTURE_SOURCES.listPath));
       const sha = createHash('sha256').update(readFileSync(real)).digest('hex');
-      const inputs = t.PC.loadFrozenInputs({ ...t.PC.DEFAULT_SOURCES, listPath: real, listSha: sha }) as AnyRec;
+      const inputs = t.PC.loadFrozenInputs({ ...t.PC.FIXTURE_SOURCES, listPath: real, listSha: sha }) as AnyRec;
       expect(inputs.list_label).toBe(`FROZEN (replay-list.tsv, sha256 ${sha})`);
     });
 
