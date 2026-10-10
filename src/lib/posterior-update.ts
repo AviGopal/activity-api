@@ -842,6 +842,25 @@ export function chainCreditAncestorHits(): number {
 let chainCreditOrgUnresolved = 0;
 /** Traces whose leaf posterior delta was skipped because their org was a default, not a known org (module lifetime). */
 let leafSkippedDefaultOrg = 0;
+/**
+ * Graded traces with a non-zero leaf delta and NO signature key, so the state-conditioned context_thompson_scores
+ * row could not be written (module lifetime). The variant_performance_metrics delta is unaffected. Counted, never
+ * silent: before this counter the drop was a warn line with no execution id, so it could not be joined to anything.
+ */
+let signatureRowDroppedNoSignature = 0;
+function countSignatureRowDroppedNoSignature(
+  executionId: string | undefined, activityId: string, orgId: string, alphaDelta: number, betaDelta: number,
+): void {
+  signatureRowDroppedNoSignature++;
+  logger.warn('posterior-update: non-zero delta dropped, execution carries no signature key so no posterior row can be written', {
+    execution_id: executionId ?? null,
+    activity_id: activityId,
+    org_id: orgId,
+    alpha_delta: alphaDelta,
+    beta_delta: betaDelta,
+    signature_row_dropped_no_signature_total: signatureRowDroppedNoSignature,
+  });
+}
 export function learningSkippedDefaultOrg(): number {
   return leafSkippedDefaultOrg;
 }
@@ -855,6 +874,7 @@ export function learningSkippedDefaultOrg(): number {
 export type PosteriorCreditCounters = {
   chain_ancestor_hits: number; chain_ancestor_misses: number; chain_ancestor_org_unresolved: number;
   leaf_skipped_default_org: number;
+  signature_row_dropped_no_signature: number;
   deltas_dropped_no_row: number; deltas_dropped_no_row_leaf: number; deltas_dropped_no_row_ancestor: number;
 };
 /** Scalars only: this is /health checks.posterior_credit. The rings ride on the shape below. */
@@ -863,6 +883,7 @@ export function posteriorCreditCounters(): PosteriorCreditCounters {
   return {
     chain_ancestor_hits: chainCreditHits, chain_ancestor_misses: chainCreditMisses, chain_ancestor_org_unresolved: chainCreditOrgUnresolved,
     leaf_skipped_default_org: leafSkippedDefaultOrg,
+    signature_row_dropped_no_signature: signatureRowDroppedNoSignature,
     deltas_dropped_no_row: posteriorDeltasDroppedNoRow(), deltas_dropped_no_row_leaf: byKind.leaf, deltas_dropped_no_row_ancestor: byKind.ancestor,
   };
 }
@@ -1426,10 +1447,7 @@ export async function applyOutcomeToPosteriors(
     !orgDefaulted &&
     !HOOK_SUBSCRIBER_PATTERN.test(activityId) &&
     ((alphaDelta !== 0 || betaDelta !== 0) && !trace.signature
-      ? (logger.warn('posterior-update: non-zero delta dropped, execution carries no signature key so no posterior row can be written', { activity_id: activityId, alpha_delta: alphaDelta, beta_delta: betaDelta }), false)
-      : true) &&
-    ((alphaDelta !== 0 || betaDelta !== 0) && !trace.signature
-      ? (logger.warn('posterior-update: non-zero delta dropped, execution carries no signature key so no posterior row can be written', { activity_id: activityId, alpha_delta: alphaDelta, beta_delta: betaDelta }), false)
+      ? (countSignatureRowDroppedNoSignature(trace.execution_id, activityId, orgId, alphaDelta, betaDelta), false)
       : true) &&
     trace.signature &&
     typeof trace.signature_version === 'number' &&
