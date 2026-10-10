@@ -410,9 +410,14 @@ export async function readLedgerByIds<T = { ledger_key?: string; status?: string
   }
   return out;
 }
-/** An arm-level reset verdict already ledgered for this row: equality only (no IN), status filtered in app. */
+/**
+ * An arm-level reset verdict already ledgered for this row: equality only (no IN), status filtered in app.
+ * variant_id/org_id are selected so every returned row is RE-CHECKED in app (a composite-index read on 2.3.10
+ * is not trusted to honour both conjuncts): a row for another variant or org is dropped and logged, never
+ * allowed to settle this row's pairs as reset.
+ */
 export const COMPENSATION_LEDGER_ROW_SQL =
-  `SELECT ledger_key, status FROM posterior_compensation_ledger WHERE variant_id = $variant_id AND org_id = $org_id`;
+  `SELECT ledger_key, variant_id, org_id, status FROM posterior_compensation_ledger WHERE variant_id = $variant_id AND org_id = $org_id`;
 
 /**
  * ONE transaction per compensated row. Decisions (decay, residue, floor, reset, ambiguity) were made in app
@@ -535,11 +540,18 @@ async function flushCompensatedRow(
 
   let rows: CompRowRead[];
   let byKey: Array<{ ledger_key?: string; status?: string; attempts?: number }>;
-  let byRow: Array<{ ledger_key?: string; status?: string }>;
+  let byRow: Array<{ ledger_key?: string; variant_id?: string; org_id?: string; status?: string }>;
   try {
     rows = (await db.query<CompRowRead>(COMPENSATION_ROW_SQL, { variant_id: variantId, org_id: orgId })) ?? [];
     byKey = await readLedgerByIds(db, items.map((i) => i.ledgerKey));
-    byRow = (await db.query<{ ledger_key?: string; status?: string }>(COMPENSATION_LEDGER_ROW_SQL, { variant_id: variantId, org_id: orgId })) ?? [];
+    const rawByRow = (await db.query<{ ledger_key?: string; variant_id?: string; org_id?: string; status?: string }>(COMPENSATION_LEDGER_ROW_SQL, { variant_id: variantId, org_id: orgId })) ?? [];
+    byRow = rawByRow.filter((r) => r?.variant_id === variantId && r?.org_id === orgId);
+    if (byRow.length !== rawByRow.length) {
+      logger.warn('posterior compensation: ledger row read returned rows for another variant/org — dropped', {
+        event: 'posterior_compensation_foreign_ledger_rows', variant_id: variantId, org_id: orgId,
+        dropped: rawByRow.filter((r) => !(r?.variant_id === variantId && r?.org_id === orgId)).map((r) => ({ ledger_key: r?.ledger_key, variant_id: r?.variant_id, org_id: r?.org_id, status: r?.status })),
+      });
+    }
   } catch (err) {
     requeueCompensation(key, items);
     if (e) refoldVariant(e);
@@ -549,6 +561,7 @@ async function flushCompensatedRow(
 
   // TERMINALLY ledgered already (an earlier flush or run): settle, apply nothing. A cas_retry row is not
   // terminal: the item is decided again, resuming its attempt count.
+  // (By-id reads return only the requested records; the `seen` check below keeps it that way.)
   const existing = new Map<string, { status: string; attempts: number }>();
   for (const r of byKey) if (r?.ledger_key && seen.has(r.ledger_key)) existing.set(r.ledger_key, { status: String(r.status ?? ''), attempts: Number(r.attempts ?? 0) || 0 });
   const armReset = byRow.some((r) => r?.status === 'reset_since_leak');

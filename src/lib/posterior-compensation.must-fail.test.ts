@@ -19,7 +19,7 @@
 import { describe, expect, test, afterEach } from 'bun:test';
 import { join as pathJoin, relative as pathRelative } from 'node:path';
 
-const CASES = 32;
+const CASES = 37;
 const ISOLATED_ENV = 'ACTIVITY_API_ISOLATED_TEST';
 const ISOLATED = process.env[ISOLATED_ENV] === import.meta.path;
 if (!ISOLATED) {
@@ -65,7 +65,25 @@ if (ISOLATED) {
     return { PU, AGG, PC };
   }
 
+  // THE TRANSACTION'S LOAD-BEARING CLAUSES, written out here independently of the module. The fake interprets
+  // the transaction by contract and cannot parse SurrealQL, so it REFUSES any transaction text that lacks one of
+  // these: deleting the CAS guard (or the dup guard) from COMPENSATION_TXN_SQL then fails every write case,
+  // instead of surviving because the fake re-implemented the guard in TS.
+  const TXN_REQUIRED = [
+    "LET $__rows = (SELECT thompson_alpha, thompson_beta, <string> (updated_at ?? '') AS updated_at_s FROM variant_performance_metrics WHERE variant_id = $variant_id AND org_id = $org_id LIMIT 2);",
+    "LET $__dup = $keys.filter(|$k| record::exists(type::thing('posterior_compensation_ledger', $k)) AND type::thing('posterior_compensation_ledger', $k).status != 'cas_retry');",
+    "LET $__cas = array::len($__rows) = $seen_rows\n  AND ($seen_rows != 1 OR ($__rows[0].thompson_alpha = $seen_alpha AND $__rows[0].thompson_beta = $seen_beta AND $__rows[0].updated_at_s = $seen_updated_at));",
+    'LET $__ok = array::len($__dup) = 0 AND $__cas;',
+    'WHERE variant_id = $variant_id AND org_id = $org_id AND $__ok = true AND $do_update = true RETURN AFTER);',
+    '  IF $__ok {\n    UPSERT',
+    '  } ELSE IF array::len($__dup) = 0 {\n    UPSERT',
+  ];
+
   class FakeDb {
+    /** Simulates the 2.3.10 silent-zero: every by-record-id ledger read returns no rows. */
+    emptyLedgerReads = false;
+    /** Simulates a composite-index read that drops a conjunct: the per-row ledger read returns every row. */
+    foreignRowRead = false;
     vpm = new Map<string, Row[]>();
     ledger = new Map<string, AnyRec>();
     writes: string[] = [];
@@ -86,6 +104,7 @@ if (ISOLATED) {
       // A by-record-id ledger read: SELECT <fields> FROM posterior_compensation_ledger:⟨k⟩, … (missing ids yield no row).
       const byId = /^SELECT (.+?) FROM ((?:posterior_compensation_ledger:⟨[0-9a-f]{64}⟩(?:, )?)+)$/.exec(sql);
       if (byId) {
+        if (this.emptyLedgerReads) return [] as T[];
         const ids = [...byId[2].matchAll(/⟨([0-9a-f]{64})⟩/g)].map((m) => m[1]);
         const wantAll = byId[1] === PC.LEDGER_READ_FIELDS;
         return ids.filter((k) => this.ledger.has(k)).map((k) => {
@@ -94,7 +113,8 @@ if (ISOLATED) {
         }) as T[];
       }
       if (sql === AGG.COMPENSATION_LEDGER_ROW_SQL) {
-        return [...this.ledger.values()].filter((l) => l.variant_id === v.variant_id && l.org_id === v.org_id).map((l) => ({ ledger_key: l.ledger_key, status: l.status })) as T[];
+        return [...this.ledger.values()].filter((l) => this.foreignRowRead || (l.variant_id === v.variant_id && l.org_id === v.org_id))
+          .map((l) => ({ ledger_key: l.ledger_key, variant_id: l.variant_id, org_id: l.org_id, status: l.status })) as T[];
       }
       if (sql === PC.COMPLETION_READ_SQL) return (this.ledger.has('complete') ? [{ ...this.ledger.get('complete') }] : []) as T[];
       if (sql === PC.COMPLETION_CREATE_SQL) {
@@ -104,15 +124,17 @@ if (ISOLATED) {
         return [{}] as T[];
       }
       if (sql.startsWith('SELECT VALUE org_id FROM variant_performance_metrics')) return [] as T[];
-      if (sql === AGG.COMPENSATION_TXN_SQL) return [null, null, null, null, null, null, this.txn(v)] as T[];
+      if (sql === AGG.COMPENSATION_TXN_SQL) return [null, null, null, null, null, null, this.txn(sql, v)] as T[];
       throw new Error(`FakeDb: unexpected SQL ${sql.slice(0, 120)}`);
     }
     async queryAll(sql: string, v: AnyRec = {}): Promise<unknown[]> {
       if (sql !== this.M.AGG.COMPENSATION_TXN_SQL) throw new Error(`FakeDb.queryAll: unexpected SQL ${sql.slice(0, 120)}`);
-      return [null, null, null, null, null, null, this.txn(v)];
+      return [null, null, null, null, null, null, this.txn(sql, v)];
     }
     /** COMPENSATION_TXN_SQL by contract: guard, UPDATE, one UPSERT per item (decided status, or the miss status). */
-    private txn(v: AnyRec): AnyRec {
+    txn(sql: string, v: AnyRec): AnyRec {
+      const missing = TXN_REQUIRED.filter((c) => !sql.includes(c));
+      if (missing.length > 0) throw new Error(`FakeDb: transaction text lacks a required clause: ${missing.join(' | ')}`);
       this.writes.push('txn');
       if (this.beforeTxn) { const h = this.beforeTxn; this.beforeTxn = null; h(); }
       const rows = this.vpm.get(`${v.variant_id}|${v.org_id}`) ?? [];
@@ -667,6 +689,78 @@ if (ISOLATED) {
         const src = readFileSync(pathJoin(import.meta.dir, f), 'utf8');
         expect(src).not.toMatch(/FROM posterior_compensation_ledger WHERE ledger_key IN/);
       }
+    });
+
+    test('dry_run says which list it read: FIXTURE (file, pinned sha), never mistakable for the real list', async () => {
+      const t = await setup();
+      seedAll(t.db);
+      const plan = ((await t.replay({})).body as AnyRec).body;
+      expect(plan.list).toBe(`FIXTURE (replay-list.fixture.tsv, sha256 ${t.PC.REPLAY_LIST_SHA256})`);
+      expect(plan.eligibility).toBe(`FIXTURE (eligibility.fixture.tsv, sha256 ${t.PC.ELIGIBILITY_SHA256})`);
+      const v = ((await t.replay({ mode: 'verify' })).body as AnyRec).body;
+      expect(v.list).toBe(plan.list);
+      // A non-fixture file name is labelled FROZEN.
+      const { mkdtempSync, writeFileSync, readFileSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { createHash } = await import('node:crypto');
+      const dir = mkdtempSync(pathJoin(tmpdir(), 'pc-'));
+      const real = pathJoin(dir, 'replay-list.tsv');
+      writeFileSync(real, readFileSync(t.PC.REPLAY_LIST_PATH));
+      const sha = createHash('sha256').update(readFileSync(real)).digest('hex');
+      const inputs = t.PC.loadFrozenInputs({ ...t.PC.DEFAULT_SOURCES, listPath: real, listSha: sha }) as AnyRec;
+      expect(inputs.list_label).toBe(`FROZEN (replay-list.tsv, sha256 ${sha})`);
+    });
+
+    test('verify on a ledger read that returns NOTHING after completion → success:false, ledger_rows_missing per arm', async () => {
+      const t = await setup();
+      seedAll(t.db);
+      await t.applyArms();
+      expect(t.db.ledger.get('complete')?.status).toBe('complete');
+      t.db.emptyLedgerReads = true; // the 2.3.10 silent zero
+      const r = ((await t.replay({ mode: 'verify' })).body as AnyRec);
+      expect(r.success).toBe(false);
+      expect(r.body.ledger_rows_read).toBe(0);
+      expect(r.body.flags.map((f: AnyRec) => [f.arm_id, f.kind])).toEqual(
+        ['fx-arm-a', 'fx-arm-c', 'fx-arm-d', 'fx-arm-e'].map((a) => [a, 'ledger_rows_missing']));
+      expect(r.body.flags[0]).toMatchObject({ expected: { rows: 2 }, observed: { rows: 0 } });
+    });
+
+    test('verify with no expectation fails (no_expectation); expected_written short → written_rows_short; met → passes', async () => {
+      const t = await setup();
+      seedAll(t.db);
+      const none = ((await t.replay({ mode: 'verify' })).body as AnyRec);
+      expect(none.success).toBe(false);
+      expect(none.body.flags.map((f: AnyRec) => f.kind)).toEqual(['no_expectation']);
+      await t.applyArms({ arm_ids: ['fx-arm-a'] }); // not complete: only arm a
+      const met = ((await t.replay({ mode: 'verify', arm_ids: ['fx-arm-a'], expected_written: { 'fx-arm-a': 2 } })).body as AnyRec);
+      expect(met.body.flags).toEqual([]);
+      expect(met.success).toBe(true);
+      t.db.emptyLedgerReads = true;
+      const short = ((await t.replay({ mode: 'verify', arm_ids: ['fx-arm-a'], expected_written: { 'fx-arm-a': 2 } })).body as AnyRec);
+      expect(short.success).toBe(false);
+      expect(short.body.flags).toEqual([expect.objectContaining({ arm_id: 'fx-arm-a', kind: 'written_rows_short', expected: { written: 2 }, observed: { written: 0 } })]);
+    });
+
+    test('a ledger row read that returns ANOTHER org\'s reset row is re-checked in app: dropped, the pair is not settled reset', async () => {
+      const t = await setup();
+      t.db.seed('fx-arm-a', { thompson_alpha: 3, thompson_beta: 5 });
+      t.db.ledger.set('b'.repeat(64), { ledger_key: 'b'.repeat(64), variant_id: 'fx-arm-a', org_id: 'organizations:other', status: 'reset_since_leak' });
+      t.db.foreignRowRead = true; // the read ignores org_id
+      const r = await t.one(t.key('exec_fx_a1'));
+      expect((r.body as AnyRec).body.status).toBe('written');
+      expect(t.db.row('fx-arm-a').thompson_beta).toBe(5 - t.residue(LEAK));
+    });
+
+    test('TXN SHAPE: the CAS guard on α, β and <string> updated_at is in the transaction, and the fake refuses a transaction without it', async () => {
+      const t = await setup();
+      const sql = t.AGG.COMPENSATION_TXN_SQL;
+      for (const clause of TXN_REQUIRED) expect({ clause, present: sql.includes(clause) }).toEqual({ clause, present: true });
+      // The guard compares exactly the pre-read's three values.
+      expect(sql).toContain('$__rows[0].thompson_alpha = $seen_alpha AND $__rows[0].thompson_beta = $seen_beta AND $__rows[0].updated_at_s = $seen_updated_at');
+      // Instrument check: qa's mutant (e) — $__ok without $__cas — is refused by the fake, so it cannot pass.
+      const mutant = sql.replace('LET $__ok = array::len($__dup) = 0 AND $__cas;', 'LET $__ok = array::len($__dup) = 0;');
+      expect(mutant).not.toBe(sql);
+      expect(() => t.db.txn(mutant, { keys: [], items: [] })).toThrow(/lacks a required clause/);
     });
 
     test('the ledger migration declares the UNIQUE ledger_key index and the nested before/after fields', async () => {

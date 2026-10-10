@@ -98,6 +98,9 @@ export type FrozenInputs =
       ok: true;
       list_sha: string;
       eligibility_sha: string;
+      /** e.g. `FIXTURE (replay-list.fixture.tsv, sha256 …)` or `FROZEN (replay-list.tsv, sha256 …)` — never ambiguous. */
+      list_label: string;
+      eligibility_label: string;
       pairs: Map<string, FrozenPair>;
       arms: Map<string, FrozenArm>;
       /** CLEAN ∩ ELIGIBLE keys per arm, arms sorted, keys in list order. */
@@ -136,6 +139,12 @@ function readTsv(text: string, required: string[]): { rows: Record<string, strin
     rows.push(Object.fromEntries(header.map((h, j) => [h, f[j]])));
   }
   return { rows };
+}
+
+/** A file named *.fixture.* is a FIXTURE; anything else is the FROZEN input. The label carries the sha. */
+function inputLabel(path: string, sha: string): string {
+  const base = path.split('/').pop() ?? path;
+  return `${/\.fixture\./.test(base) ? 'FIXTURE' : 'FROZEN'} (${base}, sha256 ${sha})`;
 }
 
 /** Read and verify both frozen files. Any mismatch or malformation refuses everything (never a partial list). */
@@ -191,7 +200,11 @@ export function loadFrozenInputs(src: FrozenSources = DEFAULT_SOURCES): FrozenIn
     const keys = [...pairs.values()].filter((p) => p.arm_id === armId && p.status === 'CLEAN').map((p) => p.ledger_key);
     if (keys.length > 0) keysByArm.set(armId, keys);
   }
-  return { ok: true, list_sha: listSha, eligibility_sha: eligSha, pairs, arms, keysByArm, eligibleKeys: [...keysByArm.values()].flat() };
+  return {
+    ok: true, list_sha: listSha, eligibility_sha: eligSha,
+    list_label: inputLabel(src.listPath, listSha), eligibility_label: inputLabel(src.eligibilityPath, eligSha),
+    pairs, arms, keysByArm, eligibleKeys: [...keysByArm.values()].flat(),
+  };
 }
 
 let defaultInputs: FrozenInputs | null = null;
@@ -271,8 +284,10 @@ async function maybeComplete(deps: CompensationDeps, inputs: Extract<FrozenInput
   if (!done) return false;
   try {
     await deps.db.query(COMPLETION_CREATE_SQL, { list_sha: inputs.list_sha, eligible_total: inputs.eligibleKeys.length });
-  } catch {
-    /* a concurrent completion already wrote it — re-read below decides */
+  } catch (err) {
+    // "already exists" is a concurrent completion (the re-read below decides); anything else is logged.
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!/already exists/i.test(msg)) logger.warn('posterior compensation: completion row write failed', { event: 'posterior_compensation_complete_failed', error: msg });
   }
   const complete = await replayComplete(deps);
   if (complete) logger.info('posterior compensation replay COMPLETE — the resolver is now inert', { event: 'posterior_compensation_complete', eligible_total: inputs.eligibleKeys.length, list_sha: inputs.list_sha });
@@ -519,9 +534,12 @@ export interface ArmPlan {
 export interface VerifyFlag {
   arm_id: string;
   org_id: string;
-  kind: 'below_recorded_after' | 'mismatch_with_logged_deltas' | 're_reset' | 'row_missing' | 'row_ambiguous';
-  expected: { alpha?: number; beta?: number; beta_min?: number } | null;
-  observed: { alpha: number; beta: number } | null;
+  kind:
+    | 'below_recorded_after' | 'mismatch_with_logged_deltas' | 're_reset' | 'row_missing' | 'row_ambiguous'
+    // The silent-zero guards: verify never passes on a ledger read that returned less than it must.
+    | 'ledger_rows_missing' | 'written_rows_short' | 'no_expectation';
+  expected: Record<string, number> | null;
+  observed: Record<string, number> | null;
   boot_at: string;
 }
 
@@ -547,7 +565,10 @@ function selectArms(pointer: Record<string, unknown>, inputs: Extract<FrozenInpu
     const keys = [...inputs.pairs.values()].filter((p) => p.arm_id === a && p.status === 'CLEAN').map((p) => p.ledger_key);
     return { arm_id: a, eligible: false, org_id: arm?.org_id ?? null, candidate_rows: arm?.candidate_rows ?? null, note: arm?.note ?? 'not in the eligibility file', keys, k: keys.length };
   });
-  const common = { list_sha: inputs.list_sha, eligibility_sha: inputs.eligibility_sha, excluded_arms: excluded, unknown_arms: unknownArms };
+  const common = {
+    list: inputs.list_label, eligibility: inputs.eligibility_label,
+    list_sha: inputs.list_sha, eligibility_sha: inputs.eligibility_sha, excluded_arms: excluded, unknown_arms: unknownArms,
+  };
   return { armIds, common };
 }
 
@@ -642,11 +663,31 @@ export async function resolvePosteriorCompensationReplay(
   const flags: VerifyFlag[] = [];
   const checked: Array<Record<string, unknown>> = [];
   let ledgerRowsRead = 0;
+  // WHAT VERIFY MUST FIND. A verify that reads nothing must not pass, so it needs an expectation:
+  //   - the completion row: every eligible key then has a TERMINAL ledger row, so each arm must read back
+  //     exactly its key count (fewer → ledger_rows_missing);
+  //   - and/or `expected_written` ({arm_id: n} from the apply result): each arm must read back at least n
+  //     `written` rows (fewer → written_rows_short).
+  // With neither, verify cannot tell "nothing compensated" from "the read returned nothing": no_expectation.
+  const complete = await replayComplete(deps);
+  const expectedWritten = pointer.expected_written && typeof pointer.expected_written === 'object' && !Array.isArray(pointer.expected_written)
+    ? (pointer.expected_written as Record<string, unknown>) : null;
+  if (!complete && !expectedWritten) {
+    flags.push({ arm_id: '*', org_id: '*', kind: 'no_expectation', expected: null, observed: null, boot_at: bootAt });
+  }
   for (const a of armIds) {
     const org = inputs.arms.get(a)!.org_id;
-    const ledger = await readLedger(deps, inputs.keysByArm.get(a) ?? []);
+    const keys = inputs.keysByArm.get(a) ?? [];
+    const ledger = await readLedger(deps, keys);
     ledgerRowsRead += ledger.size;
     const written = [...ledger.values()].filter((l) => l.status === 'written' && l.after && l.at_s).sort((x, y) => tsMs(x.at_s) - tsMs(y.at_s));
+    if (complete && ledger.size < keys.length) {
+      flags.push({ arm_id: a, org_id: org, kind: 'ledger_rows_missing', expected: { rows: keys.length }, observed: { rows: ledger.size }, boot_at: bootAt });
+    }
+    const wantWritten = expectedWritten ? Number(expectedWritten[a] ?? 0) : 0;
+    if (wantWritten > 0 && written.length < wantWritten) {
+      flags.push({ arm_id: a, org_id: org, kind: 'written_rows_short', expected: { written: wantWritten }, observed: { written: written.length }, boot_at: bootAt });
+    }
     if (written.length === 0) continue;
     const last = written[written.length - 1];
     const recAfter = { alpha: Number(last.after!.alpha), beta: Number(last.after!.beta) };
@@ -687,7 +728,7 @@ export async function resolvePosteriorCompensationReplay(
       success: flags.length === 0,
       shape: 'posteriorCompensationVerify',
       // ledger_rows_read lets a reader tell "nothing compensated yet" from "the ledger read returned nothing".
-      body: { ...common, mode, boot_at: bootAt, with_logged_deltas: !!logged, ledger_rows_read: ledgerRowsRead, checked, flags },
+      body: { ...common, mode, boot_at: bootAt, replay_complete: complete, expected_written: expectedWritten, with_logged_deltas: !!logged, ledger_rows_read: ledgerRowsRead, checked, flags },
     },
   };
 }
