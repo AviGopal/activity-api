@@ -537,7 +537,9 @@ export interface VerifyFlag {
   kind:
     | 'below_recorded_after' | 'mismatch_with_logged_deltas' | 're_reset' | 'row_missing' | 'row_ambiguous'
     // The silent-zero guards: verify never passes on a ledger read that returned less than it must.
-    | 'ledger_rows_missing' | 'written_rows_short' | 'no_expectation';
+    | 'ledger_rows_missing' | 'written_rows_short' | 'no_expectation'
+    // ...and verify never passes on a request that checks nothing or carries an unusable expectation.
+    | 'no_arms_checked' | 'unknown_arm' | 'bad_expectation' | 'ledger_read_empty';
   expected: Record<string, number> | null;
   observed: Record<string, number> | null;
   boot_at: string;
@@ -669,10 +671,25 @@ export async function resolvePosteriorCompensationReplay(
   //   - and/or `expected_written` ({arm_id: n} from the apply result): each arm must read back at least n
   //     `written` rows (fewer → written_rows_short).
   // With neither, verify cannot tell "nothing compensated" from "the read returned nothing": no_expectation.
+  //
+  // AND it must check something real: an empty arm set, an unknown arm id, or an expected_written that does not
+  // give EVERY checked arm a positive finite integer all FAIL (named flags) rather than pass vacuously.
   const complete = await replayComplete(deps);
-  const expectedWritten = pointer.expected_written && typeof pointer.expected_written === 'object' && !Array.isArray(pointer.expected_written)
+  const ewPresent = pointer.expected_written !== undefined;
+  const ewObject = ewPresent && !!pointer.expected_written && typeof pointer.expected_written === 'object' && !Array.isArray(pointer.expected_written)
     ? (pointer.expected_written as Record<string, unknown>) : null;
-  if (!complete && !expectedWritten) {
+  const expectedWritten = new Map<string, number>();
+  if (armIds.length === 0) flags.push({ arm_id: '*', org_id: '*', kind: 'no_arms_checked', expected: null, observed: null, boot_at: bootAt });
+  for (const u of common.unknown_arms) flags.push({ arm_id: u, org_id: '*', kind: 'unknown_arm', expected: null, observed: null, boot_at: bootAt });
+  if (ewPresent) {
+    if (!ewObject) flags.push({ arm_id: '*', org_id: '*', kind: 'bad_expectation', expected: null, observed: null, boot_at: bootAt });
+    for (const a of armIds) {
+      const raw = ewObject ? ewObject[a] : undefined;
+      if (typeof raw === 'number' && Number.isInteger(raw) && raw > 0) expectedWritten.set(a, raw);
+      else flags.push({ arm_id: a, org_id: inputs.arms.get(a)!.org_id, kind: 'bad_expectation', expected: null, observed: null, boot_at: bootAt });
+    }
+  }
+  if (!complete && !ewPresent) {
     flags.push({ arm_id: '*', org_id: '*', kind: 'no_expectation', expected: null, observed: null, boot_at: bootAt });
   }
   for (const a of armIds) {
@@ -684,7 +701,7 @@ export async function resolvePosteriorCompensationReplay(
     if (complete && ledger.size < keys.length) {
       flags.push({ arm_id: a, org_id: org, kind: 'ledger_rows_missing', expected: { rows: keys.length }, observed: { rows: ledger.size }, boot_at: bootAt });
     }
-    const wantWritten = expectedWritten ? Number(expectedWritten[a] ?? 0) : 0;
+    const wantWritten = expectedWritten.get(a) ?? 0;
     if (wantWritten > 0 && written.length < wantWritten) {
       flags.push({ arm_id: a, org_id: org, kind: 'written_rows_short', expected: { written: wantWritten }, observed: { written: written.length }, boot_at: bootAt });
     }
@@ -721,6 +738,9 @@ export async function resolvePosteriorCompensationReplay(
     }
     checked.push({ arm_id: a, org_id: org, recorded_after: recAfter, recorded_at: last.at_s, observed, updated_at: row.updated_at_s ?? null });
   }
+  if (ledgerRowsRead === 0 && armIds.length > 0 && (complete || expectedWritten.size > 0)) {
+    flags.push({ arm_id: '*', org_id: '*', kind: 'ledger_read_empty', expected: { rows_min: 1 }, observed: { rows: 0 }, boot_at: bootAt });
+  }
   if (flags.length > 0) logger.warn('posterior compensation verify FLAGGED', { event: 'posterior_compensation_verify_flag', flags });
   return {
     status: 200,
@@ -728,7 +748,7 @@ export async function resolvePosteriorCompensationReplay(
       success: flags.length === 0,
       shape: 'posteriorCompensationVerify',
       // ledger_rows_read lets a reader tell "nothing compensated yet" from "the ledger read returned nothing".
-      body: { ...common, mode, boot_at: bootAt, replay_complete: complete, expected_written: expectedWritten, with_logged_deltas: !!logged, ledger_rows_read: ledgerRowsRead, checked, flags },
+      body: { ...common, mode, boot_at: bootAt, replay_complete: complete, expected_written: Object.fromEntries(expectedWritten), checked_arms: armIds, with_logged_deltas: !!logged, ledger_rows_read: ledgerRowsRead, checked, flags },
     },
   };
 }

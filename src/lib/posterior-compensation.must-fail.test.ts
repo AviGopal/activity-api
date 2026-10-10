@@ -19,7 +19,7 @@
 import { describe, expect, test, afterEach } from 'bun:test';
 import { join as pathJoin, relative as pathRelative } from 'node:path';
 
-const CASES = 37;
+const CASES = 38;
 const ISOLATED_ENV = 'ACTIVITY_API_ISOLATED_TEST';
 const ISOLATED = process.env[ISOLATED_ENV] === import.meta.path;
 if (!ISOLATED) {
@@ -721,7 +721,7 @@ if (ISOLATED) {
       expect(r.success).toBe(false);
       expect(r.body.ledger_rows_read).toBe(0);
       expect(r.body.flags.map((f: AnyRec) => [f.arm_id, f.kind])).toEqual(
-        ['fx-arm-a', 'fx-arm-c', 'fx-arm-d', 'fx-arm-e'].map((a) => [a, 'ledger_rows_missing']));
+        [...['fx-arm-a', 'fx-arm-c', 'fx-arm-d', 'fx-arm-e'].map((a) => [a, 'ledger_rows_missing']), ['*', 'ledger_read_empty']]);
       expect(r.body.flags[0]).toMatchObject({ expected: { rows: 2 }, observed: { rows: 0 } });
     });
 
@@ -738,7 +738,45 @@ if (ISOLATED) {
       t.db.emptyLedgerReads = true;
       const short = ((await t.replay({ mode: 'verify', arm_ids: ['fx-arm-a'], expected_written: { 'fx-arm-a': 2 } })).body as AnyRec);
       expect(short.success).toBe(false);
-      expect(short.body.flags).toEqual([expect.objectContaining({ arm_id: 'fx-arm-a', kind: 'written_rows_short', expected: { written: 2 }, observed: { written: 0 } })]);
+      expect(short.body.flags).toEqual([
+        expect.objectContaining({ arm_id: 'fx-arm-a', kind: 'written_rows_short', expected: { written: 2 }, observed: { written: 0 } }),
+        expect.objectContaining({ arm_id: '*', kind: 'ledger_read_empty' }),
+      ]);
+    });
+
+    test('verify never passes vacuously: qa\'s 4 probes (empty read each) → success:false with a named flag', async () => {
+      const t = await setup();
+      seedAll(t.db);
+      const kinds = (r: AnyRec) => r.body.flags.map((f: AnyRec) => f.kind);
+      // Not complete yet: probes 2 and 4.
+      await t.applyArms({ arm_ids: ['fx-arm-a'] });
+      t.db.emptyLedgerReads = true;
+      const p2 = (await t.replay({ mode: 'verify', expected_written: {} })).body as AnyRec;
+      expect(p2.success).toBe(false);
+      expect(kinds(p2)).toContain('bad_expectation');
+      const p4 = (await t.replay({ mode: 'verify', arm_ids: ['fx-arm-a'], expected_written: { 'fx-arm-a': 'two' } })).body as AnyRec;
+      expect(p4.success).toBe(false);
+      expect(kinds(p4)).toEqual(['bad_expectation']);
+      for (const bad of [0, -2, 1.5, Number.NaN, Number.POSITIVE_INFINITY, null, '2']) {
+        const r = (await t.replay({ mode: 'verify', arm_ids: ['fx-arm-a'], expected_written: { 'fx-arm-a': bad } })).body as AnyRec;
+        expect({ bad, success: r.success, kinds: kinds(r) }).toEqual({ bad, success: false, kinds: ['bad_expectation'] });
+      }
+      const valid = (await t.replay({ mode: 'verify', arm_ids: ['fx-arm-a'], expected_written: { 'fx-arm-a': 2 } })).body as AnyRec;
+      expect(valid.success).toBe(false);
+      expect(kinds(valid)).toEqual(['written_rows_short', 'ledger_read_empty']);
+      // Complete: probes 1 and 3.
+      t.db.emptyLedgerReads = false;
+      await t.applyArms();
+      expect(t.db.ledger.get('complete')?.status).toBe('complete');
+      t.db.emptyLedgerReads = true;
+      const p1 = (await t.replay({ mode: 'verify', arm_ids: [] })).body as AnyRec;
+      expect(p1.success).toBe(false);
+      expect(kinds(p1)).toEqual(['no_arms_checked']);
+      const p3 = (await t.replay({ mode: 'verify', arm_ids: ['nope'] })).body as AnyRec;
+      expect(p3.success).toBe(false);
+      expect(kinds(p3)).toEqual(['no_arms_checked', 'unknown_arm']);
+      expect(p3.body.flags[1].arm_id).toBe('nope');
+      for (const r of [p1, p2, p3, p4]) expect(r.body.ledger_rows_read).toBe(0);
     });
 
     test('a ledger row read that returns ANOTHER org\'s reset row is re-checked in app: dropped, the pair is not settled reset', async () => {
