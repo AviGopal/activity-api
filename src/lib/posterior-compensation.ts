@@ -5,15 +5,18 @@
  * NOT A GENERAL β-EDIT PRIMITIVE. Two resolver shapes on the existing POST /v2/impulses/resolve (no new
  * REST endpoint), both operator-only:
  *
- *   posteriorCompensation        accepts ONLY { ledger_key }. Variant, org and leak time are DERIVED here
- *                                from the shipped list (REPLAY_LIST_*) and the frozen eligibility file
- *                                (ELIGIBILITY_*), each pinned by a sha256 constant checked at load — a file
- *                                whose bytes do not match its pin refuses EVERYTHING. A key outside
- *                                CLEAN ∩ ELIGIBLE is refused (not_in_frozen_list / arm_not_eligible).
- *   posteriorCompensationReplay  the activity's resolver: dry_run (default; writes nothing — the per-arm
- *                                plan), arms (the eligible arm ids), apply (ONE ARM PER WRITE, sequential,
- *                                rate-limited; per-arm before/after from the transaction's own RETURN), and
- *                                verify (post-boot re-read: live (α, β) against the recorded AFTER).
+ *   posteriorCompensation        the single-key write ({ ledger_key } only). REFUSES every call in this build
+ *                                (apply_requires_authorization): admin scope is not an acceptable bound on a
+ *                                posterior write, and the operator-attested posteriorReplayAuthorization record
+ *                                that will be is not implemented yet.
+ *   posteriorCompensationReplay  dry_run (default; writes nothing — the per-arm plan, with every arm's keys)
+ *                                and verify (post-boot re-read: live (α, β) against the recorded AFTER). apply
+ *                                refuses exactly like posteriorCompensation.
+ *
+ * The write path (unauthorizedApply.key / .arms) is complete and tested but unreachable from any route: variant,
+ * org and leak time are DERIVED from the shipped list (REPLAY_LIST_*) and the frozen eligibility file
+ * (ELIGIBILITY_*), each pinned by a sha256 constant over the whole bytes and checked at load — a mismatch
+ * refuses EVERYTHING; a key outside CLEAN ∩ ELIGIBLE is refused (not_in_frozen_list / arm_not_eligible).
  *
  * THE WRITE is never done here. Each pair is queued with enqueueCompensation (posterior-aggregator.ts), whose
  * flush applies it in one transaction with the row's genuine Σδ and the ledger row (see that section's header
@@ -24,14 +27,12 @@
  * (the list's applied_ts: when the β landed) to the flush. β never goes below 1 (floored, no write). A row
  * at its exit counts (α = s+1, β = f+1) was reset since the leak: reset_since_leak, no write.
  *
- * INERT AFTER COMPLETION: once every eligible key has a ledger row, the completion row
- * `posterior_compensation_ledger:complete` is written, and from then on every posteriorCompensation call
- * (and replay apply) refuses with replay_complete. A completion row present at boot is honoured the same way.
+ * INERT AFTER COMPLETION: once every eligible key has a TERMINAL ledger row, the completion row
+ * `posterior_compensation_ledger:complete` is written, and from then on every write refuses with
+ * replay_complete. A completion row present at boot is honoured the same way.
  *
- * OPERATOR-ONLY uses activity-api's existing admin check (role 'admin' or scope 'admin', the predicate the
- * activityTemplate_update/_deprecate cases use), and refuses federation on-behalf-of callers. Admin scope is
- * not operator-exclusive (identity-vessel's bootstrap key carries it); the pinned list, not the caller, is
- * what bounds what this can write.
+ * NOT A TEMPLATE: this is a one-shot repair, inert after completion, not a taught behaviour. Its durable record
+ * is the UNIQUE ledger, the per-arm log lines and the frozen pinned inputs.
  */
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -47,6 +48,8 @@ import {
   enqueueCompensation,
   flushPosteriors,
   posteriorCoalesceEnabled,
+  readLedgerByIds,
+  TERMINAL_LEDGER_STATUSES,
   type CompensationOutcome,
   type CompensationRequest,
   type CompensationStatus,
@@ -235,23 +238,23 @@ export function defaultCompensationDeps(): CompensationDeps {
   };
 }
 
-// ─── Ledger reads ───
+// ─── Ledger reads (BY RECORD ID — see readLedgerByIds; never `ledger_key IN $keys`) ───
 
-export const LEDGER_READ_SQL =
-  `SELECT ledger_key, variant_id, org_id, status, applied, after, <string> at AS at_s FROM posterior_compensation_ledger WHERE ledger_key IN $keys`;
+/** Fields of a ledger read. */
+export const LEDGER_READ_FIELDS = 'ledger_key, variant_id, org_id, status, attempts, applied, after, observed_row_ids, <string> at AS at_s';
 export const COMPLETION_READ_SQL =
   `SELECT ledger_key, status, eligible_total, <string> at AS at_s FROM type::thing('posterior_compensation_ledger', 'complete')`;
 export const COMPLETION_CREATE_SQL =
   `CREATE type::thing('posterior_compensation_ledger', 'complete') CONTENT { ledger_key: 'complete', status: 'complete', list_sha: $list_sha, eligible_total: $eligible_total, at: time::now() }`;
 
-/** Statuses that settle a pair for good (each leaves a ledger row). */
-const TERMINAL = new Set(['written', 'floored', 'reset_since_leak', 'dropped_no_row']);
-
-type LedgerRow = { ledger_key?: string; variant_id?: string; org_id?: string; status?: string; applied?: number; after?: { alpha?: number; beta?: number } | null; at_s?: string };
+type LedgerRow = {
+  ledger_key?: string; variant_id?: string; org_id?: string; status?: string; attempts?: number; applied?: number;
+  after?: { alpha?: number; beta?: number } | null; observed_row_ids?: string[]; at_s?: string;
+};
 
 async function readLedger(deps: CompensationDeps, keys: string[]): Promise<Map<string, LedgerRow>> {
   if (keys.length === 0) return new Map();
-  const rows = (await deps.db.query<LedgerRow>(LEDGER_READ_SQL, { keys })) ?? [];
+  const rows = await readLedgerByIds<LedgerRow>(deps.db, keys, LEDGER_READ_FIELDS);
   return new Map(rows.filter((r) => r?.ledger_key).map((r) => [String(r.ledger_key), r]));
 }
 
@@ -260,11 +263,11 @@ async function replayComplete(deps: CompensationDeps): Promise<boolean> {
   return rows.some((r) => r?.status === 'complete');
 }
 
-/** When every eligible key has a terminal ledger row, write the completion row (idempotent). */
+/** When every eligible key has a TERMINAL ledger row, write the completion row (idempotent). */
 async function maybeComplete(deps: CompensationDeps, inputs: Extract<FrozenInputs, { ok: true }>): Promise<boolean> {
   if (await replayComplete(deps)) return true;
   const ledger = await readLedger(deps, inputs.eligibleKeys);
-  const done = inputs.eligibleKeys.every((k) => TERMINAL.has(String(ledger.get(k)?.status ?? '')));
+  const done = inputs.eligibleKeys.every((k) => TERMINAL_LEDGER_STATUSES.has(String(ledger.get(k)?.status ?? '')));
   if (!done) return false;
   try {
     await deps.db.query(COMPLETION_CREATE_SQL, { list_sha: inputs.list_sha, eligible_total: inputs.eligibleKeys.length });
@@ -276,9 +279,14 @@ async function maybeComplete(deps: CompensationDeps, inputs: Extract<FrozenInput
   return complete;
 }
 
-// ─── Auth and the shared gate ───
+// ─── Auth ───
 
-/** activity-api's existing admin predicate (activityTemplate_update/_deprecate), minus federation OBO callers. */
+/**
+ * activity-api's existing admin predicate (activityTemplate_update/_deprecate), minus federation OBO callers.
+ * It gates the READ modes only (dry_run, verify). It is NOT a bound on writes: the bootstrap key and hub keys
+ * carry admin scope. Writes require an operator-attested, signed posteriorReplayAuthorization trust-root record
+ * naming the list sha, the eligibility sha and the node — not implemented in this build, so every write refuses.
+ */
 export function isOperatorCaller(auth: JwtAuthContext | null | undefined): boolean {
   if (!auth || auth.obo) return false;
   return auth.role === 'admin' || (Array.isArray(auth.scopes) && auth.scopes.includes('admin'));
@@ -286,6 +294,7 @@ export function isOperatorCaller(auth: JwtAuthContext | null | undefined): boole
 
 export type RefusalCode =
   | 'not_operator'
+  | 'apply_requires_authorization'
   | 'list_sha_mismatch'
   | 'eligibility_sha_mismatch'
   | 'frozen_input_invalid'
@@ -306,13 +315,21 @@ const refuse = (status: number, code: RefusalCode, detail?: string, extra: Recor
   body: { success: false, refused: code, error: code, ...(detail ? { detail } : {}), ...extra },
 });
 
-type Gate = { ok: true; inputs: Extract<FrozenInputs, { ok: true }> } | { ok: false; result: ResolverResult };
+function operatorGate(auth: JwtAuthContext | null | undefined, shape: string): ResolverResult | null {
+  if (isOperatorCaller(auth)) return null;
+  logger.warn('posterior compensation REFUSED: caller is not an operator', { event: 'posterior_compensation_refused', refused: 'not_operator', shape, key_id: auth?.keyId ?? null, user_id: auth?.userId ?? null, org_id: auth?.orgId ?? null, obo: !!auth?.obo });
+  return refuse(403, 'not_operator', 'operator (admin) credentials required');
+}
 
-async function gate(auth: JwtAuthContext | null | undefined, deps: CompensationDeps, shape: string, opts: { write: boolean }): Promise<Gate> {
-  if (!isOperatorCaller(auth)) {
-    logger.warn('posterior compensation REFUSED: caller is not an operator', { event: 'posterior_compensation_refused', refused: 'not_operator', shape, key_id: auth?.keyId ?? null, user_id: auth?.userId ?? null, org_id: auth?.orgId ?? null, obo: !!auth?.obo });
-    return { ok: false, result: refuse(403, 'not_operator', 'operator (admin) credentials required') };
-  }
+const APPLY_REFUSAL_DETAIL =
+  'writes require an operator-attested, signed posteriorReplayAuthorization trust-root record naming the list sha, the eligibility sha and the node; this build serves dry_run and verify only';
+function refuseWrite(shape: string, auth: JwtAuthContext | null | undefined): ResolverResult {
+  logger.warn('posterior compensation REFUSED: write without authorization', { event: 'posterior_compensation_refused', refused: 'apply_requires_authorization', shape, key_id: auth?.keyId ?? null, user_id: auth?.userId ?? null });
+  return refuse(403, 'apply_requires_authorization', APPLY_REFUSAL_DETAIL);
+}
+
+type InputsGate = { ok: true; inputs: Extract<FrozenInputs, { ok: true }> } | { ok: false; result: ResolverResult };
+async function inputsGate(deps: CompensationDeps, opts: { write: boolean }): Promise<InputsGate> {
   const inputs = deps.inputs();
   if (!inputs.ok) return { ok: false, result: refuse(422, inputs.refused, inputs.detail) };
   if (opts.write) {
@@ -322,7 +339,7 @@ async function gate(auth: JwtAuthContext | null | undefined, deps: CompensationD
   return { ok: true, inputs };
 }
 
-// ─── Applying keys ───
+// ─── Applying keys (UNREACHABLE from any route in this build — see unauthorizedApply) ───
 
 export type KeyResult =
   | { ledger_key: string; refused: RefusalCode; detail?: string }
@@ -360,20 +377,13 @@ async function compensateKeys(keys: string[], inputs: Extract<FrozenInputs, { ok
   return out;
 }
 
-// ─── posteriorCompensation: one key ───
-
-export async function resolvePosteriorCompensation(
-  pointer: Record<string, unknown>,
-  auth: JwtAuthContext | null | undefined,
-  deps: CompensationDeps = defaultCompensationDeps(),
-): Promise<ResolverResult> {
-  const g = await gate(auth, deps, 'posteriorCompensation', { write: true });
+async function applyKey(pointer: Record<string, unknown>, deps: CompensationDeps): Promise<ResolverResult> {
+  const g = await inputsGate(deps, { write: true });
   if (!g.ok) return g.result;
   const extra = Object.keys(pointer).filter((k) => k !== 'type' && k !== 'ledger_key');
   if (extra.length > 0) return refuse(400, 'unexpected_field', `posteriorCompensation accepts only { ledger_key }; got ${extra.join(', ')}`);
   const key = pointer.ledger_key;
   if (typeof key !== 'string' || !/^[0-9a-f]{64}$/.test(key)) return refuse(400, 'bad_request', 'ledger_key must be a sha256 hex string');
-
   const [r] = await compensateKeys([key], g.inputs, deps);
   if ('refused' in r) {
     if (r.refused !== 'coalescing_disabled') logger.warn('posterior compensation REFUSED', { event: 'posterior_compensation_refused', refused: r.refused, ledger_key: key, detail: r.detail });
@@ -381,23 +391,6 @@ export async function resolvePosteriorCompensation(
   }
   const complete = await maybeComplete(deps, g.inputs);
   return { status: 200, body: { success: true, shape: 'posteriorCompensationResult', body: { ...r, replay_complete: complete } } };
-}
-
-// ─── posteriorCompensationReplay: the activity's resolver ───
-
-export interface ArmPlan {
-  arm_id: string;
-  org_id: string;
-  k: number;
-  already: number;
-  row: 'present' | 'absent' | 'ambiguous';
-  before: { alpha: number; beta: number } | null;
-  beta_decayed_now: number | null;
-  reset_since_leak: boolean;
-  pairs: Array<{ ledger_key: string; factor: number }>;
-  expected_residue: number;
-  expected_floored: number;
-  beta_after_floor: number | null;
 }
 
 export interface ArmApplyRecord {
@@ -413,56 +406,10 @@ export interface ArmApplyRecord {
   counts: Record<CompensationStatus | 'pending' | 'refused', number>;
 }
 
-export interface VerifyFlag {
-  arm_id: string;
-  org_id: string;
-  kind: 'below_recorded_after' | 'mismatch_with_logged_deltas' | 're_reset' | 'row_missing' | 'row_ambiguous';
-  expected: { alpha?: number; beta?: number; beta_min?: number } | null;
-  observed: { alpha: number; beta: number } | null;
-  boot_at: string;
-}
-
-type RowRead = { thompson_alpha?: number | null; thompson_beta?: number | null; updated_at_s?: string | null; successful_executions?: number | null; failed_executions?: number | null };
-async function readRow(deps: CompensationDeps, armId: string, orgId: string): Promise<RowRead[]> {
-  return (await deps.db.query<RowRead>(COMPENSATION_ROW_SQL, { variant_id: armId, org_id: orgId })) ?? [];
-}
-const tsMs = (s: string | null | undefined): number => { const p = s ? Date.parse(String(s)) : NaN; return Number.isNaN(p) ? 0 : p; };
-
-/** Minimum spacing between two arms' writes, across calls (law 5 rhythm is the template's; this is the floor). */
-const MIN_ARM_SPACING_MS = 1_000;
-let lastArmWriteAt = 0;
-
-async function planArm(deps: CompensationDeps, inputs: Extract<FrozenInputs, { ok: true }>, armId: string, nowMs: number): Promise<ArmPlan> {
-  const org = inputs.arms.get(armId)!.org_id;
-  const keys = inputs.keysByArm.get(armId) ?? [];
-  const ledger = await readLedger(deps, keys);
-  const open = keys.filter((k) => !ledger.has(k));
-  const rows = await readRow(deps, armId, org);
-  const row = rows.length === 1 ? rows[0] : null;
-  const before = row ? { alpha: Number(row.thompson_alpha ?? 1), beta: Number(row.thompson_beta ?? 1) } : null;
-  const reset = !!row && (before!.alpha === Number(row.successful_executions ?? NaN) + 1 && before!.beta === Number(row.failed_executions ?? NaN) + 1
-    || [...ledger.values()].some((l) => l.status === 'reset_since_leak'));
-  const decayedBeta = row ? decayedThompsonCounts(before!.alpha, before!.beta, tsMs(row.updated_at_s), nowMs).beta : null;
-  const pairs = open.map((k) => ({ ledger_key: k, factor: compensationResidue(inputs.pairs.get(k)!.leak_at_ms, nowMs) }));
-  let beta = decayedBeta;
-  let floored = 0;
-  let residue = 0;
-  if (beta !== null && !reset) {
-    for (const p of pairs) {
-      if (beta - p.factor < 1) floored += 1;
-      else { beta -= p.factor; residue += p.factor; }
-    }
-  }
-  return {
-    arm_id: armId, org_id: org, k: open.length, already: keys.length - open.length,
-    row: rows.length === 0 ? 'absent' : rows.length === 1 ? 'present' : 'ambiguous',
-    before, beta_decayed_now: decayedBeta, reset_since_leak: reset, pairs,
-    expected_residue: residue, expected_floored: floored, beta_after_floor: reset ? decayedBeta : beta,
-  };
-}
-
 function armRecord(armId: string, orgId: string, keys: string[], results: KeyResult[]): ArmApplyRecord {
-  const counts: ArmApplyRecord['counts'] = { written: 0, floored: 0, reset_since_leak: 0, already_compensated: 0, dropped_no_row: 0, row_ambiguous: 0, pending: 0, refused: 0 };
+  const counts: ArmApplyRecord['counts'] = {
+    written: 0, floored: 0, reset_since_leak: 0, already_compensated: 0, dropped_no_row: 0, skipped_ambiguous: 0, cas_exhausted: 0, pending: 0, refused: 0,
+  };
   let applied = 0;
   let before: ArmApplyRecord['before'] = null;
   let after: ArmApplyRecord['after'] = null;
@@ -477,21 +424,114 @@ function armRecord(armId: string, orgId: string, keys: string[], results: KeyRes
   return { arm_id: armId, org_id: orgId, k: keys.length, ledger_keys: keys, before, after, nominal_sum: keys.length, applied_sum: applied, counts };
 }
 
-export async function resolvePosteriorCompensationReplay(
-  pointer: Record<string, unknown>,
-  auth: JwtAuthContext | null | undefined,
-  deps: CompensationDeps = defaultCompensationDeps(),
-): Promise<ResolverResult> {
-  const mode = pointer.mode === undefined ? 'dry_run' : String(pointer.mode);
-  if (!['dry_run', 'arms', 'apply', 'verify'].includes(mode)) {
-    // Auth first so an unknown mode never tells a non-operator anything.
-    const g0 = await gate(auth, deps, 'posteriorCompensationReplay', { write: false });
-    return g0.ok ? refuse(400, 'bad_request', `mode must be dry_run | arms | apply | verify, got ${mode}`) : g0.result;
-  }
-  const g = await gate(auth, deps, 'posteriorCompensationReplay', { write: mode === 'apply' });
+/** Minimum spacing between two arms' writes, across calls. */
+const MIN_ARM_SPACING_MS = 1_000;
+let lastArmWriteAt = 0;
+
+async function applyArms(pointer: Record<string, unknown>, deps: CompensationDeps): Promise<ResolverResult> {
+  const g = await inputsGate(deps, { write: true });
   if (!g.ok) return g.result;
   const inputs = g.inputs;
+  const { armIds, common } = selectArms(pointer, inputs);
+  const rateLimitMs = Math.max(MIN_ARM_SPACING_MS, Number.isFinite(Number(pointer.rate_limit_ms)) ? Number(pointer.rate_limit_ms) : 5_000);
+  const records: ArmApplyRecord[] = [];
+  let stoppedAt: string | null = null;
+  for (const a of armIds) {
+    // ONE ARM PER WRITE, sequential, spaced: the coalescer never batches across arms and a fault stops at an
+    // arm boundary.
+    const wait = lastArmWriteAt + rateLimitMs - Date.now();
+    if (lastArmWriteAt > 0 && wait > 0) await deps.sleep(wait);
+    const keys = inputs.keysByArm.get(a) ?? [];
+    const results = await compensateKeys(keys, inputs, deps);
+    lastArmWriteAt = Date.now();
+    const rec = armRecord(a, inputs.arms.get(a)!.org_id, keys, results);
+    records.push(rec);
+    logger.info('posterior compensation replay: arm', { event: 'posterior_compensation_replay_arm', ...rec });
+    if (rec.counts.pending > 0 || rec.counts.refused > 0) { stoppedAt = a; break; }
+  }
+  const complete = await maybeComplete(deps, inputs);
+  const sum = (f: (r: ArmApplyRecord) => number) => records.reduce((acc, r) => acc + f(r), 0);
+  return {
+    status: 200,
+    body: {
+      success: stoppedAt === null,
+      shape: 'posteriorCompensationReplayResult',
+      body: {
+        ...common, mode: 'apply', rate_limit_ms: rateLimitMs, stopped_at: stoppedAt, replay_complete: complete, arms: records,
+        totals: {
+          arms: records.length,
+          nominal_sum: sum((r) => r.nominal_sum),
+          applied_sum: sum((r) => r.applied_sum),
+          written: sum((r) => r.counts.written),
+          floored: sum((r) => r.counts.floored),
+          reset_since_leak: sum((r) => r.counts.reset_since_leak),
+          skipped_ambiguous: sum((r) => r.counts.skipped_ambiguous),
+          cas_exhausted: sum((r) => r.counts.cas_exhausted),
+          already_compensated: sum((r) => r.counts.already_compensated),
+        },
+      },
+    },
+  };
+}
 
+/**
+ * THE WRITE PATHS, NOT REACHABLE FROM ANY ROUTE IN THIS BUILD. Both route shapes refuse every write with
+ * apply_requires_authorization; these are exported only so the mechanism (queue, transaction, ledger, floor,
+ * reset, CAS, ambiguity, completion) is exercised by tests now. The follow-up wires them behind a verified
+ * posteriorReplayAuthorization record. They perform no caller check of their own.
+ */
+export const unauthorizedApply = { key: applyKey, arms: applyArms };
+
+// ─── Routes ───
+
+/** posteriorCompensation: the single-key write shape. Every call refuses in this build (no authorization path). */
+export async function resolvePosteriorCompensation(
+  _pointer: Record<string, unknown>,
+  auth: JwtAuthContext | null | undefined,
+  _deps: CompensationDeps = defaultCompensationDeps(),
+): Promise<ResolverResult> {
+  return operatorGate(auth, 'posteriorCompensation') ?? refuseWrite('posteriorCompensation', auth);
+}
+
+export interface ArmPlan {
+  arm_id: string;
+  org_id: string;
+  eligible: true;
+  /** Every CLEAN key of the arm (the set the frozen eligibility diff is made against). */
+  keys: string[];
+  /** Keys not yet terminally ledgered. */
+  k: number;
+  /** Ledger statuses already present for this arm's keys. */
+  ledger_statuses: Record<string, number>;
+  row: 'present' | 'absent' | 'ambiguous';
+  observed_row_ids: string[];
+  before: { alpha: number; beta: number } | null;
+  beta_decayed_now: number | null;
+  reset_since_leak: boolean;
+  pairs: Array<{ ledger_key: string; factor: number }>;
+  expected_residue: number;
+  expected_floored: number;
+  expected_skipped_ambiguous: number;
+  expected_dropped_no_row: number;
+  beta_after_floor: number | null;
+}
+
+export interface VerifyFlag {
+  arm_id: string;
+  org_id: string;
+  kind: 'below_recorded_after' | 'mismatch_with_logged_deltas' | 're_reset' | 'row_missing' | 'row_ambiguous';
+  expected: { alpha?: number; beta?: number; beta_min?: number } | null;
+  observed: { alpha: number; beta: number } | null;
+  boot_at: string;
+}
+
+type RowRead = { row_id?: string | null; thompson_alpha?: number | null; thompson_beta?: number | null; updated_at_s?: string | null; successful_executions?: number | null; failed_executions?: number | null };
+async function readRow(deps: CompensationDeps, armId: string, orgId: string): Promise<RowRead[]> {
+  return (await deps.db.query<RowRead>(COMPENSATION_ROW_SQL, { variant_id: armId, org_id: orgId })) ?? [];
+}
+const tsMs = (s: string | null | undefined): number => { const p = s ? Date.parse(String(s)) : NaN; return Number.isNaN(p) ? 0 : p; };
+
+function selectArms(pointer: Record<string, unknown>, inputs: Extract<FrozenInputs, { ok: true }>) {
   let armIds = [...inputs.keysByArm.keys()];
   const unknownArms: string[] = [];
   if (Array.isArray(pointer.arm_ids)) {
@@ -499,68 +539,91 @@ export async function resolvePosteriorCompensationReplay(
     for (const a of wanted) if (!inputs.keysByArm.has(a)) unknownArms.push(a);
     armIds = armIds.filter((a) => wanted.includes(a));
   }
-  const excluded = [...inputs.arms.values()].filter((a) => !a.eligible).map((a) => ({ arm_id: a.arm_id, candidate_rows: a.candidate_rows, note: a.note }));
-  const common = { mode, list_sha: inputs.list_sha, eligibility_sha: inputs.eligibility_sha, excluded_arms: excluded, unknown_arms: unknownArms };
+  // Every arm of the list that is NOT planned, with its CLEAN keys, so a diff against the frozen eligibility
+  // is mechanical: eligible arms are in `arms`, the rest here.
+  const listArms = [...new Set([...inputs.pairs.values()].map((p) => p.arm_id))].sort();
+  const excluded = listArms.filter((a) => !inputs.keysByArm.has(a)).map((a) => {
+    const arm = inputs.arms.get(a);
+    const keys = [...inputs.pairs.values()].filter((p) => p.arm_id === a && p.status === 'CLEAN').map((p) => p.ledger_key);
+    return { arm_id: a, eligible: false, org_id: arm?.org_id ?? null, candidate_rows: arm?.candidate_rows ?? null, note: arm?.note ?? 'not in the eligibility file', keys, k: keys.length };
+  });
+  const common = { list_sha: inputs.list_sha, eligibility_sha: inputs.eligibility_sha, excluded_arms: excluded, unknown_arms: unknownArms };
+  return { armIds, common };
+}
 
-  if (mode === 'arms') {
-    return { status: 200, body: { success: true, shape: 'posteriorCompensationArms', body: armIds } };
+async function planArm(deps: CompensationDeps, inputs: Extract<FrozenInputs, { ok: true }>, armId: string, nowMs: number): Promise<ArmPlan> {
+  const org = inputs.arms.get(armId)!.org_id;
+  const keys = inputs.keysByArm.get(armId) ?? [];
+  const ledger = await readLedger(deps, keys);
+  const ledgerStatuses: Record<string, number> = {};
+  for (const l of ledger.values()) ledgerStatuses[String(l.status)] = (ledgerStatuses[String(l.status)] ?? 0) + 1;
+  const open = keys.filter((k) => !TERMINAL_LEDGER_STATUSES.has(String(ledger.get(k)?.status ?? '')));
+  const rows = await readRow(deps, armId, org);
+  const row = rows.length === 1 ? rows[0] : null;
+  const before = row ? { alpha: Number(row.thompson_alpha ?? 1), beta: Number(row.thompson_beta ?? 1) } : null;
+  const reset = !!row && ((before!.alpha === Number(row.successful_executions ?? NaN) + 1 && before!.beta === Number(row.failed_executions ?? NaN) + 1)
+    || [...ledger.values()].some((l) => l.status === 'reset_since_leak'));
+  const decayedBeta = row ? decayedThompsonCounts(before!.alpha, before!.beta, tsMs(row.updated_at_s), nowMs).beta : null;
+  const pairs = open.map((k) => ({ ledger_key: k, factor: compensationResidue(inputs.pairs.get(k)!.leak_at_ms, nowMs) }));
+  let beta = decayedBeta;
+  let floored = 0;
+  let residue = 0;
+  if (beta !== null && !reset) {
+    for (const p of pairs) {
+      if (beta - p.factor < 1) floored += 1;
+      else { beta -= p.factor; residue += p.factor; }
+    }
   }
+  return {
+    arm_id: armId, org_id: org, eligible: true, keys, k: open.length, ledger_statuses: ledgerStatuses,
+    row: rows.length === 0 ? 'absent' : rows.length === 1 ? 'present' : 'ambiguous',
+    observed_row_ids: rows.length >= 2 ? rows.map((r) => String(r.row_id ?? '')) : [],
+    before, beta_decayed_now: decayedBeta, reset_since_leak: reset, pairs,
+    expected_residue: residue, expected_floored: floored,
+    expected_skipped_ambiguous: rows.length >= 2 ? open.length : 0,
+    expected_dropped_no_row: rows.length === 0 ? open.length : 0,
+    beta_after_floor: reset ? decayedBeta : beta,
+  };
+}
+
+/** posteriorCompensationReplay: dry_run (default) and verify. Any write mode refuses in this build. */
+export async function resolvePosteriorCompensationReplay(
+  pointer: Record<string, unknown>,
+  auth: JwtAuthContext | null | undefined,
+  deps: CompensationDeps = defaultCompensationDeps(),
+): Promise<ResolverResult> {
+  const denied = operatorGate(auth, 'posteriorCompensationReplay');
+  if (denied) return denied;
+  const mode = pointer.mode === undefined ? 'dry_run' : String(pointer.mode);
+  if (mode === 'apply') return refuseWrite('posteriorCompensationReplay', auth);
+  if (mode !== 'dry_run' && mode !== 'verify') return refuse(400, 'bad_request', `mode must be dry_run | verify, got ${mode}`);
+  const g = await inputsGate(deps, { write: false });
+  if (!g.ok) return g.result;
+  const inputs = g.inputs;
+  const { armIds, common } = selectArms(pointer, inputs);
 
   if (mode === 'dry_run') {
     const nowMs = deps.nowMs();
     const plans: ArmPlan[] = [];
     for (const a of armIds) plans.push(await planArm(deps, inputs, a, nowMs));
+    const sum = (f: (p: ArmPlan) => number) => plans.reduce((acc, p) => acc + f(p), 0);
+    const statusTotals: Record<string, number> = {};
+    for (const p of plans) for (const [st, n] of Object.entries(p.ledger_statuses)) statusTotals[st] = (statusTotals[st] ?? 0) + n;
     return {
       status: 200,
       body: {
         success: true,
         shape: 'posteriorCompensationPlan',
         body: {
-          ...common, at: new Date(nowMs).toISOString(), replay_complete: await replayComplete(deps),
+          ...common, mode, at: new Date(nowMs).toISOString(), replay_complete: await replayComplete(deps),
           arms: plans,
           totals: {
-            arms: plans.length, k: plans.reduce((s, p) => s + p.k, 0), already: plans.reduce((s, p) => s + p.already, 0),
-            expected_residue: plans.reduce((s, p) => s + p.expected_residue, 0), expected_floored: plans.reduce((s, p) => s + p.expected_floored, 0),
+            arms: plans.length, keys: sum((p) => p.keys.length), k: sum((p) => p.k),
+            ledger_statuses: statusTotals,
+            expected_residue: sum((p) => p.expected_residue), expected_floored: sum((p) => p.expected_floored),
+            expected_skipped_ambiguous: sum((p) => p.expected_skipped_ambiguous), expected_dropped_no_row: sum((p) => p.expected_dropped_no_row),
             reset_arms: plans.filter((p) => p.reset_since_leak).map((p) => p.arm_id),
-          },
-        },
-      },
-    };
-  }
-
-  if (mode === 'apply') {
-    const rateLimitMs = Math.max(MIN_ARM_SPACING_MS, Number.isFinite(Number(pointer.rate_limit_ms)) ? Number(pointer.rate_limit_ms) : 5_000);
-    const records: ArmApplyRecord[] = [];
-    let stoppedAt: string | null = null;
-    for (const a of armIds) {
-      // ONE ARM PER WRITE, sequential, spaced: the coalescer never batches across arms and a fault stops at
-      // an arm boundary.
-      const wait = lastArmWriteAt + rateLimitMs - Date.now();
-      if (lastArmWriteAt > 0 && wait > 0) await deps.sleep(wait);
-      const keys = inputs.keysByArm.get(a) ?? [];
-      const results = await compensateKeys(keys, inputs, deps);
-      lastArmWriteAt = Date.now();
-      const rec = armRecord(a, inputs.arms.get(a)!.org_id, keys, results);
-      records.push(rec);
-      logger.info('posterior compensation replay: arm', { event: 'posterior_compensation_replay_arm', ...rec });
-      if (rec.counts.pending > 0 || rec.counts.refused > 0 || rec.counts.row_ambiguous > 0) { stoppedAt = a; break; }
-    }
-    const complete = await maybeComplete(deps, inputs);
-    return {
-      status: 200,
-      body: {
-        success: stoppedAt === null,
-        shape: 'posteriorCompensationReplayResult',
-        body: {
-          ...common, rate_limit_ms: rateLimitMs, stopped_at: stoppedAt, replay_complete: complete, arms: records,
-          totals: {
-            arms: records.length,
-            nominal_sum: records.reduce((s, r) => s + r.nominal_sum, 0),
-            applied_sum: records.reduce((s, r) => s + r.applied_sum, 0),
-            written: records.reduce((s, r) => s + r.counts.written, 0),
-            floored: records.reduce((s, r) => s + r.counts.floored, 0),
-            reset_since_leak: records.reduce((s, r) => s + r.counts.reset_since_leak, 0),
-            already_compensated: records.reduce((s, r) => s + r.counts.already_compensated, 0),
+            excluded_arms: common.excluded_arms.length, excluded_keys: common.excluded_arms.reduce((acc, a) => acc + a.k, 0),
           },
         },
       },
@@ -578,9 +641,11 @@ export async function resolvePosteriorCompensationReplay(
   const logged = Array.isArray(pointer.genuine_deltas) ? (pointer.genuine_deltas as Array<Record<string, unknown>>) : null;
   const flags: VerifyFlag[] = [];
   const checked: Array<Record<string, unknown>> = [];
+  let ledgerRowsRead = 0;
   for (const a of armIds) {
     const org = inputs.arms.get(a)!.org_id;
     const ledger = await readLedger(deps, inputs.keysByArm.get(a) ?? []);
+    ledgerRowsRead += ledger.size;
     const written = [...ledger.values()].filter((l) => l.status === 'written' && l.after && l.at_s).sort((x, y) => tsMs(x.at_s) - tsMs(y.at_s));
     if (written.length === 0) continue;
     const last = written[written.length - 1];
@@ -621,7 +686,8 @@ export async function resolvePosteriorCompensationReplay(
     body: {
       success: flags.length === 0,
       shape: 'posteriorCompensationVerify',
-      body: { ...common, boot_at: bootAt, with_logged_deltas: !!logged, checked, flags },
+      // ledger_rows_read lets a reader tell "nothing compensated yet" from "the ledger read returned nothing".
+      body: { ...common, mode, boot_at: bootAt, with_logged_deltas: !!logged, ledger_rows_read: ledgerRowsRead, checked, flags },
     },
   };
 }

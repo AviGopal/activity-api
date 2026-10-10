@@ -5257,15 +5257,16 @@ router.post('/resolve', async (c) => {
       }
 
       case 'posteriorCompensation': {
-        // β-leak replay, one frozen-list pair by { ledger_key } only. Operator-only; the module derives
-        // variant/org/amount from the sha-pinned shipped list and refuses everything else.
+        // β-leak replay, the single-key write. Refuses every call in this build (not_operator, else
+        // apply_requires_authorization): writes wait for an operator-attested posteriorReplayAuthorization.
         const { resolvePosteriorCompensation } = await import('../lib/posterior-compensation');
         const result = await resolvePosteriorCompensation(pointer as Record<string, unknown>, jwtAuthCtx);
         return c.json(result.body as unknown as ImpulseResolveResponse, result.status as any);
       }
 
       case 'posteriorCompensationReplay': {
-        // The posterior_compensation_replay activity's resolver: dry_run (default) | arms | apply | verify.
+        // β-leak replay, operator-only reads: dry_run (default, the per-arm plan) | verify (post-boot re-read).
+        // apply refuses with apply_requires_authorization in this build.
         const { resolvePosteriorCompensationReplay } = await import('../lib/posterior-compensation');
         const result = await resolvePosteriorCompensationReplay(pointer as Record<string, unknown>, jwtAuthCtx);
         return c.json(result.body as unknown as ImpulseResolveResponse, result.status as any);

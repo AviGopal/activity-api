@@ -440,7 +440,7 @@ export function loadConfig(): Config {
         'code_modification_proposal',
         'code_modification_proposal_write',
         'db_admin',
-        // β-leak replay (operator-only; frozen, sha-pinned list; inert after completion).
+        // β-leak replay (operator-only reads: dry_run, verify; writes refuse pending authorization).
         'posteriorCompensation',
         'posteriorCompensationReplay',
         'compositionGraph',

@@ -19,7 +19,7 @@
 import { describe, expect, test, afterEach } from 'bun:test';
 import { join as pathJoin, relative as pathRelative } from 'node:path';
 
-const CASES = 27;
+const CASES = 32;
 const ISOLATED_ENV = 'ACTIVITY_API_ISOLATED_TEST';
 const ISOLATED = process.env[ISOLATED_ENV] === import.meta.path;
 if (!ISOLATED) {
@@ -46,7 +46,7 @@ if (ISOLATED) {
   process.env.POSTERIOR_FLUSH_MS = '3600000';
   delete process.env.POSTERIOR_COALESCE;
 
-  type Row = { thompson_alpha: number; thompson_beta: number; updated_at_s: string; successful_executions: number; failed_executions: number };
+  type Row = { row_id: string; thompson_alpha: number; thompson_beta: number; updated_at_s: string; successful_executions: number; failed_executions: number };
   type AnyRec = Record<string, any>;
 
   const ORG = 'organizations:substrate';
@@ -72,18 +72,30 @@ if (ISOLATED) {
     beforeTxn: (() => void) | null = null;
     constructor(private M: Awaited<ReturnType<typeof mods>>) {}
     seed(arm: string, row: Partial<Row>) {
-      this.vpm.set(`${arm}|${ORG}`, [{ thompson_alpha: 3, thompson_beta: 5, updated_at_s: NOW_ISO, successful_executions: 10, failed_executions: 10, ...row }]);
+      this.vpm.set(`${arm}|${ORG}`, [{ row_id: `variant_performance_metrics:${arm}_r0`, thompson_alpha: 3, thompson_beta: 5, updated_at_s: NOW_ISO, successful_executions: 10, failed_executions: 10, ...row }]);
+    }
+    seedTwo(arm: string) {
+      this.seed(arm, {});
+      this.vpm.get(`${arm}|${ORG}`)!.push({ ...this.row(arm), row_id: `variant_performance_metrics:${arm}_r1` });
     }
     row(arm: string): Row { return this.vpm.get(`${arm}|${ORG}`)![0]; }
     async query<T = unknown>(sql: string, v: AnyRec = {}): Promise<T[]> {
       const { AGG, PC } = this.M;
       const rows = () => this.vpm.get(`${v.variant_id}|${v.org_id}`) ?? [];
       if (sql === AGG.COMPENSATION_ROW_SQL) return rows().slice(0, 2).map((r) => ({ ...r })) as T[];
-      if (sql === AGG.COMPENSATION_LEDGER_SQL) {
-        return [...this.ledger.values()].filter((l) => v.keys.includes(l.ledger_key) || (l.variant_id === v.variant_id && l.org_id === v.org_id && l.status === 'reset_since_leak'))
-          .map((l) => ({ ledger_key: l.ledger_key, status: l.status })) as T[];
+      // A by-record-id ledger read: SELECT <fields> FROM posterior_compensation_ledger:⟨k⟩, … (missing ids yield no row).
+      const byId = /^SELECT (.+?) FROM ((?:posterior_compensation_ledger:⟨[0-9a-f]{64}⟩(?:, )?)+)$/.exec(sql);
+      if (byId) {
+        const ids = [...byId[2].matchAll(/⟨([0-9a-f]{64})⟩/g)].map((m) => m[1]);
+        const wantAll = byId[1] === PC.LEDGER_READ_FIELDS;
+        return ids.filter((k) => this.ledger.has(k)).map((k) => {
+          const l = this.ledger.get(k)!;
+          return wantAll ? { ...l } : { ledger_key: l.ledger_key, status: l.status, attempts: l.attempts };
+        }) as T[];
       }
-      if (sql === PC.LEDGER_READ_SQL) return [...this.ledger.values()].filter((l) => v.keys.includes(l.ledger_key)).map((l) => ({ ...l })) as T[];
+      if (sql === AGG.COMPENSATION_LEDGER_ROW_SQL) {
+        return [...this.ledger.values()].filter((l) => l.variant_id === v.variant_id && l.org_id === v.org_id).map((l) => ({ ledger_key: l.ledger_key, status: l.status })) as T[];
+      }
       if (sql === PC.COMPLETION_READ_SQL) return (this.ledger.has('complete') ? [{ ...this.ledger.get('complete') }] : []) as T[];
       if (sql === PC.COMPLETION_CREATE_SQL) {
         if (this.ledger.has('complete')) throw new Error('Database record already exists');
@@ -99,33 +111,37 @@ if (ISOLATED) {
       if (sql !== this.M.AGG.COMPENSATION_TXN_SQL) throw new Error(`FakeDb.queryAll: unexpected SQL ${sql.slice(0, 120)}`);
       return [null, null, null, null, null, null, this.txn(v)];
     }
-    /** COMPENSATION_TXN_SQL by contract. A thrown error = the transaction cancelled whole. */
+    /** COMPENSATION_TXN_SQL by contract: guard, UPDATE, one UPSERT per item (decided status, or the miss status). */
     private txn(v: AnyRec): AnyRec {
       this.writes.push('txn');
       if (this.beforeTxn) { const h = this.beforeTxn; this.beforeTxn = null; h(); }
       const rows = this.vpm.get(`${v.variant_id}|${v.org_id}`) ?? [];
-      const dup = (v.keys as string[]).filter((k) => this.ledger.has(k));
+      const dup = (v.keys as string[]).filter((k) => this.ledger.has(k) && this.ledger.get(k)!.status !== 'cas_retry');
       const r0 = rows[0];
-      const ok = dup.length === 0 && Math.min(rows.length, 2) === v.seen_rows
-        && (v.seen_rows === 0 || (r0.thompson_alpha === v.seen_alpha && r0.thompson_beta === v.seen_beta && r0.updated_at_s === v.seen_updated_at));
-      // Atomic: everything is staged first; a UNIQUE violation throws before anything is applied.
+      const cas = Math.min(rows.length, 2) === v.seen_rows
+        && (v.seen_rows !== 1 || (r0.thompson_alpha === v.seen_alpha && r0.thompson_beta === v.seen_beta && r0.updated_at_s === v.seen_updated_at));
+      const ok = dup.length === 0 && cas;
       const willUpdate = ok && v.do_update;
       const a = rows[0] ? (willUpdate ? { thompson_alpha: v.new_alpha, thompson_beta: v.new_beta } : rows[0]) : undefined;
-      const staged = new Map(this.ledger);
-      if (ok) {
-        for (const it of v.items as AnyRec[]) {
-          if (staged.has(it.ledger_key)) throw new Error('Database index `idx_posterior_compensation_ledger_key` already contains');
-          staged.set(it.ledger_key, { ...it, after: a ? { alpha: a.thompson_alpha, beta: a.thompson_beta } : { alpha: undefined, beta: undefined }, at_s: new Date(v.now).toISOString() });
+      const at_s = new Date(v.now).toISOString();
+      for (const it of v.items as AnyRec[]) {
+        const { miss_status, record_after, ...fields } = it;
+        if (ok) {
+          this.ledger.set(it.ledger_key, { ...fields, ...(record_after ? { after: { alpha: a!.thompson_alpha, beta: a!.thompson_beta } } : {}), at_s });
+          this.writes.push('ledger_upsert');
+        } else if (dup.length === 0) {
+          const { status: _s, before: _b, observed_row_ids: _o, ...rest } = fields;
+          this.ledger.set(it.ledger_key, { ...rest, applied: 0, status: miss_status, at_s });
+          this.writes.push('ledger_upsert');
         }
       }
       let updated = 0;
       if (willUpdate) {
-        for (const r of rows) { r.thompson_alpha = v.new_alpha; r.thompson_beta = v.new_beta; r.updated_at_s = new Date(v.now).toISOString(); }
+        for (const r of rows) { r.thompson_alpha = v.new_alpha; r.thompson_beta = v.new_beta; r.updated_at_s = at_s; }
         updated = rows.length;
         this.writes.push('vpm_update');
       }
-      if (ok) { for (const _ of v.items as AnyRec[]) this.writes.push('ledger_create'); this.ledger = staged; }
-      return { ok, dup, rows: rows.length, updated, after_alpha: a?.thompson_alpha, after_beta: a?.thompson_beta };
+      return { ok, cas, dup, rows: rows.length, updated, after_alpha: a?.thompson_alpha, after_beta: a?.thompson_beta };
     }
   }
 
@@ -145,10 +161,14 @@ if (ISOLATED) {
     };
     const inputs = M.PC.loadFrozenInputs(M.PC.DEFAULT_SOURCES) as AnyRec;
     const key = (exec: string): string => [...inputs.pairs.values()].find((p: AnyRec) => p.exec_id === exec)!.ledger_key;
-    const one = (k: string, auth: AnyRec | null = OP, extra: AnyRec = {}) => M.PC.resolvePosteriorCompensation({ type: 'posteriorCompensation', ledger_key: k, ...extra }, auth as any, deps as any);
+    // The WRITE paths are unreachable from the routes in this build (apply_requires_authorization); the mechanism
+    // is exercised through unauthorizedApply. The ROUTES are exercised for auth, refusal, dry_run and verify.
+    const one = (k: string, extra: AnyRec = {}) => M.PC.unauthorizedApply.key({ type: 'posteriorCompensation', ledger_key: k, ...extra }, deps as any);
+    const applyArms = (p: AnyRec = {}) => M.PC.unauthorizedApply.arms({ type: 'posteriorCompensationReplay', ...p }, deps as any);
+    const route1 = (k: string, auth: AnyRec | null = OP, extra: AnyRec = {}) => M.PC.resolvePosteriorCompensation({ type: 'posteriorCompensation', ledger_key: k, ...extra }, auth as any, deps as any);
     const replay = (p: AnyRec, auth: AnyRec | null = OP) => M.PC.resolvePosteriorCompensationReplay({ type: 'posteriorCompensationReplay', ...p }, auth as any, deps as any);
     const residue = (leakMs: number) => M.PU.decayedThompsonCounts(1, 2, leakMs, NOW).beta - 1;
-    return { ...M, db, deps, sleeps, key, one, replay, residue, inputs };
+    return { ...M, db, deps, sleeps, key, one, applyArms, route1, replay, residue, inputs };
   }
 
   /** Seed every eligible fixture arm with a row that will take its compensation without flooring. */
@@ -183,13 +203,13 @@ if (ISOLATED) {
     test('a re-run of the whole activity after a full run → 0 deltas (replay_complete), β and ledger unchanged', async () => {
       const t = await setup();
       seedAll(t.db);
-      const run1 = await t.replay({ mode: 'apply' });
+      const run1 = await t.applyArms();
       expect((run1.body as AnyRec).body.replay_complete).toBe(true);
       expect((run1.body as AnyRec).body.totals.written).toBe(5);
       const snapshot = JSON.stringify([...t.db.vpm.entries()]);
       const ledgerSize = t.db.ledger.size;
       const writes = t.db.writes.length;
-      const run2 = await t.replay({ mode: 'apply' });
+      const run2 = await t.applyArms();
       expect((run2.body as AnyRec).refused).toBe('replay_complete');
       expect(JSON.stringify([...t.db.vpm.entries()])).toBe(snapshot);
       expect(t.db.ledger.size).toBe(ledgerSize);
@@ -199,9 +219,9 @@ if (ISOLATED) {
     test('a re-run over an arm before completion → every pair already_compensated, applied 0, β unchanged', async () => {
       const t = await setup();
       seedAll(t.db);
-      await t.replay({ mode: 'apply', arm_ids: ['fx-arm-a'] });
+      await t.applyArms({ arm_ids: ['fx-arm-a'] });
       const beta = t.db.row('fx-arm-a').thompson_beta;
-      const again = await t.replay({ mode: 'apply', arm_ids: ['fx-arm-a'] });
+      const again = await t.applyArms({ arm_ids: ['fx-arm-a'] });
       const rec = (again.body as AnyRec).body.arms[0];
       expect(rec.counts.already_compensated).toBe(2);
       expect(rec.counts.written).toBe(0);
@@ -254,15 +274,59 @@ if (ISOLATED) {
       const p = t.AGG.enqueueCompensation({ ledgerKey: k, variantId: 'fx-arm-a', orgId: ORG, leakAtMs: LEAK, listSha: 'x' })!;
       t.db.beforeTxn = () => { const r = t.db.row('fx-arm-a'); r.thompson_beta = 8; r.updated_at_s = new Date(NOW - 1000).toISOString(); };
       await t.AGG.flushPosteriors({ db: t.db as any, nowMs: NOW });
-      expect(t.db.ledger.size).toBe(0);
+      // The miss is RECORDED (cas_retry, attempt 1), never silent; the posterior is untouched.
+      expect(t.db.ledger.get(k)?.status).toBe('cas_retry');
+      expect(t.db.ledger.get(k)?.attempts).toBe(1);
       expect(t.db.row('fx-arm-a').thompson_beta).toBe(8);
       expect(t.AGG.pendingCompensationCount()).toBe(1);
       await t.AGG.flushPosteriors({ db: t.db as any, nowMs: NOW });
       const o = await p;
       const d = t.PU.decayedThompsonCounts(3, 8, NOW - 1000, NOW);
       expect(o.status).toBe('written');
+      expect(o.attempts).toBe(2);
       expect(t.db.row('fx-arm-a').thompson_beta).toBe(d.beta - t.residue(LEAK));
       expect(t.db.ledger.size).toBe(1);
+      expect(t.db.ledger.get(k)?.status).toBe('written');
+    });
+
+    test('a row that keeps moving → cas_retry each time, then TERMINAL cas_exhausted at the bound; never compensated', async () => {
+      const t = await setup();
+      t.db.seed('fx-arm-a', { thompson_alpha: 3, thompson_beta: 5 });
+      const k = t.key('exec_fx_a1');
+      const p = t.AGG.enqueueCompensation({ ledgerKey: k, variantId: 'fx-arm-a', orgId: ORG, leakAtMs: LEAK, listSha: 'x' })!;
+      let racerBeta = 5;
+      for (let i = 1; i <= t.AGG.CAS_MAX_ATTEMPTS; i++) {
+        t.db.beforeTxn = () => { const r = t.db.row('fx-arm-a'); racerBeta += 1; r.thompson_beta = racerBeta; r.updated_at_s = new Date(NOW - i * 1000).toISOString(); };
+        await t.AGG.flushPosteriors({ db: t.db as any, nowMs: NOW });
+        expect(t.db.ledger.get(k)?.attempts).toBe(i);
+        expect(t.db.ledger.get(k)?.status).toBe(i < t.AGG.CAS_MAX_ATTEMPTS ? 'cas_retry' : 'cas_exhausted');
+      }
+      const o = await p;
+      expect(o.status).toBe('cas_exhausted');
+      expect(o.applied).toBe(0);
+      expect(t.AGG.pendingCompensationCount()).toBe(0);
+      expect(t.db.row('fx-arm-a').thompson_beta).toBe(racerBeta); // only the racer's writes
+      expect(t.db.writes).not.toContain('vpm_update');
+      expect(t.AGG.TERMINAL_LEDGER_STATUSES.has('cas_exhausted')).toBe(true);
+      expect(t.AGG.TERMINAL_LEDGER_STATUSES.has('cas_retry')).toBe(false);
+    });
+
+    test('two rows match (variant, org) → TERMINAL skipped_ambiguous with the observed row ids; no posterior write; inertness reachable', async () => {
+      const t = await setup();
+      seedAll(t.db);
+      t.db.seedTwo('fx-arm-c');
+      const k = t.key('exec_fx_c1');
+      const r = await t.one(k);
+      const b = (r.body as AnyRec).body;
+      expect(b.status).toBe('skipped_ambiguous');
+      expect(b.observed_row_ids).toEqual(['variant_performance_metrics:fx-arm-c_r0', 'variant_performance_metrics:fx-arm-c_r1']);
+      expect(t.db.ledger.get(k)?.status).toBe('skipped_ambiguous');
+      expect(t.db.ledger.get(k)?.observed_row_ids).toEqual(b.observed_row_ids);
+      expect(t.db.writes).not.toContain('vpm_update');
+      // A terminal status: with every other eligible pair decided, the replay goes inert.
+      const run = await t.applyArms();
+      expect((run.body as AnyRec).body.replay_complete).toBe(true);
+      expect(t.db.ledger.get('complete')?.status).toBe('complete');
     });
 
     test('a key ledgered by a racing writer between the pre-read and the transaction → nothing applied; settles already_compensated', async () => {
@@ -360,7 +424,7 @@ if (ISOLATED) {
       seedAll(t.db);
       const k = t.key('exec_fx_a2'); // a key that would be valid under the pinned file
       expect((await t.one(k)).body.refused).toBe('list_sha_mismatch');
-      expect((await t.replay({ mode: 'apply' })).body.refused).toBe('list_sha_mismatch');
+      expect((await t.applyArms()).body.refused).toBe('list_sha_mismatch');
       expect((await t.replay({ mode: 'dry_run' })).body.refused).toBe('list_sha_mismatch');
       expect((await t.replay({ mode: 'verify' })).body.refused).toBe('list_sha_mismatch');
       expect(t.db.writes).toEqual([]);
@@ -379,21 +443,40 @@ if (ISOLATED) {
       expect(t.db.writes).toEqual([]);
     });
 
-    test('a non-operator caller → refused (both shapes), nothing written', async () => {
+    test('a non-operator caller → refused not_operator on both route shapes (reads included), nothing written', async () => {
       const t = await setup();
       seedAll(t.db);
       const k = t.key('exec_fx_a1');
       const member = { jwtToken: '', orgId: ORG, role: 'member', scopes: ['read', 'write'] };
       const oboAdmin = { ...OP, obo: { node: 'peer', shape: 'posteriorCompensation' } };
       for (const auth of [member, null, oboAdmin]) {
-        const r = await t.one(k, auth);
+        const r = await t.route1(k, auth);
         expect(r.status).toBe(403);
         expect((r.body as AnyRec).refused).toBe('not_operator');
-        expect((await t.replay({ mode: 'apply' }, auth)).body.refused).toBe('not_operator');
-        expect((await t.replay({ mode: 'dry_run' }, auth)).body.refused).toBe('not_operator');
+        for (const mode of ['apply', 'dry_run', 'verify']) expect((await t.replay({ mode }, auth)).body.refused).toBe('not_operator');
       }
       expect(t.db.writes).toEqual([]);
       expect(t.db.ledger.size).toBe(0);
+    });
+
+    test('an OPERATOR write through either route → apply_requires_authorization; nothing written, no ledger row', async () => {
+      const t = await setup();
+      seedAll(t.db);
+      const snapshot = JSON.stringify([...t.db.vpm.entries()]);
+      const r1 = await t.route1(t.key('exec_fx_a1'), OP);
+      expect(r1.status).toBe(403);
+      expect((r1.body as AnyRec).refused).toBe('apply_requires_authorization');
+      for (const p of [{ mode: 'apply' }, { mode: 'apply', arm_ids: ['fx-arm-a'] }]) {
+        const r = await t.replay(p, OP);
+        expect(r.status).toBe(403);
+        expect((r.body as AnyRec).refused).toBe('apply_requires_authorization');
+      }
+      // Admin scope is not a write bound: the bootstrap key's scope set is refused just the same.
+      expect((await t.route1(t.key('exec_fx_a1'), { ...OP, role: undefined, scopes: ['read', 'write', 'admin'] })).body.refused).toBe('apply_requires_authorization');
+      expect(t.AGG.pendingCompensationCount()).toBe(0);
+      expect(t.db.writes).toEqual([]);
+      expect(t.db.ledger.size).toBe(0);
+      expect(JSON.stringify([...t.db.vpm.entries()])).toBe(snapshot);
     });
 
     test('an AMBIGUOUS pair is never compensated (refused by key; absent from every apply)', async () => {
@@ -403,7 +486,7 @@ if (ISOLATED) {
       const r = await t.one(amb);
       expect((r.body as AnyRec).refused).toBe('not_in_frozen_list');
       expect(String((r.body as AnyRec).detail)).toContain('AMBIGUOUS');
-      const run = await t.replay({ mode: 'apply' });
+      const run = await t.applyArms();
       const armC = (run.body as AnyRec).body.arms.find((a: AnyRec) => a.arm_id === 'fx-arm-c');
       expect(armC.ledger_keys).not.toContain(amb);
       expect(armC.k).toBe(1);
@@ -414,7 +497,7 @@ if (ISOLATED) {
       const t = await setup({ coalesceEnabled: () => false });
       seedAll(t.db);
       expect((await t.one(t.key('exec_fx_a1'))).body.refused).toBe('coalescing_disabled');
-      expect((await t.replay({ mode: 'apply' })).body.refused).toBe('coalescing_disabled');
+      expect((await t.applyArms()).body.refused).toBe('coalescing_disabled');
       expect(t.AGG.pendingCompensationCount()).toBe(0);
       expect(t.db.writes).toEqual([]);
     });
@@ -423,7 +506,7 @@ if (ISOLATED) {
       const t = await setup();
       seedAll(t.db);
       for (const extra of [{ variant_id: 'fx-arm-a' }, { org_id: ORG }, { beta_delta: -1 }, { alpha_delta: 1 }]) {
-        const r = await t.one(t.key('exec_fx_a1'), OP, extra);
+        const r = await t.one(t.key('exec_fx_a1'), extra);
         expect((r.body as AnyRec).refused).toBe('unexpected_field');
       }
       expect(t.db.writes).toEqual([]);
@@ -465,6 +548,29 @@ if (ISOLATED) {
       const e = plan.arms.find((x: AnyRec) => x.arm_id === 'fx-arm-e');
       expect(e.expected_floored).toBe(1);
       expect(plan.excluded_arms.map((x: AnyRec) => x.arm_id)).toEqual(['fx-arm-b']);
+      // Mechanical diff against the frozen eligibility: every arm carries its CLEAN keys, k and eligibility.
+      expect(a.eligible).toBe(true);
+      expect(a.keys).toEqual([t.key('exec_fx_a1'), t.key('exec_fx_a2')]);
+      expect(plan.excluded_arms[0]).toMatchObject({ arm_id: 'fx-arm-b', eligible: false, k: 1, keys: [t.key('exec_fx_b1')] });
+      expect(plan.totals).toMatchObject({ arms: 4, keys: 5, k: 5, excluded_arms: 1, excluded_keys: 1 });
+    });
+
+    test('dry run accounts for ledger statuses and planned ambiguity: k counts only non-terminal keys', async () => {
+      const t = await setup();
+      seedAll(t.db);
+      await t.applyArms({ arm_ids: ['fx-arm-a'] });
+      t.db.seedTwo('fx-arm-c');
+      // A cas_retry row is NOT terminal: its key still counts in k.
+      t.db.ledger.set(t.key('exec_fx_d1'), { ledger_key: t.key('exec_fx_d1'), variant_id: 'fx-arm-d', org_id: ORG, status: 'cas_retry', attempts: 2 });
+      const writes = t.db.writes.length;
+      const plan = (await t.replay({})).body as AnyRec;
+      expect(t.db.writes.length).toBe(writes);
+      const arm = (id: string) => plan.body.arms.find((x: AnyRec) => x.arm_id === id);
+      expect(arm('fx-arm-a')).toMatchObject({ k: 0, ledger_statuses: { written: 2 } });
+      expect(arm('fx-arm-c')).toMatchObject({ row: 'ambiguous', k: 1, expected_skipped_ambiguous: 1, observed_row_ids: ['variant_performance_metrics:fx-arm-c_r0', 'variant_performance_metrics:fx-arm-c_r1'] });
+      expect(arm('fx-arm-d')).toMatchObject({ k: 1, ledger_statuses: { cas_retry: 1 } });
+      expect(plan.body.totals.ledger_statuses).toEqual({ written: 2, cas_retry: 1 });
+      expect(plan.body.totals.expected_skipped_ambiguous).toBe(1);
     });
 
     test('the shipped fixture files match their pins; CLEAN ∩ ELIGIBLE is exactly the expected keys', async () => {
@@ -503,7 +609,7 @@ if (ISOLATED) {
     test('apply goes one arm per write, spaced by the rate limit, and records per-arm before/after and sums', async () => {
       const t = await setup();
       seedAll(t.db);
-      const r = await t.replay({ mode: 'apply' });
+      const r = await t.applyArms();
       const body = (r.body as AnyRec).body;
       expect(body.arms.map((a: AnyRec) => a.arm_id)).toEqual(['fx-arm-a', 'fx-arm-c', 'fx-arm-d', 'fx-arm-e']);
       expect(t.db.writes.filter((w) => w === 'txn').length).toBe(4); // one transaction per arm
@@ -521,10 +627,12 @@ if (ISOLATED) {
     test('verify: an untouched row passes; a row pushed below the recorded AFTER (a reset) is FLAGGED', async () => {
       const t = await setup();
       seedAll(t.db);
-      await t.replay({ mode: 'apply' });
+      await t.applyArms();
       const ok = await t.replay({ mode: 'verify' });
       expect((ok.body as AnyRec).body.flags).toEqual([]);
       expect((ok.body as AnyRec).body.checked.length).toBe(4);
+      // The ledger read is by record id; the count shows it actually returned the rows (not a silent zero).
+      expect((ok.body as AnyRec).body.ledger_rows_read).toBe(5);
       const r = t.db.row('fx-arm-c');
       r.thompson_beta = 2; // overwritten below what decay alone could reach
       const bad = await t.replay({ mode: 'verify' });
@@ -532,6 +640,33 @@ if (ISOLATED) {
       expect(flags.map((f: AnyRec) => [f.arm_id, f.kind])).toEqual([['fx-arm-c', 'below_recorded_after']]);
       expect(flags[0].observed.beta).toBe(2);
       expect(typeof flags[0].boot_at).toBe('string');
+    });
+
+    test('QUERY SHAPE: no ledger read uses `IN $…`/CONTAINS/INSIDE (2.3.10 returns ZERO rows for an indexed field IN an array)', async () => {
+      const t = await setup();
+      const { readFileSync } = await import('node:fs');
+      // The engine bug is invisible to the fake, so the statement SHAPE is pinned at the source.
+      const bad = /\bIN\s+\$|\bCONTAINS\w*\b|\b(?:NOT|ANY|ALL|NONE)?INSIDE\b/i;
+      // Negative control: the detector catches the shape that was here before.
+      for (const op of ['ledger_key IN $keys', 'ledger_key INSIDE $keys', '$keys CONTAINSANY ledger_key', '$keys CONTAINSALL ledger_key', 'ledger_key NOTINSIDE $keys', '$keys CONTAINS ledger_key']) {
+        expect(bad.test(`SELECT ledger_key, status FROM posterior_compensation_ledger WHERE ${op}`)).toBe(true);
+      }
+      const k = t.key('exec_fx_a1');
+      const statements = [
+        t.AGG.ledgerByIdsSql([k, t.key('exec_fx_a2')], 'ledger_key, status'),
+        t.AGG.ledgerByIdsSql([k], t.PC.LEDGER_READ_FIELDS),
+        t.AGG.COMPENSATION_LEDGER_ROW_SQL, t.AGG.COMPENSATION_ROW_SQL, t.AGG.COMPENSATION_TXN_SQL.replace(/FOR \$__it IN \$items/, ''),
+        t.PC.COMPLETION_READ_SQL, t.PC.COMPLETION_CREATE_SQL,
+      ];
+      for (const sql of statements) expect({ sql, bad: bad.test(sql) }).toEqual({ sql, bad: false });
+      expect(t.AGG.ledgerByIdsSql([k], 'status')).toBe(`SELECT status FROM posterior_compensation_ledger:⟨${k}⟩`);
+      // A key that is not 64-hex never reaches a statement.
+      expect(() => t.AGG.ledgerByIdsSql(["x⟩; DELETE posterior_compensation_ledger; --"], 'status')).toThrow();
+      // And no new source line spells a ledger lookup with IN.
+      for (const f of ['posterior-aggregator.ts', 'posterior-compensation.ts']) {
+        const src = readFileSync(pathJoin(import.meta.dir, f), 'utf8');
+        expect(src).not.toMatch(/FROM posterior_compensation_ledger WHERE ledger_key IN/);
+      }
     });
 
     test('the ledger migration declares the UNIQUE ledger_key index and the nested before/after fields', async () => {
