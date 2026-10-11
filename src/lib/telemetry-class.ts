@@ -17,10 +17,10 @@
  * its β is indistinguishable from failedByTask β with the data stored today.
  *
  * FAIL CLOSED: if the evidence read fails, every declared id is refused for this round.
- * NO FORCE OVERRIDE: the only authority on substrate_tuning_param writes today is the global /v2/*
- * jwtAuthMiddleware (any authenticated API key or JWT; POST /v2/tuning-params has no role check), so a
- * force flag would be exactly as strong as the declaration it overrides. Not implemented until writes
- * to this row can be authority-gated.
+ * NO FORCE OVERRIDE: POST /v2/tuning-params requires a policy-write principal only for the rows in
+ * src/policy/gate-input-rows.ts GATE_INPUT_ROWS; this row is not one, so any authenticated API key
+ * or JWT may author it, and a force flag would be exactly as strong as the declaration it
+ * overrides. Not implemented until writes to this row are authority-gated.
  */
 import { surrealDB } from '../db/surreal';
 import { withDeadline } from './deadline';
