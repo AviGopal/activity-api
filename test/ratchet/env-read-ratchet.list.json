@@ -1,0 +1,892 @@
+[
+  {
+    "name": "<dynamic>@src/config.ts:process.env[key]#1",
+    "class": "bootstrap",
+    "reason": "parseEnvInt helper plumbing; every name it serves is resolved at its call site and classified individually (read in src/config.ts)"
+  },
+  {
+    "name": "<dynamic>@src/config.ts:process.env[key]#2",
+    "class": "bootstrap",
+    "reason": "parseEnvBool helper plumbing; every name it serves is resolved at its call site and classified individually (read in src/config.ts)"
+  },
+  {
+    "name": "<dynamic>@src/services/embedding-service.ts:process.env[`${provider.toUpperCase()}_API_KEY`]#1",
+    "class": "bootstrap",
+    "reason": "credential/secret: <PROVIDER>_API_KEY provider key lookup (read in src/services/embedding-service.ts)"
+  },
+  {
+    "name": "<dynamic>@src/services/recommendation.ts:process.env[envVar]#1",
+    "class": "bootstrap",
+    "reason": "getDiscount helper plumbing; every name it serves is resolved at its call site and classified individually (read in src/services/recommendation.ts)"
+  },
+  {
+    "name": "ACCELERATOR_FLAG_INTERVAL_MS",
+    "class": "behaviour",
+    "reason": "accelerator flag job cadence (read in src/index.ts)"
+  },
+  {
+    "name": "ACCOUNT_ID_REQUIRED",
+    "class": "behaviour",
+    "reason": "toggle: require account id (read in src/config.ts)"
+  },
+  {
+    "name": "ACTIVITY_API_ENDPOINT",
+    "class": "bootstrap",
+    "reason": "peer endpoint URL: activity-api (read in src/routes/activities.ts, src/selectActivityForGoal.ts)"
+  },
+  {
+    "name": "ACTIVITY_API_INSTANCE_ID",
+    "class": "bootstrap",
+    "reason": "identity/node name: instance id stamped on traces (read in src/routes/execution-traces.ts)"
+  },
+  {
+    "name": "ACTIVITY_API_KEY",
+    "class": "bootstrap",
+    "reason": "credential/secret: activity-api API key fallback (read in src/jobs/trace-replication-tick.ts, src/routes/activities.ts, src/routes/impulses.ts +1 more)"
+  },
+  {
+    "name": "ANALYSIS_API_RETRY_ATTEMPTS",
+    "class": "behaviour",
+    "reason": "analysis API retry count (read in src/config.ts)"
+  },
+  {
+    "name": "ANALYSIS_API_RETRY_DELAY",
+    "class": "behaviour",
+    "reason": "analysis API retry delay (read in src/config.ts)"
+  },
+  {
+    "name": "ANALYSIS_API_TIMEOUT",
+    "class": "behaviour",
+    "reason": "analysis API timeout (read in src/config.ts)"
+  },
+  {
+    "name": "ANALYSIS_API_URL",
+    "class": "bootstrap",
+    "reason": "peer endpoint URL: analysis API (read in src/config.ts)"
+  },
+  {
+    "name": "AUTH_KEY_CACHE_TTL_MS",
+    "class": "behaviour",
+    "reason": "auth key cache TTL (read in src/middleware/auth-cache.ts)"
+  },
+  {
+    "name": "AUTO_PROMOTE_MIN_SAMPLES",
+    "class": "behaviour",
+    "reason": "auto-promote sample threshold (read in src/routes/activities.ts)"
+  },
+  {
+    "name": "AUTO_PROMOTE_MIN_SUCCESS_RATE",
+    "class": "behaviour",
+    "reason": "auto-promote success-rate threshold (read in src/routes/activities.ts)"
+  },
+  {
+    "name": "CLUSTER_ASSIGNMENT_CACHE_TTL_MS",
+    "class": "behaviour",
+    "reason": "cluster assignment cache TTL (read in src/lib/cluster-posterior.ts)"
+  },
+  {
+    "name": "CLUSTER_SHADOW_SAMPLE_RATE",
+    "class": "behaviour",
+    "reason": "cluster shadow sample rate (read in src/routes/activities.ts)"
+  },
+  {
+    "name": "CONCEPT_DB_CLUSTER_ENDPOINT",
+    "class": "bootstrap",
+    "reason": "peer endpoint URL: concept-db cluster resolve (read in src/lib/signature-cluster.ts)"
+  },
+  {
+    "name": "CONCEPT_DB_CLUSTER_TIMEOUT_MS",
+    "class": "behaviour",
+    "reason": "concept-db cluster call timeout (read in src/lib/signature-cluster.ts)"
+  },
+  {
+    "name": "CONCEPT_DB_EMBED_ENDPOINT",
+    "class": "bootstrap",
+    "reason": "peer endpoint URL: concept-db embed resolve (read in src/lib/signature-embedding.ts)"
+  },
+  {
+    "name": "CONCEPT_DB_EMBED_TIMEOUT_MS",
+    "class": "behaviour",
+    "reason": "concept-db embed call timeout (read in src/lib/signature-embedding.ts)"
+  },
+  {
+    "name": "CONCEPT_DB_URL",
+    "class": "bootstrap",
+    "reason": "peer endpoint URL: concept-db override (read in src/lib/prior-seed.ts)"
+  },
+  {
+    "name": "CORS_ORIGINS",
+    "class": "bootstrap",
+    "reason": "own endpoint/bind address: allowed browser origins of this endpoint (read in src/config.ts, src/index.ts)"
+  },
+  {
+    "name": "CROSS_SIG_REPUTATION_MIN_GLOBAL_OBS",
+    "class": "behaviour",
+    "reason": "cross-signature reputation observation floor (read in src/routes/activities.ts)"
+  },
+  {
+    "name": "CROSS_SIG_REPUTATION_PENALTY",
+    "class": "behaviour",
+    "reason": "toggle: cross-signature reputation penalty (tuning-param fallback) (read in src/routes/activities.ts)"
+  },
+  {
+    "name": "DB_POOL_ENABLED",
+    "class": "behaviour",
+    "reason": "toggle: DB session pool (read in src/db/auth-session-pool.ts)"
+  },
+  {
+    "name": "DB_POOL_MAX",
+    "class": "behaviour",
+    "reason": "DB session pool size (read in src/db/auth-session-pool.ts)"
+  },
+  {
+    "name": "DENSE_BACKFILL_ENABLED",
+    "class": "behaviour",
+    "reason": "toggle: dense embedding backfill (read in src/index.ts)"
+  },
+  {
+    "name": "DENSE_EMBEDDING_HNSW_ENABLED",
+    "class": "behaviour",
+    "reason": "toggle: HNSW index for dense embeddings (read in src/db/paradigm.ts)"
+  },
+  {
+    "name": "DISCOVERY_ENABLED",
+    "class": "behaviour",
+    "reason": "toggle: discovery registration (read in src/config.ts)"
+  },
+  {
+    "name": "DISCOVERY_HEARTBEAT_INTERVAL_MS",
+    "class": "behaviour",
+    "reason": "discovery heartbeat cadence (read in src/config.ts)"
+  },
+  {
+    "name": "DISCOVERY_RETRY_ATTEMPTS",
+    "class": "behaviour",
+    "reason": "discovery retry count (read in src/config.ts)"
+  },
+  {
+    "name": "DISCOVERY_RETRY_BACKOFF_MS",
+    "class": "behaviour",
+    "reason": "discovery retry backoff (read in src/config.ts)"
+  },
+  {
+    "name": "DISCOVERY_VESSEL_ENDPOINT",
+    "class": "bootstrap",
+    "reason": "peer endpoint URL: discovery (read in src/config.ts, src/routes/activities.ts, src/routes/impulses.ts +1 more)"
+  },
+  {
+    "name": "DOCKER_CONTAINER",
+    "class": "bootstrap",
+    "reason": "platform fact: detects a docker deployment for registration (read in src/services/discovery-client.ts)"
+  },
+  {
+    "name": "DUAL_WRITE_ENABLED",
+    "class": "behaviour",
+    "reason": "toggle: paradigm dual write (read in src/db/paradigm.ts)"
+  },
+  {
+    "name": "EMBEDDING_API_KEY",
+    "class": "bootstrap",
+    "reason": "credential/secret: embedding provider key (read in src/services/embedding-service.ts)"
+  },
+  {
+    "name": "EMBEDDING_BASE_URL",
+    "class": "bootstrap",
+    "reason": "peer endpoint URL: embedding provider base URL (read in src/services/embedding-service.ts)"
+  },
+  {
+    "name": "EMBEDDING_DIMENSION",
+    "class": "behaviour",
+    "reason": "embedding dimension (read in src/services/embedding-service.ts)"
+  },
+  {
+    "name": "EMBEDDING_LOOKUP_CACHE_SIZE",
+    "class": "behaviour",
+    "reason": "embedding lookup cache size (read in src/lib/embedding-lookup-cache.ts)"
+  },
+  {
+    "name": "EMBEDDING_LOOKUP_TIMEOUT_MS",
+    "class": "behaviour",
+    "reason": "embedding lookup timeout (read in src/lib/embedding-lookup-cache.ts)"
+  },
+  {
+    "name": "EMBEDDING_MODEL",
+    "class": "behaviour",
+    "reason": "embedding model selection (read in src/services/embedding-service.ts)"
+  },
+  {
+    "name": "EMBEDDING_MODEL_DIR",
+    "class": "bootstrap",
+    "reason": "filesystem root/path: local embedding model dir (read in src/services/embedding-service.ts)"
+  },
+  {
+    "name": "EMBEDDING_PRIOR_ENABLED",
+    "class": "behaviour",
+    "reason": "toggle: embedding prior (read in src/lib/posterior-update.ts, src/lib/prior-seed.ts)"
+  },
+  {
+    "name": "EMBEDDING_PRIOR_OBSERVER_ENABLED",
+    "class": "behaviour",
+    "reason": "toggle: embedding prior observer (read in src/services/embedding-prior-trainer.ts)"
+  },
+  {
+    "name": "EMBEDDING_PROVIDER",
+    "class": "behaviour",
+    "reason": "embedding provider selection (read in src/services/embedding-service.ts)"
+  },
+  {
+    "name": "EMBEDDING_SEND_DIMENSIONS",
+    "class": "behaviour",
+    "reason": "toggle: send dimensions to the embedding provider (read in src/services/embedding-service.ts)"
+  },
+  {
+    "name": "EMPIRICAL_BADNESS_FLOOR",
+    "class": "behaviour",
+    "reason": "toggle: empirical badness floor (tuning-param fallback) (read in src/routes/activities.ts)"
+  },
+  {
+    "name": "EMPIRICAL_BADNESS_MIN_OBS",
+    "class": "behaviour",
+    "reason": "empirical badness observation floor (read in src/routes/activities.ts)"
+  },
+  {
+    "name": "EMPIRICAL_BADNESS_MIN_RATE",
+    "class": "behaviour",
+    "reason": "empirical badness rate floor (read in src/routes/activities.ts)"
+  },
+  {
+    "name": "EXEMPLAR_BULK_DELAY_MS",
+    "class": "behaviour",
+    "reason": "exemplar bulk delay (read in src/services/exemplar-selector.ts)"
+  },
+  {
+    "name": "EXEMPLAR_BURST_THRESHOLD",
+    "class": "behaviour",
+    "reason": "exemplar burst threshold (read in src/services/exemplar-selector.ts)"
+  },
+  {
+    "name": "EXEMPLAR_N",
+    "class": "behaviour",
+    "reason": "exemplar count (read in src/services/exemplar-selector.ts)"
+  },
+  {
+    "name": "EXEMPLAR_SELECTOR_ENABLED",
+    "class": "behaviour",
+    "reason": "toggle: exemplar selector job (read in src/index.ts)"
+  },
+  {
+    "name": "EXEMPLAR_SELECTOR_INTERVAL_MS",
+    "class": "behaviour",
+    "reason": "exemplar selector cadence (read in src/index.ts)"
+  },
+  {
+    "name": "EXEMPLAR_SELECTOR_RUN_ON_BOOT",
+    "class": "behaviour",
+    "reason": "toggle: run exemplar selector on boot (read in src/index.ts)"
+  },
+  {
+    "name": "FED_HEALTH_PORT",
+    "class": "bootstrap",
+    "reason": "peer endpoint URL: local federation transport port (read in src/jobs/trace-replication-tick.ts)"
+  },
+  {
+    "name": "FED_SUBSTRATE_ID",
+    "class": "bootstrap",
+    "reason": "identity/node name: this substrate's federation id (read in src/jobs/trace-replication-tick.ts, src/lib/posterior-compensation.ts, src/middleware/jwtAuth.ts +1 more)"
+  },
+  {
+    "name": "GRADED_YIELD_SUCCESS",
+    "class": "behaviour",
+    "reason": "toggle: graded yield success credit (read in src/lib/posterior-update.ts)"
+  },
+  {
+    "name": "HEARTBEAT_WORKER_ENABLED",
+    "class": "behaviour",
+    "reason": "toggle: heartbeat worker (read in src/index.ts)"
+  },
+  {
+    "name": "HOST",
+    "class": "bootstrap",
+    "reason": "own endpoint/bind address: bind host (read in src/config.ts)"
+  },
+  {
+    "name": "HOSTNAME",
+    "class": "bootstrap",
+    "reason": "identity/node name: host name for vessel id (read in src/config.ts, src/services/discovery-client.ts)"
+  },
+  {
+    "name": "IDENTITY_VESSEL_URL",
+    "class": "bootstrap",
+    "reason": "peer endpoint URL: identity-vessel (credential validator) (read in src/routes/connections.ts, src/services/auth.ts)"
+  },
+  {
+    "name": "IMPULSE_DECAY_HALF_LIFE_SECONDS",
+    "class": "behaviour",
+    "reason": "impulse decay half-life (read in src/utils/session-context.ts)"
+  },
+  {
+    "name": "JWT_SECRET",
+    "class": "bootstrap",
+    "reason": "credential/secret: JWT signing secret (read in src/config.ts)"
+  },
+  {
+    "name": "KUBERNETES_SERVICE_HOST",
+    "class": "bootstrap",
+    "reason": "platform fact set by Kubernetes: detects the deployment environment for registration (read in src/routes/vessels.ts, src/services/discovery-client.ts)"
+  },
+  {
+    "name": "LEARNING_TRACK_CADENCE_MS",
+    "class": "behaviour",
+    "reason": "learning-track classifier cadence (read in src/index.ts, src/jobs/learning-track-classifier.ts)"
+  },
+  {
+    "name": "LEARNING_TRACK_CLASSIFIER_ENABLED",
+    "class": "behaviour",
+    "reason": "toggle: learning-track classifier (read in src/index.ts)"
+  },
+  {
+    "name": "LEARNING_TRACK_MIN_SAMPLES",
+    "class": "behaviour",
+    "reason": "learning-track sample floor (read in src/jobs/learning-track-classifier.ts)"
+  },
+  {
+    "name": "LEARNING_TRACK_SAMPLE_WINDOW",
+    "class": "behaviour",
+    "reason": "learning-track sample window (read in src/jobs/learning-track-classifier.ts)"
+  },
+  {
+    "name": "LEARNING_TRACK_SHAPE_LEARNING_THRESHOLD",
+    "class": "behaviour",
+    "reason": "learning-track threshold (read in src/jobs/learning-track-classifier.ts)"
+  },
+  {
+    "name": "LEARNING_TRACK_SHAPE_SYSTEM_THRESHOLD",
+    "class": "behaviour",
+    "reason": "learning-track threshold (read in src/jobs/learning-track-classifier.ts)"
+  },
+  {
+    "name": "LEARNING_TRACK_TASK_LEARNING_THRESHOLD",
+    "class": "behaviour",
+    "reason": "learning-track threshold (read in src/jobs/learning-track-classifier.ts)"
+  },
+  {
+    "name": "LEARNING_TRACK_TASK_SYSTEM_THRESHOLD",
+    "class": "behaviour",
+    "reason": "learning-track threshold (read in src/jobs/learning-track-classifier.ts)"
+  },
+  {
+    "name": "LOG_FORMAT",
+    "class": "bootstrap",
+    "reason": "log format (text/json) (read in src/config.ts)"
+  },
+  {
+    "name": "LOG_LEVEL",
+    "class": "bootstrap",
+    "reason": "log level (read in src/config.ts)"
+  },
+  {
+    "name": "M1_OBSERVER_FEATURE_DIM",
+    "class": "behaviour",
+    "reason": "M1 observer feature dimension (read in src/services/embedding-prior-trainer.ts)"
+  },
+  {
+    "name": "M1_OBSERVER_KAPPA",
+    "class": "behaviour",
+    "reason": "M1 observer kappa (read in src/services/embedding-prior-trainer.ts)"
+  },
+  {
+    "name": "M1_OBSERVER_LAMBDA",
+    "class": "behaviour",
+    "reason": "M1 observer lambda (read in src/services/embedding-prior-trainer.ts)"
+  },
+  {
+    "name": "M1_OBSERVER_MIN_OBS",
+    "class": "behaviour",
+    "reason": "M1 observer observation floor (read in src/services/embedding-prior-trainer.ts)"
+  },
+  {
+    "name": "M1_OBSERVER_ORG_ID",
+    "class": "behaviour",
+    "reason": "which org the M1 observer trains on (selects whose data is learned from; behaviour, safe direction) (read in src/services/embedding-prior-trainer.ts)"
+  },
+  {
+    "name": "M1_OBSERVER_REFIT_INTERVAL_MS",
+    "class": "behaviour",
+    "reason": "M1 observer refit cadence (read in src/services/embedding-prior-trainer.ts)"
+  },
+  {
+    "name": "M1_OBSERVER_REFIT_TRIGGER",
+    "class": "behaviour",
+    "reason": "M1 observer refit trigger count (read in src/services/embedding-prior-trainer.ts)"
+  },
+  {
+    "name": "M1_OBSERVER_WINDOW",
+    "class": "behaviour",
+    "reason": "M1 observer buffer window (read in src/services/embedding-prior-trainer.ts)"
+  },
+  {
+    "name": "MAINTENANCE_LEASE_PATH",
+    "class": "bootstrap",
+    "reason": "filesystem root/path: maintenance lease file (read in src/routes/db-admin-reconcile.ts)"
+  },
+  {
+    "name": "METABOB_API_KEY",
+    "class": "bootstrap",
+    "reason": "credential/secret: service-to-service API key (read in src/jobs/trace-replication-tick.ts, src/lib/embedding-lookup-cache.ts, src/lib/posterior-update.ts +6 more)"
+  },
+  {
+    "name": "NODE_ENV",
+    "class": "behaviour",
+    "reason": "mode: production vs development decides whether a missing JWT secret is fatal (read in src/config.ts)"
+  },
+  {
+    "name": "OPENAI_API_KEY",
+    "class": "bootstrap",
+    "reason": "credential/secret: LLM provider key (read in src/selectActivityForGoal.ts)"
+  },
+  {
+    "name": "PARADIGM_READ_ENABLED",
+    "class": "behaviour",
+    "reason": "toggle: paradigm read path (read in src/db/paradigm.ts)"
+  },
+  {
+    "name": "PARADIGM_READ_NO_FALLBACK",
+    "class": "behaviour",
+    "reason": "toggle: paradigm read without fallback (read in src/db/paradigm.ts)"
+  },
+  {
+    "name": "PARADIGM_READ_PERCENTAGE",
+    "class": "behaviour",
+    "reason": "paradigm read rollout percentage (read in src/db/paradigm.ts)"
+  },
+  {
+    "name": "POD_NAME",
+    "class": "bootstrap",
+    "reason": "identity/node name: pod name for vessel id (read in src/config.ts)"
+  },
+  {
+    "name": "PORT",
+    "class": "bootstrap",
+    "reason": "own endpoint/bind address: listen port (read in src/config.ts, src/index.ts)"
+  },
+  {
+    "name": "POSTERIOR_COALESCE",
+    "class": "behaviour",
+    "reason": "toggle: posterior update coalescing (read in src/lib/posterior-aggregator.ts)"
+  },
+  {
+    "name": "POSTERIOR_FLUSH_MS",
+    "class": "behaviour",
+    "reason": "posterior flush cadence (read in src/lib/posterior-aggregator.ts)"
+  },
+  {
+    "name": "PRIOR_SEED_ENABLED",
+    "class": "behaviour",
+    "reason": "toggle: prior seeding (read in src/lib/prior-seed.ts)"
+  },
+  {
+    "name": "PRIOR_SEED_K",
+    "class": "behaviour",
+    "reason": "prior seed neighbour count (read in src/lib/prior-seed.ts)"
+  },
+  {
+    "name": "PRIOR_SEED_KAPPA",
+    "class": "behaviour",
+    "reason": "prior seed kappa (read in src/lib/prior-seed.ts)"
+  },
+  {
+    "name": "PRIOR_SEED_TIMEOUT_MS",
+    "class": "behaviour",
+    "reason": "prior seed timeout (read in src/lib/prior-seed.ts)"
+  },
+  {
+    "name": "PROMOTE_GATE_DISABLED",
+    "class": "behaviour",
+    "reason": "toggle: disable the promote gate (read in src/routes/activities.ts)"
+  },
+  {
+    "name": "PROMOTE_GATE_K",
+    "class": "behaviour",
+    "reason": "promote gate K (read in src/routes/activities.ts)"
+  },
+  {
+    "name": "PROMOTE_GATE_THRESHOLD_MEAN",
+    "class": "behaviour",
+    "reason": "promote gate mean threshold (read in src/routes/activities.ts)"
+  },
+  {
+    "name": "PROMOTE_GATE_THRESHOLD_SAMPLES",
+    "class": "behaviour",
+    "reason": "promote gate sample threshold (read in src/routes/activities.ts)"
+  },
+  {
+    "name": "RECOMMEND_ESCALATABLE_DISCOUNT",
+    "class": "behaviour",
+    "reason": "recommendation discount factor (read in src/services/recommendation.ts)"
+  },
+  {
+    "name": "RECOMMEND_NO_COVERAGE_DISCOUNT",
+    "class": "behaviour",
+    "reason": "recommendation discount factor (read in src/services/recommendation.ts)"
+  },
+  {
+    "name": "RECOMMEND_PARTIAL_COVERAGE_DISCOUNT",
+    "class": "behaviour",
+    "reason": "recommendation discount factor (read in src/services/recommendation.ts)"
+  },
+  {
+    "name": "RECOMMEND_SIGNATURE_SAMPLING_FLOOR",
+    "class": "behaviour",
+    "reason": "recommendation signature sampling floor (read in src/routes/activities.ts)"
+  },
+  {
+    "name": "REDIS_METRICS_TTL",
+    "class": "behaviour",
+    "reason": "metrics cache TTL (read in src/config.ts)"
+  },
+  {
+    "name": "REDIS_TEMPLATE_TTL",
+    "class": "behaviour",
+    "reason": "template cache TTL (read in src/config.ts)"
+  },
+  {
+    "name": "REDIS_URL",
+    "class": "bootstrap",
+    "reason": "database connection coordinate: Redis URL (read in src/config.ts, src/routes/boredom.ts)"
+  },
+  {
+    "name": "RELEVANCE_SINK_ENDPOINT",
+    "class": "bootstrap",
+    "reason": "peer endpoint URL: relevance sink (read in src/lib/posterior-update.ts)"
+  },
+  {
+    "name": "REPAIR_SIGNATURE_CONSUME",
+    "class": "behaviour",
+    "reason": "toggle: consume repair signature for boost (tuning-param fallback) (read in src/routes/activities.ts)"
+  },
+  {
+    "name": "REPLICATION_INTERVAL_MS",
+    "class": "behaviour",
+    "reason": "trace replication cadence (read in src/index.ts)"
+  },
+  {
+    "name": "REPLICATION_MAX_BATCHES",
+    "class": "behaviour",
+    "reason": "trace replication batch cap (read in src/jobs/trace-replication-tick.ts)"
+  },
+  {
+    "name": "REPLICATION_PULL_LIMIT",
+    "class": "behaviour",
+    "reason": "trace replication pull limit (read in src/jobs/trace-replication-tick.ts)"
+  },
+  {
+    "name": "REQUIRE_AUTH",
+    "class": "behaviour",
+    "reason": "toggle: require auth (read in src/config.ts)"
+  },
+  {
+    "name": "SERVICE_NAME",
+    "class": "bootstrap",
+    "reason": "identity/node name: service name for discovery (read in src/routes/impulses.ts, src/services/discovery-client.ts)"
+  },
+  {
+    "name": "SF_BLEND",
+    "class": "behaviour",
+    "reason": "toggle: successor-feature blend (read in src/routes/activities.scoring.ts)"
+  },
+  {
+    "name": "SF_BLEND_WEIGHT",
+    "class": "behaviour",
+    "reason": "successor-feature blend weight (read in src/routes/activities.scoring.ts)"
+  },
+  {
+    "name": "SF_DISCOUNT",
+    "class": "behaviour",
+    "reason": "successor-feature discount (read in src/lib/successor-features.ts)"
+  },
+  {
+    "name": "SF_TOPK",
+    "class": "behaviour",
+    "reason": "successor-feature top-K (read in src/lib/successor-features.ts)"
+  },
+  {
+    "name": "SIGNATURE_CARDINALITY_CAP",
+    "class": "behaviour",
+    "reason": "signature cardinality cap (read in src/lib/posterior-update.ts)"
+  },
+  {
+    "name": "SIGNATURE_CLUSTER_INTERVAL_MS",
+    "class": "behaviour",
+    "reason": "signature clustering cadence (read in src/index.ts)"
+  },
+  {
+    "name": "SIGNATURE_CLUSTER_MAX_SIZE",
+    "class": "behaviour",
+    "reason": "signature cluster size cap (read in src/lib/signature-cluster.ts)"
+  },
+  {
+    "name": "SIGNATURE_CLUSTER_MIN_SIMILARITY",
+    "class": "behaviour",
+    "reason": "signature cluster similarity threshold (read in src/lib/signature-cluster.ts)"
+  },
+  {
+    "name": "SIGNATURE_CLUSTER_N_MIN",
+    "class": "behaviour",
+    "reason": "signature cluster sample floor (read in src/routes/activities.ts)"
+  },
+  {
+    "name": "SUBSTRATE_ID",
+    "class": "bootstrap",
+    "reason": "identity/node name: substrate id fallback (read in src/jobs/trace-replication-tick.ts, src/lib/posterior-compensation.ts, src/routes/execution-traces.ts)"
+  },
+  {
+    "name": "SUBSTRATE_INSTALL_DIR",
+    "class": "bootstrap",
+    "reason": "filesystem root/path: install dir (JWT key material) (read in src/middleware/jwtAuth.ts)"
+  },
+  {
+    "name": "SUCCESSOR_FEATURES",
+    "class": "behaviour",
+    "reason": "toggle: successor features (read in src/lib/successor-features.ts)"
+  },
+  {
+    "name": "SURREALDB_AUTH_ENABLED",
+    "class": "behaviour",
+    "reason": "toggle: DB auth (read in src/config.ts)"
+  },
+  {
+    "name": "SURREALDB_DATABASE",
+    "class": "bootstrap",
+    "reason": "database connection coordinate: SurrealDB database (read in src/config.ts)"
+  },
+  {
+    "name": "SURREALDB_NAMESPACE",
+    "class": "bootstrap",
+    "reason": "database connection coordinate: SurrealDB namespace (read in src/config.ts, src/routes/impulses.ts, src/services/discovery-client.ts)"
+  },
+  {
+    "name": "SURREALDB_PASSWORD",
+    "class": "bootstrap",
+    "reason": "credential/secret: SurrealDB password (read in src/config.ts)"
+  },
+  {
+    "name": "SURREALDB_URL",
+    "class": "bootstrap",
+    "reason": "database connection coordinate: SurrealDB URL (read in src/config.ts)"
+  },
+  {
+    "name": "SURREALDB_USERNAME",
+    "class": "bootstrap",
+    "reason": "credential/secret: SurrealDB user (read in src/config.ts)"
+  },
+  {
+    "name": "SURREAL_MAX_CONCURRENT_QUERIES",
+    "class": "behaviour",
+    "reason": "DB query concurrency cap (read in src/db/surreal.ts)"
+  },
+  {
+    "name": "TASK_GENERATION_ENABLED",
+    "class": "behaviour",
+    "reason": "toggle: task generation job (read in src/index.ts)"
+  },
+  {
+    "name": "TD_LAMBDA",
+    "class": "behaviour",
+    "reason": "TD lambda (tuning-param fallback) (read in src/lib/posterior-update.ts)"
+  },
+  {
+    "name": "TEMPLATE_LIFECYCLE_MIN_DELTA",
+    "class": "behaviour",
+    "reason": "template lifecycle evidence delta (read in src/routes/impulses.ts)"
+  },
+  {
+    "name": "TEMPLATE_LIFECYCLE_MIN_SAMPLES",
+    "class": "behaviour",
+    "reason": "template lifecycle sample floor (read in src/routes/impulses.ts)"
+  },
+  {
+    "name": "THOMPSON_SAMPLING_SEED",
+    "class": "behaviour",
+    "reason": "Thompson sampling RNG seed (changes selection) (read in src/routes/activities.scoring.ts)"
+  },
+  {
+    "name": "TRACE_LIST_DEFAULT_WINDOW_HOURS",
+    "class": "behaviour",
+    "reason": "trace list default window (read in src/routes/execution-traces.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_ACTIVITIES",
+    "class": "behaviour",
+    "reason": "trace retention activity set (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_AUTO",
+    "class": "behaviour",
+    "reason": "toggle: trace retention auto-discovery (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_AUTO_MAX",
+    "class": "behaviour",
+    "reason": "trace retention auto-discovery cap (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_CEILING_BUDGET_MS",
+    "class": "behaviour",
+    "reason": "trace retention ceiling time budget (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_CEILING_PER_SWEEP_CAP",
+    "class": "behaviour",
+    "reason": "trace retention per-sweep cap (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_DEFAULT_FAILURE_CAP",
+    "class": "behaviour",
+    "reason": "trace retention failure cap (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_DEFAULT_SUCCESS_CAP",
+    "class": "behaviour",
+    "reason": "trace retention success cap (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_DELETE_BATCH",
+    "class": "behaviour",
+    "reason": "trace retention delete batch (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_DRY_RUN",
+    "class": "behaviour",
+    "reason": "toggle: trace retention dry run (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_ENABLED",
+    "class": "behaviour",
+    "reason": "toggle: trace retention job (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_GLOBAL_CEILING",
+    "class": "behaviour",
+    "reason": "trace retention global row ceiling (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_GLOBAL_CEILING_BYTES",
+    "class": "behaviour",
+    "reason": "trace retention global byte ceiling (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_GLOBAL_CEILING_ENABLED",
+    "class": "behaviour",
+    "reason": "toggle: trace retention global ceiling (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_HOT_WINDOW_MS",
+    "class": "behaviour",
+    "reason": "trace retention hot window (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_INTERVAL_MS",
+    "class": "behaviour",
+    "reason": "trace retention cadence (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_ORPHAN_BUDGET_MS",
+    "class": "behaviour",
+    "reason": "orphan reap time budget (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_ORPHAN_MIN_AGE_MS",
+    "class": "behaviour",
+    "reason": "orphan reap minimum age (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_ORPHAN_REAP_CAP",
+    "class": "behaviour",
+    "reason": "orphan reap per-sweep cap (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_ORPHAN_REAP_ENABLED",
+    "class": "behaviour",
+    "reason": "toggle: orphan reap (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_OVERRIDES",
+    "class": "behaviour",
+    "reason": "trace retention per-activity overrides (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_RETENTION_ROW_SAMPLE_N",
+    "class": "behaviour",
+    "reason": "trace retention row-size sample count (read in src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_STORE_CAP",
+    "class": "behaviour",
+    "reason": "trace store row cap (fallback name) (read in src/config.ts, src/services/trace-retention.ts)"
+  },
+  {
+    "name": "TRACE_STORE_HOT_WINDOW_DAYS",
+    "class": "behaviour",
+    "reason": "trace store hot window (read in src/config.ts)"
+  },
+  {
+    "name": "TRACE_STORE_RESERVOIR_PER_ACTIVITY",
+    "class": "behaviour",
+    "reason": "trace store reservoir per activity (read in src/config.ts)"
+  },
+  {
+    "name": "TRACE_STORE_SUCCESS_SAMPLE_ACTIVITIES",
+    "class": "behaviour",
+    "reason": "trace store success-sampling activity set (read in src/config.ts)"
+  },
+  {
+    "name": "TRACE_STORE_SUCCESS_SAMPLE_RATE",
+    "class": "behaviour",
+    "reason": "trace store success sample rate (read in src/config.ts)"
+  },
+  {
+    "name": "UCB_GRADED_MEAN",
+    "class": "behaviour",
+    "reason": "toggle: UCB graded mean (tuning-param fallback) (read in src/routes/activities.ts)"
+  },
+  {
+    "name": "USER_VESSEL_ENDPOINT",
+    "class": "bootstrap",
+    "reason": "peer endpoint URL: user vessel (migration CLI) (read in src/cli/migrate-org-to-account.ts)"
+  },
+  {
+    "name": "VESSEL_CLEANUP_ENABLED",
+    "class": "behaviour",
+    "reason": "toggle: vessel cleanup job (read in src/index.ts)"
+  },
+  {
+    "name": "VESSEL_ENDPOINT",
+    "class": "bootstrap",
+    "reason": "own endpoint/bind address: advertised endpoint override (read in src/routes/impulses.ts, src/services/discovery-client.ts)"
+  },
+  {
+    "name": "VESSEL_ID",
+    "class": "bootstrap",
+    "reason": "identity/node name: vessel id (read in src/config.ts, src/routes/execution-traces.ts)"
+  },
+  {
+    "name": "WORKSPACE_ROOT",
+    "class": "bootstrap",
+    "reason": "filesystem root/path: workspace root (read in src/routes/db-admin-reconcile.ts)"
+  },
+  {
+    "name": "YIELD_COST_REF",
+    "class": "behaviour",
+    "reason": "yield cost reference (tuning-param fallback) (read in src/lib/posterior-update.ts)"
+  },
+  {
+    "name": "YIELD_FLOOR",
+    "class": "behaviour",
+    "reason": "yield floor (tuning-param fallback) (read in src/lib/posterior-update.ts)"
+  },
+  {
+    "name": "YIELD_PROD_REF",
+    "class": "behaviour",
+    "reason": "yield production reference (tuning-param fallback) (read in src/lib/posterior-update.ts)"
+  }
+]
