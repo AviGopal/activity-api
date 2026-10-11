@@ -18,6 +18,15 @@
  * Only the route's default export is imported, so at the parent commit this file loads and fails
  * behaviourally (the parent writes a gate-input row for a read/write key) rather than on a missing
  * named export. The per-name check over the whole set lives in src/policy/gate-input-rows.test.ts.
+ *
+ * FILE ORDER MUST NOT MATTER. The pull-sync gate runs the whole suite in ONE bun process, and
+ * mock.module is never undone between files: a file that ran earlier and replaced
+ * '../lib/tuning-params' with a no-op writeTuningParam made every positive-path test here see
+ * POST 200 with nothing written. So this file registers '../lib/tuning-params' itself, built from
+ * a private instance of the REAL module loaded by a query-suffixed specifier (bun keys a module
+ * instance by specifier including the query, so that import is not answered by another file's
+ * mock). That instance imports '../db/surreal', which by then is this file's stub. The CONTROL
+ * test 'the writer under test is the real one' fails by name if a bun upgrade stops honouring that.
  */
 
 import { describe, test, expect, mock } from 'bun:test';
@@ -49,6 +58,18 @@ mock.module('../db/surreal', () => ({
   // every real export, so the process-wide mock cannot break a later file's import
   getDbStats: () => ({}),
   dbStats: { snapshot: () => ({}) },
+}));
+
+// A private REAL instance (see the header): imported after the surreal stub, so its writer and
+// read-back go through `query` above. Every export is listed so the factory is complete.
+const realTuningParams = await import('../lib/tuning-params.ts?write-scope-real');
+mock.module('../lib/tuning-params', () => ({
+  getTuningParam: realTuningParams.getTuningParam,
+  writeTuningParam: realTuningParams.writeTuningParam,
+  __clearTuningParamCache: realTuningParams.__clearTuningParamCache,
+  getTuningParamList: realTuningParams.getTuningParamList,
+  __clearTuningParamListCache: realTuningParams.__clearTuningParamListCache,
+  TRACE_TELEMETRY_ACTIVITIES_PARAM: realTuningParams.TRACE_TELEMETRY_ACTIVITIES_PARAM,
 }));
 
 const tuningParamsRoutes = (await import('./tuning-params')).default;
@@ -83,6 +104,17 @@ const GATE = { name: 'AUTO_REVERT_STRIKE_LIMIT', value: 99, evidence: 'loosen th
 const LEARNING = { name: 'TD_LAMBDA', value: 0.72, evidence: 'reflect recommends' };
 // What a self-elevating caller would add: scopes and an attribution of its choosing.
 const CLAIMS = { scopes: ['policy:write', 'admin'], updated_by: 'operator', keyId: 'key-admin', key_id: 'key-admin' };
+
+describe('the writer under test is the real one', () => {
+  test('CONTROL: the writeTuningParam the route imports sends its UPSERT and read-back through this file\'s stub', async () => {
+    reset();
+    const { writeTuningParam } = await import('../lib/tuning-params');
+    await writeTuningParam('TD_LAMBDA', 0.5, { updated_by: 'control' });
+    expect(upserts()).toHaveLength(1);
+    expect(calls.filter((c) => /FROM substrate_tuning_param/.test(c.sql))).toHaveLength(1);
+    expect(rows.get('TD_LAMBDA')?.value).toBe(0.5);
+  });
+});
 
 describe('POST /v2/tuning-params: gate-input rows need a policy-write principal', () => {
   test('MUST-FAIL: a read/write-scoped key writing a gate-input row is refused 403, and nothing is written', async () => {

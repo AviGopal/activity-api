@@ -41,14 +41,21 @@ mock.module('../db/surreal', () => ({
   createAuthenticatedClient: async () => ({}),
 }));
 
+// mock.module outlives this file: whatever this factory exports is what every LATER test file in
+// the same bun process gets for '../lib/tuning-params'. Stubbing writeTuningParam as a no-op here
+// made tuning-params-write-scope.test.ts (which drives the real writer through its own surreal stub)
+// see POST 200 with nothing written whenever this file ran first; the hub's one-process gate refused
+// 37fed291 on exactly that. So only getTuningParam is overridden; every other export is the REAL
+// function, copied off the namespace BEFORE the mock patches it (the namespace object is live).
+const realTuningParams = { ...(await import('../lib/tuning-params')) };
+
 mock.module('../lib/tuning-params', () => ({
   getTuningParam: async (_n: string, _e: string | undefined, d: number) => d,
-  // Stubs to satisfy mock-completeness check. These are not used by this test.
-  writeTuningParam: async () => {},
-  __clearTuningParamCache: () => {},
-  getTuningParamList: async () => [],
-  __clearTuningParamListCache: () => {},
-  TRACE_TELEMETRY_ACTIVITIES_PARAM: 'placeholder',
+  writeTuningParam: realTuningParams.writeTuningParam,
+  __clearTuningParamCache: realTuningParams.__clearTuningParamCache,
+  getTuningParamList: realTuningParams.getTuningParamList,
+  __clearTuningParamListCache: realTuningParams.__clearTuningParamListCache,
+  TRACE_TELEMETRY_ACTIVITIES_PARAM: realTuningParams.TRACE_TELEMETRY_ACTIVITIES_PARAM,
 }));
 
 const { checkAndRetireByPosterior } = await import('./variant-creator');
