@@ -50,6 +50,7 @@ export interface TraceAggregateReportInput {
     order?: string;
   failure_class?: string;
   reason_contains?: string;
+  until_hours_ago?: number;
 }
 
 export interface TraceAggregateAuthContext {
@@ -68,6 +69,7 @@ export interface TraceAggregateReport {
   metric: string;
   group_by: string;
   window_hours: number;
+  until_hours_ago?: number;
   generated_at: string;
   rows: TraceAggregateRow[];
   /** Total distinct groups BEFORE the limit cap — not merely rows.length. */
@@ -106,12 +108,20 @@ export async function runTraceAggregateReport(
   const windowHours = clampInt(input.window_hours, 24, 1, 720);
   const limit = clampInt(input.limit, 10, 1, 1000);
   const order = String(input.order) === 'asc' ? 'ASC' : 'DESC';
+  const untilHoursAgo = clampInt(input.until_hours_ago, 0, 0, 720);
 
-  const since = new Date(Date.now() - windowHours * 3600_000).toISOString();
+  const nowMs = Date.now();
+  const untilMs = nowMs - untilHoursAgo * 3600_000;
+  const since = new Date(untilMs - windowHours * 3600_000).toISOString();
+  const until = new Date(untilMs).toISOString();
 
   // WHERE: indexed window filter + metric pre-filter + tenant scoping.
   const where: string[] = ['executed_at >= type::datetime($since)'];
   const params: Record<string, unknown> = { since };
+  if (untilHoursAgo > 0) {
+    where.push('executed_at <= type::datetime($until)');
+    (params as Record<string, unknown>).until = until;
+  }
 
   // success_count / failure_count pre-filter on the indexed `success` column so
   // the GROUP BY only touches matching rows (idx_aet_activity_success_time).
@@ -120,11 +130,11 @@ export async function runTraceAggregateReport(
 
   // Filter by failure class and reason text if provided.
   if (typeof input.failure_class === 'string' && input.failure_class) {
-    where.push('failure_class = $failure_class');
+    where.push('(metadata.verdict_class = $failure_class OR (metadata.verdict_class IS NONE AND failure_mode.class = $failure_class))');
     params.failure_class = input.failure_class;
   }
   if (typeof input.reason_contains === 'string' && input.reason_contains) {
-    where.push('reason CONTAINS $reason_contains');
+    where.push('failure_mode.reason CONTAINS $reason_contains');
     params.reason_contains = input.reason_contains;
   }
 
@@ -224,6 +234,7 @@ export async function runTraceAggregateReport(
     metric,
     group_by: groupBy,
     window_hours: windowHours,
+    until_hours_ago: untilHoursAgo,
     generated_at: new Date().toISOString(),
     rows,
     total_groups: totalGroups,
