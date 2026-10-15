@@ -224,7 +224,10 @@ export function clusterRowSlug(
   signatureVersion: number,
   clusterId: string,
 ): string {
-  const canonical = `${orgId} ${templateId} ${signatureVersion} ${clusterId}`;
+  // Normalize templateId to remove any prefixes (e.g., "templates:") before hashing.
+  const normalizedTemplateId = templateId.startsWith('templates:') ? templateId.substring('templates:'.length) : templateId;
+
+  const canonical = `${orgId}\x00${normalizedTemplateId}\x00${signatureVersion}\x00${clusterId}`;
   return createHash('sha256').update(canonical).digest('hex').slice(0, 32);
 }
 
