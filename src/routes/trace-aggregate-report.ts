@@ -80,7 +80,7 @@ export interface TraceAggregateReport {
   query_ms: number;
 }
 
-const GROUP_FIELDS = new Set(['activity_id', 'status', 'variant_id', 'failure_class']);
+const GROUP_FIELDS = new Set(['activity_id', 'status', 'variant_id', 'failure_class', 'goal_hash']);
 const METRICS = new Set(['count', 'failure_count', 'success_count', 'cost_sum']);
 
 function clampInt(v: unknown, def: number, min: number, max: number): number {
@@ -169,8 +169,17 @@ export async function runTraceAggregateReport(
   // server-side either (ORDER BY over an aggregate is what triggers the partial
   // single-bucket plan), so we group fully, then sort + cap in JS — the group
   // count is bounded (≤ a few hundred distinct templates) so this is cheap. (2026-06-27)
+  let selectExpr = groupBy;
+  if (groupBy === 'failure_class') {
+    // Coalesce late-verdict class and insert-time class. Alias to keep JS simple.
+    selectExpr = '(metadata.verdict_class ?? failure_mode.class) AS failure_class';
+  } else if (groupBy === 'goal_hash') {
+    // goal_hash is nested. Alias to flatten it for JS.
+    selectExpr = 'metadata.goal_hash AS goal_hash';
+  }
+
   const sql = `
-    SELECT ${groupBy}, ${valueExpr}
+    SELECT ${selectExpr}, ${valueExpr}
     FROM execution
     WHERE ${where.join(' AND ')}
     GROUP BY ${groupBy}
