@@ -6273,13 +6273,6 @@ app.post('/recommend', async (c) => {
       }
     }
 
-    // Compute context_bucket for per-context Thompson Sampling (Spec 3)
-    const contextBucket = orgId
-      ? computeContextBucket(task_description, effectiveShapes, orgId)
-      : null;
-    if (contextBucket) {
-      logger.debug('context_bucket computed', { context_bucket: contextBucket });
-    }
 
     // Query activities using tiered fallback strategy
     // Tier 1: Exact shape match, Tier 2: Compatible (no shapes), Tier 3: FTS on goal description
@@ -6418,87 +6411,9 @@ app.post('/recommend', async (c) => {
       return decayedThompsonCounts(alpha, beta, ms, decayNowMs, decayHalfLifeDays);
     };
 
-    // Lookup per-bucket Thompson scores (Spec 3)
-    // Phase B1: dual-scope by account_id; legacy rows match via org_id.
-    let contextScoresMap = new Map<string, { alpha: number; beta: number; n_observations: number }>();
-    if (contextBucket && activityIds.length > 0) {
-      try {
-        // ★ THE WRITE KEY AND THE READ KEY WERE DIFFERENT STRINGS. Credit writes
-        //   `template_id` through `normalizeActivityId`
-        //   (db/paradigm.ts:1932), which strips the `activity:` prefix AND the
-        //   ⟨⟩ brackets — so rows are stored BARE. `activityIds` comes from
-        //   `normalizeRecordId`, a string passthrough, so the ids bound here are
-        //   PREFIXED (`activity:⟨…⟩`, verified against live templates). `IN`
-        //   never matched, so every conditional posterior the learning loop
-        //   wrote — 4,545 rows on the probe stack — was addressable by nobody
-        //   and this map was always empty.
-        //
-        //   Query BOTH forms and key the map under both, so a caller holding
-        //   either form resolves. Normalizing only one side would silently
-        //   orphan whichever rows the other side wrote.
-        const bareIds = activityIds.map((id: string) =>
-          id.replace(/^activity:/, '').replace(/[⟨⟩`]/g, ''),
-        );
-        const idVariants = [...new Set([...activityIds, ...bareIds])];
-        const ctxResult = await surrealDB.query<any>(`
-          SELECT template_id, alpha, beta, n_observations, last_updated_at
-          FROM context_thompson_scores
-          WHERE ${accountIdScopedWhere()} AND context_bucket = $bucket AND template_id IN $ids
-        `, {
-          org_id: orgId,
-          account_id: jwtAuth?.accountId ?? null,
-          bucket: contextBucket,
-          ids: idVariants,
-        });
-
-        for (const row of (ctxResult || [])) {
-          const decayedCtx = decayRow(row.alpha ?? 1, row.beta ?? 1, row.last_updated_at);
-          const entry = {
-            alpha: decayedCtx.alpha,
-            beta: decayedCtx.beta,
-            n_observations: row.n_observations ?? 0,
-          };
-          const stored = String(row.template_id ?? '');
-          contextScoresMap.set(stored, entry);
-          const bare = stored.replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
-          if (bare !== stored) contextScoresMap.set(bare, entry);
-          const prefixed = `activity:⟨${bare}⟩`;
-          if (prefixed !== stored) contextScoresMap.set(prefixed, entry);
-        }
-        // ★ ONE COLUMN, TWO SUBJECTS — and this reader asks for the one nobody
-        //   writes. `context_bucket` is populated by the credit path with a
-        //   STATE-SPACE SIGNATURE: computeStateSpaceSignature, sha256 over
-        //   shapes|provenance|missing, `.digest().slice(0, 8)` = **16 hex**
-        //   (session-context.ts:161/181/185). This lookup asks for
-        //   computeContextBucket: sha256 over task-semantics|org|goal_cluster,
-        //   `.digest().slice(0, 4)` = **8 hex** (:201). Different algorithm,
-        //   different inputs, different WIDTH — no width fix could make them
-        //   meet, and measured live it is exactly what happens: bucket
-        //   `b832569e` (8 hex) against stored 16-hex rows, matched:0 on 23/23
-        //   then 17 more.
-        //
-        //   Kept, not deleted: its subject is not dead (2,120 rows, 246k
-        //   observations, still written), so removing the reader would discard a
-        //   live posterior. But it must not be MISTAKEN for a working
-        //   conditional lookup — `matched:0` here is structural, not evidence
-        //   that the conditional agreed with the global. The v1 signature-keyed
-        //   reader below is the one whose key can actually bind.
-        logger.info('context_thompson_scores lookup', {
-          event: 'cts_lookup',
-          requested: activityIds.length,
-          matched: contextScoresMap.size,
-          bucket: contextBucket,
-          bucket_subject: 'task_semantics_8hex',
-          note: contextScoresMap.size === 0
-            ? 'structural zero: this reader keys on computeContextBucket (8 hex) while the credit path writes computeStateSpaceSignature (16 hex)'
-            : undefined,
-        });
-      } catch (ctxErr: any) {
-        logger.warn('context_thompson_scores lookup failed (non-blocking)', {
-          error: ctxErr.message,
-        });
-      }
-    }
+    // The 8-hex per-bucket lookup (Spec 3) is RETIRED (2026-10-16, user decision): it keyed on computeContextBucket, which
+    // the credit path never writes (it writes the v1 state-space signature below), and matched in ~1% of lookups. Its
+    // writer at trace ingest is retired with it. The v1 signature-keyed lookup below is the conditional posterior.
 
     // Phase 24 §4: conditional posterior lookup using v1 state-space signature
     // Queries signature_version=1 rows; overrides α/β when n_observations >= SIGNATURE_SAMPLING_FLOOR.
@@ -6966,17 +6881,17 @@ app.post('/recommend', async (c) => {
         alpha += totalBoost;
         const adjustedBeta = betaVal + impulseBetaPenalty;
 
-        // Context-bucketed Thompson blend (Spec 3)
-        const ctxRow = contextScoresMap.get(activityId);
-        const nContext = ctxRow ? (ctxRow.alpha + ctxRow.beta - 2) : 0;
-        const blendWeight = nContext >= 5 ? 0.7 : nContext >= 2 ? 0.3 : 0.0;
-        let alphaBlended = blendWeight * (ctxRow?.alpha ?? 1) + (1 - blendWeight) * alpha;
+        // The global posterior (the 8-hex context blend is retired; the v1 conditional override follows). blendWeight
+        // stays an explicit 0: the reputation penalty below scales by it and is a no-op at 0, exactly as the retired
+        // blend left it whenever no 8-hex row matched (~99% of lookups).
+        const blendWeight = 0;
+        let alphaBlended = alpha;
         if (repairScoresMap.size > 0 && repairScoresMap.has(activityId)) alphaBlended += repairScoresMap.get(activityId)!;
-        let betaBlended  = blendWeight * (ctxRow?.beta  ?? 1) + (1 - blendWeight) * adjustedBeta;
+        let betaBlended  = adjustedBeta;
 
         // Phase 24 §4: v1 conditional posterior override
         // When state-space-signature row has enough observations, use it directly.
-        let posteriorSource: string = blendWeight > 0 ? 'context_bucketed' : scoreMethod;
+        let posteriorSource: string = scoreMethod;
         const repairBoost = repairScoresMap.get(activityId) ?? 0;
         const sigRow = sigScoresMap.get(activityId);
         // C6: apply the conditional (signature-keyed) posterior only when it has
@@ -7215,12 +7130,6 @@ app.post('/recommend', async (c) => {
               output_shape_coverage: outputShapeBoost,
               shape_mismatch_penalty: shapeMismatchPenalty,
             },
-            // Context-bucketed Thompson metadata (Spec 3)
-            ...(contextBucket ? {
-              context_bucket: contextBucket,
-              context_blend_weight: blendWeight,
-              context_n_observations: nContext,
-            } : {}),
             // Phase 24 §4: conditional posterior metadata
             ...(sigRow ? {
               conditional_sig: stateSpaceSig,
