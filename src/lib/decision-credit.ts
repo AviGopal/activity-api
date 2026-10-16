@@ -147,7 +147,7 @@ export async function recordExecutionDecisionOutcome(
     // caller never passes executedAt) left 100% of execution-sourced rows untimed,
     // breaking any time-ordered consumer or retention keyed on this field.
     content.executed_at = input.executedAt != null ? String(input.executedAt) : new Date().toISOString();
-    await db.query(`UPSERT type::thing('decision_outcome', $eid) CONTENT $content`, {
+    await db.query(`UPSERT type::thing('decision_outcome', $eid) MERGE $content`, {
       eid: input.executionId,
       content,
     });
@@ -204,7 +204,7 @@ export async function recordDecisionOutcome(
     if (record.selected_at != null) content.selected_at = String(record.selected_at);
     if (record.executed_at != null) content.executed_at = String(record.executed_at);
     // Deterministic record id so a re-ingested outcome updates rather than duplicates.
-    await db.query(`UPSERT type::thing('decision_outcome', $cid) CONTENT $content`, {
+    await db.query(`UPSERT type::thing('decision_outcome', $cid) MERGE $content`, {
       cid: record.correlation_id,
       content,
     });
