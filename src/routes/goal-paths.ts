@@ -530,15 +530,12 @@ app.post('/', async (c) => {
       SELECT * FROM goal_execution_paths
       WHERE goal_hash = $goal_hash
         AND path_signature = $path_signature
-        AND org_id = $org_id
       LIMIT 1
     `;
     
-    // PER ORG (migration 224): a run updates only its own org's row; another org's runs of the same path are their own row.
     const existing = await surrealDB.query<GoalExecutionPath[]>(checkQuery, {
       goal_hash: goalHash,
       path_signature: pathSignature,
-      org_id: pathOrgId,
     });
     
     let path: GoalExecutionPath;
@@ -608,9 +605,6 @@ app.post('/', async (c) => {
           execution_count = (execution_count ?? 0) + 1,
           successful_executions = (successful_executions ?? 0) + $success_delta,
           failed_executions = (failed_executions ?? 0) + $failure_delta,
-          -- Org-scoped counters (migration 224): cold on a legacy row's first per-org run, never mixed across orgs.
-          org_successful_executions = (org_successful_executions ?? 0) + $success_delta,
-          org_failed_executions = (org_failed_executions ?? 0) + $failure_delta,
           thompson_alpha = (thompson_alpha ?? 1) + $success_delta,
           thompson_beta = (thompson_beta ?? 1) + $failure_delta,
           last_inference_confidence = $inference_confidence ?? last_inference_confidence,
@@ -637,14 +631,12 @@ app.post('/', async (c) => {
           updated_at = time::now()
         WHERE goal_hash = $goal_hash
           AND path_signature = $path_signature
-          AND org_id = $org_id
         RETURN AFTER
       `;
 
       const updated = await surrealDB.query<GoalExecutionPath[]>(updateQuery, {
         goal_hash: goalHash,
         path_signature: pathSignature,
-        org_id: pathOrgId,
         success_delta: successDelta,
         failure_delta: failureDelta,
         success_rate: nextSuccessRate,
@@ -702,8 +694,6 @@ app.post('/', async (c) => {
           success_count: $successful_executions,
           successful_executions: $successful_executions,
           failed_executions: $failed_executions,
-          org_successful_executions: $successful_executions,
-          org_failed_executions: $failed_executions,
           thompson_alpha: $thompson_alpha,
           thompson_beta: $thompson_beta,
           success_rate: $success_rate,
@@ -865,16 +855,10 @@ app.get('/', async (c) => {
         ? query.endpoint_output_shape
         : undefined;
 
-    // PER ORG (migration 224): a caller reads only its OWN org's paths. The org is the authenticated one (JWT, else the
-    // session's), resolved as the POST resolves it but WITHOUT a caller-supplied org, so no caller can name another
-    // org's rows; with none it is the 'public' default, the org its own unattributed writes are stored under.
-    const getSession = ((c.get as any)('session') as SessionData | undefined) || { session_id: 'internal', org_id: null, project_id: null, api_key: null, latest_job_id: null };
-    const { org: callerOrg } = resolveTraceOrg({ bodyOrg: undefined, jwtOrg: getJwtAuthFromContext(c)?.orgId, sessionOrg: getSession?.org_id });
     let whereClause = '';
     const params: Record<string, any> = {
       limit: validated.limit,
       offset: validated.offset,
-      caller_org: callerOrg,
     };
 
     if (validated.goal_hash) {
@@ -888,9 +872,6 @@ app.get('/', async (c) => {
       whereClause = 'WHERE goal_category = $goal_category';
       params.goal_category = validated.goal_category;
     }
-
-    whereClause += whereClause ? ' AND ' : 'WHERE ';
-    whereClause += 'org_id = $caller_org';
 
     if (validated.min_executions > 1) {
       whereClause += whereClause ? ' AND ' : 'WHERE ';

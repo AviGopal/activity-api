@@ -739,9 +739,6 @@ export const GoalExecutionPathSchema = z.object({
   total_executions: z.number().int().default(0),
   successful_executions: z.number().int().default(0),
   failed_executions: z.number().int().default(0),
-  // Org-scoped reach counters (migration 224): runs recorded under the per-org key only; absent on an untouched legacy row.
-  org_successful_executions: z.number().int().optional(),
-  org_failed_executions: z.number().int().optional(),
   thompson_alpha: z.number().default(1.0),
   thompson_beta: z.number().default(1.0),
   success_rate: z.number().min(0).max(1),
