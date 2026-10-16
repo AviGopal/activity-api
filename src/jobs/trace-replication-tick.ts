@@ -141,7 +141,16 @@ async function upsertRow(row: Record<string, unknown>): Promise<boolean> {
   }
 }
 
-async function pullFromPeer(peer: PeerVessel): Promise<{ pulled: number; stored: number }> {
+/** An auth refusal carried INSIDE a transport envelope (the egress answered 200; the peer's resolve said no). Read from the
+ *  answer's own structured code fields (the codes the fleet's auth layers emit), never from prose. */
+export function isAuthRefusalBody(b: any): boolean {
+  if (!b || typeof b !== 'object') return false;
+  const inner = typeof b.value === 'string' ? (() => { try { return JSON.parse(b.value); } catch { return null; } })() : b.value ?? b;
+  const codes = [b.code, b.error?.code, inner?.code, inner?.error?.code, inner?.failure_mode, b.status, inner?.status].filter((x) => typeof x === 'string' || typeof x === 'number');
+  return codes.some((c) => c === 401 || c === 403 || c === 'INVALID_API_KEY' || c === 'UNAUTHORIZED' || c === 'unauthorized' || c === 'caller_credential_required');
+}
+
+async function pullFromPeer(peer: PeerVessel): Promise<{ pulled: number; stored: number; refused?: 'unauthorized' }> {
   const target = peer.libp2p_multiaddr?.[0];
   if (!target) return { pulled: 0, stored: 0 };
 
@@ -167,6 +176,12 @@ async function pullFromPeer(peer: PeerVessel): Promise<{ pulled: number; stored:
         signal: AbortSignal.timeout(30000),
       });
       if (!resp.ok) {
+        // An AUTH refusal is the peer authority not knowing this node's credential (cross-authority): logged as such,
+        // as evidence for cross-authority-peer-dials-present-a-credential-the-peer-authority-never-issued.
+        if (resp.status === 401 || resp.status === 403) {
+          logger.warn('[Replication] peer refused this node\'s credential (cross-authority); skipped this tick', { peer: peer.vesselId, status: resp.status });
+          return { pulled: 0, stored: 0, refused: 'unauthorized' };
+        }
         logger.warn('[Replication] egress resolve non-OK', {
           peer: peer.vesselId,
           status: resp.status,
@@ -174,6 +189,10 @@ async function pullFromPeer(peer: PeerVessel): Promise<{ pulled: number; stored:
         break;
       }
       const data: any = await resp.json();
+      if (isAuthRefusalBody(data?.content ?? data)) {
+        logger.warn('[Replication] peer refused this node\'s credential (cross-authority); skipped this tick', { peer: peer.vesselId });
+        return { pulled: 0, stored: 0, refused: 'unauthorized' };
+      }
       // Transport envelope: { content: { value: "<json string>" } } (value is
       // the stringified resolve payload); tolerate object/plain forms too.
       let payload: any = data?.content ?? data;
@@ -251,8 +270,13 @@ export async function runTraceReplicationTick(): Promise<void> {
         v.vesselId !== selfId && (!ownSubstrateId || !v.vesselId.endsWith(`@${ownSubstrateId}`)) &&
         v.protocol === 'libp2p' &&
         Array.isArray(v.libp2p_multiaddr) &&
-        v.libp2p_multiaddr.length > 0,
+        v.libp2p_multiaddr.length > 0 &&
+        // REACHABILITY (d): discovery stamps a libp2p row egress_unreachable while THIS node's federation egress is
+        // not live (masked, stopped, refusing); every pull of it would be refused at the egress. Skipped, counted.
+        !(v as unknown as { egress_unreachable?: unknown }).egress_unreachable,
     );
+    const stamped = (vessels as unknown as Array<{ egress_unreachable?: unknown }>).filter((v) => v.egress_unreachable === true).length;
+    if (stamped > 0) logger.info('[Replication] skipped peers behind an unreachable local egress', { stamped });
     logger.info('[Replication] tick: discovered peers', {
       total: vessels.length,
       libp2pPeers: peers.length,
