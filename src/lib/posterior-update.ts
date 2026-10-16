@@ -1184,6 +1184,98 @@ export function decayedThompsonCounts(
     beta: 1 + (beta - 1) * d,
   };
 }
+/**
+ * THE LEAF VPM THOMPSON DELTA, one writer (extracted for CHANGE DB1): enqueued on the posterior-aggregator when
+ * coalescing is on, else the decayed read-then-UPDATE below. Used by applyOutcomeToPosteriors for a graded trace, and
+ * by the subscriber-run counts path (alpha += ok, beta += fail) so a lifecycle subscriber's own posterior is fed from
+ * its counts once its normal runs no longer write full traces.
+ */
+export async function applyVariantThompsonDelta(
+  db: DBQueryable,
+  activityId: string,
+  orgId: string,
+  alphaDelta: number,
+  betaDelta: number,
+  executionId?: string,
+  warnings: string[] = [],
+): Promise<'enqueued' | 'written' | 'write_failed'> {
+  if (enqueueVariantDelta(activityId, orgId, alphaDelta, betaDelta, 'leaf', undefined, executionId)) return 'enqueued';
+  let outcome: 'written' | 'write_failed' = 'written';
+  try {
+    // Read current Thompson counts and apply decay before writing
+    const selectResult = await db.query<{
+      thompson_alpha?: number | null;
+      thompson_beta?: number | null;
+      updated_at?: string | null;
+    }>(
+      `SELECT thompson_alpha, thompson_beta, updated_at FROM variant_performance_metrics WHERE variant_id = $activity_id AND org_id = $org_id LIMIT 1`,
+      { activity_id: activityId, org_id: orgId },
+    );
+
+    const row = selectResult[0];
+    const alpha = row?.thompson_alpha ?? 1;
+    const beta = row?.thompson_beta ?? 1;
+    let lastUpdatedMs = 0;
+    if (row?.updated_at && typeof row.updated_at === 'string') {
+      const parsed = new Date(row.updated_at).getTime();
+      if (!Number.isNaN(parsed)) {
+        lastUpdatedMs = parsed;
+      }
+    }
+
+    const decayHalfLifeDays = await resolveThompsonDecayHalfLifeDays();
+    const decayed = decayedThompsonCounts(alpha, beta, lastUpdatedMs, Date.now(), decayHalfLifeDays);
+    const newAlpha = decayed.alpha + alphaDelta;
+    const newBeta = decayed.beta + betaDelta;
+
+    // SELF-HEALING DERIVED RATE. `success_rate` was written by the executions
+    // endpoint as int/int on two TYPE int columns, so SurrealDB truncated every
+    // value to exactly 0 or 1. Measured over the full template population: 438 of
+    // 1,059 rows carrying counters have MIXED outcomes (0 < successful < total)
+    // and ALL 438 read 0 or 1 — a mathematically impossible value for every one
+    // of them.
+    //
+    // That is not cosmetic, because the value is read back and amplified:
+    // composition-graph.ts reconstructs alpha = success_rate * total_executions + 1
+    // and beta = (1 - success_rate) * total_executions + 1. A row like
+    // development-vessel:trace-store-reconcile (20 successes of 23, genuinely 87%)
+    // stored 0 and therefore reconstructs to alpha=1 / beta=24 — a working arm
+    // handed a maximally pessimistic posterior and suppressed in selection.
+    //
+    // Recomputing it HERE heals it. This statement already runs on every graded
+    // execution, it targets the row that holds the counters, and — unlike the
+    // executions-endpoint UPDATE — it does not increment them, so reading them in
+    // the same statement carries no SET-clause evaluation-order dependence. Each
+    // affected row therefore repairs itself the next time its arm executes, with
+    // no backfill activity, no hand-run SQL, and no separate write path to keep
+    // consistent. math::max([1, ...]) makes the divide safe on a zero-count row.
+    await db.query(
+      `
+      UPDATE variant_performance_metrics
+      SET
+        thompson_alpha = $new_alpha,
+        thompson_beta  = $new_beta,
+        success_rate = (successful_executions ?? 0) * 1.0 / math::max([1, total_executions ?? 0]),
+        updated_at = time::now()
+      WHERE variant_id = $activity_id AND org_id = $org_id
+      `,
+      { new_alpha: newAlpha, new_beta: newBeta, activity_id: activityId, org_id: orgId },
+    );
+  } catch (err) {
+    outcome = 'write_failed';
+    const msg = `posterior-update DB write failed: ${err instanceof Error ? err.message : String(err)}`;
+    warnings.push(msg);
+    logger.warn('posterior-update: variant_performance_metrics update failed', {
+      activity_id: activityId,
+      org_id: orgId,
+      alpha_delta: alphaDelta,
+      beta_delta: betaDelta,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  return outcome;
+}
+
 export async function applyOutcomeToPosteriors(
   trace: TraceForPosterior,
   db: DBQueryable,
@@ -1370,84 +1462,7 @@ export async function applyOutcomeToPosteriors(
   }
 
 
-  if (
-    leafWrite &&
-    !enqueueVariantDelta(activityId, orgId, alphaDelta, betaDelta, 'leaf', undefined, trace.execution_id)
-  ) {
-    vpmOutcome = 'written';
-    try {
-      // Read current Thompson counts and apply decay before writing
-      const selectResult = await db.query<{
-        thompson_alpha?: number | null;
-        thompson_beta?: number | null;
-        updated_at?: string | null;
-      }>(
-        `SELECT thompson_alpha, thompson_beta, updated_at FROM variant_performance_metrics WHERE variant_id = $activity_id AND org_id = $org_id LIMIT 1`,
-        { activity_id: activityId, org_id: orgId },
-      );
-
-      const row = selectResult[0];
-      const alpha = row?.thompson_alpha ?? 1;
-      const beta = row?.thompson_beta ?? 1;
-      let lastUpdatedMs = 0;
-      if (row?.updated_at && typeof row.updated_at === 'string') {
-        const parsed = new Date(row.updated_at).getTime();
-        if (!Number.isNaN(parsed)) {
-          lastUpdatedMs = parsed;
-        }
-      }
-
-      const decayHalfLifeDays = await resolveThompsonDecayHalfLifeDays();
-      const decayed = decayedThompsonCounts(alpha, beta, lastUpdatedMs, Date.now(), decayHalfLifeDays);
-      const newAlpha = decayed.alpha + alphaDelta;
-      const newBeta = decayed.beta + betaDelta;
-
-      // SELF-HEALING DERIVED RATE. `success_rate` was written by the executions
-      // endpoint as int/int on two TYPE int columns, so SurrealDB truncated every
-      // value to exactly 0 or 1. Measured over the full template population: 438 of
-      // 1,059 rows carrying counters have MIXED outcomes (0 < successful < total)
-      // and ALL 438 read 0 or 1 — a mathematically impossible value for every one
-      // of them.
-      //
-      // That is not cosmetic, because the value is read back and amplified:
-      // composition-graph.ts reconstructs alpha = success_rate * total_executions + 1
-      // and beta = (1 - success_rate) * total_executions + 1. A row like
-      // development-vessel:trace-store-reconcile (20 successes of 23, genuinely 87%)
-      // stored 0 and therefore reconstructs to alpha=1 / beta=24 — a working arm
-      // handed a maximally pessimistic posterior and suppressed in selection.
-      //
-      // Recomputing it HERE heals it. This statement already runs on every graded
-      // execution, it targets the row that holds the counters, and — unlike the
-      // executions-endpoint UPDATE — it does not increment them, so reading them in
-      // the same statement carries no SET-clause evaluation-order dependence. Each
-      // affected row therefore repairs itself the next time its arm executes, with
-      // no backfill activity, no hand-run SQL, and no separate write path to keep
-      // consistent. math::max([1, ...]) makes the divide safe on a zero-count row.
-      await db.query(
-        `
-        UPDATE variant_performance_metrics
-        SET
-          thompson_alpha = $new_alpha,
-          thompson_beta  = $new_beta,
-          success_rate = (successful_executions ?? 0) * 1.0 / math::max([1, total_executions ?? 0]),
-          updated_at = time::now()
-        WHERE variant_id = $activity_id AND org_id = $org_id
-        `,
-        { new_alpha: newAlpha, new_beta: newBeta, activity_id: activityId, org_id: orgId },
-      );
-    } catch (err) {
-      vpmOutcome = 'write_failed';
-      const msg = `posterior-update DB write failed: ${err instanceof Error ? err.message : String(err)}`;
-      warnings.push(msg);
-      logger.warn('posterior-update: variant_performance_metrics update failed', {
-        activity_id: activityId,
-        org_id: orgId,
-        alpha_delta: alphaDelta,
-        beta_delta: betaDelta,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
+  if (leafWrite) vpmOutcome = await applyVariantThompsonDelta(db, activityId, orgId, alphaDelta, betaDelta, trace.execution_id, warnings);
 
   // v1 conditional context_thompson_scores write — stratified deltas, signature-keyed
   // M4: skip the v1 conditional write for all-deterministic templates as well;

@@ -27,7 +27,8 @@ import {
 import { resolveLearningTrack, type LearningTrack } from '../lib/learning-track';
 import { incrementExemplarBurstCounter } from '../services/exemplar-selector';
 import { incrementTraceStoreCounter } from '../lib/trace-store-counters';
-import { applyOutcomeToPosteriors } from '../lib/posterior-update';
+import { applyOutcomeToPosteriors, applyVariantThompsonDelta } from '../lib/posterior-update';
+import { applySubscriberCounts, subscriberCountsProblem, type SubscriberCountsBatch, type SubscriberCountsDeps, type SubscriberCountEntry } from '../lib/subscriber-run-counts';
 import { resolveTraceOrg } from '../lib/trace-org';
 import { classifyReach } from '../lib/reach-classify';
 import { failureClassOf } from '../lib/failure-class';
@@ -1835,6 +1836,9 @@ export async function deriveCompositionEdgeFromParent(
   childExecutionId?: string,
   /** Tenant. `org_id` is a required, non-NONE column on this SCHEMAFULL table. */
   orgId?: string,
+  /** COUNTED subscriber runs (CHANGE DB1): increment by `runs` / `ok` instead of one execution, with the parent's
+   *  template already resolved (one batched read per counts batch), so no per-run parent lookup is made. */
+  counts?: { runs: number; ok: number; parentActivityId: string },
 ): Promise<void> {
   if (!childActivityId || !parentExecutionId) return;
   if (!orgId) {
@@ -1936,10 +1940,10 @@ export async function deriveCompositionEdgeFromParent(
         pid_qualified: `execution:${bare}`,
       });
     };
-    let parentRows = await tryLookup(parentExecutionId);
+    let parentRows: unknown = counts ? [[{ activity_id: counts.parentActivityId }]] : await tryLookup(parentExecutionId);
     const firstOf = (rows: unknown): string | undefined =>
       Array.isArray(rows) ? ((rows as unknown[]).flat()[0] as { activity_id?: string } | undefined)?.activity_id : undefined;
-    if (!firstOf(parentRows) && bareParent !== parentExecutionId) {
+    if (!counts && !firstOf(parentRows) && bareParent !== parentExecutionId) {
       parentRows = await tryLookup(bareParent);
     }
     const parentActivityId = Array.isArray(parentRows)
@@ -2056,8 +2060,8 @@ export async function deriveCompositionEdgeFromParent(
     //   $existing supplies the prior counters, defaulting on first sight.
     const priorCount = Number(existingRow?.execution_count ?? 0);
     const priorSuccess = Number(existingRow?.success_count ?? 0);
-    const nextCount = priorCount + 1;
-    const nextSuccess = priorSuccess + (success ? 1 : 0);
+    const nextCount = priorCount + (counts ? counts.runs : 1);
+    const nextSuccess = priorSuccess + (counts ? counts.ok : success ? 1 : 0);
     // ★ INTERPOLATE, AS THE WORKING WRITER DOES. This is the LAST remaining
     //   difference from composition-edge-reconcile.ts:480, which has written
     //   this table successfully for months: it builds the CONTENT body from
@@ -2388,6 +2392,68 @@ export function deriveCorrelationIdFromTags(tags: unknown): string | null {
  *
  * Store execution trace for future reference (debugging, ribosome, impulses)
  */
+// ── LIFECYCLE SUBSCRIBER RUN COUNTS (CHANGE DB1) ──────────────────────────────────────────────────────────────
+// ias-executor-ts flushes counted (normal) subscriber runs here; anomalous runs still POST full traces to '/'.
+// What is applied and why: src/lib/subscriber-run-counts.ts. A defaulted org is refused, as for a trace: these are
+// org-keyed learning writes.
+export const subscriberCountsDeps: SubscriberCountsDeps = {
+  vpmCounters: async (variantId: string, orgId: string, e: SubscriberCountEntry) => {
+    const found = await surrealDB.query<{ id: unknown }>(
+      'SELECT id FROM variant_performance_metrics WHERE variant_id = $variant_id AND org_id = $org_id LIMIT 1',
+      { variant_id: variantId, org_id: orgId },
+    );
+    const id = (Array.isArray(found) ? (found as unknown[]).flat()[0] as { id?: unknown } | undefined : undefined)?.id;
+    if (!id) return false;
+    await surrealDB.query(
+      `UPDATE $id SET
+         total_executions = (total_executions ?? 0) + $runs,
+         successful_executions = (successful_executions ?? 0) + $ok,
+         failed_executions = (failed_executions ?? 0) + $fail,
+         success_rate = (<float> ((successful_executions ?? 0) + $ok)) / (<float> math::max([1, (total_executions ?? 0) + $runs])),
+         avg_duration_ms = (((avg_duration_ms ?? 0) * (total_executions ?? 0)) + $duration_sum) / math::max([1, (total_executions ?? 0) + $runs]),
+         avg_cost_usd = (((avg_cost_usd ?? 0) * (total_executions ?? 0)) + $cost_sum) / math::max([1, (total_executions ?? 0) + $runs]),
+         last_executed_at = time::now(),
+         updated_at = time::now()`,
+      { id, runs: e.runs, ok: e.ok, fail: e.fail, duration_sum: e.duration_ms_sum ?? 0, cost_sum: e.cost_usd_sum ?? 0 },
+    );
+    return true;
+  },
+  thompson: (variantId: string, orgId: string, a: number, b: number) => applyVariantThompsonDelta(surrealDB, variantId, orgId, a, b),
+  resolveParents: async (executionIds: string[]) => {
+    // ONE record-id fetch for the whole batch (not `IN $ids`, which an indexed 2.3.10 read can answer with nothing).
+    const ids = executionIds.slice(0, 500).map((x) => (x.includes(':') ? x.split(':').pop()!.replace(/[\u27e8\u27e9`]/g, '') : x));
+    const params: Record<string, string> = {};
+    const things = ids.map((id, i) => { params[`p${i}`] = id; return `type::thing('execution', $p${i})`; }).join(', ');
+    const rows = await surrealDB.query<{ eid?: string; activity_id?: string }>(`SELECT meta::id(id) AS eid, activity_id FROM [${things}]`, params);
+    const out = new Map<string, string>();
+    for (const r of (Array.isArray(rows) ? (rows as unknown[]).flat() : []) as Array<{ eid?: string; activity_id?: string }>) {
+      if (r && typeof r.eid === 'string' && typeof r.activity_id === 'string') out.set(r.eid, r.activity_id);
+    }
+    for (const x of executionIds) { const bare = x.includes(':') ? x.split(':').pop()!.replace(/[\u27e8\u27e9`]/g, '') : x; const v = out.get(bare); if (v) out.set(x, v); }
+    return out;
+  },
+  edge: (parentActivityId: string, childActivityId: string, runs: number, ok: number, orgId: string) =>
+    deriveCompositionEdgeFromParent(childActivityId, 'subscriber-counts', ok > 0, undefined, undefined, orgId, { runs, ok, parentActivityId }),
+};
+
+app.post('/subscriber-counts', async (c) => {
+  try {
+    const jwtAuth = getJwtAuthFromContext(c);
+    const session = ((c.get as any)('session') as SessionData | undefined);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'invalid JSON body' }, 400); }
+    const problem = subscriberCountsProblem(body);
+    if (problem) return c.json({ error: problem }, 400);
+    const { org, defaulted } = resolveTraceOrg({ bodyOrg: (body as { org_id?: unknown }).org_id, jwtOrg: jwtAuth?.orgId, sessionOrg: session?.org_id });
+    if (defaulted) return c.json({ error: 'org unresolved: subscriber counts are org-keyed learning writes and are refused, as a defaulted-org trace is' }, 400);
+    const r = await applySubscriberCounts(body as SubscriberCountsBatch, org, subscriberCountsDeps);
+    return c.json({ success: true, ...r }, 200);
+  } catch (err) {
+    logger.error('[subscriber-counts] request failed', { error: err instanceof Error ? err.message : String(err) });
+    return c.json({ error: 'subscriber counts failed' }, 500);
+  }
+});
+
 app.post('/', async (c) => {
   try {
     // Check for JWT auth first (MiniBob instances)
