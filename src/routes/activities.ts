@@ -135,7 +135,7 @@ import {
   type ImpulseShapeActivityScore,
 } from '../models/schemas';
 import { broadcaster } from '../websocket/broadcaster';
-import { autoCreateVariantIfNeeded, checkAndRetireTemplate } from '../services/variant-creator';
+import { autoCreateVariantIfNeeded } from '../services/variant-creator';
 import { applyOutcomeToPosteriors, decayedThompsonCounts, isEnvironmentalFailureReason, resolveThompsonDecayHalfLifeDays } from '../lib/posterior-update';
 import { incrementTraceStoreCounter } from '../lib/trace-store-counters';
 import { classifyTemplateTiers } from '../services/tier-classifier';
@@ -2717,40 +2717,11 @@ void import("./execution-traces").then((m) => m.insertTraceDigest({ execution_id
           });
         });
 
-      // Step 5: Check and retire template if needed (after enough executions)
-      // Non-blocking: don't await, fire and forget.
-      // Phase B4a: thread accountId for dual-tenant scoping on the read.
-      checkAndRetireTemplate(activityIdFromRequest, orgId, accountId)
-        .then((wasRetired) => {
-          if (wasRetired) {
-            logger.info('Template retired due to poor performance', {
-              activity_id: activityIdFromRequest,
-            });
-
-            // Emit template_retired event via WebSocket
-            // Phase G1 (2026-04-28): tenancy fields surfaced for filtering.
-            broadcaster.emit({
-              type: 'template_retired',
-              timestamp: new Date().toISOString(),
-              data: {
-                activity_id: activityIdFromRequest,
-                reason: 'poor_performance',
-                org_id: orgId ?? null,
-                account_id: accountId ?? null,
-              },
-            });
-
-            // Invalidate cache for retired template
-            redis.del(`${CACHE_KEY_PREFIX}${activityIdFromRequest}`);
-            redis.srem(CACHE_LIST_KEY, activityIdFromRequest);
-          }
-        })
-        .catch((error) => {
-          logger.warn('Template retirement check failed (non-blocking)', {
-            activity_id: activityIdFromRequest,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        });
+      // Step 5 (retirement) is NOT evaluated here. checkAndRetireTemplate could never complete (variant-creator.ts
+      // 2026-08-16: wrong table, an unindexed ~43 s scan, then .filter on a single row object), and once feature_compose
+      // and the mitosis cutover began posting here (08-29) its SELECT failed on every post ("Missing order idiom
+      // created_at": 56 in 6 h on node 1, 2026-10-16). Retirement is decided by checkAndRetireByPosterior at trace
+      // ingest (execution-traces.ts), the replacement that superseded it.
     }
 
     // Return response with updated metrics
