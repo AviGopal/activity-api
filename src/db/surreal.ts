@@ -267,11 +267,7 @@ class SurrealDBClient {
       // posteriors and the state-signature cells never land, and the topology cannot
       // self-assemble. Retry a few times with small exponential backoff so the
       // learning writes win instead of losing the race.
-      if (
-        _conflictRetries < 4 &&
-        (err.message.includes('read or write conflict') ||
-          err.message.includes('Failed to commit transaction'))
-      ) {
+      if (_conflictRetries < CONFLICT_RETRY_MAX && isRetryableWriteConflict(err)) {
         const backoffMs = 25 * Math.pow(2, _conflictRetries); // 25, 50, 100, 200ms
         await new Promise((resolve) => setTimeout(resolve, backoffMs));
         return await this.exec(sql, params, mode, _isRetry, _conflictRetries + 1);
@@ -373,6 +369,28 @@ export async function createAuthenticatedClient(jwtToken: string): Promise<Surre
 }
 
 /**
+ * SurrealDB's optimistic-concurrency abort ("Failed to commit transaction due to a read or write conflict. This
+ * transaction can be retried"): the transaction rolled back whole, so running it again is safe. One predicate for
+ * every path that retries it (exec below, queryWithAuth).
+ */
+function isRetryableWriteConflict(err: unknown): boolean {
+  const m = err instanceof Error ? err.message : String(err ?? '');
+  return m.includes('read or write conflict') || m.includes('Failed to commit transaction');
+}
+const CONFLICT_RETRY_MAX = 4;
+/** Run a query, retrying a retryable write conflict with the same backoff exec uses (25, 50, 100, 200 ms). */
+async function withConflictRetry<T>(run: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await run();
+    } catch (e) {
+      if (attempt >= CONFLICT_RETRY_MAX || !isRetryableWriteConflict(e)) throw e;
+      await new Promise((resolve) => setTimeout(resolve, 25 * Math.pow(2, attempt)));
+    }
+  }
+}
+
+/**
  * Execute a query with user-scoped authentication.
  * Uses the JWT token to enforce RBAC permissions at the database level.
  *
@@ -404,7 +422,10 @@ export async function queryWithAuth<T = any>(
         namespace: config.surrealdb.namespace,
         database: config.surrealdb.database,
       });
-      const result = await session.db.query(sql, params);
+      // WRITE CONFLICTS ARE RETRIED HERE TOO. The root client (exec) has retried them since 2026-06-21, but
+      // trace ingest runs as the caller's JWT on this path, so its learning writes (the context re-derive, the
+      // composition-edge derive) were dropped on every conflict: 1,959 in 6 h on node 1 (2026-10-16), never retried.
+      const result = await withConflictRetry(() => session.db.query(sql, params));
       const firstResult = Array.isArray(result) && result.length > 0 ? result[0] : [];
       return firstResult as T[];
     } finally {
@@ -422,7 +443,7 @@ export async function queryWithAuth<T = any>(
       database: config.surrealdb.database,
     });
 
-    const result = await db.query(sql, params);
+    const result = await withConflictRetry(() => db.query(sql, params));
 
     logger.debug('Authenticated query result', {
       resultType: typeof result,
