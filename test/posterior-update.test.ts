@@ -15,6 +15,8 @@ import {
   type ExecutionForChainCredit,
 } from '../src/lib/posterior-update';
 import { computeStateSpaceSignature } from '../src/utils/session-context';
+import { flushContextLane } from '../src/lib/context-posterior-lane';
+import { ctsWrites } from './support/cts-lane-writes';
 import type { FailureMode } from '../src/models/schemas';
 
 // ---------------------------------------------------------------------------
@@ -729,10 +731,13 @@ describe('propagateCreditAlongChain — §5: per-ancestor v1 signatures', () => 
       ORG,
     );
 
-    // composition_chain reversed: C=depth-1, B=depth-2, A=depth-3
-    const cSigCall = calls.find(c => c.sql.includes('context_thompson_scores') && c.params.activity_id === 'C');
-    const bSigCall = calls.find(c => c.sql.includes('context_thompson_scores') && c.params.activity_id === 'B');
-    const aSigCall = calls.find(c => c.sql.includes('context_thompson_scores') && c.params.activity_id === 'A');
+    // composition_chain reversed: C=depth-1, B=depth-2, A=depth-3. The cts writes go through the aggregator's cts lane
+    // (CHANGE DB2): flush it into this db, then read each key's write.
+    await flushContextLane(db as never);
+    const w = ctsWrites(calls);
+    const cSigCall = w.find(x => x.activity_id === 'C') && { params: w.find(x => x.activity_id === 'C')! };
+    const bSigCall = w.find(x => x.activity_id === 'B') && { params: w.find(x => x.activity_id === 'B')! };
+    const aSigCall = w.find(x => x.activity_id === 'A') && { params: w.find(x => x.activity_id === 'A')! };
 
     expect(cSigCall).toBeDefined();
     expect(cSigCall!.params.sig).toBe(sigC);
@@ -770,10 +775,11 @@ describe('propagateCreditAlongChain — §5: per-ancestor v1 signatures', () => 
       ORG,
     );
 
-    const ctsCalls = calls.filter(c => c.sql.includes('context_thompson_scores'));
+    await flushContextLane(db as never); // CHANGE DB2: cts writes go through the aggregator's cts lane
+    const ctsCalls = ctsWrites(calls);
     expect(ctsCalls).toHaveLength(1);
-    expect(ctsCalls[0].params.activity_id).toBe('C');
-    expect(ctsCalls[0].params.sig).toBe(sigC);
+    expect(ctsCalls[0].activity_id).toBe('C');
+    expect(ctsCalls[0].sig).toBe(sigC);
   });
 });
 
@@ -851,9 +857,10 @@ describe('applyOutcomeToPosteriors — v1 signature conditional writes', () => {
       ORG,
     );
 
-    const sigWrites = calls.filter(c => c.sql.includes('context_thompson_scores'));
+    await flushContextLane(db as never); // CHANGE DB2: cts writes go through the aggregator's cts lane
+    const sigWrites = ctsWrites(calls);
     expect(sigWrites).toHaveLength(1);
-    expect(sigWrites[0].params.alpha_delta).toBe(0);
-    expect(sigWrites[0].params.beta_delta).toBe(1);
+    expect(sigWrites[0].alpha_delta).toBe(0);
+    expect(sigWrites[0].beta_delta).toBe(1);
   });
 });

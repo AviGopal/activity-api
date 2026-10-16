@@ -25,7 +25,7 @@ import type { FailureMode } from '../models/schemas';
 import { seedPriorFromConcepts } from './prior-seed';
 import { lookupEmbeddingForSignature } from './embedding-lookup-cache';
 import { classifyTemplateTiers, type ResolverTier } from '../services/tier-classifier';
-import { enqueueVariantDelta, installPosteriorFlushOnShutdown, posteriorDeltasDroppedNoRow, posteriorDeltasDroppedNoRowByKind, recentAncestorDeltas, recentNoRowDrops, recordAncestorDelta, recordNoRowDrop, type AncestorDeltaRecord, type NoRowDropRecord } from './posterior-aggregator';
+import { enqueueVariantDelta, writeContextDelta, installPosteriorFlushOnShutdown, posteriorDeltasDroppedNoRow, posteriorDeltasDroppedNoRowByKind, recentAncestorDeltas, recentNoRowDrops, recordAncestorDelta, recordNoRowDrop, type AncestorDeltaRecord, type NoRowDropRecord } from './posterior-aggregator';
 import { embedSignatureForShapes } from '../jobs/signature-embed-backfill';
 import { applyClusterPosterior } from './cluster-posterior';
 import { getTuningParam } from './tuning-params';
@@ -761,37 +761,12 @@ async function writeAncestorDelta(
         if (e) embedding = e;
       }
       const seed = await seedPriorFromConcepts(ancestorId, signature, orgId, embedding);
-      await db.query(
-        `
-        LET $existing = (SELECT * FROM context_thompson_scores
-          WHERE org_id = $org_id AND template_id = $activity_id
-            AND signature_version = $sig_version AND context_bucket = $sig LIMIT 1);
-        IF array::len($existing) > 0 THEN
-          UPDATE context_thompson_scores
-          SET alpha = alpha + $alpha_delta, beta = beta + $beta_delta,
-              n_observations = n_observations + 1, last_updated_at = time::now()
-          WHERE org_id = $org_id AND template_id = $activity_id
-            AND signature_version = $sig_version AND context_bucket = $sig
-        ELSE
-          CREATE context_thompson_scores CONTENT {
-            org_id: $org_id, template_id: $activity_id, context_bucket: $sig,
-            signature_version: $sig_version, alpha: $alpha0 + $alpha_delta,
-            beta: $beta0 + $beta_delta, n_observations: 1,
-            last_updated_at: time::now(), created_at: time::now()
-          }
-        END
-        `,
-        {
-          activity_id: ancestorId,
-          org_id: orgId,
-          sig: signature,
-          sig_version: signatureVersion,
-          alpha_delta: alphaDelta,
-          beta_delta: betaDelta,
-          alpha0: seed.alpha0,
-          beta0: seed.beta0,
-        },
-      );
+      // CHANGE DB2: the ancestor's cts delta into the same lane (one UPSERT ... WHERE per key per flush; no decay, no cap,
+      // as before). Replaces a LET SELECT / IF UPDATE ELSE CREATE script that was never atomic.
+      await writeContextDelta(db, {
+        kind: 'ancestor', orgId, templateId: ancestorId, signatureVersion, bucket: signature,
+        alpha: alphaDelta, beta: betaDelta, alpha0: seed.alpha0, beta0: seed.beta0,
+      });
     } catch (err) {
       logger.warn('posterior-update: chain credit write to context_thompson_scores failed', {
         ancestor_id: ancestorId,
@@ -1507,56 +1482,16 @@ export async function applyOutcomeToPosteriors(
       // math::max([0, ...]) clamps clock skew (datetime subtraction errors on negative
       // durations in SurrealDB 2.3.3, so we diff time::unix seconds instead).
       // Expression verified against the live 2.3.3 instance.
-      await db.query(
-        `
-        LET $existing = (SELECT * FROM context_thompson_scores
-          WHERE org_id = $org_id
-            AND template_id = $activity_id
-            AND signature_version = $sig_version
-            AND context_bucket = $sig
-          LIMIT 1);
-        LET $cardinality = (SELECT count() FROM context_thompson_scores
-          WHERE org_id = $org_id
-            AND template_id = $activity_id
-            AND signature_version = $sig_version
-          GROUP ALL)[0].count ?? 0;
-        IF array::len($existing) > 0 THEN
-          UPDATE context_thompson_scores
-          SET alpha = 1 + (alpha - 1) * math::pow(0.5, math::max([0, time::unix(time::now()) - time::unix(last_updated_at ?? time::now())]) / $half_life_secs) + $alpha_delta,
-              beta  = 1 + (beta - 1) * math::pow(0.5, math::max([0, time::unix(time::now()) - time::unix(last_updated_at ?? time::now())]) / $half_life_secs) + $beta_delta,
-              n_observations = n_observations + 1,
-              last_updated_at = time::now()
-          WHERE org_id = $org_id
-            AND template_id = $activity_id
-            AND signature_version = $sig_version
-            AND context_bucket = $sig
-        ELSE IF $cardinality < $cap THEN
-          CREATE context_thompson_scores CONTENT {
-            org_id: $org_id,
-            template_id: $activity_id,
-            context_bucket: $sig,
-            signature_version: $sig_version,
-            alpha: $alpha0 + $alpha_delta,
-            beta:  $beta0 + $beta_delta,
-            n_observations: 1,
-            last_updated_at: time::now(),
-            created_at: time::now()
-          }
-        END
-        `,
-        {
-          org_id: orgId,
-          activity_id: activityId,
-          sig: trace.signature,
-          sig_version: trace.signature_version,
-          alpha_delta: alphaDelta,
-          beta_delta: betaDelta,
-          cap: CARDINALITY_CAP,
-          alpha0: seed.alpha0,
-          beta0: seed.beta0,
-          half_life_secs: (await resolveThompsonDecayHalfLifeDays()) * 86400,
-        },
-      );
+      // CHANGE DB2: a delta into the cts lane (context-posterior-lane.ts), applied with every other pending key in ONE
+      // transaction as one UPSERT ... WHERE: decay in the expression, a new bucket only under the cap (counted once per
+      // template per flush, not per trace). Replaces a LET SELECT / count() GROUP ALL / IF UPDATE ELSE CREATE script whose
+      // statements each ran as their own transaction, so the SELECT -> CREATE was never atomic.
+      const v1Write = await writeContextDelta(db, {
+        kind: 'leaf', orgId, templateId: activityId, signatureVersion: trace.signature_version, bucket: trace.signature,
+        alpha: alphaDelta, beta: betaDelta, halfLifeSecs: (await resolveThompsonDecayHalfLifeDays()) * 86400,
+        cap: CARDINALITY_CAP, alpha0: seed.alpha0, beta0: seed.beta0,
+      });
+      if (v1Write === 'write_failed') signatureRow = 'write_failed';
       logger.debug('posterior_update_v1_conditional', {
         event: 'posterior_update_v1_conditional',
         activity_id: activityId,

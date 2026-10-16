@@ -20,6 +20,7 @@
  * to synchronous in-place UPDATEs. Flushes on SIGTERM/SIGINT so no deltas are lost
  * on shutdown.
  */
+import { applyContextDeltaNow, contextLanePendingCount, enqueueContextDelta, flushContextLane, type ContextDelta } from './context-posterior-lane';
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
 import { decayedThompsonCounts } from "./posterior-update";
@@ -234,6 +235,19 @@ function ensureTimer(): void {
   }, FLUSH_MS);
   // Don't keep the event loop alive solely for the flush timer.
   (flushTimer as { unref?: () => void }).unref?.();
+}
+
+/**
+ * CHANGE DB2: write a context_thompson_scores delta. Coalescing on: summed into the cts lane and applied with every
+ * other pending key in one transaction on the next flush ('enqueued'). Off: the same one-key UPSERT now.
+ */
+export async function writeContextDelta(db: Queryable, d: ContextDelta): Promise<'enqueued' | 'written' | 'write_failed'> {
+  if (posteriorCoalesceEnabled()) {
+    enqueueContextDelta(d);
+    ensureTimer();
+    return 'enqueued';
+  }
+  return (await applyContextDeltaNow(db, d)) ? 'written' : 'write_failed';
 }
 
 /**
@@ -727,9 +741,11 @@ export interface FlushOptions {
  * Rows carrying compensation items are flushed first, transactionally (flushCompensatedRow).
  */
 export async function flushPosteriors(opts: FlushOptions = {}): Promise<void> {
-  if (flushing || (pendingVariant.size === 0 && pendingCompensation.size === 0)) return;
+  if (flushing || (pendingVariant.size === 0 && pendingCompensation.size === 0 && contextLanePendingCount() === 0)) return;
   flushing = true;
   try {
+    // CHANGE DB2: every pending context_thompson_scores delta, in ONE transaction (context-posterior-lane.ts).
+    await flushContextLane(opts.db ?? surrealDB);
     const batch = [...pendingVariant.values()];
     pendingVariant.clear();
     if (pendingCompensation.size > 0) {

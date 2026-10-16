@@ -42,7 +42,7 @@ function probe(trace: Record<string, unknown>, coalesce: '0' | '1' = '0'): Probe
       const writes = [];
       const db = { query: async (sql) => {
         if (/UPDATE variant_performance_metrics/.test(sql)) { writes.push('vpm'); if (process.env.VPM_THROWS) throw new Error('boom'); return [{ id: 'variant_performance_metrics:x' }]; }
-        if (/CREATE context_thompson_scores/.test(sql)) { writes.push('cts'); return []; }
+        if (/(CREATE|UPSERT) context_thompson_scores/.test(sql)) { writes.push('cts'); return []; }
         if (/shape_score_counted/.test(sql)) return [{ counted: true, duplicate: false }];
         return [];
       } };

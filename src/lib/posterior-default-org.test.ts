@@ -59,8 +59,11 @@ function probe(mode: 'leaf' | 'chain', opts: Record<string, unknown>): Probe {
           writes.push({ kind: 'new_alpha' in (vars ?? {}) ? 'leaf' : 'ancestor', activity_id: vars.activity_id, org_id: vars.org_id });
           return [{ id: 'variant_performance_metrics:x' }];
         }
-        if (/context_thompson_scores/.test(sql) && /CREATE context_thompson_scores/.test(sql)) {
-          writes.push({ kind: 'cts', activity_id: vars.activity_id, org_id: vars.org_id });
+        if (/context_thompson_scores/.test(sql) && /(CREATE|UPSERT) context_thompson_scores/.test(sql)) {
+          // CHANGE DB2: through the cts lane one statement carries each key as k<i>_tpl / k<i>_org.
+          const ks = Object.keys(vars ?? {}).filter((k) => k.startsWith('k') && k.endsWith('_tpl'));
+          if (ks.length > 0) for (const k of ks) { const p = k.slice(0, -4); writes.push({ kind: 'cts', activity_id: vars[p + '_tpl'], org_id: vars[p + '_org'] }); }
+          else writes.push({ kind: 'cts', activity_id: vars.activity_id, org_id: vars.org_id });
           return [];
         }
         if (/FROM execution WHERE id IN/.test(sql)) {

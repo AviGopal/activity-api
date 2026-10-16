@@ -28,6 +28,7 @@ import { resolveLearningTrack, type LearningTrack } from '../lib/learning-track'
 import { incrementExemplarBurstCounter } from '../services/exemplar-selector';
 import { incrementTraceStoreCounter } from '../lib/trace-store-counters';
 import { applyOutcomeToPosteriors, applyVariantThompsonDelta } from '../lib/posterior-update';
+import { writeContextDelta } from '../lib/posterior-aggregator';
 import { applySubscriberCounts, subscriberCountsProblem, type SubscriberCountsBatch, type SubscriberCountsDeps, type SubscriberCountEntry } from '../lib/subscriber-run-counts';
 import { resolveTraceOrg } from '../lib/trace-org';
 import { classifyReach } from '../lib/reach-classify';
@@ -2851,12 +2852,14 @@ app.post('/', async (c) => {
       try {
         const _successForRepair = body.status === 'completed' || body.status === 'success' || body.success === true;
         const _repairDelta = priorRepairDelta(_successForRepair);
-        await surrealDB.query(
-          `LET $existing = (SELECT * FROM context_thompson_scores WHERE org_id = $org_id AND template_id = $activity_id AND signature_version = 2 AND context_bucket = $sig LIMIT 1); IF array::len($existing) > 0 THEN UPDATE context_thompson_scores SET alpha = alpha + $da, beta = beta + $db, n_observations = n_observations + 1, last_updated_at = time::now() WHERE org_id = $org_id AND template_id = $activity_id AND signature_version = 2 AND context_bucket = $sig ELSE CREATE context_thompson_scores CONTENT { org_id: $org_id, template_id: $activity_id, context_bucket: $sig, signature_version: 2, alpha: 1 + $da, beta: 1 + $db, n_observations: 1, last_updated_at: time::now(), created_at: time::now() } END`,
-          { activity_id: body.template_id, org_id: trace.org_id, sig: _priorRepairSig, da: _repairDelta.dAlpha, db: _repairDelta.dBeta }
-        );
-      } catch (_e) {
-        // non-blocking
+        // CHANGE DB2: into the cts lane (one UPSERT ... WHERE per key per flush, in one transaction), not an awaited
+        // LET SELECT / IF UPDATE ELSE CREATE that was never atomic. The lane logs and counts its own failures.
+        await writeContextDelta(surrealDB, {
+          kind: 'repair', orgId: trace.org_id as string, templateId: body.template_id as string, signatureVersion: 2,
+          bucket: _priorRepairSig, alpha: _repairDelta.dAlpha, beta: _repairDelta.dBeta,
+        });
+      } catch (err) {
+        logger.warn('[repair-v2] context posterior delta failed (non-blocking)', { template_id: body.template_id, error: err instanceof Error ? err.message : String(err) });
       }
     }
     const failureModeTypeForSig = body.failure_mode?.type;

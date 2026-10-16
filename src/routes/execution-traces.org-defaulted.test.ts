@@ -185,8 +185,10 @@ async function postTrace(body: Row): Promise<Response> {
 
 /** Every org-keyed learning write the handler (and the credit call it makes) issued for TEMPLATE. */
 function learningWrites() {
+  // The context lane's one-transaction flush names each key's parameters k<i>_tpl / k<i>_org (CHANGE DB2).
   const forTemplate = (q: { params: any }) =>
-    q.params?.activity_id === TEMPLATE || q.params?.variant_id === TEMPLATE || q.params?.template_id === TEMPLATE;
+    q.params?.activity_id === TEMPLATE || q.params?.variant_id === TEMPLATE || q.params?.template_id === TEMPLATE
+    || Object.entries(q.params ?? {}).some(([k, v]) => /^k\d+_tpl$/.test(k) && v === TEMPLATE);
   return {
     vpm: queries.filter((q) => /(UPDATE|INSERT INTO)\s+(variant_performance_metrics|\$id)\b/i.test(q.sql) && /variant_performance_metrics|total_executions/i.test(q.sql)).filter(forTemplate),
     activityTemplate: queries.filter((q) => /UPDATE\s+activity_template/i.test(q.sql)).filter(forTemplate),
