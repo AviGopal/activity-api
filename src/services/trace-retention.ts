@@ -511,8 +511,9 @@ export function getDrainPressure(): { surplus: number | null; measuredAt: number
   // 'empty' = the valve found nothing cold to delete: the surplus is all inside the hot window and no
   // drain can shrink it, so nobody should wait on it. 'failed' = the valve could not delete at all
   // (its candidate read failed, or every batch failed with nothing removed): a drain that is not
-  // progressing is no more a reason to wait than one that has nothing to do.
-  const stalled = lastCeilingOutcome?.stoppedBy === 'empty' || lastCeilingOutcome?.stoppedBy === 'failed';
+  // progressing is no more a reason to wait than one that has nothing to do. 'protected_only' = what is left
+  // over the cap is evidence, which the valve never evicts.
+  const stalled = lastCeilingOutcome?.stoppedBy === 'empty' || lastCeilingOutcome?.stoppedBy === 'failed' || lastCeilingOutcome?.stoppedBy === 'protected_only';
   return { surplus, measuredAt: measuredSurplus?.at ?? null, drainInFlight: sweepInFlight, drainCanProgress: !valveDryRun && !stalled };
 }
 /** Test hook. */
@@ -546,6 +547,73 @@ async function computeEffectiveCeiling(cfg: TraceRetentionConfig): Promise<{ cei
     });
     return { ceiling: cfg.globalCeiling, boundBy: 'rows', meanBytes: null };
   }
+}
+
+// ── EVIDENCE IS COMPACTED BEFORE ANY DELETE; THE VALVE NEVER EVICTS IT ───────
+//
+// WHY (2026-10-03, node 1, db fork, positive-controlled): one sweep on SurrealDB 2.3.10 deleted 2,015
+// reach-graded executions. Every deleting phase was evidence-blind: the stratum reservoir sampled graded
+// rows like any other, the valve's range drain and id fallback were oldest-first and kind-blind, and the
+// telemetry drain took every cold row of a declared id. Retention was then held in dry-run, so nothing
+// pruned and the store grew past 2.6x its cap. The check-first suite
+// (trace-retention.evidence-compaction.test.ts) pins the contract kept here.
+//
+// PROTECTED ("graded or labelled evidence"): `reached` is a boolean (reached:false is evidence too), or the
+// tags carry 'reach_graded:true', or the id is a goal_verification_labels execution_id, or the id is the
+// execution_id of a trace_evidence_ref whose `open` is not false.
+//
+// Two rules:
+//   - the valve (telemetry drain, range drain, id fallback) deletes UNPROTECTED rows only; when only
+//     protected rows remain over the cap it deletes none and reports stoppedBy 'protected_only';
+//   - every id-list delete (the stratum reservoir and the valve's fallback) first writes, in the SAME
+//     transaction, one execution_observation record per protected row it removes: the trace body may go,
+//     the observation (verdict, instrument, horizon, code version, at) may not.
+//
+// WHY NEW TABLES (law 3, REALIGNMENT 13.4 "establish reuse ... or record why a new table is required"):
+// trace_digest is reaped by this same retention, has no observation fields, and is written before the
+// reach verdict arrives; goal_verification_labels is the oracle corpus that calibration reads; and
+// execution_trace_content is the body being deleted. See migration 220.
+//
+// The membership list is read once per statement batch (LET), not per row: both reference tables are
+// small, and `meta::id(id) NOTINSIDE $__prot` with the executed_at index planned was positive-controlled on
+// 2.3.10 (a residual predicate on an indexed SELECT is applied; the known 2.3.10 trap is an indexed COUNT,
+// which is why the range drain counts its id list instead of the range).
+const PROTECTED_REFS_LET = `LET $__prot = array::union((SELECT VALUE execution_id FROM goal_verification_labels), (SELECT VALUE execution_id FROM trace_evidence_ref WHERE open != false));`;
+const UNPROTECTED_WHERE = `!type::is::bool(reached) AND !(tags CONTAINS 'reach_graded:true') AND meta::id(id) NOTINSIDE $__prot`;
+/** Compaction: one execution_observation per protected row of `idsVar`, written before that list is deleted. */
+const COMPACT_SQL = (idsVar: string) => `${PROTECTED_REFS_LET}
+FOR $__r IN (SELECT id, reached, tags, success FROM ${idsVar}) {
+  LET $__eid = meta::id($__r.id);
+  LET $__graded = type::is::bool($__r.reached) OR ($__r.tags CONTAINS 'reach_graded:true');
+  IF $__graded OR $__eid INSIDE $__prot {
+    LET $__label = (SELECT VALUE verdict FROM goal_verification_labels WHERE execution_id = $__eid LIMIT 1)[0];
+    UPSERT type::thing('execution_observation', $__eid) SET
+      execution_id = $__eid,
+      observation = IF type::is::bool($__r.reached) { $__r.reached } ELSE IF $__label != NONE { $__label } ELSE IF $__graded { $__r.tags CONTAINS 'reached:true' } ELSE { $__r.success ?? 'cited' },
+      instrument = IF $__graded { 'reach_verdict' } ELSE IF $__label != NONE { 'goal_verification_label' } ELSE { 'trace_evidence_ref' },
+      horizon = NULL,
+      code_version = NULL,
+      code_version_status = 'unknown',
+      at = time::now();
+  };
+};`;
+
+/** The externally referenced execution ids (labels, open evidence refs), for a statement that binds $__prot. */
+async function protectedRefIds(stmtTimeoutS: number): Promise<string[]> {
+  const r = await withDeadline(surrealDB.query<unknown>(
+    `RETURN array::union((SELECT VALUE execution_id FROM goal_verification_labels), (SELECT VALUE execution_id FROM trace_evidence_ref WHERE open != false))`,
+  ), deadlineFor(1, stmtTimeoutS), 'protected reference read');
+  const list = Array.isArray(r) && Array.isArray(r[0]) ? r[0] : r;
+  return (Array.isArray(list) ? list : []).filter((x): x is string => typeof x === 'string');
+}
+
+/** Whether any cold row exists at all (used to tell 'nothing cold' from 'only protected rows are cold'). */
+async function anyColdRow(cutIso: string, stmtTimeoutS: number): Promise<boolean> {
+  const r = await withDeadline(surrealDB.query<unknown>(
+    `SELECT VALUE id FROM ${TABLE} WHERE executed_at < type::datetime($cut) LIMIT 1 TIMEOUT ${stmtTimeoutS}s`,
+    { cut: cutIso },
+  ), deadlineFor(1, stmtTimeoutS), 'cold-row probe');
+  return Array.isArray(r) && r.length > 0;
 }
 
 // ── SET-BASED CEILING DRAIN ──────────────────────────────────────────────────
@@ -648,13 +716,14 @@ export interface DrainResult {
 
 const DRAIN_BATCH_SQL = (stmtTimeoutS: number) => `
 BEGIN TRANSACTION;
-LET $ts = (SELECT VALUE executed_at FROM ${TABLE} WHERE executed_at < type::datetime($cut) LIMIT $n TIMEOUT ${stmtTimeoutS}s);
+${PROTECTED_REFS_LET}
+LET $ts = (SELECT VALUE executed_at FROM ${TABLE} WHERE executed_at < type::datetime($cut) AND ${UNPROTECTED_WHERE} LIMIT $n TIMEOUT ${stmtTimeoutS}s);
 LET $b = IF array::len($ts) < $n { type::datetime($cut) } ELSE { time::max($ts) };
-LET $c = IF array::len($ts) = 0 { 0 } ELSE { (SELECT count() FROM ${TABLE} WHERE executed_at < $b GROUP ALL TIMEOUT ${stmtTimeoutS}s)[0].count ?? 0 };
+LET $__ids = IF array::len($ts) = 0 { [] } ELSE { (SELECT VALUE id FROM ${TABLE} WHERE executed_at < $b AND ${UNPROTECTED_WHERE} TIMEOUT ${stmtTimeoutS}s) };
+LET $c = array::len($__ids);
 LET $ok = $c > 0 AND $c <= $max;
 IF $ok {
-  LET $__ids = (SELECT VALUE id FROM ${TABLE} WHERE executed_at < $b TIMEOUT ${stmtTimeoutS}s);
-  DELETE ${TABLE} WHERE executed_at < $b RETURN NONE TIMEOUT ${stmtTimeoutS}s;
+  DELETE $__ids RETURN NONE TIMEOUT ${stmtTimeoutS}s;
   ${PRUNE_MARKERS_SQL('$__ids', stmtTimeoutS)}
 };
 RETURN { fetched: array::len($ts), counted: $c, deleted: IF $ok { $c } ELSE { 0 } };
@@ -666,7 +735,7 @@ COMMIT TRANSACTION;`;
  */
 async function deleteExecutionIds(ids: unknown[], deleteStatement: string, stmtTimeoutS = 20): Promise<void> {
   await withDeadline(
-    surrealDB.queryAll(`BEGIN TRANSACTION;\n${deleteStatement};\n${PRUNE_MARKERS_SQL('$ids', stmtTimeoutS)}\nCOMMIT TRANSACTION;`, { ids }),
+    surrealDB.queryAll(`BEGIN TRANSACTION;\n${COMPACT_SQL('$ids')}\n${deleteStatement};\n${PRUNE_MARKERS_SQL('$ids', stmtTimeoutS)}\nCOMMIT TRANSACTION;`, { ids }),
     deadlineFor(2, stmtTimeoutS),
     'execution id-list delete',
   );
@@ -794,7 +863,8 @@ export async function drainColdByRange(opts: {
 const TELEMETRY_BATCH_SQL = (stmtTimeoutS: number) => `
 BEGIN TRANSACTION;
 LET $__t0 = time::now();
-LET $__ids = (SELECT VALUE id FROM ${TABLE} WITH INDEX idx_execution_activity WHERE activity_id = $aid AND executed_at < type::datetime($cut) LIMIT $n TIMEOUT ${stmtTimeoutS}s);
+${PROTECTED_REFS_LET}
+LET $__ids = (SELECT VALUE id FROM ${TABLE} WITH INDEX idx_execution_activity WHERE activity_id = $aid AND ${UNPROTECTED_WHERE} AND executed_at < type::datetime($cut) LIMIT $n TIMEOUT ${stmtTimeoutS}s);
 LET $__t1 = time::now();
 DELETE $__ids RETURN NONE TIMEOUT ${stmtTimeoutS}s;
 LET $__t2 = time::now();
@@ -951,7 +1021,7 @@ async function runCeilingValve(cfg: TraceRetentionConfig, coldCutoffIso: string)
         // undeletable row costs one failed batch per sweep instead of the entire sweep.
         const quarantined = new Set<string>();
         let quarantineFailures = 0;
-        let stoppedBy: 'target' | 'budget' | 'empty' | 'iters' | 'failed' = 'iters';
+        let stoppedBy: 'target' | 'budget' | 'empty' | 'iters' | 'failed' | 'protected_only' = 'iters';
         // SET-BASED FIRST (see drainColdByRange); the id-list loop below runs only when the range
         // path reports it cannot progress, with whatever target and budget remain.
         const drainPolicy = await loadDrainPolicy();
@@ -963,6 +1033,9 @@ async function runCeilingValve(cfg: TraceRetentionConfig, coldCutoffIso: string)
         done = telemetry.removed + range.removed;
         const idFallback = range.stoppedBy === 'needs_ids';
         if (range.stoppedBy !== 'needs_ids') stoppedBy = range.stoppedBy;
+        // Nothing unprotected is cold, yet the store is still over: if anything cold remains it is all
+        // evidence, which the valve never evicts. Say so instead of reporting 'empty'.
+        if (range.stoppedBy === 'empty' && done < target && await anyColdRow(coldCutoffIso, drainPolicy.stmtTimeoutS)) stoppedBy = 'protected_only';
         for (let iter = 0; idFallback && iter < maxIters && done < target; iter++) {
           if (Date.now() >= budgetUntil) { stoppedBy = 'budget'; break; }
           const thisBatch = Math.min(batchSize, target - done);
@@ -1003,14 +1076,16 @@ async function runCeilingValve(cfg: TraceRetentionConfig, coldCutoffIso: string)
           // abandoned candidate read has no ids to quarantine, so it ends the id loop as 'failed'.
           let rows: Array<{ id: unknown }>;
           try {
+            // Unprotected rows only (see EVIDENCE above): the protected list is read first and bound as $__prot.
+            const prot = await protectedRefIds(drainPolicy.stmtTimeoutS);
             rows = await withDeadline(surrealDB.query<{ id: unknown }>(
               quarantined.size > 0
-                ? `SELECT id FROM ${TABLE} WHERE executed_at < type::datetime($cut) AND id NOT IN $skip LIMIT $batch TIMEOUT ${drainPolicy.stmtTimeoutS}s`
-                : `SELECT id FROM ${TABLE} WHERE executed_at < type::datetime($cut) LIMIT $batch TIMEOUT ${drainPolicy.stmtTimeoutS}s`,
+                ? `SELECT id FROM ${TABLE} WHERE executed_at < type::datetime($cut) AND ${UNPROTECTED_WHERE} AND id NOT IN $skip LIMIT $batch TIMEOUT ${drainPolicy.stmtTimeoutS}s`
+                : `SELECT id FROM ${TABLE} WHERE executed_at < type::datetime($cut) AND ${UNPROTECTED_WHERE} LIMIT $batch TIMEOUT ${drainPolicy.stmtTimeoutS}s`,
               // Reuse the sweep's own cold cutoff (line ~295) rather than recomputing it,
               // so the valve and the per-activity strata can never disagree about what
               // "cold" means.
-              { batch: thisBatch, cut: coldCutoffIso, ...(quarantined.size > 0 ? { skip: [...quarantined] } : {}) },
+              { batch: thisBatch, cut: coldCutoffIso, __prot: prot, ...(quarantined.size > 0 ? { skip: [...quarantined] } : {}) },
             ), deadlineFor(1, drainPolicy.stmtTimeoutS), 'valve id-fallback select');
           } catch (err) {
             logger.warn('[trace-retention] global-ceiling valve: id-fallback select FAILED — ending the id loop', {
@@ -1056,7 +1131,7 @@ async function runCeilingValve(cfg: TraceRetentionConfig, coldCutoffIso: string)
               surplus,
               note: 'over ceiling but no rows older than the hot window — ceiling and cold cutoff disagree',
             });
-            stoppedBy = 'empty';
+            stoppedBy = done < target && await anyColdRow(coldCutoffIso, drainPolicy.stmtTimeoutS) ? 'protected_only' : 'empty';
             break;
           }
           // A FAILING BATCH MUST NOT KILL THE SWEEP.

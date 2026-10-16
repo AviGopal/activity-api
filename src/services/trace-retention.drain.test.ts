@@ -215,7 +215,9 @@ run('set-based ceiling drain (real SurrealDB)', () => {
       sent.push(sql);
       if (/BEGIN TRANSACTION/.test(sql) && ++calls === 4) {
         beforeKilled = await total();
-        const killed = sql.replace(/(DELETE execution WHERE executed_at < \$b RETURN NONE TIMEOUT \d+s;)/, '$1\nTHROW "killed mid-batch";');
+        // The range DELETE removes the batch's UNPROTECTED id list (trace-retention.ts EVIDENCE); either form is
+        // the statement after which the kill must roll the whole batch back.
+        const killed = sql.replace(/(DELETE (?:execution WHERE executed_at < \$b|\$__ids) RETURN NONE TIMEOUT \d+s;)/, '$1\nTHROW "killed mid-batch";');
         expect(killed).toContain('THROW');
         try {
           return await origAll(killed, p);
