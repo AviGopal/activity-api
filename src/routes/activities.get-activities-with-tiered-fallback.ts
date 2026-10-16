@@ -1,5 +1,7 @@
 import { ParadigmActivity, queryActivitiesByDense, queryActivitiesByFTS, queryActivitiesByShapes } from "../db/paradigm";
 import { logger } from "../utils/logger";
+import { getTemplateCatalogue } from "../utils/template-cache";
+import type { QueryPathResult } from "../db/paradigm";
 import { mergeByRRF } from "../utils/rrf";
 import { localEmbeddingService } from "../services/embedding-service";
 
@@ -90,6 +92,42 @@ function filterBySatisfiableInputShapes(
   });
 }
 
+
+/**
+ * RECOMMEND'S CANDIDATE READ, CACHED (CHANGE DB3). /recommend measured p50 6.0 s on node1 (2 h to 2026-10-16T07:54Z):
+ * about ten sequential DB round trips per call, and its candidate query (`SELECT * FROM activity` by shapes, run once
+ * or twice per call for tiers 1 and 2) re-reads a catalogue that changes only when a template is written. This serves
+ * it from the in-process template catalogue cache (utils/template-cache.ts), which already carries the shaped TTL
+ * (tuning row template_catalogue_cache_ttl_ms, default 60 s; <= 0 disables), concurrent misses sharing one load, and
+ * the generation guard; every template write that calls invalidateTemplateCache / invalidateTemplateCacheMany clears
+ * it, so a template write is visible on the next read. Not for an RBAC JWT query (its rows depend on $auth). An EMPTY
+ * result is never cached (a transient empty read must not stick for the TTL). A hit is returned as a deep copy:
+ * callers enrich these rows in place.
+ */
+export async function queryActivitiesByShapesCached(
+  shapes: string[],
+  orgId: string | null,
+  category: string | null,
+  executionType: 'template' | 'tool' | 'composition' | 'vessel_function' | null,
+  limit: number,
+  jwtToken: string | null,
+  query: typeof queryActivitiesByShapes = queryActivitiesByShapes,
+): Promise<QueryPathResult<ParadigmActivity>> {
+  if (jwtToken) return query(shapes, orgId, category, executionType, limit, jwtToken);
+  const key = JSON.stringify(['recommend-candidates', [...(shapes ?? [])].sort(), orgId ?? null, category ?? null, executionType ?? null, limit]);
+  // An empty read is returned as it came, not cached (the loader rejects it) and not read a second time.
+  let empty: QueryPathResult<ParadigmActivity> | null = null;
+  const cat = await getTemplateCatalogue<QueryPathResult<ParadigmActivity>>(key, async () => {
+    const r = await query(shapes, orgId, category, executionType, limit, null);
+    if (!r || !Array.isArray(r.data) || r.data.length === 0) { empty = r; throw new Error('an empty candidate read is not cached'); }
+    return { templates: [r], total: r.data.length };
+  });
+  const hit = cat?.templates?.[0];
+  if (hit) return structuredClone(hit);
+  if (empty) return empty;
+  return query(shapes, orgId, category, executionType, limit, null);
+}
+
 export /**
  * Tiered fallback for activity recommendations
  * Each tier progressively relaxes constraints to ensure results
@@ -130,7 +168,7 @@ async function getActivitiesWithTieredFallback(
       minResults,
     });
 
-    const tier1Result = await queryActivitiesByShapes(
+    const tier1Result = await queryActivitiesByShapesCached(
       shapes,
       orgId,
       category,
@@ -275,7 +313,7 @@ async function getActivitiesWithTieredFallback(
     minResults,
   });
 
-  const tier2Result = await queryActivitiesByShapes(
+  const tier2Result = await queryActivitiesByShapesCached(
     [], // No shape filter - accept all activities
     orgId,
     category,
