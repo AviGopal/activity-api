@@ -714,19 +714,33 @@ export interface DrainResult {
   stoppedBy: 'target' | 'budget' | 'empty' | 'needs_ids';
 }
 
+/** The range drain's lower bound when a call starts: before any execution. */
+const DRAIN_FLOOR_ISO = '1970-01-01T00:00:00.000Z';
+
+// THE RANGE STAYS INDEX-ORDERED; PROTECTION IS FILTERED IN MEMORY (2026-10-16). The first evidence-aware form put the
+// protected filter into the $ts and $__ids SELECTs. Measured on node 1's first live run and reproduced on a 400k-row
+// scratch store (54% protected, 18.5k label ids): with a residual predicate the $ts LIMIT no longer returned the OLDEST
+// rows, so $b landed ~100k rows ahead, and the per-row `NOTINSIDE $__prot` over that range ran past the 20 s TIMEOUT on
+// every batch (the valve fell back to the 25-row id loop). Now: $ts takes the oldest $n timestamps at/after $lo off the
+// index exactly as before, the range [$lo, $b) is read once, and the unprotected ids are the in-memory set difference
+// of its cheap-unprotected ids and the protected list (array::complement: ~0.1 s for 2000 x 18.5k, vs ~3 s per-row).
+// $lo is the drain's own lower bound within one call: a range whose rows are ALL protected is stepped over instead of
+// re-read forever (once the unprotected rows are gone, the head of the index is evidence).
 const DRAIN_BATCH_SQL = (stmtTimeoutS: number) => `
 BEGIN TRANSACTION;
 ${PROTECTED_REFS_LET}
-LET $ts = (SELECT VALUE executed_at FROM ${TABLE} WHERE executed_at < type::datetime($cut) AND ${UNPROTECTED_WHERE} LIMIT $n TIMEOUT ${stmtTimeoutS}s);
+LET $ts = (SELECT VALUE executed_at FROM ${TABLE} WHERE executed_at < type::datetime($cut) AND executed_at >= type::datetime($lo) LIMIT $n TIMEOUT ${stmtTimeoutS}s);
 LET $b = IF array::len($ts) < $n { type::datetime($cut) } ELSE { time::max($ts) };
-LET $__ids = IF array::len($ts) = 0 { [] } ELSE { (SELECT VALUE id FROM ${TABLE} WHERE executed_at < $b AND ${UNPROTECTED_WHERE} TIMEOUT ${stmtTimeoutS}s) };
+LET $__cand = IF array::len($ts) = 0 { [] } ELSE { (SELECT id, reached, tags FROM ${TABLE} WHERE executed_at >= type::datetime($lo) AND executed_at < $b TIMEOUT ${stmtTimeoutS}s) };
+LET $__cheap = (SELECT VALUE meta::id(id) FROM $__cand WHERE !type::is::bool(reached) AND !(tags CONTAINS 'reach_graded:true'));
+LET $__ids = array::map(array::complement($__cheap, $__prot), |$e| type::thing('${TABLE}', $e));
 LET $c = array::len($__ids);
 LET $ok = $c > 0 AND $c <= $max;
 IF $ok {
   DELETE $__ids RETURN NONE TIMEOUT ${stmtTimeoutS}s;
   ${PRUNE_MARKERS_SQL('$__ids', stmtTimeoutS)}
 };
-RETURN { fetched: array::len($ts), counted: $c, deleted: IF $ok { $c } ELSE { 0 } };
+RETURN { fetched: array::len($ts), counted: $c, deleted: IF $ok { $c } ELSE { 0 }, scanned: array::len($__cand), boundary: $b };
 COMMIT TRANSACTION;`;
 
 /**
@@ -752,17 +766,30 @@ export async function runDrainBatch(
   max: number,
   stmtTimeoutS: number,
 ): Promise<{ fetched: number; counted: number; deleted: number }> {
+  const { fetched, counted, deleted } = await runDrainBatchAt(cutIso, n, max, stmtTimeoutS, DRAIN_FLOOR_ISO);
+  return { fetched, counted, deleted };
+}
+
+/** runDrainBatch from a lower bound, also reporting the rows it read and the boundary (the drain's own cursor). */
+async function runDrainBatchAt(
+  cutIso: string,
+  n: number,
+  max: number,
+  stmtTimeoutS: number,
+  loIso: string,
+): Promise<{ fetched: number; counted: number; deleted: number; scanned: number; boundary: string | null }> {
   const raw = await withDeadline(
-    surrealDB.queryAll(DRAIN_BATCH_SQL(stmtTimeoutS), { cut: cutIso, n, max }),
+    surrealDB.queryAll(DRAIN_BATCH_SQL(stmtTimeoutS), { cut: cutIso, n, max, lo: loIso }),
     deadlineFor(5, stmtTimeoutS),
     'range drain batch',
   );
   const out = (Array.isArray(raw) ? raw : []).filter(
-    (r): r is { fetched: number; counted: number; deleted: number } =>
+    (r): r is { fetched: number; counted: number; deleted: number; scanned?: number; boundary?: unknown } =>
       !!r && typeof r === 'object' && 'deleted' in (r as object),
   ).pop();
   if (!out) throw new Error('drain batch returned no summary');
-  return { fetched: Number(out.fetched), counted: Number(out.counted), deleted: Number(out.deleted) };
+  const boundary = out.boundary == null ? null : new Date(String(out.boundary)).toISOString();
+  return { fetched: Number(out.fetched), counted: Number(out.counted), deleted: Number(out.deleted), scanned: Number(out.scanned ?? 0), boundary };
 }
 
 /**
@@ -784,6 +811,9 @@ export async function drainColdByRange(opts: {
   // table width doubles back to the policy batch within a few sub-second batches, while on a slow
   // one (aggregate view present) a cold-start 2000-row batch would time out and roll back first.
   let n = Math.max(1, Math.min(policy.batch, carriedDrainWidth ?? DRAIN_COLD_START_WIDTH));
+  // Local to this call: the next call re-reads from the floor, so rows imported below the cursor (replication keeps
+  // their original executed_at) or rows whose protection ended are reached again.
+  let lo = DRAIN_FLOOR_ISO;
   let removed = 0;
   let batches = 0;
   let failures = 0;
@@ -797,10 +827,13 @@ export async function drainColdByRange(opts: {
       const want = Math.min(n, allowance);
       const batchStarted = Date.now();
       try {
-        const { fetched, counted, deleted } = await runDrainBatch(cutIso, want, allowance, policy.stmtTimeoutS);
+        const { fetched, counted, deleted, scanned, boundary } = await runDrainBatchAt(cutIso, want, allowance, policy.stmtTimeoutS, lo);
         const tookMs = Date.now() - batchStarted;
         if (fetched === 0) return fin({ removed, batches, failures, stoppedBy: 'empty' });
         if (deleted > 0) {
+          // Every unprotected row below the boundary is gone (the batch deletes all of them or none), so what
+          // remains below it is evidence: start the next range there.
+          if (boundary) lo = boundary;
           removed += deleted;
           batches++;
           // Size by DURATION, not by success alone. Per-row delete cost on this table is not a
@@ -815,9 +848,13 @@ export async function drainColdByRange(opts: {
           // The range holds more rows than we may delete (ties, or a non-ascending scan): narrow it.
           n = Math.max(1, Math.floor(want / 2));
           continue;
+        } else if (counted === 0 && scanned > 0 && boundary && boundary > lo) {
+          // The whole range [lo, boundary) is protected evidence: step over it, never delete it.
+          lo = boundary;
+          continue;
         } else {
-          // counted 0 with rows in hand = every fetched row shares the boundary timestamp; a range
-          // cannot split them. Hand the remainder to the id-list loop.
+          // counted 0 with rows in hand and nothing below the boundary = every fetched row shares the boundary
+          // timestamp; a range cannot split them. Hand the remainder to the id-list loop.
           return fin({ removed, batches, failures, stoppedBy: 'needs_ids' });
         }
       } catch (err) {
