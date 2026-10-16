@@ -234,6 +234,8 @@ const TRACE_LIST_CACHE_MAX = 200;
 const traceListCache = new Map<string, { body: unknown; expiresAt: number }>();
 
 const RESOLVED_CONFIG_MAX_CHARS = 4000;
+/** Trust-boundary cap on a task's stored attempts (light-dispatch retries at most 3). */
+const ATTEMPTS_MAX = 10;
 
 export function normalizePersistedTask(task: any): {
   task_id: string;
@@ -253,6 +255,8 @@ export function normalizePersistedTask(task: any): {
   input_shapes?: string[];
   output_shapes?: string[];
   resolved_config?: Record<string, unknown>;
+  budget_ms?: number;
+  attempts?: Array<{ n: number; started_at?: string; duration_ms: number; ok: boolean; error?: string; code?: string }>;
 } {
   const { input_impulse_ids: inputImpulseIds, output_impulse_ids: outputImpulseIds } =
     extractTaskImpulseIds(task);
@@ -262,7 +266,8 @@ export function normalizePersistedTask(task: any): {
   // through without a schema bump. Only emit a key when a value is present so
   // SurrealDB stores `null` only where minibob explicitly set it.
   const out: ReturnType<typeof normalizePersistedTask> = {
-    task_id: task?.taskId || task?.task_id,
+    // light-dispatch's task rows name the task `id` (its template task id).
+    task_id: task?.taskId || task?.task_id || (typeof task?.id === 'string' ? task.id : undefined),
     description: task?.description,
     status: task?.status,
     duration_ms: task?.duration ?? task?.duration_ms,
@@ -286,6 +291,23 @@ export function normalizePersistedTask(task: any): {
   }
   if (typeof task?.cost_usd === 'number') {
     out.cost_usd = task.cost_usd;
+  }
+  // Per-task ATTEMPTS and BUDGET (light-dispatch abort-budget fix): how many requests a task really
+  // sent and under what abort budget. A retried task is otherwise indistinguishable from a single
+  // call, and three paid model requests read as one. Bounded at the trust boundary: at most
+  // ATTEMPTS_MAX entries, each reduced to its known scalar fields.
+  if (typeof task?.budget_ms === 'number' && Number.isFinite(task.budget_ms)) {
+    out.budget_ms = task.budget_ms;
+  }
+  if (Array.isArray(task?.attempts)) {
+    out.attempts = task.attempts.slice(0, ATTEMPTS_MAX)
+      .filter((a: any) => a && typeof a.n === 'number' && typeof a.duration_ms === 'number' && typeof a.ok === 'boolean')
+      .map((a: any) => ({
+        n: a.n, duration_ms: a.duration_ms, ok: a.ok,
+        ...(typeof a.started_at === 'string' && Number.isFinite(Date.parse(a.started_at)) ? { started_at: a.started_at.slice(0, 40) } : {}),
+        ...(typeof a.error === 'string' ? { error: a.error.slice(0, 200) } : {}),
+        ...(typeof a.code === 'string' ? { code: a.code.slice(0, 64) } : {}),
+      }));
   }
   // Option-B placeholder-provenance (FLEXIBLE tasks column rides these through):
   // which producer tasks this task consumed via {{placeholders}}, and the
