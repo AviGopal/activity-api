@@ -11,8 +11,8 @@ import {
   getOrFetchValidatedApiKey,
   _resetAuthKeyCache,
   _authKeyCacheSize,
-} from './auth-cache';
-import type { JwtAuthContext } from './jwtAuth';
+} from '../src/middleware/auth-cache';
+import type { JwtAuthContext } from '../src/middleware/jwtAuth';
 
 const authedCtx: JwtAuthContext = {
   jwtToken: 'tok',
