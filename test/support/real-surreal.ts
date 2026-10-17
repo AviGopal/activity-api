@@ -134,7 +134,16 @@ export async function startRealSurreal(): Promise<RealSurreal> {
     async stop() {
       try { await realClient?.close?.(); } catch { /* ignore */ }
       for (const r of restores.reverse()) r();
-      proc?.kill();
+      // AWAIT THE ENGINE'S EXIT. A bare kill() returned at once, so the next real-engine file (each starts its own engine)
+      // could start while this one was still shutting down; in pull-sync's clone-tree file order that overlap made the
+      // next start miss its 8 s health window ("surreal did not answer /health within 8 s"): a beforeAll failure with no
+      // test name, i.e. an unnamed load failure, plus named failures in every real-engine file after it.
+      if (proc) {
+        proc.kill();
+        const exited = await Promise.race([proc.exited.then(() => true), Bun.sleep(5_000).then(() => false)]);
+        if (!exited) { console.warn(`[real-surreal] engine on ${url} ignored SIGTERM for 5 s; sent SIGKILL`); proc.kill(9); await proc.exited; }
+      }
+      clearTimeout(hardStop);
     },
   };
   return handle;
