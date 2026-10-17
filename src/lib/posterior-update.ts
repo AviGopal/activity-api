@@ -1160,6 +1160,40 @@ export function decayedThompsonCounts(
   };
 }
 /**
+ * The tier class of a trace's tasks, for the M4 tier-restricted bandit skip. A task's pre-classified resolver_tier wins;
+ * a task WITHOUT one is classified from its resolver, and when the trace carries only `resolver_id` (light-dispatch's
+ * records: "<vessel>:<shape>" or "<shape>") from the part after the vessel prefix. Before this a task with no tier and no
+ * `resolver` classified as 'llm' whatever ran, and light-dispatch stamped every task "deterministic" instead, so ~90% of
+ * posterior decisions skipped (gap light-dispatch-stamps-every-task-deterministic-...). The classifier's name lists
+ * (tier-classifier.ts DETERMINISTIC_RESOLVERS / LLM_RESOLVERS) are pre-existing, reused not added; an unknown resolver
+ * falls to a stochastic tier, i.e. it learns (the conservative direction). End state: resolvers declare their tier in
+ * registration (gap resolvers-do-not-declare-their-tier-in-registration-so-tier-is-inferred-from-a-name-list).
+ */
+export function classifyTraceTiers(tasks: Array<Record<string, any> | null | undefined>): ReturnType<typeof classifyTemplateTiers> {
+  return classifyTemplateTiers({
+    tasks: tasks.map((t) => {
+      // Prefer pre-classified resolver_tier when present.
+      if (t?.resolver_tier === 'deterministic') {
+        // Provide a synthetic deterministic resolver name from the canonical set.
+        return { resolver: 'bash' };
+      }
+      if (t?.resolver_tier === 'llm') {
+        return { resolver: 'llm' };
+      }
+      if (t?.resolver_tier === 'pattern') {
+        // Pattern tier is stochastic; classifier returns 'pattern' for unknown
+        // resolver strings, which counts as stochastic in classifyTemplateTiers.
+        return { resolver: '__pattern_tier__' };
+      }
+      // No pre-classified tier: the resolver that ran decides (resolver, else resolver_id after its vessel prefix).
+      const rid = typeof t?.resolver_id === 'string' ? t.resolver_id : '';
+      const fromId = rid.includes(':') ? rid.slice(rid.lastIndexOf(':') + 1) : rid;
+      return { resolver: t?.resolver ?? (fromId || undefined), prompt: t?.prompt };
+    }),
+  });
+}
+
+/**
  * THE LEAF VPM THOMPSON DELTA, one writer (extracted for CHANGE DB1): enqueued on the posterior-aggregator when
  * coalescing is on, else the decayed read-then-UPDATE below. Used by applyOutcomeToPosteriors for a graded trace, and
  * by the subscriber-run counts path (alpha += ok, beta += fail) so a lifecycle subscriber's own posterior is fed from
@@ -1345,26 +1379,7 @@ export async function applyOutcomeToPosteriors(
   // If the trace omits `resolver_tier` on every task, the synthetic template
   // has no tier info and the classifier conservatively returns
   // `all_stochastic` — i.e. existing behaviour is preserved.
-  const tierClass = classifyTemplateTiers({
-    tasks: (trace.tasks ?? []).map((t) => {
-      // Prefer pre-classified resolver_tier when present.
-      if (t?.resolver_tier === 'deterministic') {
-        // Provide a synthetic deterministic resolver name from the canonical set.
-        return { resolver: 'bash' };
-      }
-      if (t?.resolver_tier === 'llm') {
-        return { resolver: 'llm' };
-      }
-      if (t?.resolver_tier === 'pattern') {
-        // Pattern tier is stochastic; classifier returns 'pattern' for unknown
-        // resolver strings, which counts as stochastic in classifyTemplateTiers.
-        return { resolver: '__pattern_tier__' };
-      }
-      // No pre-classified tier: pass through resolver / prompt fields and let
-      // classifyTemplateTiers decide.
-      return { resolver: t?.resolver, prompt: t?.prompt };
-    }),
-  });
+  const tierClass = classifyTraceTiers(trace.tasks ?? []);
   const skipVariantUpdate = tierClass === 'all_deterministic' || trace.metadata?.information_yield === 'idle';
   // Defaulted org (see orgDefaulted above): counted once per trace, where the leaf delta would have been written.
   if (orgDefaulted && !skipVariantUpdate && (alphaDelta !== 0 || betaDelta !== 0)) {
