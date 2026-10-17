@@ -28,6 +28,7 @@ import { classifyTemplateTiers, type ResolverTier } from '../services/tier-class
 import { enqueueVariantDelta, writeContextDelta, installPosteriorFlushOnShutdown, posteriorDeltasDroppedNoRow, posteriorDeltasDroppedNoRowByKind, recentAncestorDeltas, recentNoRowDrops, recordAncestorDelta, recordNoRowDrop, type AncestorDeltaRecord, type NoRowDropRecord } from './posterior-aggregator';
 import { embedSignatureForShapes } from '../jobs/signature-embed-backfill';
 import { applyClusterPosterior } from './cluster-posterior';
+import { GOAL_DIRECTION_SIGNATURE_VERSION, goalDirectionSignature } from './goal-direction-signature';
 import { getTuningParam } from './tuning-params';
 import { classifyReach, isReachInapplicable } from './reach-classify';
 import { countShapeOutcome } from './shape-score-counter';
@@ -99,6 +100,11 @@ export interface TraceForPosterior {
   signature?: string;
   /** Must accompany signature; typically 1 for v1 signatures. */
   signature_version?: number;
+  /**
+   * The GOAL-DIRECTION bucket (goal-direction-signature.ts): the walk's target shape set, its own partition at
+   * GOAL_DIRECTION_SIGNATURE_VERSION. Written beside (never instead of) the pool-signature row. Absent: not written.
+   */
+  goal_direction_signature?: string;
   /**
    * Horizontal-composition (§7) fan-out width, surfaced from the engine via
    * the persisted trace's body.metadata.siblingGroupSize. When a compose_parallel
@@ -914,7 +920,7 @@ export async function propagateCreditAlongChain(
 
   // Batch-resolve execution IDs to variant IDs.
   // org_id is undefined when the producer's own org is unknown: absent on its row, or recorded there as a default.
-  type AncestorMeta = { variant_id: string; org_id?: string; signature?: string; signature_version?: number };
+  type AncestorMeta = { variant_id: string; org_id?: string; signature?: string; signature_version?: number; goal_direction_signature?: string };
   let ancestorMetaByExecId: Map<string, AncestorMeta> = new Map();
   try {
     const limited = ancestors.slice(0, CREDIT_PROPAGATION_MAX_DEPTH);
@@ -936,8 +942,8 @@ export async function propagateCreditAlongChain(
     // substrate org), so crediting under the consumer's org updated no row.
     // org_defaulted: a producer posted with no org was stored under the 'public' default and marked so
     // (metadata.org_defaulted). Its org is a guess, exactly like a missing one, so it is read as unresolved.
-    const rows = limited.length === 0 ? [] : await db.query<{ execution_id: string; variant_id: string; org_id?: string; org_defaulted?: boolean; signature?: string; signature_version?: number }>(
-      `SELECT meta::id(id) AS execution_id, (variant_id ?? activity_id) AS variant_id, org_id, metadata.org_defaulted AS org_defaulted, signature, signature_version
+    const rows = limited.length === 0 ? [] : await db.query<{ execution_id: string; variant_id: string; org_id?: string; org_defaulted?: boolean; signature?: string; signature_version?: number; goal_target_shapes?: unknown }>(
+      `SELECT meta::id(id) AS execution_id, (variant_id ?? activity_id) AS variant_id, org_id, metadata.org_defaulted AS org_defaulted, signature, signature_version, metadata.goal_target_shapes AS goal_target_shapes
        FROM execution WHERE id IN [${things}]`,
       params,
     );
@@ -948,6 +954,8 @@ export async function propagateCreditAlongChain(
           org_id: row.org_defaulted !== true && typeof row.org_id === 'string' && row.org_id.length > 0 ? row.org_id : undefined,
           signature: typeof row.signature === 'string' ? row.signature : undefined,
           signature_version: typeof row.signature_version === 'number' ? row.signature_version : undefined,
+          // The ancestor's own goal direction, re-derived from its stored target set with the ONE derivation.
+          goal_direction_signature: goalDirectionSignature(row.goal_target_shapes) ?? undefined,
         });
       }
     }
@@ -1042,6 +1050,20 @@ export async function propagateCreditAlongChain(
     if (betaDelta > 0) chainCreditBetaHits++;
     await writeAncestorDelta(ancestorId, alphaDelta, betaDelta, db, meta.org_id, ancestorSig, ancestorSigVersion,
       { ancestorExecutionId: ancestorExecId, leafActivityId: execution.activity_id });
+    // The ancestor's goal-direction partition takes the same chain credit ((c1)): a satisfier is usually a step, not
+    // the leaf, so without this its goal-direction rows would only ever see the walks it ended.
+    if (meta.goal_direction_signature && typeof meta.org_id === 'string' && meta.org_id.length > 0) {
+      try {
+        await writeContextDelta(db, {
+          kind: 'ancestor', orgId: meta.org_id, templateId: ancestorId, signatureVersion: GOAL_DIRECTION_SIGNATURE_VERSION,
+          bucket: meta.goal_direction_signature, alpha: alphaDelta, beta: betaDelta,
+        });
+      } catch (gdErr) {
+        logger.warn('posterior-update: ancestor goal-direction context write failed (non-blocking)', {
+          ancestor_id: ancestorId, error: gdErr instanceof Error ? gdErr.message : String(gdErr),
+        });
+      }
+    }
   }
 
   if (noSigCount > 0) {
@@ -1552,6 +1574,30 @@ export async function applyOutcomeToPosteriors(
         trace.signature_version,
         trace.input_impulse_shapes,
       );
+    }
+  }
+
+  // THE GOAL-DIRECTION PARTITION ((c1), user ruling 2026-10-17T08:34:28Z): the same graded delta, keyed by the walk's
+  // target shape set at its own signature_version, beside the pool-signature row above (never inside it). Same gates as
+  // the leaf write; a new row starts from the neutral prior (no concept seeding, no cluster mirror: its own partition).
+  if (
+    !skipVariantUpdate &&
+    !orgDefaulted &&
+    !HOOK_SUBSCRIBER_PATTERN.test(activityId) &&
+    typeof trace.goal_direction_signature === 'string' && trace.goal_direction_signature.length > 0 &&
+    (alphaDelta !== 0 || betaDelta !== 0)
+  ) {
+    try {
+      await writeContextDelta(db, {
+        kind: 'leaf', orgId, templateId: activityId, signatureVersion: GOAL_DIRECTION_SIGNATURE_VERSION,
+        bucket: trace.goal_direction_signature, alpha: alphaDelta, beta: betaDelta,
+        halfLifeSecs: (await resolveThompsonDecayHalfLifeDays()) * 86400,
+        cap: parseInt(process.env.SIGNATURE_CARDINALITY_CAP ?? '200', 10),
+      });
+    } catch (gdErr) {
+      logger.warn('posterior-update: goal-direction context write failed (non-blocking)', {
+        activity_id: activityId, error: gdErr instanceof Error ? gdErr.message : String(gdErr),
+      });
     }
   }
 

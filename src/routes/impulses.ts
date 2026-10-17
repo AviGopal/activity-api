@@ -11,6 +11,7 @@
  * Multi-tenant isolation enforced via SurrealDB PERMISSIONS (org_id from JWT auth).
  */
 
+import { GOAL_DIRECTION_SIGNATURE_VERSION, goalDirectionSignature } from '../lib/goal-direction-signature';
 import { Hono } from 'hono';
 import { surrealDB, queryWithAuth, createAuthenticatedClient } from '../db/surreal';
 import { logger } from '../utils/logger';
@@ -1532,13 +1533,20 @@ router.post('/resolve', async (c) => {
         }
 
         const shapeSig = (pointer as any).shape_signature;
-        const contextBucket = (pointer as any).context_bucket;
+        // (c1) THE GOAL-DIRECTION READ: a caller passes the walk's target shape set (goal_target_shapes) and the bucket is
+        // derived HERE with the same goalDirectionSignature the trace writer uses, at its own signature_version, so a
+        // reader can never key differently from the writer (the 8-hex vs 16-hex split cannot recur).
+        const goalDirectionBucket = goalDirectionSignature((pointer as any).goal_target_shapes);
+        const contextBucket = goalDirectionBucket ?? (pointer as any).context_bucket;
         // Phase 9.6 (audit inv-029 additive observability): signature_version
         // explicit pointer field. Defaults to 1 — current signature schema.
         // When v2 lands the caller can pin the version explicitly.
-        const signatureVersion = typeof (pointer as any).signature_version === 'number'
-          ? (pointer as any).signature_version
-          : 1;
+        const explicitSignatureVersion = goalDirectionBucket !== null || typeof (pointer as any).signature_version === 'number';
+        const signatureVersion = goalDirectionBucket !== null
+          ? GOAL_DIRECTION_SIGNATURE_VERSION
+          : typeof (pointer as any).signature_version === 'number'
+            ? (pointer as any).signature_version
+            : 1;
 
         // Reuse the same execution-table aggregate that variantMetricsSummary
         // uses, narrowed to a single variant. activity_id is the variant-level
@@ -1574,12 +1582,16 @@ router.post('/resolve', async (c) => {
         if (typeof contextBucket === 'string' && contextBucket.length > 0) {
           // Per-context durable posterior (the real conditional α/β the selector samples per bucket).
           params.context_bucket = contextBucket;
+          // A version the caller named (or the goal-direction partition) is a FILTER: one bucket string can exist in two
+          // partitions (the goal-direction hash of {X} equals the pool hash of a no-input trace producing X). Unnamed: as
+          // before (no version filter).
+          if (explicitSignatureVersion) params.signature_version = signatureVersion;
           const ctxSelect = `
             SELECT (alpha ?? 1) AS alpha, (beta ?? 1) AS beta,
                    n_observations AS total_executions,
                    n_observations AS success_count, 0 AS failure_count
             FROM context_thompson_scores
-            WHERE template_id = $variant_id AND context_bucket = $context_bucket
+            WHERE template_id = $variant_id AND context_bucket = $context_bucket${explicitSignatureVersion ? ' AND signature_version = $signature_version' : ''}
           `;
           rows = await executeAsAuth<any>(jwtAuthCtx, ctxSelect + ` AND org_id = $org_id`, params);
           if ((rows[0]?.total_executions ?? 0) > 0) {

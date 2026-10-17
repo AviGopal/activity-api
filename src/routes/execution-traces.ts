@@ -5,6 +5,7 @@
  * Used by dashboard to display execution history timeline
  */
 
+import { goalDirectionSignature } from '../lib/goal-direction-signature';
 import { validRepairSignature, priorRepairDelta } from '../lib/repair-signature-consume';
 import { Hono } from 'hono';
 import { createHash } from 'node:crypto';
@@ -3725,6 +3726,9 @@ app.post('/', async (c) => {
           ...(Array.isArray((trace as any).tags) && (trace as any).tags.length > 0 ? { tags: (trace as any).tags as string[] } : {}),
           ...(resolvedCompositionChain.length > 0 ? { composition_chain: resolvedCompositionChain } : {}),
           ...(v1Sig ? { signature: v1Sig, signature_version: v1SigVersion } : {}),
+          // (c1) the goal-direction partition: the walk's target shape set (metadata.goal_target_shapes), derived with the
+          // one goalDirectionSignature the thompson_posterior reader uses. Absent target set: no goal-direction row.
+          ...(goalDirectionSignature((body as any).metadata?.goal_target_shapes) ? { goal_direction_signature: goalDirectionSignature((body as any).metadata?.goal_target_shapes)! } : {}),
           // §7 horizontal-composition fan-out width, surfaced from the engine via
           // body.metadata.siblingGroupSize, so chain-credit averages over siblings
           // instead of k-fold-summing at shared ancestors.
