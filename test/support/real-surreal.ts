@@ -21,6 +21,12 @@
  *    query, queryAll AND queryRaw are all routed, so no client method escapes the real engine.
  *  - records every statement at the SDK layer (the Surreal instance's own query()), so a recount
  *    cannot be evaded by switching between query/queryAll/queryRaw.
+ *  - never touches globalThis.fetch: test files replace it with mocks and some leave one installed past
+ *    their own end, so a later file's health loop polled a mock and failed its beforeAll ("surreal did
+ *    not answer /health within 8 s"), an unnamed load failure. /health and raw SQL use the NATIVE fetch
+ *    (Bun.fetch, which a mock assigned to globalThis.fetch does not replace), and the SDK connects over
+ *    WebSocket (ws://…/rpc), which does not use fetch. Swapping the global around SDK calls was tried
+ *    and rejected: a call still in flight from an earlier file swapped another file's mock out mid-test.
  */
 import { readFileSync, readdirSync } from 'node:fs';
 import { spawn, type Subprocess } from 'bun';
@@ -28,6 +34,9 @@ import { spawn, type Subprocess } from 'bun';
 export const NS = 'activity-system';
 export const DB = 'learning_loop';
 const ROOT = new URL('../../', import.meta.url).pathname;
+
+/** Bun's own fetch: a mock assigned to globalThis.fetch does not replace it. */
+const nativeFetch = Bun.fetch as unknown as typeof fetch;
 
 export interface SdkCall { sql: string; params: Record<string, unknown> | undefined }
 
@@ -53,13 +62,14 @@ export function schemaFiles(): string[] {
 export async function startRealSurreal(): Promise<RealSurreal> {
   const port = 19_000 + Math.floor(Math.random() * 900);
   const url = `http://127.0.0.1:${port}`;
+  const rpcUrl = `ws://127.0.0.1:${port}/rpc`; // the SDK's engine: WebSocket, so no fetch (see the header)
   const pass = crypto.randomUUID();
   let proc: Subprocess | null = null;
   const restores: Array<() => void> = [];
   let realClient: any = null;
 
   const raw = async (text: string): Promise<any[]> => {
-    const r = await fetch(`${url}/sql`, {
+    const r = await nativeFetch(`${url}/sql`, {
       method: 'POST',
       headers: { Accept: 'application/json', 'surreal-ns': NS, 'surreal-db': DB, Authorization: 'Basic ' + btoa(`root:${pass}`) },
       body: text,
@@ -76,7 +86,7 @@ export async function startRealSurreal(): Promise<RealSurreal> {
   (hardStop as any).unref?.();
   let up = false;
   for (let i = 0; i < 80 && !up; i++) {
-    try { up = (await fetch(`${url}/health`)).ok; } catch { /* not up yet */ }
+    try { up = (await nativeFetch(`${url}/health`)).ok; } catch { /* not up yet */ }
     if (!up) await Bun.sleep(100);
   }
   if (!up) { proc.kill(); throw new Error('surreal did not answer /health within 8 s'); }
@@ -100,7 +110,7 @@ export async function startRealSurreal(): Promise<RealSurreal> {
       return res;
     },
     async connectModuleClient() {
-      process.env.SURREALDB_URL = url;
+      process.env.SURREALDB_URL = rpcUrl;
       process.env.SURREALDB_NAMESPACE = NS;
       process.env.SURREALDB_DATABASE = DB;
       process.env.SURREALDB_USERNAME = 'root';
@@ -108,7 +118,7 @@ export async function startRealSurreal(): Promise<RealSurreal> {
       const { config } = await import('../../src/config');
       const saved = { ...config.surrealdb };
       restores.push(() => Object.assign(config.surrealdb, saved));
-      Object.assign(config.surrealdb, { url, namespace: NS, database: DB, username: 'root', password: pass, authEnabled: true });
+      Object.assign(config.surrealdb, { url: rpcUrl, namespace: NS, database: DB, username: 'root', password: pass, authEnabled: true });
       const real = await import('../../src/db/surreal.ts?real-surreal-harness');
       realClient = real.surrealDB;
       await realClient.close?.();
