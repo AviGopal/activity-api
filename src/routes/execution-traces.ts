@@ -32,7 +32,7 @@ import { applyOutcomeToPosteriors, applyVariantThompsonDelta } from '../lib/post
 import { writeContextDelta } from '../lib/posterior-aggregator';
 import { applySubscriberCounts, subscriberCountsProblem, type SubscriberCountsBatch, type SubscriberCountsDeps, type SubscriberCountEntry } from '../lib/subscriber-run-counts';
 import { resolveTraceOrg } from '../lib/trace-org';
-import { classifyReach } from '../lib/reach-classify';
+import { classifyReach, isObserveTrace, noteObserveSkip, observeSkipCount } from '../lib/reach-classify';
 import { failureClassOf } from '../lib/failure-class';
 import { updateSuccessorFeatures } from '../lib/successor-features';
 import { applyClusterPosterior } from '../lib/cluster-posterior';
@@ -2714,6 +2714,19 @@ app.post('/', async (c) => {
     if (betaWithheldAtInsert && !insertTags.includes('reach_withheld:true')) {
       (trace as any).tags = [...insertTags, 'reach_withheld:true'];
     }
+    // AN OBSERVE TRACE IS PERSISTED, NEVER LEARNED FROM (the insert half of POST /reach's OBSERVE rule). goal-host's
+    // observe dispatch (learning_mode "observe": a probe, a held-out measurement) tags its traces learning_mode:observe;
+    // a row /reach already marked carries reach_observe:true (lib/reach-classify.ts isObserveTrace). Either, or a body
+    // learning_mode:"observe", makes this insert write the trace, its tags, digest, content and chain backfill, and
+    // nothing it would learn from: the repair-signature delta, the exemplar burst counter and the composition edge are
+    // skipped here, and the whole learning block after the authoritative write (template and vpm counters and seeds,
+    // applyOutcomeToPosteriors with recordDecisionOutcome, retirement, psi, shape-activity scores, forwardToLearning,
+    // the execution_completed broadcast the ribosome extracts on) is skipped by ONE early return after it. Counted by
+    // reachObserveSkips() and logged. reach_observe:true is stamped so every later reader classifies it ungraded.
+    const observeAtInsert = isObserveTrace({ tags: insertTags }) || body.learning_mode === 'observe';
+    if (observeAtInsert && !insertTags.includes('reach_observe:true')) {
+      (trace as any).tags = [...(Array.isArray((trace as any).tags) ? ((trace as any).tags as string[]) : insertTags), 'reach_observe:true'];
+    }
 
     // ========================================================================
     // TASK #3: Activity Shape Validation
@@ -2871,7 +2884,7 @@ app.post('/', async (c) => {
     // (inserted before failure-mode sig block; prior_repair_signature comes from caller metadata)
     const _priorRepairSigRaw = (meta as any)?.prior_repair_signature ?? (trace as any)?.metadata?.prior_repair_signature;
     const _priorRepairSig = validRepairSignature(_priorRepairSigRaw);
-    if (_priorRepairSig && body.template_id && !traceOrgDefaulted && !betaWithheldAtInsert) {
+    if (_priorRepairSig && body.template_id && !traceOrgDefaulted && !betaWithheldAtInsert && !observeAtInsert) {
       try {
         const _successForRepair = body.status === 'completed' || body.status === 'success' || body.success === true;
         const _repairDelta = priorRepairDelta(_successForRepair);
@@ -3075,7 +3088,7 @@ app.post('/', async (c) => {
       logger.warn('execution_trace_content dual-write failed', { execution_id: trace.execution_id, err: err instanceof Error ? err.message : String(err) });
     });
     // Burst counter for adaptive exemplar selection
-    void incrementExemplarBurstCounter(trace.activity_id as string).catch(() => {});
+    if (!observeAtInsert) void incrementExemplarBurstCounter(trace.activity_id as string).catch(() => {});
     // trace_store_counters bookkeeping (migration 156) — O(1) row-count so the
     // reconciliation observer never has to COUNT() the AET table itself.
     void incrementTraceStoreCounter();
@@ -3100,7 +3113,7 @@ app.post('/', async (c) => {
     // The compose resolver stamps parent_execution_id on nested child traces,
     // but nothing turned those pairs into activity_composition_graph edges —
     // the graph had frozen. Best-effort + detached, like the chain backfill.
-    if (body.parent_execution_id && !traceOrgDefaulted) {
+    if (body.parent_execution_id && !traceOrgDefaulted && !observeAtInsert) {
       void deriveCompositionEdgeFromParent(
         trace.activity_id as string | undefined,
         body.parent_execution_id as string | undefined,
@@ -3445,6 +3458,17 @@ app.post('/', async (c) => {
         throw paradigmError;
       }
     } // end execution authoritative write
+
+    // OBSERVE (see observeAtInsert above): the trace is stored; nothing below learns from it.
+    if (observeAtInsert) {
+      const skips = noteObserveSkip();
+      logger.info('[insert] OBSERVE trace — persisted, no posterior or learning write', {
+        execution_id: trace.execution_id,
+        activity_id: trace.variant_id,
+        observe_skips: skips,
+      });
+      return c.json({ success: true, execution_id: trace.execution_id, stored: true, trace: result[0], observed: true });
+    }
 
     // ========================================================================
     // FIX 2: Update Thompson Sampling scores in activity table
@@ -4861,9 +4885,8 @@ app.post('/deliberation', async (c) => {
   }
 });
 
-/** Observe verdicts /reach recorded without grading (module lifetime; see the OBSERVE note in POST /reach). */
-let reachObserveSkipCount = 0;
-export function reachObserveSkips(): number { return reachObserveSkipCount; }
+/** Observe traces and verdicts recorded without any learning write (module lifetime; lib/reach-classify.ts). */
+export function reachObserveSkips(): number { return observeSkipCount(); }
 
 // Patch the reach-gate verdict onto an already-persisted trace. POST '/' INSERTs
 // the trace BEFORE the goal-host reach gate runs (the gate is post-execution), so
@@ -4958,7 +4981,7 @@ app.post('/reach', async (c) => {
       }
     }
     const preTags: string[] = Array.isArray(preRow?.tags) ? (preRow.tags as string[]) : [];
-    const observeVerdict = observeByBody || preTags.includes('learning_mode:observe') || preTags.includes('reach_observe:true');
+    const observeVerdict = observeByBody || isObserveTrace({ tags: preTags });
     // AET WRITE IS GATED ON THE DUAL-WRITE SWITCH THAT ALREADY GOVERNS IT — this is
     // the same guard the insert path applies, applied here too.
     //
@@ -5012,7 +5035,7 @@ app.post('/reach', async (c) => {
       : (typeof preRow?.activity_id === 'string' ? (preRow.activity_id as string) : '');
     const preIsSatellite = String(execId).startsWith('walk-satisfier-') || preActivityId.startsWith('satisfier:');
     if (observeVerdict) {
-      reachObserveSkipCount++;
+      const skips = noteObserveSkip();
       if (preReadOk && preRow && !preTags.includes('reach_observe:true')) {
         try {
           await surrealDB.query(
@@ -5027,7 +5050,7 @@ app.post('/reach', async (c) => {
         execution_id: String(execId),
         activity_id: preActivityId || null,
         reached: body.reached,
-        observe_skips: reachObserveSkipCount,
+        observe_skips: skips,
       });
     } else if (preReadOk && preRow && preActivityId && !preIsSatellite && !preTags.includes('reach_graded:true') && !preTags.includes('reach_withheld:true') && !betaWithheld) {
       const preVerdict = classifyReach({

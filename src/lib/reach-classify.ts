@@ -59,6 +59,23 @@ export function isReachInapplicable(t: { tags?: string[] }): boolean {
  * `legacy-success` is REMOVED from the union rather than left unreachable, so it cannot
  * be quietly reintroduced at a call site later.
  */
+/**
+ * AN OBSERVE EXECUTION IS NEVER GRADED. goal-host's observe dispatch (learning_mode "observe": a probe, a held-out
+ * measurement) tags its traces learning_mode:observe, and POST /reach / POST / stamp reach_observe:true on a row they
+ * recorded as observe. Such a row's verdict is a measurement, not a lesson: classifyReach answers 'ungraded' for it
+ * AHEAD of its reached:* tag, so every reader of this one gate (posterior credit, the ribosome's extraction, the
+ * trace-aggregate failure-class counts, the shape-counter seed) learns nothing from it.
+ */
+export function isObserveTrace(t: { tags?: string[] }): boolean {
+  const tags = t.tags ?? [];
+  return tags.includes('learning_mode:observe') || tags.includes('reach_observe:true');
+}
+let observeSkips = 0;
+/** Count one observe execution or verdict a learning writer skipped; returns the running count. */
+export function noteObserveSkip(): number { return ++observeSkips; }
+/** Observe executions and verdicts skipped by a learning writer since process start. */
+export function observeSkipCount(): number { return observeSkips; }
+
 export function classifyReach(t: {
   success: boolean;
   execution_id?: string;
@@ -66,6 +83,7 @@ export function classifyReach(t: {
   tags?: string[];
 }): ReachVerdict {
   const tags = t.tags ?? [];
+  if (isObserveTrace(t)) return 'ungraded';
   if (tags.includes('reached:true')) return 'reached';
   // A telemetry/infra probe's or declined execution's `reached:false` is INAPPLICABLE, not a failure verdict —
   // intercept it here, ahead of the not-reached arm, so infra sub-steps (auth resolves) and principled declines

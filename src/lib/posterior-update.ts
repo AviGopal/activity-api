@@ -30,7 +30,7 @@ import { embedSignatureForShapes } from '../jobs/signature-embed-backfill';
 import { applyClusterPosterior } from './cluster-posterior';
 import { GOAL_DIRECTION_SIGNATURE_VERSION, goalDirectionSignature } from './goal-direction-signature';
 import { getTuningParam } from './tuning-params';
-import { classifyReach, isReachInapplicable } from './reach-classify';
+import { classifyReach, isObserveTrace, isReachInapplicable, noteObserveSkip } from './reach-classify';
 import { countShapeOutcome } from './shape-score-counter';
 import { recordDecisionOutcome, recordExecutionDecisionOutcome } from './decision-credit';
 
@@ -285,7 +285,7 @@ export interface UpdateSummary {
    * than informative signal (M4 tier-restricted bandit).
    * Absent when the UPDATE ran normally.
    */
-    skipped_reason?: 'all_deterministic' | 'ungraded_reach' | 'idle_yield';
+    skipped_reason?: 'all_deterministic' | 'ungraded_reach' | 'idle_yield' | 'observe';
 }
 
 // ---------------------------------------------------------------------------
@@ -1318,6 +1318,14 @@ export async function applyOutcomeToPosteriors(
   // Strip activity:⟨⟩ wrapper so the WHERE clause matches variant_performance_metrics rows
   // written by the legacy path (which stores bare ids like "development-vessel:harness-run-matrix").
   const activityId = normalizeActivityId(rawActivityId);
+  // OBSERVE (reach-classify.ts isObserveTrace): an observe execution moves NO posterior through ANY caller (the trace
+  // routes, goal-paths, activities): no leaf or chain delta, no signature row, no decision outcome, no shape count.
+  // Checked first, ahead of the ungraded-failure arm, which would otherwise blame an ungraded observe failure.
+  if (isObserveTrace({ tags: trace.tags })) {
+    const skips = noteObserveSkip();
+    logger.info('posterior update SKIPPED: observe execution', { activity_id: activityId, execution_id: trace.execution_id, observe_skips: skips });
+    return { activity_id: activityId, alpha_delta: 0, beta_delta: 0, failure_mode_type: null, impulse_relevance_writes: 0, warnings, skipped_reason: 'observe' };
+  }
   // Seam 3a: resolve the graded-yield references from authored tuning rows (TTL-cached,
   // env→default fallback). Behavior-preserving when no row exists.
   const yieldRefs = await resolveYieldRefs();
