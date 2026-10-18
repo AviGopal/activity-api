@@ -726,6 +726,8 @@ describe('propagateCreditAlongChain — §5: per-ancestor v1 signatures', () => 
           B: { signature: sigB, signature_version: 1 },
           C: { signature: sigC, signature_version: 1 },
         },
+        signature: sigC,
+        signature_version: 1,
       },
       db,
       ORG,
