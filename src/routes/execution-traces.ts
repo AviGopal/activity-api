@@ -4861,6 +4861,10 @@ app.post('/deliberation', async (c) => {
   }
 });
 
+/** Observe verdicts /reach recorded without grading (module lifetime; see the OBSERVE note in POST /reach). */
+let reachObserveSkipCount = 0;
+export function reachObserveSkips(): number { return reachObserveSkipCount; }
+
 // Patch the reach-gate verdict onto an already-persisted trace. POST '/' INSERTs
 // the trace BEFORE the goal-host reach gate runs (the gate is post-execution), so
 // `reached` / `completion_shapes` can only be written back here, keyed by
@@ -4886,6 +4890,13 @@ app.post('/reach', async (c) => {
     // non-deterministic verdict with no consumed chain). Only for reached === false: a reached
     // verdict ignores the field. The verdict itself is still persisted below; only grading is skipped.
     const betaWithheld = body.beta_withheld === true && body.reached === false;
+    // AN OBSERVE VERDICT IS RECORDED, NEVER GRADED. goal-host's observe dispatch (learning_mode "observe": a probe, a
+    // held-out measurement) sends its verdict with learning_mode:"observe"; the trace itself carries the
+    // learning_mode:observe tag the dispatch was tagged with. Either marks it: the verdict (reached, completion_shapes,
+    // tags, verdict class) is persisted below, but no posterior, counter or successor-feature write is made from it, and
+    // a reach_observe:true marker keeps a later /reach for the same execution (a spool drain without the field) from
+    // grading it. Counted (reachObserveSkips) and logged.
+    const observeByBody = body.learning_mode === 'observe';
     // AUTHORITATIVE PRE-READ — must precede the UPDATE below. It captures the row
     // exactly as it stood BEFORE this patch, which is the only way to know what the
     // INSERT path (app.post('/'), applyOutcomeToPosteriors) already did with this
@@ -4947,6 +4958,7 @@ app.post('/reach', async (c) => {
       }
     }
     const preTags: string[] = Array.isArray(preRow?.tags) ? (preRow.tags as string[]) : [];
+    const observeVerdict = observeByBody || preTags.includes('learning_mode:observe') || preTags.includes('reach_observe:true');
     // AET WRITE IS GATED ON THE DUAL-WRITE SWITCH THAT ALREADY GOVERNS IT — this is
     // the same guard the insert path applies, applied here too.
     //
@@ -4999,7 +5011,25 @@ app.post('/reach', async (c) => {
       ? (preRow.variant_id as string)
       : (typeof preRow?.activity_id === 'string' ? (preRow.activity_id as string) : '');
     const preIsSatellite = String(execId).startsWith('walk-satisfier-') || preActivityId.startsWith('satisfier:');
-    if (preReadOk && preRow && preActivityId && !preIsSatellite && !preTags.includes('reach_graded:true') && !preTags.includes('reach_withheld:true') && !betaWithheld) {
+    if (observeVerdict) {
+      reachObserveSkipCount++;
+      if (preReadOk && preRow && !preTags.includes('reach_observe:true')) {
+        try {
+          await surrealDB.query(
+            `UPDATE type::thing('execution', $execution_id) SET tags = array::union(tags ?? [], ['reach_observe:true'])`,
+            { execution_id: String(execId) },
+          );
+        } catch (e) {
+          logger.warn('[reach-patch] reach_observe marker write failed', { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      logger.info('[reach] OBSERVE verdict — recorded, no posterior or learning write', {
+        execution_id: String(execId),
+        activity_id: preActivityId || null,
+        reached: body.reached,
+        observe_skips: reachObserveSkipCount,
+      });
+    } else if (preReadOk && preRow && preActivityId && !preIsSatellite && !preTags.includes('reach_graded:true') && !preTags.includes('reach_withheld:true') && !betaWithheld) {
       const preVerdict = classifyReach({
         success: preRow.success === true,
         execution_id: String(execId),
@@ -5101,7 +5131,7 @@ app.post('/reach', async (c) => {
       });
     }
     const updatedTrace: any = Array.isArray(res) && Array.isArray(res[0]) && res[0].length > 0 ? res[0][0] : null;
-    if (updatedTrace && updatedTrace.signature && updatedTrace.metadata?.org_defaulted !== true) {
+    if (!observeVerdict && updatedTrace && updatedTrace.signature && updatedTrace.metadata?.org_defaulted !== true) {
       import('../lib/successor-features').then(({ updateSuccessorFeatures }) => {
         updateSuccessorFeatures(
           {
@@ -5211,7 +5241,7 @@ app.post('/reach', async (c) => {
     // and abandons the verdict whenever it is 0, so the mirror must be counted.
     const aetUpdated = Array.isArray(res) && Array.isArray(res[0]) ? (res[0] as unknown[]).length : (Array.isArray(res) ? res.length : 0);
     const updated = aetUpdated + mirrored;
-    return c.json({ success: true, execution_id: String(execId), reached: body.reached, updated, ...(idempotent ? { idempotent: true } : {}) }, 200);
+    return c.json({ success: true, execution_id: String(execId), reached: body.reached, updated, ...(idempotent ? { idempotent: true } : {}), ...(observeVerdict ? { observed: true } : {}) }, 200);
   } catch (err) {
     logger.warn('[reach-patch] failed to persist reach verdict on trace', { error: err instanceof Error ? err.message : String(err) });
     return c.json({ success: false, error: err instanceof Error ? err.message : String(err) }, 500);
