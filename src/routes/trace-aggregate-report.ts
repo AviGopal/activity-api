@@ -78,6 +78,9 @@ export interface TraceAggregateReport {
   truncated: boolean;
   empty: boolean;
   query_ms: number;
+  measured: boolean;
+  matched_total: number | null;
+  reason?: string;
 }
 
 const GROUP_FIELDS = new Set(['activity_id', 'status', 'variant_id', 'failure_class', 'goal_hash']);
@@ -109,6 +112,26 @@ export async function runTraceAggregateReport(
   const limit = clampInt(input.limit, 10, 1, 1000);
   const order = String(input.order) === 'asc' ? 'ASC' : 'DESC';
   const untilHoursAgo = clampInt(input.until_hours_ago, 0, 0, 720);
+
+  // Refuse unserved group_by rather than silently falling back to activity_id.
+  if (!GROUP_FIELDS.has(String(input.group_by))) {
+    return {
+      shape: 'traceAggregateReport',
+      metric,
+      group_by: String(input.group_by ?? ''),
+      window_hours: windowHours,
+      until_hours_ago: untilHoursAgo,
+      generated_at: new Date().toISOString(),
+      rows: [],
+      total_groups: 0,
+      truncated: false,
+      empty: true,
+      query_ms: -1,
+      measured: false,
+      matched_total: null,
+      reason: 'unserved_group_by',
+    };
+  }
 
   const nowMs = Date.now();
   const untilMs = nowMs - untilHoursAgo * 3600_000;
@@ -189,11 +212,17 @@ export async function runTraceAggregateReport(
   let rows: TraceAggregateRow[] = [];
   let totalGroups = 0;
   let truncated = false;
+  let matchedTotal: number | null = 0;
   let queryOk = true;
   try {
     const result = await db.query(sql, params);
     const set = Array.isArray(result) && result.length > 0 ? result[0] : [];
     const arr = Array.isArray(set) ? (set as Array<Record<string, unknown>>) : [];
+    matchedTotal = arr.reduce((s, r) => {
+      const v = (r as { value?: unknown }).value;
+      const n = typeof v === 'number' ? v : Number(v ?? 0) || 0;
+      return s + n;
+    }, 0);
     rows = arr
       .map((r) => {
         // The grouped column comes back under its raw field name (we no longer
@@ -227,6 +256,7 @@ export async function runTraceAggregateReport(
     }
   } catch (err) {
     queryOk = false;
+    matchedTotal = null;
     logger.error('[trace-aggregate-report] aggregate query failed', {
       error: err instanceof Error ? err.message : String(err),
       group_by: groupBy,
@@ -249,6 +279,8 @@ export async function runTraceAggregateReport(
     total_groups: totalGroups,
     truncated,
     empty: rows.length === 0,
+    measured: queryOk,
+    matched_total: matchedTotal,
     query_ms: queryOk ? queryMs : -1,
   };
 }
