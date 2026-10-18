@@ -34,7 +34,7 @@
 import { surrealDB } from '../db/surreal';
 import { withDeadline } from '../lib/deadline';
 import { logger } from '../utils/logger';
-import { decrementTraceStoreCounter } from '../lib/trace-store-counters';
+import { decrementTraceStoreCounter, TRACE_STORE_COUNTER_ID } from '../lib/trace-store-counters';
 import { PRUNE_MARKERS_SQL } from '../lib/shape-score-counter';
 
 // WRITE-FLIP/decommission: retention now bounds the canonical `execution`
@@ -684,6 +684,12 @@ export interface DrainPolicy {
    * sweep's in-flight flag, so the valve and its telemetry-first drain never ran.
    */
   phaseBudgetMs: number;
+  /**
+   * A range drain resumes from its PERSISTED lower bound (see RANGE DRAIN CURSOR); every this-many resumed passes
+   * it starts from the floor instead, so rows the cursor cannot see (replication imports keep their original
+   * executed_at below it) are reached on a bounded cadence.
+   */
+  rescanPasses: number;
 }
 
 /**
@@ -695,13 +701,14 @@ export interface DrainPolicy {
 export async function loadDrainPolicy(): Promise<DrainPolicy> {
   const { getTuningParam } = await import('../lib/tuning-params');
   const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, Math.floor(v)));
-  const [batch, minBatch, pauseMs, stmtTimeoutS, restMs, phaseBudgetMs] = await Promise.all([
+  const [batch, minBatch, pauseMs, stmtTimeoutS, restMs, phaseBudgetMs, rescanPasses] = await Promise.all([
     getTuningParam('TRACE_RETENTION_DRAIN_BATCH', undefined, 2000),
     getTuningParam('TRACE_RETENTION_DRAIN_MIN_BATCH', undefined, 50),
     getTuningParam('TRACE_RETENTION_DRAIN_PAUSE_MS', undefined, 250),
     getTuningParam('TRACE_RETENTION_DRAIN_STMT_TIMEOUT_S', undefined, 20),
     getTuningParam('TRACE_RETENTION_DRAIN_REST_MS', undefined, 60_000),
     getTuningParam('TRACE_RETENTION_PHASE_BUDGET_MS', undefined, 120_000),
+    getTuningParam('TRACE_RETENTION_DRAIN_RESCAN_PASSES', undefined, 12),
   ]);
   const b = clamp(batch, 1, 20_000);
   return {
@@ -711,6 +718,7 @@ export async function loadDrainPolicy(): Promise<DrainPolicy> {
     stmtTimeoutS: clamp(stmtTimeoutS, 1, 120),
     restMs: clamp(restMs, 0, 3_600_000),
     phaseBudgetMs: clamp(phaseBudgetMs, 1_000, 3_600_000),
+    rescanPasses: clamp(rescanPasses, 1, 10_000),
   };
 }
 
@@ -810,6 +818,70 @@ async function runDrainBatchAt(
 let carriedDrainWidth: number | null = null;
 const DRAIN_COLD_START_WIDTH = 250;
 
+// ── RANGE DRAIN CURSOR (2026-10-18) ──────────────────────────────────────────
+//
+// WHY. drainColdByRange started $lo at DRAIN_FLOOR_ISO on EVERY call and stepped over all-protected ranges only
+// within the call, so each pass re-read the whole protected head (graded and labelled rows the valve never
+// deletes) in policy-width ranges before reaching anything deletable. Measured live: node 1 passes of 43-252 s
+// removing 2-116 rows; the hub ~294 s per pass removing 0 at a ~61k surplus, re-entered ~60 s later (~80% DB
+// duty). A cursor in process memory would not help: every pull-sync converge restarts this process.
+//
+// WHAT. The lower bound a pass ends on is PERSISTED on the trace store's own counter row
+// (trace_store_counters:execution, migration 225), with the protected set it was computed under, and the next
+// pass starts there. The invariant is the range drain's own: below $lo every row is graded or protected (a
+// deleting batch removes every unprotected row below its boundary; a stepped range was all protected).
+//
+// THE NEXT PASS STARTS AT THE FLOOR INSTEAD (the start and its source are logged) when:
+//   - no cursor is stored, or the read fails ('reset:none', 'reset:read_failed');
+//   - protection was RELEASED since it was stored ('reset:protection_released'): the protected list is shorter,
+//     or more trace_evidence_ref rows are closed (open = false). A row below the cursor may now be deletable;
+//   - policy.rescanPasses passes have resumed since the last floor start ('reset:rescan'): rows replication
+//     imports keep their original executed_at, which can be below the cursor.
+interface DrainStart { lo: string; source: string; passes: number; protSize: number | null; released: number | null }
+
+async function readDrainStart(policy: DrainPolicy): Promise<DrainStart> {
+  const t = policy.stmtTimeoutS;
+  try {
+    const raw = await withDeadline(surrealDB.queryAll(`
+${PROTECTED_REFS_LET}
+LET $__c = (SELECT <string> drain_floor AS floor, drain_floor_prot AS prot, drain_floor_released AS released, drain_floor_passes AS passes FROM ${TRACE_STORE_COUNTER_ID} WHERE drain_floor != NONE TIMEOUT ${t}s)[0];
+LET $__rel = (SELECT count() AS n FROM trace_evidence_ref WHERE open = false GROUP ALL TIMEOUT ${t}s)[0].n ?? 0;
+RETURN { stored: $__c, prot: array::len($__prot), released: $__rel };`), deadlineFor(3, t), 'range drain cursor read');
+    const out = (Array.isArray(raw) ? raw : []).filter((r): r is { stored?: { floor?: unknown; prot?: unknown; released?: unknown; passes?: unknown } | null; prot: number; released: number } =>
+      !!r && typeof r === 'object' && 'prot' in (r as object)).pop();
+    if (!out) throw new Error('cursor read returned no summary');
+    const protSize = Number(out.prot);
+    const released = Number(out.released);
+    const st = out.stored;
+    const floor = { lo: DRAIN_FLOOR_ISO, passes: 0, protSize, released };
+    const stored = [st?.prot, st?.released, st?.passes].map(Number);
+    if (!st || typeof st.floor !== 'string' || !stored.every(Number.isFinite)) return { ...floor, source: 'reset:none' };
+    if (Number(st.prot) > protSize || released > Number(st.released)) return { ...floor, source: 'reset:protection_released' };
+    if (Number(st.passes) >= policy.rescanPasses) return { ...floor, source: 'reset:rescan' };
+    return { lo: st.floor, source: 'stored', passes: Number(st.passes), protSize, released };
+  } catch (err) {
+    logger.warn('[trace-retention] range drain cursor read failed — starting at the floor', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { lo: DRAIN_FLOOR_ISO, source: 'reset:read_failed', passes: 0, protSize: null, released: null };
+  }
+}
+
+/** Persist where this pass ended, under the protected set it started with. Never throws (the next pass resets). */
+async function writeDrainCursor(lo: string, start: DrainStart, policy: DrainPolicy): Promise<void> {
+  if (start.protSize === null || start.released === null) return; // no digest to validate it against later
+  try {
+    await withDeadline(surrealDB.query(
+      `UPSERT ${TRACE_STORE_COUNTER_ID} SET table_name = 'execution', drain_floor = type::datetime($lo), drain_floor_prot = $prot, drain_floor_released = $released, drain_floor_passes = $passes, drain_floor_at = time::now() TIMEOUT ${policy.stmtTimeoutS}s`,
+      { lo, prot: start.protSize, released: start.released, passes: start.source === 'stored' ? start.passes + 1 : 0 },
+    ), deadlineFor(1, policy.stmtTimeoutS), 'range drain cursor write');
+  } catch (err) {
+    logger.warn('[trace-retention] range drain cursor write failed — the next pass starts at the floor or the last cursor', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 export async function drainColdByRange(opts: {
   cutIso: string;
   target: number;
@@ -822,13 +894,19 @@ export async function drainColdByRange(opts: {
   // table width doubles back to the policy batch within a few sub-second batches, while on a slow
   // one (aggregate view present) a cold-start 2000-row batch would time out and roll back first.
   let n = Math.max(1, Math.min(policy.batch, carriedDrainWidth ?? DRAIN_COLD_START_WIDTH));
-  // Local to this call: the next call re-reads from the floor, so rows imported below the cursor (replication keeps
-  // their original executed_at) or rows whose protection ended are reached again.
-  let lo = DRAIN_FLOOR_ISO;
   let removed = 0;
   let batches = 0;
   let failures = 0;
+  let scannedRows = 0;
   const phaseStarted = enterPhase('valve:range_drain');
+  // The persisted cursor (see RANGE DRAIN CURSOR): where the last pass ended, unless protection was released or a
+  // re-scan is due.
+  const start = await readDrainStart(policy);
+  let lo = start.lo;
+  const startLabel = lo === DRAIN_FLOOR_ISO ? 'FLOOR' : lo;
+  logger.info(`[trace-retention] range_drain start=${startLabel} source=${start.source}`, {
+    start: startLabel, source: start.source, resumedPasses: start.passes, protected: start.protSize, releasedRefs: start.released,
+  });
   let result: DrainResult | null = null;
   const fin = (r: DrainResult): DrainResult => (result = r);
   try {
@@ -839,6 +917,7 @@ export async function drainColdByRange(opts: {
       const batchStarted = Date.now();
       try {
         const { fetched, counted, deleted, scanned, boundary } = await runDrainBatchAt(cutIso, want, allowance, policy.stmtTimeoutS, lo);
+        scannedRows += scanned;
         const tookMs = Date.now() - batchStarted;
         if (fetched === 0) return fin({ removed, batches, failures, stoppedBy: 'empty' });
         if (deleted > 0) {
@@ -883,7 +962,11 @@ export async function drainColdByRange(opts: {
     return fin({ removed, batches, failures, stoppedBy: 'target' });
   } finally {
     carriedDrainWidth = n;
-    phaseDone('valve:range_drain', phaseStarted, { removed, batches, failures, stoppedBy: (result as DrainResult | null)?.stoppedBy ?? 'threw', width: n });
+    await writeDrainCursor(lo, start, policy);
+    phaseDone('valve:range_drain', phaseStarted, {
+      removed, batches, failures, stoppedBy: (result as DrainResult | null)?.stoppedBy ?? 'threw', width: n,
+      start: startLabel, source: start.source, end: lo === DRAIN_FLOOR_ISO ? 'FLOOR' : lo, scanned: scannedRows,
+    });
   }
 }
 

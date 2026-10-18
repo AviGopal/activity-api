@@ -129,7 +129,7 @@ describe('[MUST-FAIL] retention steps over a protected head at production size (
       cutIso: iso(Date.now() - HOT_MS),
       target: 3000,
       budgetUntil: Date.now() + 45_000,
-      policy: { batch: 2000, minBatch: 50, pauseMs: 0, stmtTimeoutS: TIMEOUT_MS / 1000, restMs: 0, phaseBudgetMs: 120_000 },
+      policy: { batch: 2000, minBatch: 50, pauseMs: 0, stmtTimeoutS: TIMEOUT_MS / 1000, restMs: 0, phaseBudgetMs: 120_000, rescanPasses: 12 },
     });
     const wall = Date.now() - t0;
     const batches = timed.slice(from).filter((c) => isTelemetryBatch(c.sql));
