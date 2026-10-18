@@ -1681,15 +1681,16 @@ router.post('/resolve', async (c) => {
         if (!shapeSig) {
           try {
             const sigCountQuery = `
-              SELECT array::len(array::distinct((SELECT VALUE shape_signature FROM execution WHERE activity_id = $variant_id AND ${resolvedScope === 'global' ? '(org_id IS NONE OR org_id = NONE)' : accountIdScopedWhere()})))) AS sigs
+              SELECT array::len(array::distinct((SELECT VALUE signature FROM execution WHERE activity_id = $variant_id AND ${resolvedScope === 'global' ? '(org_id IS NONE OR org_id = NONE)' : accountIdScopedWhere()}))) AS sigs
               FROM execution
               WHERE activity_id = $variant_id
                 AND ${resolvedScope === 'global' ? '(org_id IS NONE OR org_id = NONE)' : accountIdScopedWhere()}
             `;
             const sigRows = await executeAsAuth<any>(jwtAuthCtx, sigCountQuery, params);
             signaturesAggregated = sigRows[0]?.sigs ?? 1;
-          } catch {
-            // Best-effort — keep default of 1 if the aggregation query fails.
+          } catch (error) {
+            // Best-effort — keep default of 1 if the aggregation query fails, but say so: a silent 1 hid a parse error on every call.
+            logger.warn('thompson_posterior: signature count query failed, reporting signatures_aggregated=1', { variant_id: variantId, error: error instanceof Error ? error.message : String(error) });
           }
           signatureForResponse = null;
         }
