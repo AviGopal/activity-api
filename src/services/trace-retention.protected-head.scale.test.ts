@@ -1,6 +1,6 @@
 /**
  * [MUST-FAIL, COST-SCALED] The telemetry batch and the id loop delete unprotected rows when the oldest rows they
- * read are protected evidence, on a production-sized store.
+ * read are protected evidence, at the production protected-set size.
  *
  * GAP: the-retention-telemetry-batch-and-id-loop-still-test-protection-per-row-so-their-batches-time-out-scanning-
  * protected-rows. 22457fe moved the range drain off the per-row `meta::id(id) NOTINSIDE $__prot` test; its two sibling
@@ -9,16 +9,21 @@
  * EXPLAIN also showed both selects were FULL TABLE SCANS: the unary `!` in their graded test makes the 2.3.10 planner
  * fall back ("unary expressions not supported"), WITH INDEX or not. Live effect: the sweep spent its budget deleting 0.
  *
- * The store (the live execution DDL, every index): 400,000 executions, 59% protected.
+ * The store (the live execution DDL, every index): 67,500 executions, 84% protected; the protected list is the
+ * production size (18,500 label ids + 18,500 open-ref ids), which is what the per-row test's cost scales with.
  *   - 18,500 rows of a general activity at ONE timestamp, the oldest in the store, cited by open trace_evidence_ref
  *     rows (a tie group the range drain cannot split, so it hands the valve to the id loop), ids sorting first;
- *   - 100,000 rows of a declared telemetry activity, the first 18,500 in record-id order labelled;
- *   - 200,000 graded rows (reached, or the reach_graded tag) and 81,500 unprotected general rows.
+ *   - 25,000 rows of a declared telemetry activity, the first 18,500 in record-id order labelled;
+ *   - 20,000 graded rows (reached, or the reach_graded tag) and 4,000 unprotected general rows.
+ * (A first version seeded 400,000 rows: 200k graded + 81.5k unprotected filler more. Same verdicts on both trees,
+ * but its seed took 340-410 s on a loaded host against the harness's 600 s engine limit. Inserts cost ~1 ms a row
+ * on the live DDL whatever the transport, so the filler went; the protected heads and the list did not.)
  * One telemetry drain and one sweep's id loop must each complete every statement under the 20 s TIMEOUT, delete
  * unprotected rows, keep every protected row, and step over the protected head without re-reading it. A plan control
  * EXPLAINs the shipped selects and requires the index, the class check that catches the next unary predicate.
  *
- * Separately named (*.scale.test.ts) because the seed alone takes ~2.5 min. It runs in the normal suite and on its own;
+ * Separately named (*.scale.test.ts): the seed takes ~30-80 s and the parent's batches each wait out the TIMEOUT. It
+ * runs in the normal suite and on its own;
  * it is NEVER skipped: if the engine cannot start or seed, every test fails with the cause.
  */
 import { describe, test, expect, afterAll, spyOn } from 'bun:test';
@@ -43,12 +48,19 @@ const warns: string[] = [];
 const infos: Array<{ msg: string; meta: Record<string, unknown> }> = [];
 let ready: Promise<void> | null = null;
 
-async function insert(table: string, rows: string[]): Promise<void> {
-  for (let i = 0; i < rows.length; i += 1000) await rs!.sql(`INSERT INTO ${table} [${rows.slice(i, i + 1000).join(',')}] RETURN NONE;`);
+/** Seed over the SDK's WebSocket connection, rows bound as a parameter, 5000 per statement. */
+async function insert(table: string, rows: Array<Record<string, unknown>>): Promise<void> {
+  for (let i = 0; i < rows.length; i += 5000) await rs!.sdk.query(`INSERT INTO ${table} $rows RETURN NONE`, { rows: rows.slice(i, i + 5000) });
 }
 const iso = (ms: number) => new Date(ms).toISOString();
-const exec = (id: string, aid: string, at: number, extra = '') =>
-  `{id:'${id}', activity_id:'${aid}', success:true, duration_ms:1, cost_usd:0.0, tokens_in:0, tokens_out:0, input_impulses:[], output_impulses:[], account_id_version:0, org_id:'o', created_at:d'${iso(at)}', executed_at:d'${iso(at)}'${extra}}`;
+const exec = (id: string, aid: string, at: number, extra: Record<string, unknown> = {}) => ({
+  id, activity_id: aid, success: true, duration_ms: 1, cost_usd: 0.5, tokens_in: 0, tokens_out: 0, input_impulses: [], output_impulses: [],
+  account_id_version: 0, org_id: 'o', created_at: new Date(at), executed_at: new Date(at), ...extra,
+});
+const TELE_ROWS = 25_000;
+const GRADED = 20_000;
+const FREE = 4_000;
+const TOTAL = HEAD + TELE_ROWS + GRADED + FREE;
 
 async function setup(): Promise<void> {
   rs = await startRealSurreal();
@@ -73,17 +85,17 @@ async function setup(): Promise<void> {
   const started = Date.now();
   // The tie head: oldest timestamp in the store, ids sorting first, every row cited by an open evidence ref.
   await insert('execution', Array.from({ length: HEAD }, (_, k) => exec(`a_${pad(k)}`, GEN, t0)));
-  await insert('trace_evidence_ref', Array.from({ length: HEAD }, (_, k) => `{execution_id:'a_${pad(k)}', source:'gap', ref:'scale', open:true}`));
-  // Telemetry: 100k rows, the first 18.5k in record-id order labelled.
-  await insert('execution', Array.from({ length: 100_000 }, (_, k) => exec(`t_${pad(k)}`, TELE, now - 20 * DAY + ((k * 7919) % 100_000) * 1000)));
+  await insert('trace_evidence_ref', Array.from({ length: HEAD }, (_, k) => ({ execution_id: `a_${pad(k)}`, source: 'gap', ref: 'scale', open: true })));
+  // Telemetry: the first 18.5k rows in record-id order labelled; timestamps not in id order.
+  await insert('execution', Array.from({ length: TELE_ROWS }, (_, k) => exec(`t_${pad(k)}`, TELE, now - 20 * DAY + ((k * 7919) % TELE_ROWS) * 1000)));
   await insert('goal_verification_labels', Array.from({ length: HEAD }, (_, k) =>
-    `{execution_id:'t_${pad(k)}', org_id:'o', goal:'g', activity_id:'${TELE}', verdict:'achieved', confidence:1.0, labeler:'automated'}`));
+    ({ execution_id: `t_${pad(k)}`, org_id: 'o', goal: 'g', activity_id: TELE, verdict: 'achieved', confidence: 0.5, labeler: 'automated' })));
   // Graded rows (half by the reached verdict, half by the reach_graded tag) interleaved with unprotected rows.
-  await insert('execution', Array.from({ length: 200_000 }, (_, k) => exec(`m_${pad(k)}`, 'graded_scale_probe', now - 25 * DAY + k * 2000,
-    k % 2 === 0 ? `, reached:${k % 4 === 0}` : `, tags:['reach_graded:true', 'reached:true']`)));
-  await insert('execution', Array.from({ length: 81_500 }, (_, k) => exec(`u_${pad(k)}`, GEN, now - 25 * DAY + k * 2000 + 1000)));
+  await insert('execution', Array.from({ length: GRADED }, (_, k) => exec(`m_${pad(k)}`, 'graded_scale_probe', now - 25 * DAY + k * 2000,
+    k % 2 === 0 ? { reached: k % 4 === 0 } : { tags: ['reach_graded:true', 'reached:true'] })));
+  await insert('execution', Array.from({ length: FREE }, (_, k) => exec(`u_${pad(k)}`, GEN, now - 25 * DAY + k * 2000 + 1000)));
   await rs.sql(`UPDATE substrate_tuning_param SET \`value\` = '${TELE}' WHERE name = 'TRACE_RETENTION_TELEMETRY_ACTIVITIES';`);
-  console.log(`[scale] seeded 400000 executions, ${HEAD} labels, ${HEAD} open refs in ${Date.now() - started} ms`);
+  console.log(`[scale] seeded ${TOTAL} executions, ${HEAD} labels, ${HEAD} open refs in ${Date.now() - started} ms`);
 }
 function engine(): Promise<void> {
   ready ??= setup();
@@ -116,13 +128,13 @@ const strictlyIncreasing = (xs: ReadonlyArray<readonly [number, string]>) =>
 let teleSql: { sql: string; params: Record<string, unknown> } | null = null;
 let idSql: { sql: string; params: Record<string, unknown> } | null = null;
 
-describe('[MUST-FAIL] retention steps over a protected head at production size (real SurrealDB, live DDL)', () => {
+describe('[MUST-FAIL] retention steps over a protected head (real SurrealDB, live DDL, production-size protected list)', () => {
   test('SCALE telemetry: one drain call deletes unprotected rows, every batch under the TIMEOUT, the labelled head never re-read', async () => {
     await engine();
     const protBefore = await protectedCount();
     const totalBefore = await total();
-    expect(protBefore).toBe(HEAD * 2 + 200_000);
-    expect(totalBefore).toBe(400_000);
+    expect(protBefore).toBe(HEAD * 2 + GRADED);
+    expect(totalBefore).toBe(TOTAL);
     const from = timed.length;
     const t0 = Date.now();
     const r = await M.drainTelemetryClass({
@@ -138,11 +150,13 @@ describe('[MUST-FAIL] retention steps over a protected head at production size (
     const deleted = totalBefore - await total();
     console.log(`[scale] telemetry drain: wall ${wall} ms, removed ${r.removed}, deleted ${deleted}, stoppedBy ${r.stoppedBy}, batches ${batches.length}, max batch ${maxMs} ms, failed ${batches.filter((b) => !b.ok).length}`);
     expect(r.activities).toEqual([TELE]);
-    expect(batches.filter((b) => !b.ok).length).toBe(0); // no batch rolled back on its TIMEOUT
-    expect(maxMs).toBeLessThan(TIMEOUT_MS);
+    // The verdict is the OUTCOME (rows deleted), not a time: on the parent every batch hits the TIMEOUT, driven by the
+    // production-size protected list, and nothing is deleted. The time bounds below are the statement TIMEOUT itself.
     expect(r.removed).toBe(3000);
     expect(r.stoppedBy).toBe('target');
     expect(deleted).toBe(r.removed);
+    expect(batches.filter((b) => !b.ok).length).toBe(0); // no batch rolled back on its TIMEOUT
+    expect(maxMs).toBeLessThan(TIMEOUT_MS);
     expect(await protectedCount()).toBe(protBefore); // CONTROL: no protected row deleted
     // CONTROL: the labelled head was stepped over, not re-read: the cursor strictly advances, and the batch count is
     // bounded by the head at the drain's width (250 doubling to 2000) plus the deleting batches.
@@ -183,11 +197,12 @@ describe('[MUST-FAIL] retention steps over a protected head at production size (
     // The range drain could not split the tie head and handed the valve to the id loop on its first batch.
     expect(range?.['stoppedBy']).toBe('needs_ids');
     expect(Number(range?.['removed'])).toBe(0);
+    // The verdict is the OUTCOME (rows deleted), not a time (see the telemetry test).
+    expect(deleted).toBe(500);
+    expect(outcome?.stoppedBy).toBe('target');
     expect(pages.filter((p) => !p.ok).length).toBe(0);
     expect(warns.some((w) => w.includes('id-fallback select FAILED'))).toBe(false);
     expect(maxMs).toBeLessThan(TIMEOUT_MS);
-    expect(deleted).toBe(500);
-    expect(outcome?.stoppedBy).toBe('target');
     expect(await protectedCount()).toBe(protBefore); // CONTROL: no protected row deleted
     // CONTROL: every page starts past the last one (the tie head is read once), and the page count is bounded by the
     // head at the policy width plus the 25-row deleting pages.

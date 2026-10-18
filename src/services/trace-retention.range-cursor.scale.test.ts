@@ -7,23 +7,26 @@
  * each pass re-read the whole protected head before it reached anything deletable. An in-memory cursor would not
  * help either: pull-sync converges restart the process.
  *
- * The store (the live DDL, every index): a 160,000-row protected head (150,000 graded rows, 10,000 rows cited by open
- * trace_evidence_ref rows, all older than anything else) and 40,000 unprotected rows above it.
+ * The store (the live DDL, every index): a 50,000-row protected head (40,000 graded rows, 10,000 rows cited by open
+ * trace_evidence_ref rows, all older than anything else) and 5,000 unprotected rows above it. (A first version used a
+ * 160k head + 40k free rows, with the same verdicts on both trees (161x fewer rows on pass 2), but its seed took up to
+ * 4 min on a loaded host against the harness's 600 s engine limit; inserts cost ~1 ms a row on the live DDL whatever
+ * the transport.)
  *   - MUST-FAIL: after a pass deletes its target, a SECOND pass, run on a freshly imported module (a simulated restart,
  *     same DB), reads >= 10x fewer range rows than the first, still deletes unprotected rows, and logs that it resumed
  *     from the stored cursor ("range_drain start=<executed_at> source=stored"). CONTROL: no protected row is deleted.
  * The release, rescan and restart controls run on a small store in trace-retention.range-cursor.test.ts.
- * Separately named (*.scale.test.ts): the seed takes 1-4 min with host load and a floor pass reads the whole head
- * (~100 s). It runs in the normal suite and is never skipped.
+ * Separately named (*.scale.test.ts): the seed takes ~20-60 s with host load and a floor pass reads the whole head.
+ * It runs in the normal suite and is never skipped.
  */
 import { describe, test, expect, afterAll, spyOn } from 'bun:test';
 import { startRealSurreal, type RealSurreal } from '../../test/support/real-surreal';
 
 const DAY = 86_400_000;
 const HOT_MS = 2 * 3600_000;
-const GRADED = 150_000;
+const GRADED = 40_000;
 const CITED = 10_000;
-const FREE = 40_000;
+const FREE = 5_000;
 const pad = (i: number) => String(i).padStart(6, '0');
 const iso = (ms: number) => new Date(ms).toISOString();
 
@@ -37,10 +40,13 @@ const infos: string[] = [];
 let pass = 0;
 let ready: Promise<void> | null = null;
 
-const exec = (id: string, at: number, extra = '') =>
-  `{id:'${id}', activity_id:'cursor_scale_probe', success:true, duration_ms:1, cost_usd:0.0, tokens_in:0, tokens_out:0, input_impulses:[], output_impulses:[], account_id_version:0, org_id:'o', created_at:d'${iso(at)}', executed_at:d'${iso(at)}'${extra}}`;
-async function insert(table: string, rows: string[]): Promise<void> {
-  for (let i = 0; i < rows.length; i += 1000) await rs!.sql(`INSERT INTO ${table} [${rows.slice(i, i + 1000).join(',')}] RETURN NONE;`);
+const exec = (id: string, at: number, extra: Record<string, unknown> = {}) => ({
+  id, activity_id: 'cursor_scale_probe', success: true, duration_ms: 1, cost_usd: 0.5, tokens_in: 0, tokens_out: 0, input_impulses: [], output_impulses: [],
+  account_id_version: 0, org_id: 'o', created_at: new Date(at), executed_at: new Date(at), ...extra,
+});
+/** Seed over the SDK's WebSocket connection, rows bound as a parameter, 5000 per statement. */
+async function insert(table: string, rows: Array<Record<string, unknown>>): Promise<void> {
+  for (let i = 0; i < rows.length; i += 5000) await rs!.sdk.query(`INSERT INTO ${table} $rows RETURN NONE`, { rows: rows.slice(i, i + 5000) });
 }
 
 async function setup(): Promise<void> {
@@ -64,14 +70,14 @@ async function setup(): Promise<void> {
   const now = Date.now();
   const base = now - 40 * DAY;
   const started = Date.now();
-  // The head: every 16th row cited by an open evidence ref, the rest graded (reached, or the reach_graded tag).
+  // The head: every 5th row cited by an open evidence ref, the rest graded (reached, or the reach_graded tag).
   const head = GRADED + CITED;
-  const rows: string[] = [];
-  const refs: string[] = [];
+  const rows: Array<Record<string, unknown>> = [];
+  const refs: Array<Record<string, unknown>> = [];
   for (let k = 0, c = 0; k < head; k++) {
     const id = `h_${pad(k)}`;
-    if (k % 16 === 0 && c < CITED) { rows.push(exec(id, base + k * 1000)); refs.push(`{execution_id:'${id}', source:'gap', ref:'cursor', open:true}`); c++; }
-    else rows.push(exec(id, base + k * 1000, k % 2 === 0 ? `, reached:${k % 4 === 0}` : `, tags:['reach_graded:true']`));
+    if (k % 5 === 0 && c < CITED) { rows.push(exec(id, base + k * 1000)); refs.push({ execution_id: id, source: 'gap', ref: 'cursor', open: true }); c++; }
+    else rows.push(exec(id, base + k * 1000, k % 2 === 0 ? { reached: k % 4 === 0 } : { tags: ['reach_graded:true'] }));
   }
   await insert('execution', rows);
   await insert('trace_evidence_ref', refs);
@@ -127,12 +133,14 @@ describe('[MUST-FAIL] the range drain resumes from a persisted cursor (real Surr
     // A fresh module instance: no in-process state survives, only the database.
     const M2: Mod = await import('./trace-retention.ts?simulated-restart');
     const p2 = await runPass(M2, 1000);
-    expect(p1.start).toBe('[trace-retention] range_drain start=FLOOR source=reset:none');
-    expect(p1.deleted).toBeGreaterThan(0);
+    // The verdict is the RATIO of range rows read, never a time. Pass 1 starts at the floor and reads the whole head;
+    // on the parent pass 2 does too (it re-reads >= the head) and fails here.
     expect(p1.read).toBeGreaterThanOrEqual(GRADED + CITED);
-    expect(p2.start).toMatch(/^\[trace-retention\] range_drain start=\d{4}-\d\d-\d\dT\S+ source=stored$/);
+    expect(p1.deleted).toBeGreaterThan(0);
     expect(p2.deleted).toBeGreaterThan(0);
     expect(p2.read * 10).toBeLessThanOrEqual(p1.read);
+    expect(p1.start).toBe('[trace-retention] range_drain start=FLOOR source=reset:none');
+    expect(p2.start).toMatch(/^\[trace-retention\] range_drain start=\d{4}-\d\d-\d\dT\S+ source=stored$/);
     expect(await protectedCount()).toBe(protBefore); // CONTROL: no protected row deleted
   }, 560_000);
 });
