@@ -119,6 +119,14 @@ describe('Y1-read-b: failure-class dimension, signature filters, measured flag',
     expect(r.matched_total).toBe(10);
   });
 
+  it('cost_sum rows that carry no row count give matched_total null with a reason, never the dollar sum', async () => {
+    const { db } = fakeDb([{ activity_id: 'a', value: 2.5 }, { activity_id: 'b', value: 4 }]);
+    const r = await runTraceAggregateReport(db, { group_by: 'activity_id', metric: 'cost_sum' }, AUTH);
+    expect(r.measured).toBe(true);
+    expect(r.matched_total).toBeNull();
+    expect(typeof r.reason).toBe('string');
+  });
+
   it('a failed query is measured:false, not a zero that reads as "condition gone"', async () => {
     const { db } = fakeDb(new Error('query timed out'));
     const r = await runTraceAggregateReport(db, { group_by: 'status', reason_contains: 'URL is invalid' }, AUTH);

@@ -18,7 +18,8 @@
  * Pointer contract (all optional except sensible defaults):
  *   {
  *     type: "traceAggregateReport",
- *     group_by?: "activity_id" | "status" | "variant_id",   // default activity_id
+ *     group_by?: "activity_id" | "status" | "variant_id" | "failure_class" | "goal_hash",
+ *                                                            // default activity_id
  *     metric?: "count" | "failure_count" | "success_count" | "cost_sum"
  *                                                            // default count
  *     window_hours?: number,    // default 24, clamped [1, 720]
@@ -30,7 +31,8 @@
  *   {
  *     metric, group_by, window_hours, generated_at,
  *     rows: [{ key, value }],   // already sorted + capped
- *     total_groups, query_ms
+ *     total_groups, query_ms,
+ *     measured, matched_total   // matched_total: rows the window matched, for every metric
  *   }
  * On no data it returns rows: [] with a clear `empty: true` flag — NEVER a
  * timeout / HTTP 000 / false-zero. count() failures surface as null, not 0.
@@ -104,9 +106,9 @@ export async function runTraceAggregateReport(
 ): Promise<TraceAggregateReport> {
   const input = (rawInput ?? {}) as TraceAggregateReportInput;
 
-  const groupBy = GROUP_FIELDS.has(String(input.group_by))
-    ? String(input.group_by)
-    : 'activity_id';
+  // An omitted group_by is the documented default; a present one must be served.
+  const groupByOmitted = input.group_by == null || String(input.group_by) === '';
+  const groupBy = groupByOmitted ? 'activity_id' : String(input.group_by);
   const metric = METRICS.has(String(input.metric)) ? String(input.metric) : 'count';
   const windowHours = clampInt(input.window_hours, 24, 1, 720);
   const limit = clampInt(input.limit, 10, 1, 1000);
@@ -114,7 +116,7 @@ export async function runTraceAggregateReport(
   const untilHoursAgo = clampInt(input.until_hours_ago, 0, 0, 720);
 
   // Refuse unserved group_by rather than silently falling back to activity_id.
-  if (!GROUP_FIELDS.has(String(input.group_by))) {
+  if (!GROUP_FIELDS.has(groupBy)) {
     return {
       shape: 'traceAggregateReport',
       metric,
@@ -181,8 +183,11 @@ export async function runTraceAggregateReport(
 
   // The aggregate expression. count() for the count metrics; cost sum otherwise.
   // math::sum(cost_usd) tolerates missing rows (returns 0 for an empty set).
+  // A cost sum also counts its rows (`matched`), so matched_total is a row count
+  // for every metric; for the count metrics `value` already is one.
   const valueExpr =
-    metric === 'cost_sum' ? 'math::sum(cost_usd) AS value' : 'count() AS value';
+    metric === 'cost_sum' ? 'math::sum(cost_usd) AS value, count() AS matched' : 'count() AS value';
+  const rowCountField = metric === 'cost_sum' ? 'matched' : 'value';
 
   // CRITICAL: do NOT alias the grouped column (`SELECT activity_id AS key ...
   // GROUP BY activity_id` collapses the whole result into ONE degenerate bucket
@@ -213,16 +218,19 @@ export async function runTraceAggregateReport(
   let totalGroups = 0;
   let truncated = false;
   let matchedTotal: number | null = 0;
+  let reason: string | undefined;
   let queryOk = true;
   try {
     const result = await db.query(sql, params);
     const set = Array.isArray(result) && result.length > 0 ? result[0] : [];
     const arr = Array.isArray(set) ? (set as Array<Record<string, unknown>>) : [];
-    matchedTotal = arr.reduce((s, r) => {
-      const v = (r as { value?: unknown }).value;
-      const n = typeof v === 'number' ? v : Number(v ?? 0) || 0;
-      return s + n;
+    // Rows matched across every group, before the limit cap. A group with no
+    // numeric row count makes the total unknown (null), never a guess.
+    matchedTotal = arr.reduce<number | null>((s, r) => {
+      const n = r[rowCountField];
+      return s !== null && typeof n === 'number' && Number.isFinite(n) ? s + n : null;
     }, 0);
+    if (matchedTotal === null) reason = 'row_count_unavailable';
     rows = arr
       .map((r) => {
         // The grouped column comes back under its raw field name (we no longer
@@ -281,6 +289,7 @@ export async function runTraceAggregateReport(
     empty: rows.length === 0,
     measured: queryOk,
     matched_total: matchedTotal,
+    ...(reason ? { reason } : {}),
     query_ms: queryOk ? queryMs : -1,
   };
 }

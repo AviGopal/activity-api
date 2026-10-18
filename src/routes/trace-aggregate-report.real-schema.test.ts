@@ -33,6 +33,9 @@ const { runTraceAggregateReport } = await import('./trace-aggregate-report');
 const ORG = 'organizations:agg-probe';
 const OTHER_ORG = 'organizations:agg-other';
 const AUTH = { orgId: ORG, authType: 'apikey' as const };
+// Rows that carry a cost live in their own org, so every count over ORG above is unchanged.
+const COST_ORG = 'organizations:agg-cost';
+const COST_AUTH = { orgId: COST_ORG, authType: 'apikey' as const };
 
 const word = () => Array.from(crypto.getRandomValues(new Uint8Array(7)), (b) => String.fromCharCode(97 + (b % 26))).join('');
 const tok = (p: string) => `deterministic:${p}-${word()}`;
@@ -53,12 +56,12 @@ let startError = '';
 let db: any = null;
 
 function exec(o: {
-  org?: string; at?: string; success: boolean; activity?: string; status?: string;
+  org?: string; at?: string; success: boolean; activity?: string; status?: string; cost?: number;
   metadata?: Record<string, unknown>; failure_mode?: Record<string, unknown>;
 }): string {
   const fields = [
     `activity_id: '${o.activity ?? 'agg-a'}'`, 'input_impulses: []', 'output_impulses: []', `success: ${o.success}`,
-    'duration_ms: 10', 'cost_usd: 0.0', 'tokens_in: 0', 'tokens_out: 0', `org_id: '${o.org ?? ORG}'`,
+    'duration_ms: 10', `cost_usd: ${(o.cost ?? 0).toFixed(2)}`, 'tokens_in: 0', 'tokens_out: 0', `org_id: '${o.org ?? ORG}'`,
     `executed_at: ${o.at ?? 'time::now() - 1h'}`, 'created_at: time::now()',
     `status: '${o.status ?? (o.success ? 'success' : 'failure')}'`,
   ];
@@ -100,6 +103,9 @@ beforeAll(async () => {
     for (let i = 0; i < 2; i++) s.push(exec({ at: 'time::now() - 30h', success: false, activity: 'agg-late', metadata: { verdict_class: K_VERDICT, goal_hash: G[1] } }));
     // The until_hours_ago probe: one row each at now-1h, now-50h, now-100h.
     for (const h of [1, 50, 100]) s.push(exec({ at: `time::now() - ${h}h`, success: false, activity: UNTIL_ACTIVITY, failure_mode: { type: 'execution_error', class: K_INSERT, reason: 'until probe' } }));
+    // The cost probe (COST_ORG): 4 rows costing $11.50 in total, so a dollar sum cannot pass for a row count.
+    for (let i = 0; i < 3; i++) s.push(exec({ org: COST_ORG, success: true, activity: 'cost-a', cost: 2.5 }));
+    s.push(exec({ org: COST_ORG, success: false, activity: 'cost-b', cost: 4 }));
     await rs.sql(s.join('\n'));
   } catch (e) {
     startError = `cannot start: ${e instanceof Error ? e.message : String(e)}`;
@@ -221,5 +227,60 @@ describe('trace aggregate c3 (real schema): bound filters on the real fields', (
     const open = await runTraceAggregateReport(db, { group_by: 'activity_id', window_hours: 48, limit: 50 }, AUTH);
     expect(keyed(open)[UNTIL_ACTIVITY]).toBe(1);
     expect(keyed(open)['agg-late']).toBe(6);
+  }, 60_000);
+});
+
+describe('trace aggregate (real schema): the documented group_by default, and matched_total as a row count', () => {
+  // In ORG's default 24 h window: 17 fixture rows at now-1h plus the until-probe row at now-1h.
+  const IN_WINDOW = { 'agg-late': 4, 'agg-insert': 3, 'agg-both': 2, 'agg-loses-alone': 1, 'agg-unclassed': 2, 'agg-ok': 5, [UNTIL_ACTIVITY]: 1 };
+
+  it('an omitted group_by groups by activity_id, the documented default, and is measured with a row count', async () => {
+    // The only reader (development-vessel trace-failure-pattern-report) sends no group_by.
+    for (const input of [{ limit: 50 }, { group_by: null, limit: 50 }, { group_by: '', limit: 50 }]) {
+      rs!.calls.length = 0;
+      const r = await runTraceAggregateReport(db, input, AUTH);
+      expect(r.measured).toBe(true);
+      expect(r.reason).toBeUndefined();
+      expect(r.group_by).toBe('activity_id');
+      expect(keyed(r)).toEqual(IN_WINDOW);
+      expect(r.matched_total).toBe(18);
+      expect(rs!.calls.some((c) => /GROUP BY\s+activity_id\b/.test(c.sql))).toBe(true);
+    }
+  }, 60_000);
+
+  it('cost_sum: matched_total is the number of matched rows, not the dollar sum', async () => {
+    const r = await runTraceAggregateReport(db, { group_by: 'activity_id', metric: 'cost_sum', limit: 50 }, COST_AUTH);
+    expect(r.measured).toBe(true);
+    // The dollars stay in the rows ...
+    expect(keyed(r)['cost-a']).toBeCloseTo(7.5, 6);
+    expect(keyed(r)['cost-b']).toBeCloseTo(4, 6);
+    expect(sumRows(r)).toBeCloseTo(11.5, 6);
+    // ... and matched_total counts the rows the window matched.
+    expect(r.matched_total).toBe(4);
+    // Capping the rows does not change the count of matched rows.
+    const capped = await runTraceAggregateReport(db, { group_by: 'activity_id', metric: 'cost_sum', limit: 1 }, COST_AUTH);
+    expect(capped.rows.length).toBe(1);
+    expect(capped.matched_total).toBe(4);
+  }, 60_000);
+
+  it('control: a present, served group_by is unchanged, and its matched_total is the row count', async () => {
+    const r = await runTraceAggregateReport(db, { group_by: 'status', limit: 50 }, AUTH);
+    expect(r.group_by).toBe('status');
+    expect(r.measured).toBe(true);
+    expect(keyed(r)).toEqual({ failure: 13, success: 5 });
+    expect(r.matched_total).toBe(18);
+    const f = await runTraceAggregateReport(db, { group_by: 'activity_id', metric: 'failure_count', limit: 2 }, AUTH);
+    expect(f.matched_total).toBe(13);
+  }, 60_000);
+
+  it('control: a present group_by this resolver does not serve is still refused, and no query runs', async () => {
+    rs!.calls.length = 0;
+    const r = await runTraceAggregateReport(db, { group_by: 'not_a_dimension', limit: 50 }, AUTH);
+    expect(r.measured).toBe(false);
+    expect(r.reason).toBe('unserved_group_by');
+    expect(r.matched_total).toBeNull();
+    expect(r.group_by).toBe('not_a_dimension');
+    expect(r.rows).toEqual([]);
+    expect(rs!.calls.length).toBe(0);
   }, 60_000);
 });
