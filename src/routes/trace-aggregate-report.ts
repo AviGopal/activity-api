@@ -43,6 +43,7 @@
 
 import type { Surreal } from 'surrealdb';
 import { logger } from '../utils/logger';
+import { OBSERVE_TRACE_TAGS } from '../lib/reach-classify';
 
 export interface TraceAggregateReportInput {
   group_by?: string;
@@ -152,6 +153,13 @@ export async function runTraceAggregateReport(
   // the GROUP BY only touches matching rows (idx_aet_activity_success_time).
   if (metric === 'failure_count') where.push('success = false');
     else if (metric === 'success_count') where.push('success = true');
+
+  // OBSERVE (lib/reach-classify.ts isObserveTrace): an observe execution (goal-host's learning_mode "observe" probe) is
+  // a measurement, not evidence about an arm, so no count in this report includes it — its failure class above all, which
+  // the gap detectors read. The same tags isObserveTrace reads, bound as a parameter. BINARY form on purpose: a unary
+  // `!` makes SurrealDB 2.3.10 fall back to a full table scan. A row with no tags (NONE) contains none and is counted.
+  where.push('(tags CONTAINSANY $observe_tags) = false');
+  params.observe_tags = [...OBSERVE_TRACE_TAGS];
 
   // Filter by failure class and reason text if provided.
   if (typeof input.failure_class === 'string' && input.failure_class) {

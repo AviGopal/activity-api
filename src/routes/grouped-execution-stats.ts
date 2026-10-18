@@ -31,6 +31,7 @@
 
 import type { Surreal } from 'surrealdb';
 import { logger } from '../utils/logger';
+import { OBSERVE_TRACE_TAGS } from '../lib/reach-classify';
 
 export interface GroupedExecutionStatsInput {
   window_hours?: number;
@@ -186,8 +187,14 @@ export async function runGroupedExecutionStats(
   // classifyReach uses.
   const inapplicableSql =
     `AND !array::any(tags ?? [], |$t| string::starts_with($t, "telemetry:") OR string::starts_with($t, "satisfier:"))`;
-  const reachedSql = `SELECT activity_id, count() AS value FROM execution WHERE ${whereSql} AND reached = true ${inapplicableSql} GROUP BY activity_id`;
-  const gradedSql = `SELECT activity_id, count() AS value FROM execution WHERE ${whereSql} AND reached != NONE ${inapplicableSql} GROUP BY activity_id`;
+  // AN OBSERVE VERDICT IS NOT A REACH STATISTIC (lib/reach-classify.ts isObserveTrace). goal-host's observe probe
+  // (learning_mode "observe") gets its `reached` column written by POST /reach like any other row, so without this its
+  // probes counted in reach_rate and graded_count. The same tags isObserveTrace reads, bound; BINARY form, because a
+  // unary `!` makes SurrealDB 2.3.10 fall back to a full table scan. A row with no tags contains none and is counted.
+  const observeSql = 'AND (tags CONTAINSANY $observe_tags) = false';
+  params.observe_tags = [...OBSERVE_TRACE_TAGS];
+  const reachedSql = `SELECT activity_id, count() AS value FROM execution WHERE ${whereSql} AND reached = true ${inapplicableSql} ${observeSql} GROUP BY activity_id`;
+  const gradedSql = `SELECT activity_id, count() AS value FROM execution WHERE ${whereSql} AND reached != NONE ${inapplicableSql} ${observeSql} GROUP BY activity_id`;
 
   const startedAt = Date.now();
   let queryOk = true;

@@ -63,12 +63,19 @@ export function isReachInapplicable(t: { tags?: string[] }): boolean {
  * AN OBSERVE EXECUTION IS NEVER GRADED. goal-host's observe dispatch (learning_mode "observe": a probe, a held-out
  * measurement) tags its traces learning_mode:observe, and POST /reach / POST / stamp reach_observe:true on a row they
  * recorded as observe. Such a row's verdict is a measurement, not a lesson: classifyReach answers 'ungraded' for it
- * AHEAD of its reached:* tag, so every reader of this one gate (posterior credit, the ribosome's extraction, the
- * trace-aggregate failure-class counts, the shape-counter seed) learns nothing from it.
+ * AHEAD of its reached:* tag, so the readers of THIS gate (posterior credit via applyOutcomeToPosteriors, the
+ * shape-score counter and its seed, this repo's ribosome route) learn nothing from it.
+ *
+ * NOT every reader goes through classifyReach. Readers that count straight from the stored columns bind
+ * OBSERVE_TRACE_TAGS in their own query instead: trace-aggregate-report (failure-class counts) and
+ * grouped-execution-stats (reached / graded counts). The ribosome-vessel reads the reached column/tag directly; it is
+ * protected only because POST / does not broadcast execution_completed for an observe row.
  */
+/** The tags that mark an observe execution (read by isObserveTrace, and bound by the SQL readers that cannot call it). */
+export const OBSERVE_TRACE_TAGS: readonly string[] = ['learning_mode:observe', 'reach_observe:true'];
 export function isObserveTrace(t: { tags?: string[] }): boolean {
   const tags = t.tags ?? [];
-  return tags.includes('learning_mode:observe') || tags.includes('reach_observe:true');
+  return OBSERVE_TRACE_TAGS.some((x) => tags.includes(x));
 }
 let observeSkips = 0;
 /** Count one observe execution or verdict a learning writer skipped; returns the running count. */
