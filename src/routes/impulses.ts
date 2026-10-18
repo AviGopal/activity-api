@@ -1680,14 +1680,25 @@ router.post('/resolve', async (c) => {
         let signatureForResponse: string | null = typeof shapeSig === 'string' ? shapeSig : null;
         if (!shapeSig) {
           try {
+            // ONE SCAN, BOUNDED. This was `SELECT <count over a subquery> AS sigs FROM execution WHERE …`, which
+            // re-ran the subquery once per execution of the variant (O(N²)): it never finished on real arms and
+            // left a runaway query in the engine after the client gave up. RETURN evaluates the count once.
+            // The scan's WHERE is the variant predicate ALONE, and the scope predicate filters its rows: 2.3.10
+            // plans `activity_id = $v AND (account_id = … OR (account_id IS NONE AND org_id = …))` as a union of
+            // four index iterators, one of them account_id IS NONE, i.e. nearly every row in the table.
+            // TIMEOUT is server-side, so a slow count ends in the engine too and lands in the warn below.
             const sigCountQuery = `
-              SELECT array::len(array::distinct((SELECT VALUE signature FROM execution WHERE activity_id = $variant_id AND ${resolvedScope === 'global' ? '(org_id IS NONE OR org_id = NONE)' : accountIdScopedWhere()}))) AS sigs
-              FROM execution
-              WHERE activity_id = $variant_id
-                AND ${resolvedScope === 'global' ? '(org_id IS NONE OR org_id = NONE)' : accountIdScopedWhere()}
+              RETURN array::len(array::distinct((
+                SELECT VALUE signature FROM (
+                  SELECT signature, account_id, org_id FROM execution WHERE activity_id = $variant_id TIMEOUT 5s
+                ) WHERE ${resolvedScope === 'global' ? '(org_id IS NONE OR org_id = NONE)' : accountIdScopedWhere()}
+              )));
             `;
-            const sigRows = await executeAsAuth<any>(jwtAuthCtx, sigCountQuery, params);
-            signaturesAggregated = sigRows[0]?.sigs ?? 1;
+            const sigs = (await executeAsAuth<any>(jwtAuthCtx, sigCountQuery, params)) as unknown;
+            // RETURN answers the bare number; anything else is a failed count, not a count of 1.
+            if (typeof sigs !== 'number') throw new Error(`signature count returned ${JSON.stringify(sigs)}`);
+            // No in-scope execution keeps the answer the old query gave for it (no rows -> 1).
+            signaturesAggregated = sigs > 0 ? sigs : 1;
           } catch (error) {
             // Best-effort — keep default of 1 if the aggregation query fails, but say so: a silent 1 hid a parse error on every call.
             logger.warn('thompson_posterior: signature count query failed, reporting signatures_aggregated=1', { variant_id: variantId, error: error instanceof Error ? error.message : String(error) });
