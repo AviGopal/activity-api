@@ -32,7 +32,7 @@ import { applyOutcomeToPosteriors, applyVariantThompsonDelta } from '../lib/post
 import { writeContextDelta } from '../lib/posterior-aggregator';
 import { applySubscriberCounts, subscriberCountsProblem, type SubscriberCountsBatch, type SubscriberCountsDeps, type SubscriberCountEntry } from '../lib/subscriber-run-counts';
 import { resolveTraceOrg } from '../lib/trace-org';
-import { classifyReach, isObserveTrace, noteObserveSkip, observeSkipCount } from '../lib/reach-classify';
+import { classifyReach, isObserveTrace, isReachRetracted, noteObserveSkip, observeSkipCount } from '../lib/reach-classify';
 import { failureClassOf } from '../lib/failure-class';
 import { updateSuccessorFeatures } from '../lib/successor-features';
 import { applyClusterPosterior } from '../lib/cluster-posterior';
@@ -3416,7 +3416,8 @@ app.post('/', async (c) => {
         // completion". `budget_exhausted` is NOT included — a walk can legitimately
         // reach its goal and then exceed a budget on the way out, and treating that
         // as unreached would erase real successes.
-        reached: reachedVerdict(
+        // A retracted verdict (reach-correction.ts) stays NONE on a re-posted trace: its reached:false tag is latched.
+        reached: isReachRetracted({ tags: (trace as any).tags }) ? undefined : reachedVerdict(
           typeof (body as any).reached === 'boolean' ? (body as any).reached
           : typeof (trace as any).reached === 'boolean' ? (trace as any).reached
           : Array.isArray((trace as any).tags) && (trace as any).tags.includes('reached:true') ? true
@@ -4982,6 +4983,16 @@ app.post('/reach', async (c) => {
     }
     const preTags: string[] = Array.isArray(preRow?.tags) ? (preRow.tags as string[]) : [];
     const observeVerdict = observeByBody || isObserveTrace({ tags: preTags });
+    // A RETRACTED reach:false IS NOT RE-LATCHED BY A REDELIVERY. A recorded correction (lib/reach-correction.ts)
+    // set this row's `reached` to NONE and tagged it reach_retracted:<list_sha>; a retry or spool drain of the
+    // same not-reached verdict would set the column back to false while the tag says retracted, so every
+    // column reader (grouped stats, the list hydrate, the reach rollup) would count it again. Nothing is
+    // written; the verdict is reported as held, like an idempotent redelivery. Only the inverse correction
+    // removes a retraction. A reached:true verdict is not intercepted.
+    if (body.reached === false && preReadOk && preRow && isReachRetracted({ tags: preTags })) {
+      logger.info('[reach-patch] not-reached verdict on a RETRACTED row — held, not re-latched', { execution_id: String(execId) });
+      return c.json({ success: true, execution_id: String(execId), reached: body.reached, updated: 1, idempotent: true, retracted: true }, 200);
+    }
     // AET WRITE IS GATED ON THE DUAL-WRITE SWITCH THAT ALREADY GOVERNS IT — this is
     // the same guard the insert path applies, applied here too.
     //

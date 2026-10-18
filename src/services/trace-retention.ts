@@ -591,17 +591,23 @@ const PROTECTED_REFS_LET = `LET $__prot = array::union((SELECT VALUE execution_i
 const UNGRADED_WHERE = `type::is::bool(reached) = false AND tags CONTAINSNOT 'reach_graded:true'`;
 /** The ids of `candVar` (an id list) that are not in $__prot, as records: the in-memory protection filter. */
 const UNPROTECTED_OF = (candVar: string) => `array::map(array::complement(array::map(${candVar}, |$i| meta::id($i)), $__prot), |$e| type::thing('${TABLE}', $e))`;
-/** Compaction: one execution_observation per protected row of `idsVar`, written before that list is deleted. */
-const COMPACT_SQL = (idsVar: string) => `${PROTECTED_REFS_LET}
-FOR $__r IN (SELECT id, reached, tags, success FROM ${idsVar}) {
+/**
+ * Compaction: one execution_observation per protected row of `idsVar`, written before that list is deleted.
+ * A RETRACTED verdict (metadata.reach_retraction, lib/reach-correction.ts) compacts to no observation, with
+ * instrument 'reach_retracted' and the retraction's provenance: its `reached` is NONE but reach_graded:true
+ * stays, so without this branch the graded fallback would read the latched tags and record `false`.
+ */
+export const COMPACT_SQL = (idsVar: string) => `${PROTECTED_REFS_LET}
+FOR $__r IN (SELECT id, reached, tags, success, metadata.reach_retraction AS retraction FROM ${idsVar}) {
   LET $__eid = meta::id($__r.id);
   LET $__graded = type::is::bool($__r.reached) OR ($__r.tags CONTAINS 'reach_graded:true');
   IF $__graded OR $__eid INSIDE $__prot {
     LET $__label = (SELECT VALUE verdict FROM goal_verification_labels WHERE execution_id = $__eid LIMIT 1)[0];
     UPSERT type::thing('execution_observation', $__eid) SET
       execution_id = $__eid,
-      observation = IF type::is::bool($__r.reached) { $__r.reached } ELSE IF $__label != NONE { $__label } ELSE IF $__graded { $__r.tags CONTAINS 'reached:true' } ELSE { $__r.success ?? 'cited' },
-      instrument = IF $__graded { 'reach_verdict' } ELSE IF $__label != NONE { 'goal_verification_label' } ELSE { 'trace_evidence_ref' },
+      observation = IF type::is::bool($__r.reached) { $__r.reached } ELSE IF $__label != NONE { $__label } ELSE IF $__r.retraction != NONE { NONE } ELSE IF $__graded { $__r.tags CONTAINS 'reached:true' } ELSE { $__r.success ?? 'cited' },
+      instrument = IF $__r.retraction != NONE AND $__label = NONE AND !type::is::bool($__r.reached) { 'reach_retracted' } ELSE IF $__graded { 'reach_verdict' } ELSE IF $__label != NONE { 'goal_verification_label' } ELSE { 'trace_evidence_ref' },
+      retraction = $__r.retraction,
       horizon = NULL,
       code_version = NULL,
       code_version_status = 'unknown',

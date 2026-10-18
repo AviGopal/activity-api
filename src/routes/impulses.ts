@@ -5108,6 +5108,15 @@ router.post('/resolve', async (c) => {
         return c.json(result.body as unknown as ImpulseResolveResponse, result.status as any);
       }
 
+      case 'reachCorrection': {
+        // A recorded correction retracts a latched reach:false to ungraded, operator-only: dry_run (default,
+        // read-only: the frozen candidate list and its sha) | apply (also needs this node's verified
+        // posteriorReplayAuthorization record naming the list sha). Moves no posterior (reach-correction.ts).
+        const { resolveReachCorrection } = await import('../lib/reach-correction');
+        const result = await resolveReachCorrection(pointer as Record<string, unknown>, jwtAuthCtx);
+        return c.json(result.body as unknown as ImpulseResolveResponse, result.status as any);
+      }
+
       case 'edge_liveness_report': {
         // ADVERTISED IS A CLAIM; DEMONSTRATED IS A FACT (2026-08-09).
         //

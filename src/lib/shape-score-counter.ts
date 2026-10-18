@@ -36,7 +36,7 @@
  * of the counter, no table-wide count. Same role as variant_performance_metrics (the durable
  * per-variant posterior written from posterior-update.ts), keyed by shape signature.
  */
-import { classifyReach, type ReachVerdict } from './reach-classify';
+import { classifyReach, REACH_RETRACTED_PREFIX, type ReachVerdict } from './reach-classify';
 
 export type GradingOccasion = 'insert' | 'reach' | 'seed';
 
@@ -129,16 +129,21 @@ const LATE_TAGS = new Set(['reached:true', 'reached:false', 'reach_graded:true']
  *             route's idempotence stamp, written immediately before it credits). A reach tag
  *             without that stamp was persisted but never graded (the 2026-09-11..d0 window), so
  *             VPM never received it and it is not seeded.
+ *   retracted — a `reach_retracted:<list_sha>` tag (lib/reach-correction.ts) is a LATE event: it never
+ *             changes the insert occasion, and it makes the late occasion ungraded. A row already counted
+ *             stays counted (shape_score_counted is per execution and occasion), exactly as VPM keeps the
+ *             β the retracted verdict charged: a retraction moves no posterior and no counter.
  */
 export function seedGradings(r: SeedRow): Array<{ occasion: GradingOccasion; verdict: ReachVerdict }> {
   const tags = Array.isArray(r.tags) ? r.tags : [];
   const patched = r.completion_shapes !== undefined && r.completion_shapes !== null;
-  const insertTags = patched ? tags.filter((t) => !LATE_TAGS.has(t)) : tags;
+  const retraction = tags.filter((t) => typeof t === 'string' && t.startsWith(REACH_RETRACTED_PREFIX));
+  const insertTags = (patched ? tags.filter((t) => !LATE_TAGS.has(t)) : tags).filter((t) => !retraction.includes(t));
   const out: Array<{ occasion: GradingOccasion; verdict: ReachVerdict }> = [];
   const atInsert = classifyReach({ success: r.success === true, execution_id: r.eid, activity_id: r.activity_id, tags: insertTags });
   if (atInsert !== 'ungraded') out.push({ occasion: 'insert', verdict: atInsert });
   if (tags.includes('reach_graded:true') && (tags.includes('reached:true') || tags.includes('reached:false'))) {
-    const late = classifyReach({ success: r.success === true, execution_id: r.eid, activity_id: r.activity_id, tags: [...insertTags, tags.includes('reached:true') ? 'reached:true' : 'reached:false'] });
+    const late = classifyReach({ success: r.success === true, execution_id: r.eid, activity_id: r.activity_id, tags: [...insertTags, tags.includes('reached:true') ? 'reached:true' : 'reached:false', ...retraction] });
     if (late !== 'ungraded') out.push({ occasion: 'reach', verdict: late });
   }
   return out;

@@ -27,6 +27,17 @@ export function isReachInapplicable(t: { tags?: string[] }): boolean {
 }
 
 /**
+ * A reach verdict RETRACTED by a recorded correction (lib/reach-correction.ts): the row carries
+ * `reach_retracted:<list_sha>`, naming the frozen list whose provenance (rule, commit) says the latched
+ * `reached:false` was produced by a wrong grading rule. The verdict is withdrawn, not reversed: the
+ * per-task shapes a fresh verdict would need were never stored, so the row can only go back to ungraded.
+ */
+export const REACH_RETRACTED_PREFIX = 'reach_retracted:';
+export function isReachRetracted(t: { tags?: string[] }): boolean {
+  return (t.tags ?? []).some((tag) => typeof tag === 'string' && tag.startsWith(REACH_RETRACTED_PREFIX) && tag.length > REACH_RETRACTED_PREFIX.length);
+}
+
+/**
  * The ONE honest-reach primitive shared by the ribosome (extract-or-not) and the
  * posterior (credit / penalize / skip).
  *
@@ -92,6 +103,10 @@ export function classifyReach(t: {
   const tags = t.tags ?? [];
   if (isObserveTrace(t)) return 'ungraded';
   if (tags.includes('reached:true')) return 'reached';
+  // A RETRACTED verdict is no verdict: ahead of the not-reached arm (the latched `reached:false` tag stays on
+  // the row, since tags are only ever unioned) and ahead of the failure arm, so the row reads ungraded. Only
+  // a `success:true` row is ever retracted (reach-correction.ts refuses a failed one: failure speaks for itself).
+  if (isReachRetracted(t)) return 'ungraded';
   // A telemetry/infra probe's or declined execution's `reached:false` is INAPPLICABLE, not a failure verdict —
   // intercept it here, ahead of the not-reached arm, so infra sub-steps (auth resolves) and principled declines
   // are ungraded {0,0} rather than β-penalized. Placed after `reached:true` so a genuine

@@ -443,6 +443,8 @@ export function loadConfig(): Config {
         // β-leak replay (operator-only reads: dry_run, verify; writes refuse pending authorization).
         'posteriorCompensation',
         'posteriorCompensationReplay',
+        // Reach retraction (operator-only: dry_run selects a frozen list; apply needs the same authorization record).
+        'reachCorrection',
         'compositionGraph',
         'edge_liveness_report',
       ],

@@ -388,7 +388,7 @@ const refuse = (status: number, code: RefusalCode, detail?: string, extra: Recor
   body: { success: false, refused: code, error: code, ...(detail ? { detail } : {}), ...extra },
 });
 
-function operatorGate(auth: JwtAuthContext | null | undefined, shape: string): ResolverResult | null {
+export function operatorGate(auth: JwtAuthContext | null | undefined, shape: string): ResolverResult | null {
   if (isOperatorCaller(auth)) return null;
   logger.warn('posterior compensation REFUSED: caller is not an operator', { event: 'posterior_compensation_refused', refused: 'not_operator', shape, key_id: auth?.keyId ?? null, user_id: auth?.userId ?? null, org_id: auth?.orgId ?? null, obo: !!auth?.obo });
   return refuse(403, 'not_operator', 'operator (admin) credentials required');
@@ -405,9 +405,20 @@ const isLoopbackUrl = (u: string): boolean => {
  * included), or a body whose node / list_sha256 / eligibility_sha256 differs from this node's pins.
  * EXPIRES: body.review_by must be a parseable time not yet passed (authorization_expired otherwise; no hold or
  * grant is indefinite). Checked on EVERY write call, against deps.nowMs(), since the record is re-read each call.
+ *
+ * PER LIST, NOT PER NODE. A node can hold more than one frozen list (this replay's β list, and a reach-retraction
+ * list: lib/reach-correction.ts), each with its own record. The record judged is the newest open one naming THIS
+ * list's sha; only when none names it is the newest open record judged (and refused, by the same checks, with the
+ * same reasons as before). Taking the newest open record regardless meant a second list's record shadowed the
+ * first's. The eligibility sha is checked when the expectation carries one; a list without an eligibility file
+ * (a retraction list) needs a record without one.
  */
 export type AuthorizationDenial = { code: 'apply_requires_authorization' | 'authorization_expired'; why: string };
-export async function checkAuthorization(deps: CompensationDeps, inputs: Extract<FrozenInputs, { ok: true }>): Promise<AuthorizationDenial | null> {
+export type AuthorizationExpectation = { node: string | null; list_sha: string; eligibility_sha?: string | null };
+export async function checkAuthorization(
+  deps: Pick<CompensationDeps, 'fetch' | 'poolResolveUrl' | 'nowMs'>,
+  inputs: AuthorizationExpectation,
+): Promise<AuthorizationDenial | null> {
   const deny = (why: string): AuthorizationDenial => ({ code: 'apply_requires_authorization', why });
   if (!isLoopbackUrl(deps.poolResolveUrl)) return deny(`the authorization is read only from this node's development-vessel; ${deps.poolResolveUrl} is not loopback`);
   let rows: Array<Record<string, any>>;
@@ -424,14 +435,17 @@ export async function checkAuthorization(deps: CompensationDeps, inputs: Extract
   } catch (err) {
     return deny(`authorization unreadable (${err instanceof Error ? err.message : String(err)})`);
   }
-  const row = rows.filter((r) => r?.shape === AUTHORIZATION_SHAPE && r?.status === 'open')
-    .sort((a, b) => String(b.updated_at ?? '').localeCompare(String(a.updated_at ?? '')))[0];
+  const open = rows.filter((r) => r?.shape === AUTHORIZATION_SHAPE && r?.status === 'open')
+    .sort((a, b) => String(b.updated_at ?? '').localeCompare(String(a.updated_at ?? '')));
+  const forList = open.filter((r) => r?.body?.list_sha256 === inputs.list_sha);
+  const row = (forList.length > 0 ? forList : open)[0];
   if (!row) return deny('no open posteriorReplayAuthorization record');
   if (row.attested?.by !== 'operator') return deny('the record is not operator-attested');
   if (row.attested_verified !== true) return deny('development-vessel did not verify the record\'s operator attestation');
   const b = (row.body ?? {}) as Record<string, unknown>;
   if (b.node !== inputs.node) return deny(`the record names node '${String(b.node)}', this node is '${String(inputs.node)}'`);
-  if (b.list_sha256 !== inputs.list_sha || b.eligibility_sha256 !== inputs.eligibility_sha) return deny('the record\'s list / eligibility sha256 do not match this node\'s pins');
+  const eligibilityDiffers = inputs.eligibility_sha != null ? b.eligibility_sha256 !== inputs.eligibility_sha : b.eligibility_sha256 != null;
+  if (b.list_sha256 !== inputs.list_sha || eligibilityDiffers) return deny('the record\'s list / eligibility sha256 do not match this node\'s pins');
   const reviewMs = typeof b.review_by === 'string' ? Date.parse(b.review_by) : NaN;
   if (!Number.isFinite(reviewMs)) return { code: 'authorization_expired', why: `the record's review_by '${String(b.review_by)}' is missing or unparseable` };
   if (deps.nowMs() > reviewMs) return { code: 'authorization_expired', why: `the record's review_by ${String(b.review_by)} has passed` };
