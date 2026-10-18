@@ -99,6 +99,11 @@ beforeAll(async () => {
       `CREATE context_thompson_scores CONTENT { template_id: '${ACT}', org_id: '${ORG}', context_bucket: 'b0', alpha: 2.0, beta: 4.0, n_observations: 4 };`,
     ].join('\n'));
     RC = await import('./reach-correction');
+    // The decision outcomes the latched verdicts fed, written by their own writer (the universal capture path).
+    const { recordExecutionDecisionOutcome } = await import('./decision-credit');
+    for (const id of [E.latched, E.unlatched]) {
+      await recordExecutionDecisionOutcome(db, { executionId: id, activityId: ACT, orgId: ORG, success: true, reached: false });
+    }
     posteriorsBefore = await posteriors();
   } catch (e) {
     startError = `cannot start: ${e instanceof Error ? e.message : String(e)}`;
@@ -259,6 +264,29 @@ describe('a recorded correction retracts a latched reach:false (real engine)', (
     const after = await row(id);
     expect({ reached: after.reached, verdict: classifyReach({ success: true, tags: after.tags }) }).toEqual({ reached: true, verdict: 'reached' });
     expect(after.metadata.superseded_verdicts.length).toBe(regraded.metadata.superseded_verdicts.length);
+  }, 60_000);
+
+  it('MUST-FAIL: the retracted execution\'s decision_outcome reach is cleared to null, with the same provenance', async () => {
+    const outcome = async (id: string) => (await rs!.sql(`SELECT reached, outcome_success, predicted_success, reach_correction FROM type::thing('decision_outcome', '${id}');`))[0].result[0];
+    const d = await outcome(E.latched);
+    expect(d.reached ?? null).toBe(null);
+    expect(d.reach_correction).toMatchObject({ correction_of: 'reach:false', list_sha: SHA, rule: PROV.rule, commit: PROV.commit, prior_reached: false });
+    expect(d.outcome_success).toBe(true);
+    // decision-calibration reads it as an unknown reach, not a not-reached outcome.
+    const { aggregateDecisionCalibration } = await import('../routes/execution-traces');
+    const rows = (await rs!.sql(`SELECT activity_id, source, predicted_success, outcome_success, reached, executed_at, created_at FROM decision_outcome WHERE activity_id = '${ACT}';`))[0].result;
+    expect(aggregateDecisionCalibration(rows, 1)[0]).toMatchObject({ decisions: 2, reached_known: 1, actual_reach_rate: 0 });
+    // CONTROL: the unlatched execution's row is untouched.
+    const u = await outcome(E.unlatched);
+    expect({ reached: u.reached, corr: u.reach_correction ?? null }).toEqual({ reached: false, corr: null });
+    // Re-applying keeps the provenance; the inverse restores the reach and marks the correction undone; again retracts.
+    expect(await correct(E.latched)).toEqual({ execution_id: E.latched, status: 'already_retracted' });
+    expect((await outcome(E.latched)).reach_correction.at).toEqual(d.reach_correction.at);
+    expect(await correct(E.latched, { inverse: true })).toEqual({ execution_id: E.latched, status: 'restored' });
+    const back = await outcome(E.latched);
+    expect({ reached: back.reached, inverse: back.reach_correction.inverse, predicted: back.predicted_success }).toEqual({ reached: false, inverse: true, predicted: d.predicted_success });
+    expect(await correct(E.latched)).toEqual({ execution_id: E.latched, status: 'retracted' });
+    expect((await outcome(E.latched)).reached ?? null).toBe(null);
   }, 60_000);
 
   it('CONTROL: NO posterior row changed (variant_performance_metrics, context_thompson_scores, shape counter)', async () => {

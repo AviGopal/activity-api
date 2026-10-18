@@ -170,6 +170,57 @@ export async function recordExecutionDecisionOutcome(
   }
 }
 
+/** The provenance a reach correction carries (lib/reach-correction.ts). */
+export interface DecisionOutcomeCorrection {
+  correction_of: string;
+  list_sha: string;
+  rule: string;
+  commit: string;
+  /** true: undo this list's correction (restore the prior reach). */
+  inverse?: boolean;
+}
+
+/**
+ * A RETRACTED reach clears the decision outcome it fed. recordExecutionDecisionOutcome is UPSERT MERGE and omits
+ * a null reach, so it can only ever add a verdict: a row written from a reach:false that a recorded correction
+ * later retracted kept `reached: false`, and decision-calibration counted it as a known not-reached outcome
+ * against the arm's prediction. This is the same writer's correction path, for the same rows (keyed on the
+ * execution id; also the correlation-keyed row recordDecisionOutcome wrote when the execution carried a
+ * `correlation:<id>` tag):
+ *   - retract: `reached` -> NONE, `reach_correction` = the provenance + the prior reach. Only a row holding
+ *     reached:false matches, so it is idempotent.
+ *   - inverse: `reached` restored from reach_correction.prior_reached, and the correction marked inverse with its
+ *     time. Only a row this list retracted matches.
+ * UPDATE, never UPSERT: a correction never creates a decision row. Nothing else is touched (no posterior re-read,
+ * predicted_success and outcome_success stay as captured). Never throws; returns the number of rows changed.
+ */
+export async function correctExecutionDecisionOutcome(
+  db: DecisionCreditDB,
+  input: { executionId: string; correlationId?: string | null; correction: DecisionOutcomeCorrection },
+): Promise<number> {
+  try {
+    const ids = [input.executionId, ...(input.correlationId ? [input.correlationId] : [])].filter((x) => typeof x === 'string' && x.length > 0);
+    if (ids.length === 0) return 0;
+    const corr = input.correction;
+    const sql = corr.inverse === true
+      ? `UPDATE $targets SET reached = reach_correction.prior_reached, reach_correction.inverse = true, reach_correction.restored_at = time::now()
+           WHERE reached = NONE AND reach_correction.list_sha = $list_sha AND reach_correction.inverse != true RETURN id`
+      : `UPDATE $targets SET reach_correction = { correction_of: $correction_of, list_sha: $list_sha, rule: $rule, commit: $commit, prior_reached: reached, at: time::now() }, reached = NONE
+           WHERE reached = false RETURN id`;
+    const res = await db.query(sql.replace('$targets', ids.map((_, i) => `type::thing('decision_outcome', $id${i})`).join(', ')), {
+      ...Object.fromEntries(ids.map((id, i) => [`id${i}`, id])),
+      correction_of: corr.correction_of, list_sha: corr.list_sha, rule: corr.rule, commit: corr.commit,
+    });
+    return Array.isArray(res) ? res.length : 0;
+  } catch (e) {
+    logger.warn('[decision-credit] correctExecutionDecisionOutcome best-effort failed', {
+      error: e instanceof Error ? e.message : String(e),
+      execution_id: input.executionId,
+    });
+    return 0;
+  }
+}
+
 /**
  * Best-effort persist. Looks up the selection by correlation_id (indexed, UNIQ),
  * builds the record, and UPSERTs it into `decision_outcome`. Never throws — a

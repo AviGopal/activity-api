@@ -18,7 +18,9 @@
  *   - a metadata.superseded_verdicts entry, superseded_by `correction:<list_sha>`, written even though no
  *     verdict_class was stamped, bounded like the route's own (SUPERSEDED_VERDICTS_KEPT).
  * It moves NO posterior: no variant_performance_metrics, context_thompson_scores or shape counter write. The
- * β the verdict charged stays until a separate, attested posterior correction.
+ * β the verdict charged stays until a separate, attested posterior correction. The decision_outcome row the
+ * verdict fed is cleared to a null reach with the same provenance, through its writer (decision-credit.ts
+ * correctExecutionDecisionOutcome); that step is idempotent, so a retry of an already-retracted row heals it.
  *
  * ONLY A LATCHED, CLEAN, NOT-REACHED ROW: reach_graded:true, reached:false, no reached:true, success:true. A
  * failed execution is not-reached by its own exit status whatever the rule said (classifyReach's failure arm),
@@ -47,6 +49,7 @@ import type { JwtAuthContext } from '../middleware/jwtAuth';
 import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
 import { REACH_RETRACTED_PREFIX } from './reach-classify';
+import { correctExecutionDecisionOutcome } from './decision-credit';
 import {
   checkAuthorization,
   defaultCompensationDeps,
@@ -139,6 +142,16 @@ RETURN id`;
 
 type PreRow = { success?: boolean; tags?: string[]; reached?: boolean | null; retraction?: { list_sha?: string } | null };
 
+/** Clear (or, inverse, restore) the decision outcome(s) of a corrected execution. Best-effort, idempotent. */
+async function correctDecisionOutcome(db: QueryDb, eid: string, tags: string[], prov: ReachCorrectionProvenance, inverse: boolean): Promise<void> {
+  const corrTag = tags.find((t) => typeof t === 'string' && t.startsWith('correlation:'));
+  await correctExecutionDecisionOutcome(db, {
+    executionId: eid,
+    correlationId: corrTag ? corrTag.slice('correlation:'.length) : null,
+    correction: { correction_of: CORRECTION_OF_REACH_FALSE, list_sha: prov.list_sha, rule: prov.rule, commit: prov.commit, ...(inverse ? { inverse: true } : {}) },
+  });
+}
+
 /**
  * Apply ONE correction (or its inverse) to one execution. Performs no caller or authorization check: it is
  * reached from the resolver only through the apply gate, and exported so the real-engine tests drive it.
@@ -160,7 +173,10 @@ export async function applyReachCorrection(db: QueryDb, c: ReachCorrection): Pro
   const heldSha = row.retraction?.list_sha ?? null;
 
   if (c.inverse === true) {
-    if (heldSha === null) return { execution_id: eid, status: 'not_retracted' };
+    if (heldSha === null) {
+      await correctDecisionOutcome(db, eid, tags, prov, true);
+      return { execution_id: eid, status: 'not_retracted' };
+    }
     if (heldSha !== prov.list_sha) return { execution_id: eid, refused: 'retracted_by_other_list', detail: `retracted under list ${heldSha}` };
     // RE-GRADED SINCE THE RETRACTION: a later /reach reached:true set the column and the tag (only reach:false is
     // held on a retracted row). Restoring prior_reached would write false under a reached:true tag, so the row is
@@ -171,14 +187,15 @@ export async function applyReachCorrection(db: QueryDb, c: ReachCorrection): Pro
     }
     const res = await db.query(RESTORE_SQL, { eid, prov, tag, by: `inverse-correction:${prov.list_sha}`, correction_of: tag });
     if (!Array.isArray(res) || res.length === 0) return { execution_id: eid, refused: 'write_failed', detail: 'the restore matched no row' };
+    await correctDecisionOutcome(db, eid, tags, prov, true);
     logger.info('[reach-correction] retraction REVERSED', { event: 'reach_correction_restored', execution_id: eid, list_sha: prov.list_sha });
     return { execution_id: eid, status: 'restored' };
   }
 
   if (heldSha !== null) {
-    return heldSha === prov.list_sha
-      ? { execution_id: eid, status: 'already_retracted' }
-      : { execution_id: eid, refused: 'retracted_by_other_list', detail: `already retracted under list ${heldSha}` };
+    if (heldSha !== prov.list_sha) return { execution_id: eid, refused: 'retracted_by_other_list', detail: `already retracted under list ${heldSha}` };
+    await correctDecisionOutcome(db, eid, tags, prov, false);
+    return { execution_id: eid, status: 'already_retracted' };
   }
   if (tags.includes('reached:true')) return { execution_id: eid, refused: 'reached_true', detail: 'the row holds reached:true; a correction of reach:false never retracts it' };
   if (!tags.includes('reached:false')) return { execution_id: eid, refused: 'not_reach_false', detail: 'the row holds no reached:false verdict' };
@@ -186,6 +203,7 @@ export async function applyReachCorrection(db: QueryDb, c: ReachCorrection): Pro
   if (row.success !== true) return { execution_id: eid, refused: 'failed_execution', detail: 'a failed execution is not-reached by its exit status; only a clean completion is retracted' };
   const res = await db.query(RETRACT_SQL, { eid, prov, tag, by: `correction:${prov.list_sha}`, correction_of: CORRECTION_OF_REACH_FALSE });
   if (!Array.isArray(res) || res.length === 0) return { execution_id: eid, refused: 'write_failed', detail: 'the row changed between the read and the write; nothing retracted' };
+  await correctDecisionOutcome(db, eid, tags, prov, false);
   logger.info('[reach-correction] latched reach:false RETRACTED to ungraded', { event: 'reach_correction_retracted', execution_id: eid, list_sha: prov.list_sha, rule: prov.rule, commit: prov.commit });
   return { execution_id: eid, status: 'retracted' };
 }
