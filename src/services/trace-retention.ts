@@ -575,11 +575,22 @@ async function computeEffectiveCeiling(cfg: TraceRetentionConfig): Promise<{ cei
 // execution_trace_content is the body being deleted. See migration 220.
 //
 // The membership list is read once per statement batch (LET), not per row: both reference tables are
-// small, and `meta::id(id) NOTINSIDE $__prot` with the executed_at index planned was positive-controlled on
-// 2.3.10 (a residual predicate on an indexed SELECT is applied; the known 2.3.10 trap is an indexed COUNT,
-// which is why the range drain counts its id list instead of the range).
+// small. It is applied IN MEMORY, never per scanned row: a valve SELECT carries at most the cheap graded
+// test (UNGRADED_WHERE) and the batch takes array::complement of its ids against $__prot. Measured on
+// 2.3.10 with the live DDL (18.5k label ids), the per-row `meta::id(id) NOTINSIDE $__prot` costs ~1.5 ms
+// for every row it reads: a batch whose oldest rows are protected ran past its 20 s TIMEOUT and the valve
+// deleted nothing. The range drain moved off it first (see DRAIN_BATCH_SQL); the telemetry batch and the
+// id loop carried it until 2026-10-18.
+//
+// UNGRADED_WHERE IS WRITTEN WITHOUT A UNARY `!`. On 2.3.10 a unary expression anywhere in a WHERE makes
+// the planner fall back to a full table scan (EXPLAIN: "Fallback: unary expressions not supported"), even
+// under WITH INDEX. `!type::is::bool(reached) AND !(tags CONTAINS ...)` therefore turned the telemetry
+// select and the id-loop select into table scans in record-id order. The binary form below is the same
+// predicate (CONTAINSNOT on a NONE tags is true, as !(NONE CONTAINS x) is) and keeps the index plan.
 const PROTECTED_REFS_LET = `LET $__prot = array::union((SELECT VALUE execution_id FROM goal_verification_labels), (SELECT VALUE execution_id FROM trace_evidence_ref WHERE open != false));`;
-const UNPROTECTED_WHERE = `!type::is::bool(reached) AND !(tags CONTAINS 'reach_graded:true') AND meta::id(id) NOTINSIDE $__prot`;
+const UNGRADED_WHERE = `type::is::bool(reached) = false AND tags CONTAINSNOT 'reach_graded:true'`;
+/** The ids of `candVar` (an id list) that are not in $__prot, as records: the in-memory protection filter. */
+const UNPROTECTED_OF = (candVar: string) => `array::map(array::complement(array::map(${candVar}, |$i| meta::id($i)), $__prot), |$e| type::thing('${TABLE}', $e))`;
 /** Compaction: one execution_observation per protected row of `idsVar`, written before that list is deleted. */
 const COMPACT_SQL = (idsVar: string) => `${PROTECTED_REFS_LET}
 FOR $__r IN (SELECT id, reached, tags, success FROM ${idsVar}) {
@@ -732,7 +743,7 @@ ${PROTECTED_REFS_LET}
 LET $ts = (SELECT VALUE executed_at FROM ${TABLE} WHERE executed_at < type::datetime($cut) AND executed_at >= type::datetime($lo) LIMIT $n TIMEOUT ${stmtTimeoutS}s);
 LET $b = IF array::len($ts) < $n { type::datetime($cut) } ELSE { time::max($ts) };
 LET $__cand = IF array::len($ts) = 0 { [] } ELSE { (SELECT id, reached, tags FROM ${TABLE} WHERE executed_at >= type::datetime($lo) AND executed_at < $b TIMEOUT ${stmtTimeoutS}s) };
-LET $__cheap = (SELECT VALUE meta::id(id) FROM $__cand WHERE !type::is::bool(reached) AND !(tags CONTAINS 'reach_graded:true'));
+LET $__cheap = (SELECT VALUE meta::id(id) FROM $__cand WHERE ${UNGRADED_WHERE});
 LET $__ids = array::map(array::complement($__cheap, $__prot), |$e| type::thing('${TABLE}', $e));
 LET $c = array::len($__ids);
 LET $ok = $c > 0 AND $c <= $max;
@@ -897,16 +908,24 @@ export async function drainColdByRange(opts: {
 // execution DDL): 2000-row batches take ~0.7 s (select 30-110 ms, delete 470-830 ms, marker prune
 // ~20 ms), ~2,500 rows/s; the select grows slowly as the drain proceeds (index tombstones at the head
 // of this id's range), the delete stays flat.
+//
+// PROTECTION IS FILTERED IN MEMORY, AS THE RANGE DRAIN DOES (2026-10-18). The select carries only the cheap
+// graded test, in its binary form so the activity index is planned at all (see UNGRADED_WHERE); labelled
+// and open-ref ids are removed by array::complement against $__prot. The activity index yields this id's
+// rows in record-id order, so $after (the last id the previous batch read) is the drain's cursor within
+// one call: a batch whose candidates are ALL protected is stepped over instead of re-read, and is never
+// deleted. The cursor is local to the call, like the range drain's $lo.
 const TELEMETRY_BATCH_SQL = (stmtTimeoutS: number) => `
 BEGIN TRANSACTION;
 LET $__t0 = time::now();
 ${PROTECTED_REFS_LET}
-LET $__ids = (SELECT VALUE id FROM ${TABLE} WITH INDEX idx_execution_activity WHERE activity_id = $aid AND ${UNPROTECTED_WHERE} AND executed_at < type::datetime($cut) LIMIT $n TIMEOUT ${stmtTimeoutS}s);
+LET $__cand = (SELECT VALUE id FROM ${TABLE} WITH INDEX idx_execution_activity WHERE activity_id = $aid AND id > $after AND ${UNGRADED_WHERE} AND executed_at < type::datetime($cut) LIMIT $n TIMEOUT ${stmtTimeoutS}s);
+LET $__ids = ${UNPROTECTED_OF('$__cand')};
 LET $__t1 = time::now();
 DELETE $__ids RETURN NONE TIMEOUT ${stmtTimeoutS}s;
 LET $__t2 = time::now();
 ${PRUNE_MARKERS_SQL('$__ids', stmtTimeoutS)}
-RETURN { deleted: array::len($__ids), select_ms: duration::millis($__t1 - $__t0), delete_ms: duration::millis($__t2 - $__t1), prune_ms: duration::millis(time::now() - $__t2) };
+RETURN { deleted: array::len($__ids), scanned: array::len($__cand), last: array::last($__cand), select_ms: duration::millis($__t1 - $__t0), delete_ms: duration::millis($__t2 - $__t1), prune_ms: duration::millis(time::now() - $__t2) };
 COMMIT TRANSACTION;`;
 
 export async function drainTelemetryClass(opts: {
@@ -932,6 +951,8 @@ export async function drainTelemetryClass(opts: {
     return { removed, batches, activities, stoppedBy };
   };
   for (const aid of activities) {
+    // This id's cursor within the call (see TELEMETRY_BATCH_SQL): NULL sorts below every record id.
+    let after: unknown = null;
     for (;;) {
       if (removed >= opts.target) return finish('target');
       if (Date.now() >= opts.budgetUntil) return finish('budget');
@@ -939,26 +960,30 @@ export async function drainTelemetryClass(opts: {
       const started = Date.now();
       try {
         const raw = await withDeadline(
-          surrealDB.queryAll(TELEMETRY_BATCH_SQL(opts.policy.stmtTimeoutS), { aid, cut: opts.cutIso, n: want }),
+          surrealDB.queryAll(TELEMETRY_BATCH_SQL(opts.policy.stmtTimeoutS), { aid, cut: opts.cutIso, n: want, after }),
           deadlineFor(3, opts.policy.stmtTimeoutS),
           `telemetry drain batch (${aid})`,
         );
-        const out = (Array.isArray(raw) ? raw : []).filter((r): r is { deleted: number; select_ms?: number; delete_ms?: number; prune_ms?: number } =>
+        const out = (Array.isArray(raw) ? raw : []).filter((r): r is { deleted: number; scanned?: number; last?: unknown; select_ms?: number; delete_ms?: number; prune_ms?: number } =>
           !!r && typeof r === 'object' && 'deleted' in (r as object)).pop();
         const deleted = Number(out?.deleted ?? 0);
         sums.select_ms += Number(out?.select_ms ?? 0);
         sums.delete_ms += Number(out?.delete_ms ?? 0);
         sums.prune_ms += Number(out?.prune_ms ?? 0);
-        if (deleted === 0) break; // this id has no cold rows left
-        removed += deleted;
-        batches++;
+        if (Number(out?.scanned ?? 0) === 0 || out?.last == null) break; // this id has no cold ungraded rows left
+        // Every candidate up to `last` is now deleted or protected evidence: the next batch starts past it.
+        after = out.last;
         const took = Date.now() - started;
-        // Progress, not per-batch noise: the first batch and every 25th (a 1.4M-row drain is hundreds).
-        if (batches === 1 || batches % 25 === 0) {
-          logger.info('[trace-retention] telemetry drain progress', {
-            activity_id: aid, batch: batches, deleted, removed, ms: took,
-            select_ms: out?.select_ms, delete_ms: out?.delete_ms, prune_ms: out?.prune_ms, width: want,
-          });
+        if (deleted > 0) {
+          removed += deleted;
+          batches++;
+          // Progress, not per-batch noise: the first batch and every 25th (a 1.4M-row drain is hundreds).
+          if (batches === 1 || batches % 25 === 0) {
+            logger.info('[trace-retention] telemetry drain progress', {
+              activity_id: aid, batch: batches, deleted, removed, ms: took,
+              select_ms: out?.select_ms, delete_ms: out?.delete_ms, prune_ms: out?.prune_ms, width: want,
+            });
+          }
         }
         const timeoutMs = opts.policy.stmtTimeoutS * 1000;
         if (took > timeoutMs / 2) n = Math.max(1, Math.floor(want / 2));
@@ -1073,7 +1098,16 @@ async function runCeilingValve(cfg: TraceRetentionConfig, coldCutoffIso: string)
         // Nothing unprotected is cold, yet the store is still over: if anything cold remains it is all
         // evidence, which the valve never evicts. Say so instead of reporting 'empty'.
         if (range.stoppedBy === 'empty' && done < target && await anyColdRow(coldCutoffIso, drainPolicy.stmtTimeoutS)) stoppedBy = 'protected_only';
-        for (let iter = 0; idFallback && iter < maxIters && done < target; iter++) {
+        // The id loop's own cursor within this sweep, as the range drain's $lo. Its candidates come off
+        // idx_execution_executed_at in index order, (executed_at, id), so after each page every row up to
+        // its last one is deleted or protected evidence, and the next page starts past it: a page that is
+        // ALL protected is stepped over instead of re-read, including inside a tie group at one timestamp
+        // (the case the range path hands this loop). Steps delete nothing and do not count against the
+        // iteration guard; the budget bounds them.
+        let lo = DRAIN_FLOOR_ISO;
+        let after: unknown = null;
+        let steps = 0;
+        for (let iter = 0; idFallback && iter < maxIters + steps && done < target; iter++) {
           if (Date.now() >= budgetUntil) { stoppedBy = 'budget'; break; }
           const thisBatch = Math.min(batchSize, target - done);
           // NO `ORDER BY` — that is the whole fix, and this file already proved it.
@@ -1111,19 +1145,56 @@ async function runCeilingValve(cfg: TraceRetentionConfig, coldCutoffIso: string)
           // ~308,000 rows instead of dying on the first page.
           // BOUNDED like every other sweep statement (server TIMEOUT + client deadline). A failed or
           // abandoned candidate read has no ids to quarantine, so it ends the id loop as 'failed'.
-          let rows: Array<{ id: unknown }>;
+          let cand: unknown[];
+          const ids: unknown[] = [];
+          let next: { lo: string; after: unknown } | null = null;
+          // A page reads the drain policy's batch width of candidates (protected rows cost a read, not a
+          // delete) and deletes at most thisBatch of them.
+          const width = Math.max(thisBatch, drainPolicy.batch);
           try {
-            // Unprotected rows only (see EVIDENCE above): the protected list is read first and bound as $__prot.
+            // Unprotected rows only (see EVIDENCE above): the select carries the cheap graded test, and the
+            // protected list (read first) is removed from the page in memory, never tested per scanned row.
             const prot = await protectedRefIds(drainPolicy.stmtTimeoutS);
-            rows = await withDeadline(surrealDB.query<{ id: unknown }>(
+            // [executed_at, id] > [$lo, $after] is the cursor (arrays compare element-wise; NULL sorts below
+            // every id); the executed_at range is what the index plans.
+            const page = `executed_at >= type::datetime($lo) AND [executed_at, id] > [type::datetime($lo), $after] AND ${UNGRADED_WHERE}`;
+            const rows = await withDeadline(surrealDB.query<{ id: unknown }>(
               quarantined.size > 0
-                ? `SELECT id FROM ${TABLE} WHERE executed_at < type::datetime($cut) AND ${UNPROTECTED_WHERE} AND id NOT IN $skip LIMIT $batch TIMEOUT ${drainPolicy.stmtTimeoutS}s`
-                : `SELECT id FROM ${TABLE} WHERE executed_at < type::datetime($cut) AND ${UNPROTECTED_WHERE} LIMIT $batch TIMEOUT ${drainPolicy.stmtTimeoutS}s`,
+                ? `SELECT id FROM ${TABLE} WHERE executed_at < type::datetime($cut) AND ${page} AND id NOT IN $skip LIMIT $batch TIMEOUT ${drainPolicy.stmtTimeoutS}s`
+                : `SELECT id FROM ${TABLE} WHERE executed_at < type::datetime($cut) AND ${page} LIMIT $batch TIMEOUT ${drainPolicy.stmtTimeoutS}s`,
               // Reuse the sweep's own cold cutoff (line ~295) rather than recomputing it,
               // so the valve and the per-activity strata can never disagree about what
               // "cold" means.
-              { batch: thisBatch, cut: coldCutoffIso, __prot: prot, ...(quarantined.size > 0 ? { skip: [...quarantined] } : {}) },
+              { batch: width, cut: coldCutoffIso, lo, after, ...(quarantined.size > 0 ? { skip: [...quarantined] } : {}) },
             ), deadlineFor(1, drainPolicy.stmtTimeoutS), 'valve id-fallback select');
+            cand = (Array.isArray(rows) ? rows : [])
+              .map((r) => (r as { id?: unknown })?.id)
+              .filter((id) => id != null);
+            if (cand.length > 0) {
+              // Per candidate, in page order: its key, whether it is outside $__prot (array::complement, in
+              // memory), and its executed_at as the engine's own string (a JS Date would drop sub-millisecond
+              // digits and re-read a tie group).
+              const r = await withDeadline(surrealDB.query<unknown>(
+                `RETURN { keys: array::map($cand, |$i| meta::id($i)), free: array::complement(array::map($cand, |$i| meta::id($i)), $__prot), at: (SELECT VALUE <string> executed_at FROM $cand TIMEOUT ${drainPolicy.stmtTimeoutS}s) }`,
+                { cand, __prot: prot },
+              ), deadlineFor(1, drainPolicy.stmtTimeoutS), 'valve id-fallback protection filter');
+              const split = (Array.isArray(r) ? r[0] : r) as { keys?: unknown; free?: unknown; at?: unknown } | undefined;
+              const keys = Array.isArray(split?.keys) ? split.keys.map(String) : [];
+              const free = new Set(Array.isArray(split?.free) ? split.free.map(String) : []);
+              const at = Array.isArray(split?.at) ? split.at : [];
+              // A page whose rows changed under it (a length mismatch) deletes nothing and keeps the cursor.
+              if (keys.length === cand.length && at.length === cand.length) {
+                // The first thisBatch unprotected candidates are deleted; the cursor moves to the row before the
+                // first unprotected candidate left for a later page, else to the page's last row.
+                let p = cand.length - 1;
+                for (let i = 0; i < cand.length; i++) {
+                  if (!free.has(keys[i]!)) continue;
+                  if (ids.length === thisBatch) { p = i - 1; break; }
+                  ids.push(cand[i]);
+                }
+                if (typeof at[p] === 'string') next = { lo: at[p] as string, after: cand[p] };
+              }
+            }
           } catch (err) {
             logger.warn('[trace-retention] global-ceiling valve: id-fallback select FAILED — ending the id loop', {
               iter, deletedSoFar: done, error: err instanceof Error ? err.message : String(err),
@@ -1131,9 +1202,6 @@ async function runCeilingValve(cfg: TraceRetentionConfig, coldCutoffIso: string)
             stoppedBy = 'failed';
             break;
           }
-          const ids = (Array.isArray(rows) ? rows : [])
-            .map((r) => (r as { id?: unknown })?.id)
-            .filter((id) => id != null);
           if (iter === 0) {
             // WHY THE FIRST ITERATION IS LOGGED (2026-08-09).
             //
@@ -1150,12 +1218,14 @@ async function runCeilingValve(cfg: TraceRetentionConfig, coldCutoffIso: string)
             logger.info('[trace-retention] global-ceiling valve: first batch', {
               cut: coldCutoffIso,
               requested: thisBatch,
-              returned: ids.length,
+              read: width,
+              returned: cand.length,
+              unprotected: ids.length,
               surplus,
               target,
             });
           }
-          if (ids.length === 0) {
+          if (cand.length === 0) {
             // Not necessarily "table drained" — the original comment assumed the only
             // reason for an empty page is exhaustion. With a cutoff-bounded WHERE it
             // also means nothing is older than the hot window, which is a policy
@@ -1170,6 +1240,13 @@ async function runCeilingValve(cfg: TraceRetentionConfig, coldCutoffIso: string)
             });
             stoppedBy = done < target && await anyColdRow(coldCutoffIso, drainPolicy.stmtTimeoutS) ? 'protected_only' : 'empty';
             break;
+          }
+          // Every row up to the cursor is deleted below or protected evidence: the next page starts past it.
+          if (next) { lo = next.lo; after = next.after; }
+          if (ids.length === 0) {
+            // The whole page is protected evidence: step over it, never delete it.
+            steps++;
+            continue;
           }
           // A FAILING BATCH MUST NOT KILL THE SWEEP.
           //
