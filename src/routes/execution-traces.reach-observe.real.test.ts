@@ -15,12 +15,16 @@
 //   [MUST-FAIL] a later /reach for the same execution WITHOUT the field (a spool drain) still grades nothing;
 //   [MUST-FAIL] a trace tagged learning_mode:observe is not graded even when the verdict omits the field;
 //   [CONTROL]   each sentinel (a learn verdict) credits α in vpm and cts.
+// SUITE-SAFE. In the one-process suite, earlier files leave POSTERIOR_COALESCE=0 behind (reach-beta-withheld,
+// reach-default-org), which the aggregator read at load and, with coalescing off, never re-reads; and some replace
+// modules on this path with mock.module. So the path's replaced modules and a fresh aggregator are registered as REAL
+// instances for this file (useRealModules), with coalescing pinned on, its default; both are put back in afterAll.
 process.env.SURREALDB_NAMESPACE ??= 'activity-system';
 process.env.SURREALDB_DATABASE ??= 'learning_loop';
 process.env.PRIOR_SEED_ENABLED = 'false';
 process.env.RELEVANCE_SINK_ENDPOINT = 'http://127.0.0.1:9';
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
-import { startRealSurreal, type RealSurreal } from '../../test/support/real-surreal';
+import { startRealSurreal, useRealModules, type RealSurreal } from '../../test/support/real-surreal';
 
 const ORG = 'organizations:reach-observe-probe';
 const USE = 'USE NS `activity-system` DB learning_loop;';
@@ -36,6 +40,8 @@ let ET: { request: (path: string, init?: RequestInit) => Response | Promise<Resp
 let AGG: any;
 let LANE: any;
 let startError = '';
+const originalCoalesce = process.env.POSTERIOR_COALESCE;
+let restoreModules: () => void = () => {};
 
 function exec(id: string, activity: string, tags: string[]): string {
   return `CREATE execution:\`${id}\` CONTENT { activity_id: '${activity}', input_impulses: [], output_impulses: [], success: true, duration_ms: 10, cost_usd: 0.0, tokens_in: 0, tokens_out: 0, org_id: '${ORG}', executed_at: time::now() - 1m, created_at: time::now(), status: 'success', signature: '${SIG}', signature_version: 1, tags: ${JSON.stringify(tags)} };`;
@@ -72,10 +78,14 @@ async function settleOnSentinel(i: number): Promise<{ vpm: Array<{ a: number }>;
 
 beforeAll(async () => {
   try {
+    process.env.POSTERIOR_COALESCE = '1';
+    // posterior-update before the aggregator: they import each other, and the aggregator loaded first trips the cycle.
+    await import('../lib/posterior-update');
+    restoreModules = await useRealModules(['src/lib/tuning-params', 'src/lib/prior-seed', 'src/lib/embedding-lookup-cache', 'src/lib/posterior-aggregator',
+      'src/db/paradigm', 'src/websocket/broadcaster', 'src/services/variant-creator']);
     db = await startRealSurreal();
     client = await db.connectModuleClient();
     ET = (await import('./execution-traces')).default as typeof ET;
-    await import('../lib/posterior-update');
     AGG = await import('../lib/posterior-aggregator');
     LANE = await import('../lib/context-posterior-lane');
     await db.sql(`${USE} ${[
@@ -87,7 +97,11 @@ beforeAll(async () => {
     startError = `cannot start: ${e instanceof Error ? e.message : String(e)}`;
   }
 }, 240_000);
-afterAll(async () => { await db?.stop(); });
+afterAll(async () => {
+  restoreModules();
+  if (originalCoalesce === undefined) delete process.env.POSTERIOR_COALESCE; else process.env.POSTERIOR_COALESCE = originalCoalesce;
+  await db?.stop();
+});
 
 describe('POST /reach on the real engine: an observe verdict is recorded, not graded', () => {
   it('instrument: surreal started and the arms are seeded', async () => {

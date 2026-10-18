@@ -18,13 +18,19 @@
 //               seven learning tables, forward co-change in their window and are broadcast.
 // Redis, the websocket broadcaster (recorded) and variant creation are stubbed; outbound fetch is answered locally
 // and recorded (the engine itself is reached over its own WebSocket and Bun.fetch).
+// SUITE-SAFE. In the one-process suite, earlier files leave two things behind that this file read as "nothing learns":
+// execution-traces.account-id's mock.module of db/paradigm (insertExecution returns null, updateShapeActivityScores a
+// no-op: no execution row, no shape score) and POSTERIOR_COALESCE=0 (insert-beta-withheld), which the aggregator read
+// at load and, with coalescing off, never re-reads. So the path's replaced modules and a fresh aggregator are
+// registered as REAL instances for this file (useRealModules), with coalescing pinned on, its default; both are put
+// back in afterAll.
 process.env.SURREALDB_NAMESPACE ??= 'activity-system';
 process.env.SURREALDB_DATABASE ??= 'learning_loop';
 process.env.PRIOR_SEED_ENABLED = 'false';
 process.env.RELEVANCE_SINK_ENDPOINT = 'http://127.0.0.1:9';
 import { afterAll, beforeAll, describe, expect, it, spyOn } from 'bun:test';
 import { Hono } from 'hono';
-import { startRealSurreal, type RealSurreal } from '../../test/support/real-surreal';
+import { startRealSurreal, useRealModules, type RealSurreal } from '../../test/support/real-surreal';
 
 const ORG = 'organizations:insert-observe-probe';
 const USE = 'USE NS `activity-system` DB learning_loop;';
@@ -44,6 +50,8 @@ let LANE: any;
 let startError = '';
 const spies: Array<{ mockRestore(): void }> = [];
 const originalFetch = globalThis.fetch;
+const originalCoalesce = process.env.POSTERIOR_COALESCE;
+let restoreModules: () => void = () => {};
 const emitted: Array<{ type: string; data?: { execution_id?: string } }> = [];
 const fetched: string[] = [];
 
@@ -109,6 +117,11 @@ let learnFetched: string[] = [];
 
 beforeAll(async () => {
   try {
+    process.env.POSTERIOR_COALESCE = '1';
+    // posterior-update before the aggregator: they import each other, and the aggregator loaded first trips the cycle.
+    await import('../lib/posterior-update');
+    restoreModules = await useRealModules(['src/lib/tuning-params', 'src/lib/prior-seed', 'src/lib/embedding-lookup-cache', 'src/lib/posterior-aggregator',
+      'src/db/paradigm', 'src/websocket/broadcaster', 'src/services/variant-creator']);
     db = await startRealSurreal();
     client = await db.connectModuleClient();
     globalThis.fetch = (async (input: unknown) => {
@@ -136,7 +149,6 @@ beforeAll(async () => {
     stub(variantCreatorMod, 'checkAndRetireTemplate', async () => false);
     stub(variantCreatorMod, 'checkAndRetireByPosterior', async () => false);
     const ET = (await import('./execution-traces')).default;
-    await import('../lib/posterior-update');
     AGG = await import('../lib/posterior-aggregator');
     LANE = await import('../lib/context-posterior-lane');
     app = new Hono();
@@ -178,6 +190,8 @@ beforeAll(async () => {
 afterAll(async () => {
   for (const s of spies.splice(0)) s.mockRestore();
   globalThis.fetch = originalFetch;
+  restoreModules();
+  if (originalCoalesce === undefined) delete process.env.POSTERIOR_COALESCE; else process.env.POSTERIOR_COALESCE = originalCoalesce;
   await db?.stop();
 });
 

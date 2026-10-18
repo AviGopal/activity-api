@@ -30,6 +30,7 @@
  */
 import { readFileSync, readdirSync } from 'node:fs';
 import { spawn, type Subprocess } from 'bun';
+import { mock } from 'bun:test';
 
 export const NS = 'activity-system';
 export const DB = 'learning_loop';
@@ -51,6 +52,30 @@ export interface RealSurreal {
   /** Load `src/db/surreal`, point it at this engine and record it. Returns the module client. */
   connectModuleClient(): Promise<any>;
   stop(): Promise<void>;
+}
+
+/**
+ * Register a REAL instance of each module in `specs` (repo-relative, no extension, e.g. 'src/db/paradigm') for the
+ * rest of the calling file, the way connectModuleClient() routes the db client. Bun keeps a mock.module for the rest of
+ * the process and patches it into modules already linked, so in a full-suite run a route loaded by an earlier file can
+ * hold that file's stubs: execution-traces.account-id's paradigm factory makes insertExecution return null and
+ * updateShapeActivityScores a no-op, so a real-engine file after it persists no execution row and credits no shape
+ * score, and passes only when run alone. Each spec is loaded under a distinct specifier (not answered by any mock) and
+ * registered over whatever is there now; list leaves before the modules that import them, since a real instance links
+ * against what is registered when it loads. The specifier is a variable, so mock-module-completeness (which scans
+ * literal factories in src/) does not read these as factories. Returns a restore that re-registers what each spec held
+ * before, so the files after this one see the process exactly as they would have without it.
+ */
+export async function useRealModules(specs: string[]): Promise<() => void> {
+  const restores: Array<() => void> = [];
+  for (const spec of specs) {
+    const path = `${ROOT}${spec}.ts`;
+    const held = { ...(await import(path)) };
+    const real = { ...(await import(`${path}?real-module-harness`)) };
+    mock.module(path, () => real);
+    restores.push(() => mock.module(path, () => held));
+  }
+  return () => { for (const r of restores.reverse()) r(); };
 }
 
 /** The files init-database.ts applies, in its order. */
