@@ -21,6 +21,12 @@ import { startRealSurreal, type RealSurreal } from '../../test/support/real-surr
  *
  * The small-store control runs FIRST, before the scale seed, so it reads the same route on a store where even the
  * quadratic query answers. Needs `surreal` on PATH; if it is missing the instrument test FAILS rather than skipping.
+ *
+ * EVERY FAILURE IS NAMED. A hook that outlives its timeout, or a promise abandoned by a test and rejected later (when
+ * afterAll stops the engine), is reported as a bare "(fail) (unnamed)" that a gate cannot attribute; on a loaded host
+ * the 25k-row seed and an engine slow to exit are exactly those. So the start and both seeds race their own bound
+ * (inside their test or hook's timeout) and fail by name, every abandoned promise has a catch, and afterAll's timeout
+ * covers waiting out an abandoned start, then stop()'s SIGTERM wait plus the SIGKILL.
  */
 
 const ORG = 'organizations:sigscale-probe';
@@ -33,11 +39,14 @@ const BIG_SIGS = 50;
 const OTHER_ROWS = 20000;
 const WALL_BOUND_MS = 2000; // with the fix
 const CAP_MS = 10_000; // the quadratic query is abandoned here, so a regression fails instead of hanging the file
+const START_BOUND_MS = 180_000; // engine start + schema + small seed, inside beforeAll's 240 s
+const SEED_BOUND_MS = 180_000; // the scale seed, inside its test's 240 s
 
 let rs: RealSurreal | null = null;
 let db: any = null;
 let startError = '';
 let routes: any = null;
+let starting: Promise<void> | null = null;
 
 // `n` executions of `activity` (a SurrealQL expression over $i) in `org`, signature `prefix-<i % mod>`.
 function seed(activity: string, org: string, n: number, prefix: string, mod: number): string {
@@ -74,9 +83,19 @@ async function posterior(activity: string): Promise<Record<string, any>> {
   return JSON.parse(String(body.content ?? '{}')).content ?? {};
 }
 
+// Race `p` against `ms`; past it, throw a message that names what overran. The loser is caught, never left to reject unhandled.
+async function bounded<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  p.catch(() => {});
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const over = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} exceeded ${ms / 1000} s (host under load?)`)), ms); });
+  try { return await Promise.race([p, over]); } finally { clearTimeout(timer); }
+}
+
 async function timed(activity: string): Promise<{ ms: number; p: Record<string, any> | null }> {
   const t0 = performance.now();
-  const p = await Promise.race([posterior(activity), Bun.sleep(CAP_MS).then(() => null)]);
+  const call = posterior(activity);
+  call.catch(() => {}); // abandoned at the cap, it rejects when afterAll stops the engine
+  const p = await Promise.race([call, Bun.sleep(CAP_MS).then(() => null)]);
   return { ms: Math.round(performance.now() - t0), p };
 }
 
@@ -89,22 +108,29 @@ function countScans(): Array<{ sql: string; params: Record<string, unknown> | un
 
 beforeAll(async () => {
   try {
-    rs = await startRealSurreal();
-    db = await rs.connectModuleClient();
-    routes = (await import('./impulses')).default;
-    // The small store: 4 signatures over 8 rows, plus another arm's and another org's rows that must not count.
-    await rs.sql([
-      seed(`'${SMALL}'`, ORG, 8, 'small', 4),
-      seed(`'sigscale-other-' + <string>($i % 3)`, ORG, 30, 'oth', 30),
-      seed(`'${SMALL}'`, XORG, 6, 'xorg', 6),
-      vpm(SMALL, 8),
-    ].join('\n'));
+    starting = (async () => {
+      rs = await startRealSurreal();
+      db = await rs.connectModuleClient();
+      routes = (await import('./impulses')).default;
+      // The small store: 4 signatures over 8 rows, plus another arm's and another org's rows that must not count.
+      await rs.sql([
+        seed(`'${SMALL}'`, ORG, 8, 'small', 4),
+        seed(`'sigscale-other-' + <string>($i % 3)`, ORG, 30, 'oth', 30),
+        seed(`'${SMALL}'`, XORG, 6, 'xorg', 6),
+        vpm(SMALL, 8),
+      ].join('\n'));
+    })();
+    await bounded(starting, START_BOUND_MS, 'engine start and small-store seed');
   } catch (e) {
     startError = `cannot start: ${e instanceof Error ? e.message : String(e)}`;
   }
 }, 240_000);
 
-afterAll(async () => { await rs?.stop(); });
+afterAll(async () => {
+  // A start abandoned at its bound may still bring an engine up: wait for it (bounded) so stop() sees it, never orphan it.
+  await bounded(starting ?? Promise.resolve(), 15_000, 'abandoned engine start').catch(() => {});
+  await rs?.stop();
+}, 45_000);
 
 describe('thompson_posterior signature count at scale on the real engine', () => {
   it('instrument: surreal started, small store seeded', async () => {
@@ -122,12 +148,12 @@ describe('thompson_posterior signature count at scale on the real engine', () =>
 
   it(`an arm with ${BIG_ROWS} executions over ${BIG_SIGS} signatures answers within ${WALL_BOUND_MS} ms with the right count`, async () => {
     const t0 = performance.now();
-    await rs!.sql([
+    await bounded(rs!.sql([
       seed(`'${BIG}'`, ORG, BIG_ROWS, 'big', BIG_SIGS),
       seed(`'sigscale-other-' + <string>($i % 200)`, ORG, OTHER_ROWS, 'oth', 30),
       seed(`'${BIG}'`, XORG, 300, 'xorg', 20),
       vpm(BIG, BIG_ROWS),
-    ].join('\n'));
+    ].join('\n')), SEED_BOUND_MS, `the ${BIG_ROWS + OTHER_ROWS + 300}-row scale seed`);
     const c = await counts();
     expect(c[`${BIG}@${ORG}`]).toBe(BIG_ROWS);
     expect(c[`other@${ORG}`]).toBe(OTHER_ROWS + 30);
