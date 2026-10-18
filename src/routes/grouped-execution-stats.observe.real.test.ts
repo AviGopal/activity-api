@@ -18,7 +18,8 @@ const { runGroupedExecutionStats } = await import('./grouped-execution-stats');
  * Against a scratch SurrealDB with the real schema (test/support/real-surreal.ts), counted from rows:
  *   [MUST-FAIL] observe rows (learning_mode:observe or reach_observe:true) with reached true/false are counted in
  *               neither reached_count nor graded_count;
- *   [CONTROL]   learn rows (one with no tags at all) are counted, and the existing telemetry exclusion still holds.
+ *   [CONTROL]   learn rows are counted, including one whose tags field is ABSENT (NONE) and one with tags [] (`NONE
+ *               CONTAINSANY [...]` must not drop legacy untagged rows), and the existing telemetry exclusion still holds.
  */
 
 const ORG = 'organizations:ges-observe-probe';
@@ -46,8 +47,8 @@ beforeAll(async () => {
     await rs.connectModuleClient();
     db = rs.sdk;
     await rs.sql([
-      // learn: 2 reached (one untagged), 1 not reached
-      exec(true, ['dispatcher_used:goal-host', 'reached:true']), exec(true), exec(false, ['learning_mode:learn', 'reached:false']),
+      // learn: 2 reached (one with the tags field ABSENT, i.e. NONE), 2 not reached (one with tags [])
+      exec(true, ['dispatcher_used:goal-host', 'reached:true']), exec(true), exec(false, ['learning_mode:learn', 'reached:false']), exec(false, []),
       // observe: 3 reached, 2 not reached, either observe tag
       exec(true, ['learning_mode:observe', 'reached:true']), exec(true, ['reach_observe:true']), exec(true, ['learning_mode:observe']),
       exec(false, ['learning_mode:observe', 'reached:false']), exec(false, ['reach_observe:true', 'reached:false']),
@@ -62,17 +63,21 @@ beforeAll(async () => {
 afterAll(async () => { await rs?.stop(); });
 
 describe('grouped execution stats exclude observe verdicts', () => {
-  it('instrument: surreal started and all 9 rows seeded', async () => {
+  it('instrument: surreal started, all 10 rows seeded, one with tags NONE (field absent) and one with tags []', async () => {
     expect(startError).toBe('');
     const n = await rs!.sql(`SELECT id FROM execution WITH NOINDEX WHERE org_id = '${ORG}';`);
-    expect(n[0].result.length).toBe(9);
+    expect(n[0].result.length).toBe(10);
+    const none = await rs!.sql(`SELECT id FROM execution WITH NOINDEX WHERE org_id = '${ORG}' AND tags IS NONE;`);
+    expect(none[0].result.length).toBe(1);
+    const empty = await rs!.sql(`SELECT id FROM execution WITH NOINDEX WHERE org_id = '${ORG}' AND tags = [];`);
+    expect(empty[0].result.length).toBe(1);
   }, 60_000);
 
   it('[MUST-FAIL] reached_count and graded_count count only the learn rows', async () => {
     const r = await runGroupedExecutionStats(db, { activity_id: ARM }, AUTH);
-    expect(r.reached_count).toBe(2);
-    expect(r.graded_count).toBe(3);
-    expect(r.reach_rate).toBeCloseTo(2 / 3, 6);
+    expect(r.reached_count).toBe(2); // includes the NONE-tags row
+    expect(r.graded_count).toBe(4);  // includes the NONE-tags and []-tags rows
+    expect(r.reach_rate).toBeCloseTo(2 / 4, 6);
   }, 60_000);
 
   it('[CONTROL] the observe exclusion is a bound parameter on a binary predicate', async () => {

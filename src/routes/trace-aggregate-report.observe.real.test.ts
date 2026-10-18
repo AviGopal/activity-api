@@ -19,7 +19,8 @@ const { runTraceAggregateReport } = await import('./trace-aggregate-report');
  * Against a scratch SurrealDB with the real schema (test/support/real-surreal.ts), counted from rows:
  *   [MUST-FAIL] observe rows carrying a failure class (late verdict class or insert-time class, tagged
  *               learning_mode:observe or reach_observe:true) are counted under no class, in no metric;
- *   [CONTROL]   learn rows of the same class are counted (including a row with no tags at all), and the observe tags
+ *   [CONTROL]   learn rows of the same class are counted (including a row whose tags field is ABSENT, i.e. NONE, and
+ *               one with tags []: `NONE CONTAINSANY [...]` must not drop legacy untagged rows), and the observe tags
  *               are bound as a parameter on a binary predicate (no unary `!`: SurrealDB 2.3.10 full-scans on it).
  */
 
@@ -53,10 +54,11 @@ beforeAll(async () => {
     await rs.connectModuleClient();
     db = rs.sdk;
     const s: string[] = [];
-    // LEARN rows: 2 late-class (one with no tags at all), 1 insert-class.
+    // LEARN rows: 2 late-class (one with the tags field ABSENT, i.e. NONE), 2 insert-class (one with tags []).
     s.push(exec({ success: false, activity: 'agg-learn', tags: ['dispatcher_used:goal-host', 'reached:false'], metadata: { verdict_class: K_LATE } }));
     s.push(exec({ success: false, activity: 'agg-learn', metadata: { verdict_class: K_LATE } }));
     s.push(exec({ success: false, activity: 'agg-learn', tags: ['learning_mode:learn'], failure_mode: { type: 'execution_error', class: K_INSERT, reason: 'x' } }));
+    s.push(exec({ success: false, activity: 'agg-learn', tags: [], failure_mode: { type: 'execution_error', class: K_INSERT, reason: 'x' } }));
     // OBSERVE rows of the same classes: 3 late-class, 2 insert-class, either observe tag.
     for (const tag of ['learning_mode:observe', 'reach_observe:true', 'learning_mode:observe'])
       s.push(exec({ success: false, activity: 'agg-observe', tags: ['dispatcher_used:goal-host', tag, 'reached:false'], metadata: { verdict_class: K_LATE } }));
@@ -73,22 +75,27 @@ beforeAll(async () => {
 afterAll(async () => { await rs?.stop(); });
 
 describe('trace aggregate excludes observe executions', () => {
-  it('instrument: surreal started and all 9 rows seeded', async () => {
+  it('instrument: surreal started, all 10 rows seeded, one with tags NONE (field absent) and one with tags []', async () => {
     expect(startError).toBe('');
     const n = await rs!.sql(`SELECT id FROM execution WITH NOINDEX WHERE org_id = '${ORG}';`);
-    expect(n[0].result.length).toBe(9);
+    expect(n[0].result.length).toBe(10);
+    // tags is option<array<string>> (migration 157): an absent field is NONE, and NULL is not storable in an option.
+    const none = await rs!.sql(`SELECT id FROM execution WITH NOINDEX WHERE org_id = '${ORG}' AND tags IS NONE;`);
+    expect(none[0].result.length).toBe(1);
+    const empty = await rs!.sql(`SELECT id FROM execution WITH NOINDEX WHERE org_id = '${ORG}' AND tags = [];`);
+    expect(empty[0].result.length).toBe(1);
   }, 60_000);
 
   it('[MUST-FAIL] group_by failure_class counts only the learn rows of each class', async () => {
     const r = await runTraceAggregateReport(db, { group_by: 'failure_class', metric: 'failure_count', limit: 50 }, AUTH);
-    expect(keyed(r)).toEqual({ [K_LATE]: 2, [K_INSERT]: 1 });
+    expect(keyed(r)).toEqual({ [K_LATE]: 2, [K_INSERT]: 2 }); // the NONE-tags and []-tags learn rows are counted
   }, 60_000);
 
   it('[MUST-FAIL] a failure_class filter and the count metric exclude observe rows too', async () => {
     const late = await runTraceAggregateReport(db, { group_by: 'activity_id', failure_class: K_LATE, limit: 50 }, AUTH);
     expect(keyed(late)).toEqual({ 'agg-learn': 2 });
     const all = await runTraceAggregateReport(db, { group_by: 'activity_id', metric: 'count', limit: 50 }, AUTH);
-    expect(keyed(all)).toEqual({ 'agg-learn': 3 });
+    expect(keyed(all)).toEqual({ 'agg-learn': 4 });
   }, 60_000);
 
   it('[CONTROL] the predicate is binary and the observe tags are a bound parameter', async () => {
