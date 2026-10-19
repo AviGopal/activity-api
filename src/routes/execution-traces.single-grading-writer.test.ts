@@ -16,6 +16,8 @@
  *   - MUST-FAIL (D1): a top-level goal-host walk awaiting its verdict with a FAILED task is not blamed at insert and not
  *     stamped; its late reached:true credits α once and β 0. CONTROL: a child run (parent_execution_id set) that
  *     inherits the goal-host tag keeps the ungraded-failure arm's β and is stamped.
+ *   - MUST-FAIL (D4): when the insert's learning block throws before the grading is handed off, the row is left
+ *     unstamped (the stamp is withdrawn) and the late reached:true credits α once.
  *
  * Harness: the insert-beta-withheld pattern (spies on the real exports, restored afterAll; no mock.module). Deltas
  * are read from the credit path's own ENQUEUED / APPLIED / PARTIAL lines, which name the arm and both deltas.
@@ -379,6 +381,25 @@ describe('CONTROL (D1) — a child run that inherits the goal-host tag keeps its
     expect(ins.status).toBe(200);
     expect(appliedTo(arm, ins.from)).toEqual({ alpha: 0, beta: 1, lines: 1 });
     expect(executionRows.get(id)?.tags ?? []).toContain('insert_graded:true');
+  });
+});
+
+describe('MUST-FAIL (D4) — a learning block that throws before grading leaves the row unstamped', () => {
+  test('inserted reached:true, learning block throws; then reached:true ⇒ α credited once, by /reach', async () => {
+    const arm = 'fixture-vessel:learning-throws-arm';
+    const id = 'exec-learning-throws-1';
+    throwOnLearningRead.add(arm);
+    try {
+      const ins = await postTrace(body(id, arm, { tags: ['reached:true'] }));
+      expect(ins.status).toBe(200);
+      expect(appliedTo(arm, ins.from).lines).toBe(0);
+      expect(executionRows.get(id)?.tags ?? []).not.toContain('insert_graded:true');
+      const reach = await postReach(id, { reached: true });
+      expect(reach.status).toBe(200);
+      const d = appliedTo(arm, ins.from);
+      expect(d.lines).toBe(1);
+      expect(d.alpha).toBeGreaterThan(0);
+    } finally { throwOnLearningRead.delete(arm); }
   });
 });
 

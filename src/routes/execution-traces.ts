@@ -3510,6 +3510,8 @@ app.post('/', async (c) => {
       return c.json({ success: true, execution_id: trace.execution_id, stored: true, trace: result[0], observed: true });
     }
 
+    // Set the moment the insert's grading is handed to applyOutcomeToPosteriors (see the catch below).
+    let insertGradingHandedOff = false;
     // ========================================================================
     // FIX 2: Update Thompson Sampling scores in activity table
     // Enhanced with shape match scoring for quality-aware learning
@@ -3773,7 +3775,9 @@ app.post('/', async (c) => {
           activity_id: trace.variant_id,
           reason: betaWithheldReason,
         });
-      } else applyOutcomeToPosteriors(
+      } else {
+        insertGradingHandedOff = true;
+        void applyOutcomeToPosteriors(
         {
           activity_id: trace.variant_id as string,
           ...(awaitingVerdictAtInsert ? { awaiting_verdict: true } : {}),
@@ -3814,6 +3818,7 @@ app.post('/', async (c) => {
           error: err instanceof Error ? err.message : String(err),
         });
       });
+      }
 
       // RETIREMENT, on the route the fleet actually posts to (2026-08-16).
       //
@@ -3900,6 +3905,28 @@ app.post('/', async (c) => {
         activity_id: trace.variant_id,
         error: scoreUpdateError instanceof Error ? scoreUpdateError.message : String(scoreUpdateError),
       });
+      // THE STAMP NAMES A GRADING THAT HAPPENED. The row was stamped insert_graded:true in the authoritative write; if
+      // the block threw before the grading was handed to applyOutcomeToPosteriors, nothing was credited, so the stamp
+      // is removed and the late POST /reach grades the execution instead of skipping it. Logged and counted.
+      if (insertGrade?.graded && !insertGradingHandedOff) {
+        insertGradeStampsWithdrawn += 1;
+        let withdrawn = false;
+        try {
+          await surrealDB.query(
+            `UPDATE type::thing('execution', $execution_id) SET tags = array::complement(tags ?? [], [$marker])`,
+            { execution_id: String(trace.execution_id), marker: INSERT_GRADED_TAG },
+          );
+          withdrawn = true;
+        } catch (e) {
+          logger.warn('[insert] insert_graded withdraw failed', { execution_id: trace.execution_id, error: e instanceof Error ? e.message : String(e) });
+        }
+        logger.warn('[insert] grading never ran — insert_graded:true withdrawn so the late verdict grades this execution', {
+          execution_id: trace.execution_id,
+          activity_id: trace.variant_id,
+          withdrawn,
+          insert_grade_stamps_withdrawn: insertGradeStampsWithdrawn,
+        });
+      }
     }
 
     // The 8-hex context-bucket write (Spec 3) is RETIRED (2026-10-16, user decision). Its reader in recommend matched in
@@ -4925,6 +4952,10 @@ app.post('/deliberation', async (c) => {
     return c.json({ success: false, error: err instanceof Error ? err.message : String(err) }, 500);
   }
 });
+
+/** Insert stamps withdrawn because the insert's grading never ran (module lifetime). */
+let insertGradeStampsWithdrawn = 0;
+export function insertGradeStampsWithdrawnCount(): number { return insertGradeStampsWithdrawn; }
 
 /** Observe traces and verdicts recorded without any learning write (module lifetime; lib/reach-classify.ts). */
 export function reachObserveSkips(): number { return observeSkipCount(); }
