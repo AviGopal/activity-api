@@ -2734,17 +2734,19 @@ app.post('/', async (c) => {
     // before the write, not after the credit, so no /reach can read the row between the two. reach_graded:true is NOT
     // reused: its readers (the shape-counter seed, reach-correction) read it as "POST /reach credited this row".
     // The marker is decided here only: a poster-supplied copy is dropped, so no caller can pre-empt the late verdict.
+    // insertGrade is also the verdict every other insert-time learning write reads (the repair-v2 row below).
+    let insertGrade: ReturnType<typeof posteriorGrade> | null = null;
     {
       const tagsNow: string[] = Array.isArray((trace as any).tags) ? ((trace as any).tags as string[]) : [];
       const others = tagsNow.filter((t) => t !== INSERT_GRADED_TAG);
-      const insertGrades = !observeAtInsert && !betaWithheldAtInsert && posteriorGrade({
+      insertGrade = observeAtInsert || betaWithheldAtInsert ? null : posteriorGrade({
         success: trace.success as boolean,
         execution_id: trace.execution_id as string | undefined,
         activity_id: trace.variant_id as string,
         tags: others,
         tasks: trace.tasks,
-      }).graded;
-      if (insertGrades) (trace as any).tags = [...others, INSERT_GRADED_TAG];
+      });
+      if (insertGrade?.graded) (trace as any).tags = [...others, INSERT_GRADED_TAG];
       else if (others.length !== tagsNow.length) (trace as any).tags = others;
     }
 
@@ -2904,10 +2906,16 @@ app.post('/', async (c) => {
     // (inserted before failure-mode sig block; prior_repair_signature comes from caller metadata)
     const _priorRepairSigRaw = (meta as any)?.prior_repair_signature ?? (trace as any)?.metadata?.prior_repair_signature;
     const _priorRepairSig = validRepairSignature(_priorRepairSigRaw);
-    if (_priorRepairSig && body.template_id && !traceOrgDefaulted && !betaWithheldAtInsert && !observeAtInsert) {
+    // GRADED ONLY (D8a): the repair attempt's outcome is its reach verdict at insert (insertGrade, the gate every
+    // insert-time posterior write reads), never its exit status. Ungraded: no delta, logged on the SKIPPED line.
+    if (_priorRepairSig && body.template_id && !traceOrgDefaulted && !betaWithheldAtInsert && !observeAtInsert && !insertGrade?.graded) {
+      logger.info('posterior variant update SKIPPED', {
+        activity_id: body.template_id, execution_id: trace.execution_id ?? null, reason: 'reach_ungraded', source: 'repair_v2',
+        reach_verdict: insertGrade?.reachVerdict ?? 'ungraded', alpha_delta: 0, beta_delta: 0,
+      });
+    } else if (_priorRepairSig && body.template_id && !traceOrgDefaulted && !betaWithheldAtInsert && !observeAtInsert) {
       try {
-        const _successForRepair = body.status === 'completed' || body.status === 'success' || body.success === true;
-        const _repairDelta = priorRepairDelta(_successForRepair);
+        const _repairDelta = priorRepairDelta(insertGrade?.effectiveSuccess === true);
         // CHANGE DB2: into the cts lane (one UPSERT ... WHERE per key per flush, in one transaction), not an awaited
         // LET SELECT / IF UPDATE ELSE CREATE that was never atomic. The lane logs and counts its own failures.
         await writeContextDelta(surrealDB, {
@@ -3632,8 +3640,6 @@ app.post('/', async (c) => {
           activity_id: candidateId,
           org_id: traceOrgId,
           org_id_alt: orgIdAlt,
-          alpha_delta: alphaDelta,
-          beta_delta: betaDelta,
           success_delta: trace.success ? 1 : 0,
           failure_delta: trace.success ? 0 : 1,
         };
@@ -3684,7 +3690,9 @@ app.post('/', async (c) => {
             });
           }
         } else {
-          logger.warn('[learning] Thompson Sampling score update returned no results in either table', {
+          // Counters only: this UPDATE writes no alpha/beta (the alpha_delta/beta_delta it once logged were never in its
+          // SQL), so a miss here loses no posterior. Posteriors are applyOutcomeToPosteriors' alone, reach-gated.
+          logger.warn('[learning] activity_template counter update matched no template row', {
             execution_id: trace.execution_id,
             activity_id: candidateId,
             query_params: updateParams,
