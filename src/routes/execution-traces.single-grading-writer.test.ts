@@ -195,13 +195,12 @@ stub(variantCreatorMod, 'checkAndRetireByPosterior', async () => false);
 
 // The credit path's own lines: APPLIED / SKIPPED name the arm and both deltas; the WITHHELD lines name the reason.
 const infos: Array<{ msg: string; meta: Row }> = [];
-{
-  const orig = logger.info.bind(logger);
-  spies.push(spyOn(logger, 'info').mockImplementation(((msg: string, meta?: Row) => {
-    infos.push({ msg: String(msg), meta: meta ?? {} });
-    return orig(msg, meta as never);
-  }) as never));
-}
+// RECORD ONLY, never call through. In one process an earlier file may have left logger.info spied (and unrestored);
+// spyOn then hands back THAT mock, so a call-through to the `info` captured here would call this implementation
+// again, recursing until the stack overflows and every POST answers 500. Restored in afterAll.
+spies.push(spyOn(logger, 'info').mockImplementation(((msg: string, meta?: Row) => {
+  infos.push({ msg: String(msg), meta: meta ?? {} });
+}) as never));
 
 afterAll(() => {
   for (const s of spies.splice(0)) s.mockRestore();
