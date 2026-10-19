@@ -11,8 +11,11 @@
  * What this applies, per (subscriber template, parent execution) count, for exactly the readers a normal subscriber
  * trace fed (history: CHANGE DB1 record):
  *   - the subscriber's own variant_performance_metrics: execution counters (total / successful / failed, average
- *     duration and cost) and its Thompson alpha/beta (alpha += ok, beta += fail) through the one leaf writer
- *     (applyVariantThompsonDelta), so its posterior is fed, not starved to failures only;
+ *     duration and cost) and its Thompson beta (beta += fail) through the one leaf writer (applyVariantThompsonDelta);
+ *   - NO alpha. A counted run is a clean exit with no reach verdict, which the honest-reach gate (classifyReach) reads
+ *     as ungraded: credited by nothing, as a normal subscriber trace was at insert. Crediting alpha += ok here was an
+ *     exit-status credit (measured: a 0%-reached subscriber gained ~240 alpha/h); the withheld runs are logged on the
+ *     same `posterior variant update SKIPPED` line, reason reach_ungraded, that applyOutcomeToPosteriors writes;
  *   - the parent -> subscriber hub edge in activity_composition_graph (execution_count / success_count), with the
  *     parents' templates resolved in ONE read per batch instead of one read per trace.
  * What it deliberately does NOT apply (both were wrong for a subscriber, and are named fixes):
@@ -26,6 +29,7 @@
  * applied once.
  */
 import { logger } from '../utils/logger';
+import { classifyReach } from './reach-classify';
 
 export interface SubscriberParentCount { parent_execution_id: string; runs: number; ok: number }
 export interface SubscriberCountEntry {
@@ -97,7 +101,16 @@ export async function applySubscriberCounts(batch: SubscriberCountsBatch, orgId:
     out.entries += 1; out.runs += e.runs; stats.entries += 1; stats.runs += e.runs;
     try {
       if (!(await deps.vpmCounters(variantId, orgId, e))) { out.missing_vpm_rows += 1; stats.missing_vpm_rows += 1; }
-      if (e.ok + e.fail > 0) await deps.thompson(variantId, orgId, e.ok, e.fail);
+      // The one honest-reach gate: a clean exit with no verdict is ungraded (no alpha); a failure is not-reached (beta).
+      const alpha = classifyReach({ success: true, activity_id: variantId }) === 'reached' ? e.ok : 0;
+      const beta = classifyReach({ success: false, activity_id: variantId }) === 'not-reached' ? e.fail : 0;
+      if (e.ok > alpha) {
+        logger.info('posterior variant update SKIPPED', {
+          activity_id: variantId, execution_id: null, reason: 'reach_ungraded', source: 'subscriber_counts',
+          batch_id: batch.batch_id, ungraded_runs: e.ok - alpha, reach_verdict: 'ungraded', alpha_delta: 0, beta_delta: 0,
+        });
+      }
+      if (alpha + beta > 0) await deps.thompson(variantId, orgId, alpha, beta);
     } catch (err) {
       stats.errors += 1;
       logger.warn('[subscriber-counts] posterior write failed', { batch_id: batch.batch_id, template_id: e.template_id, error: err instanceof Error ? err.message : String(err) });

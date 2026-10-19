@@ -1,15 +1,20 @@
 // LIFECYCLE SUBSCRIBER RUNS ARE COUNTED, AND THE COUNTS FEED EXACTLY THE READERS A NORMAL SUBSCRIBER TRACE FED (DB1).
 //
-//   [MUST-FAIL] a batch feeds the subscriber's VPM counters and its Thompson alpha/beta (alpha += ok, beta += fail),
-//               and the parent -> subscriber hub edges, summed per parent TEMPLATE, with parents resolved in ONE read.
+//   [MUST-FAIL] a batch feeds the subscriber's VPM counters and its Thompson beta (beta += fail), and the parent ->
+//               subscriber hub edges, summed per parent TEMPLATE, with parents resolved in ONE read.
+//   [MUST-FAIL] D8a: a counted run is a clean exit with no reach verdict, so it credits NO alpha: N completed-but-
+//               unreached runs leave alpha unchanged (no Thompson write at all when nothing failed), and the withheld
+//               runs are logged on the SKIPPED reach_ungraded line with the template.
+//   [CONTROL]   a failed counted run still charges beta += fail, exactly once.
 //   [MUST-FAIL] wiring: POST /subscriber-counts exists, refuses a defaulted org, and the edge path takes counts.
 //   [CONTROL]   a redelivered batch is applied once; a batch that failed to apply is applied on redelivery.
 //   [CONTROL]   malformed counts are refused (ok + fail must equal runs).
 //   [CONTROL]   no ancestor credit and no decision_outcome are ever written from counts (the deps have no such path).
 //   [CONTROL]   a failed parent lookup skips edges, is logged and counted, and the posterior is still fed.
-import { beforeEach, describe, expect, it } from 'bun:test';
+import { beforeEach, describe, expect, it, spyOn } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { applySubscriberCounts, subscriberCountsProblem, subscriberCountsStats, __resetSubscriberCountsForTests, type SubscriberCountsDeps } from './subscriber-run-counts';
+import { logger } from '../utils/logger';
 
 type Call = [string, ...unknown[]];
 function deps(calls: Call[], over: Partial<SubscriberCountsDeps> = {}): SubscriberCountsDeps {
@@ -32,14 +37,15 @@ const batch = (id: string) => ({
 beforeEach(() => __resetSubscriberCountsForTests());
 
 describe('subscriber run counts', () => {
-  it('[MUST-FAIL] feeds VPM counters, Thompson (alpha += ok, beta += fail) and per-parent-template edges, one parent read', async () => {
+  it('[MUST-FAIL] feeds VPM counters, Thompson (beta += fail, no alpha) and per-parent-template edges, one parent read', async () => {
     const calls: Call[] = [];
     const r = await applySubscriberCounts(batch('b1'), 'org-1', deps(calls));
     expect(r).toMatchObject({ duplicate: false, entries: 2, runs: 8, edges: 3, missing_vpm_rows: 0, unresolved_parents: 0 });
     expect(calls.filter((c) => c[0] === 'resolve')).toEqual([['resolve', ['exec_aaaa0001', 'exec_aaaa0002', 'exec_bbbb0001']]]);
     expect(calls).toContainEqual(['vpm', 'validator-dispatch', 'org-1', 5, 4, 1]);
-    expect(calls).toContainEqual(['thompson', 'validator-dispatch', 'org-1', 4, 1]);
-    expect(calls).toContainEqual(['thompson', 'slot-binding', 'org-1', 3, 0]);
+    expect(calls).toContainEqual(['thompson', 'validator-dispatch', 'org-1', 0, 1]);
+    // slot-binding: 3 clean exits, no failure -> nothing to write
+    expect(calls.filter((c) => c[0] === 'thompson' && c[1] === 'slot-binding')).toEqual([]);
     // two parent executions of goal-walk-a are ONE edge, summed
     expect(calls).toContainEqual(['edge', 'goal-walk-a', 'validator-dispatch', 4, 3, 'org-1']);
     expect(calls).toContainEqual(['edge', 'goal-walk-b', 'validator-dispatch', 1, 1, 'org-1']);
@@ -90,6 +96,30 @@ describe('subscriber run counts', () => {
     expect(r.edges).toBe(0);
     expect(r.unresolved_parents).toBe(4);
     expect(subscriberCountsStats().errors).toBeGreaterThanOrEqual(1);
-    expect(calls.filter((c) => c[0] === 'thompson').length).toBe(2);
+    // validator-dispatch has a failure in this batch, so its posterior write still happens
+    expect(calls.filter((c) => c[0] === 'thompson' && c[1] === 'validator-dispatch').length).toBe(1);
+  });
+
+  it('[MUST-FAIL] D8a: N completed-but-unreached counted runs credit no alpha, and the withheld runs are logged', async () => {
+    const lines: Array<{ msg: string; meta: Record<string, unknown> }> = [];
+    const spy = spyOn(logger, 'info').mockImplementation(((msg: string, meta?: Record<string, unknown>) => { lines.push({ msg: String(msg), meta: meta ?? {} }); }) as never);
+    try {
+      const calls: Call[] = [];
+      await applySubscriberCounts({ batch_id: 'b-ungraded', entries: [{ template_id: 'validator-dispatch', runs: 8, ok: 8, fail: 0 }] }, 'org-1', deps(calls));
+      const alpha = calls.filter((c) => c[0] === 'thompson').reduce((s, c) => s + Number(c[3]), 0);
+      expect(alpha).toBe(0);
+      expect(calls.filter((c) => c[0] === 'thompson')).toEqual([]);
+      // the run counters are still fed (runs are runs; the reader analysis decides what they mean)
+      expect(calls).toContainEqual(['vpm', 'validator-dispatch', 'org-1', 8, 8, 0]);
+      const skipped = lines.filter((l) => l.msg === 'posterior variant update SKIPPED' && l.meta.activity_id === 'validator-dispatch');
+      expect(skipped).toHaveLength(1);
+      expect(skipped[0]!.meta).toMatchObject({ reason: 'reach_ungraded', ungraded_runs: 8, alpha_delta: 0, beta_delta: 0 });
+    } finally { spy.mockRestore(); }
+  });
+
+  it('[CONTROL] a failed counted run still charges beta += fail, once', async () => {
+    const calls: Call[] = [];
+    await applySubscriberCounts({ batch_id: 'b-fail', entries: [{ template_id: 'slot-binding', runs: 2, ok: 0, fail: 2 }] }, 'org-1', deps(calls));
+    expect(calls.filter((c) => c[0] === 'thompson')).toEqual([['thompson', 'slot-binding', 'org-1', 0, 2]]);
   });
 });
