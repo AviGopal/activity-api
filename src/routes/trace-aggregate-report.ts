@@ -23,7 +23,7 @@
  *     metric?: "count" | "failure_count" | "success_count" | "cost_sum"
  *                                                            // default count
  *     window_hours?: number,    // default 24, clamped [1, 720]
- *     limit?: number,           // default 10, clamped [1, 1000]
+ *     limit?: number,           // default 10, clamped [1, MAX_GROUPS] (20000)
  *     order?: "desc" | "asc",   // default desc (highest first)
  *   }
  *
@@ -89,6 +89,13 @@ export interface TraceAggregateReport {
 const GROUP_FIELDS = new Set(['activity_id', 'status', 'variant_id', 'failure_class', 'goal_hash']);
 const METRICS = new Set(['count', 'failure_count', 'success_count', 'cost_sum']);
 
+// The most groups one report returns. The query groups EVERY matching row in the database either way (the cap is
+// applied in JS below), so this bounds the response, not the database work. It was 1000, which is below the number
+// of distinct activity_ids in a 720 h window, so every 30-day per-template count came back truncated and its readers
+// (development-vessel's reachable-unlearned report and health tick) had to call their counts UNMEASURED. A reader
+// that needs every group asks for this many and still checks `truncated`: past the cap the report says so.
+const MAX_GROUPS = 20000;
+
 function clampInt(v: unknown, def: number, min: number, max: number): number {
   const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : NaN;
   if (!Number.isFinite(n)) return def;
@@ -112,7 +119,7 @@ export async function runTraceAggregateReport(
   const groupBy = groupByOmitted ? 'activity_id' : String(input.group_by);
   const metric = METRICS.has(String(input.metric)) ? String(input.metric) : 'count';
   const windowHours = clampInt(input.window_hours, 24, 1, 720);
-  const limit = clampInt(input.limit, 10, 1, 1000);
+  const limit = clampInt(input.limit, 10, 1, MAX_GROUPS);
   const order = String(input.order) === 'asc' ? 'ASC' : 'DESC';
   const untilHoursAgo = clampInt(input.until_hours_ago, 0, 0, 720);
 
