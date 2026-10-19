@@ -6,7 +6,7 @@
  * and checks the UpdateSummary fields.
  */
 
-import { describe, test, expect, mock } from 'bun:test';
+import { describe, test, expect, mock, afterAll } from 'bun:test';
 import {
   applyOutcomeToPosteriors,
   propagateCreditAlongChain,
@@ -15,9 +15,18 @@ import {
   type ExecutionForChainCredit,
 } from '../src/lib/posterior-update';
 import { computeStateSpaceSignature } from '../src/utils/session-context';
-import { flushContextLane } from '../src/lib/context-posterior-lane';
+import { flushContextLane, __resetContextLaneForTests } from '../src/lib/context-posterior-lane';
+import { __resetPosteriorAggregatorForTests } from '../src/lib/posterior-aggregator';
 import { ctsWrites } from './support/cts-lane-writes';
 import type { FailureMode } from '../src/models/schemas';
+
+// With coalescing on, the chain-credit cases enqueue variant deltas (test-activity, A..E, org-test) that the flush
+// writes through the process's surrealDB, which no store answers here: they re-queued on every tick for the rest of
+// the process and were flushed into a later file's stubs and engine. They are this file's, so it discards them.
+afterAll(() => {
+  __resetPosteriorAggregatorForTests();
+  __resetContextLaneForTests();
+});
 
 // ---------------------------------------------------------------------------
 // Mock DB factory

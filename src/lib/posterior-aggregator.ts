@@ -150,7 +150,8 @@ function noteExecution(e: Pick<PendingVariant, 'executionIds' | 'executionIdsOve
 
 const pendingVariant = new Map<string, PendingVariant>();
 let flushTimer: ReturnType<typeof setInterval> | null = null;
-let flushing = false;
+/** The flush now running, if any. A caller that flushes meanwhile waits for it, then flushes what is left. */
+let flushInFlight: Promise<void> | null = null;
 
 /** Deltas discarded because no `variant_performance_metrics` row matched the UPDATE.
  *  Module-scope so the count survives across flushes and appears in every warning — a
@@ -225,16 +226,42 @@ export function posteriorDeltasDroppedNoRow(): number {
   return droppedNoRow;
 }
 
+function hasPendingWork(): boolean {
+  return pendingVariant.size > 0 || pendingCompensation.size > 0 || contextLanePendingCount() > 0;
+}
+
+function stopTimer(): void {
+  if (flushTimer) clearInterval(flushTimer);
+  flushTimer = null;
+}
+
 function ensureTimer(): void {
   if (flushTimer) return;
   flushTimer = setInterval(() => {
     // Refresh the coalesce setting on the cadence the module already has — this is what makes
     // the flag data rather than a process-start constant.
     void refreshCoalesceSetting();
+    // The timer never queues behind a slow flush: the next tick looks again.
+    if (flushInFlight) return;
+    // AN IDLE QUEUE STOPS THE TIMER; the next enqueue starts it again (ensureTimer). A timer left ticking
+    // with nothing to write flushed through whatever store the process held next. Coalescing OFF keeps it
+    // ticking, so the refresh above can still read the setting back on (no enqueue would restart it).
+    if (!hasPendingWork()) { if (posteriorCoalesceEnabled()) stopTimer(); return; }
     void flushPosteriors();
   }, FLUSH_MS);
   // Don't keep the event loop alive solely for the flush timer.
   (flushTimer as { unref?: () => void }).unref?.();
+}
+
+/**
+ * TEST-ONLY: discard every queued delta and compensation item and stop the timer, without writing or counting
+ * a drop. A test file whose deltas can never reach a store calls it in afterAll, so no later file in the same
+ * process flushes them through its own stubs or engine. The context lane has its own reset (__resetContextLaneForTests).
+ */
+export function __resetPosteriorAggregatorForTests(): void {
+  pendingVariant.clear();
+  pendingCompensation.clear();
+  stopTimer();
 }
 
 /**
@@ -741,8 +768,12 @@ export interface FlushOptions {
  * Rows carrying compensation items are flushed first, transactionally (flushCompensatedRow).
  */
 export async function flushPosteriors(opts: FlushOptions = {}): Promise<void> {
-  if (flushing || (pendingVariant.size === 0 && pendingCompensation.size === 0 && contextLanePendingCount() === 0)) return;
-  flushing = true;
+  // A FLUSH ISSUED DURING ANOTHER WAITS FOR IT. It used to return at once, so a caller's own delta (enqueued after
+  // the running flush took its batch) was still queued when the caller went on to read the store.
+  while (flushInFlight) await flushInFlight;
+  if (!hasPendingWork()) return;
+  let done!: () => void;
+  flushInFlight = new Promise<void>((resolve) => { done = resolve; });
   try {
     // CHANGE DB2: every pending context_thompson_scores delta, in ONE transaction (context-posterior-lane.ts).
     await flushContextLane(opts.db ?? surrealDB);
@@ -844,7 +875,8 @@ export async function flushPosteriors(opts: FlushOptions = {}): Promise<void> {
       }
     }
   } finally {
-    flushing = false;
+    flushInFlight = null;
+    done();
   }
 }
 
