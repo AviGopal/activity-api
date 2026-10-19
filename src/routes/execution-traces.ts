@@ -32,7 +32,7 @@ import { applyOutcomeToPosteriors, applyVariantThompsonDelta, posteriorGrade } f
 import { writeContextDelta } from '../lib/posterior-aggregator';
 import { applySubscriberCounts, subscriberCountsProblem, type SubscriberCountsBatch, type SubscriberCountsDeps, type SubscriberCountEntry } from '../lib/subscriber-run-counts';
 import { resolveTraceOrg } from '../lib/trace-org';
-import { classifyReach, INSERT_GRADED_TAG, isObserveTrace, isReachRetracted, noteObserveSkip, observeSkipCount } from '../lib/reach-classify';
+import { classifyReach, INSERT_GRADED_TAG, isAwaitingVerdict, isObserveTrace, isReachRetracted, noteObserveSkip, observeSkipCount } from '../lib/reach-classify';
 import { failureClassOf } from '../lib/failure-class';
 import { updateSuccessorFeatures } from '../lib/successor-features';
 import { applyClusterPosterior } from '../lib/cluster-posterior';
@@ -2735,16 +2735,27 @@ app.post('/', async (c) => {
     // reused: its readers (the shape-counter seed, reach-correction) read it as "POST /reach credited this row".
     // The marker is decided here only: a poster-supplied copy is dropped, so no caller can pre-empt the late verdict.
     // insertGrade is also the verdict every other insert-time learning write reads (the repair-v2 row below).
+    // A walk AWAITING its verdict (isAwaitingVerdict: goal-host-tagged, top-level, no reach tag) is graded by POST /reach
+    // alone: ungraded => no write here, beta included, so it is neither blamed nor stamped (awaiting_verdict below).
     let insertGrade: ReturnType<typeof posteriorGrade> | null = null;
+    let awaitingVerdictAtInsert = false;
     {
       const tagsNow: string[] = Array.isArray((trace as any).tags) ? ((trace as any).tags as string[]) : [];
       const others = tagsNow.filter((t) => t !== INSERT_GRADED_TAG);
+      awaitingVerdictAtInsert = isAwaitingVerdict({
+        execution_id: trace.execution_id as string | undefined,
+        activity_id: trace.variant_id as string,
+        tags: others,
+        parent_execution_id: body.parent_execution_id,
+        composition_chain: resolvedCompositionChain,
+      });
       insertGrade = observeAtInsert || betaWithheldAtInsert ? null : posteriorGrade({
         success: trace.success as boolean,
         execution_id: trace.execution_id as string | undefined,
         activity_id: trace.variant_id as string,
         tags: others,
         tasks: trace.tasks,
+        awaiting_verdict: awaitingVerdictAtInsert,
       });
       if (insertGrade?.graded) (trace as any).tags = [...others, INSERT_GRADED_TAG];
       else if (others.length !== tagsNow.length) (trace as any).tags = others;
@@ -3765,6 +3776,7 @@ app.post('/', async (c) => {
       } else applyOutcomeToPosteriors(
         {
           activity_id: trace.variant_id as string,
+          ...(awaitingVerdictAtInsert ? { awaiting_verdict: true } : {}),
           success: trace.success as boolean,
           failure_mode: (body.failure_mode ?? null) as any,
           ...(typeof (body.metadata as { information_yield?: unknown } | undefined)?.information_yield === 'string'

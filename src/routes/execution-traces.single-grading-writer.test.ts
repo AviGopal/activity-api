@@ -13,6 +13,9 @@
  *   - CONTROL: a goal-host walk awaiting its verdict is graded by /reach alone: reached:true credits α once,
  *     reached:false charges β once, and the insert moves nothing.
  *   - CONTROL: a poster cannot pre-empt the late verdict by sending the insert marker itself.
+ *   - MUST-FAIL (D1): a top-level goal-host walk awaiting its verdict with a FAILED task is not blamed at insert and not
+ *     stamped; its late reached:true credits α once and β 0. CONTROL: a child run (parent_execution_id set) that
+ *     inherits the goal-host tag keeps the ungraded-failure arm's β and is stamped.
  *
  * Harness: the insert-beta-withheld pattern (spies on the real exports, restored afterAll; no mock.module). Deltas
  * are read from the credit path's own ENQUEUED / APPLIED / PARTIAL lines, which name the arm and both deltas.
@@ -92,8 +95,19 @@ function addTag(execId: string, tag: string): void {
   const r = executionRows.get(execId);
   if (r) r.tags = [...new Set([...((r.tags as string[] | undefined) ?? []), tag])];
 }
+// Arms whose learning-block template read throws (the first statement of the insert's learning block).
+const throwOnLearningRead = new Set<string>();
 function answer(sql: string, params: any): any {
   queries.push({ sql, params });
+  if (/SELECT output_shapes FROM activity_template/.test(sql) && /OR name = \$activity_id/.test(sql) && throwOnLearningRead.has(String(params?.activity_id))) {
+    throw new Error('learning-block read failed (test)');
+  }
+  const untag = /^\s*UPDATE type::thing\('execution', \$execution_id\) SET tags = array::complement\(tags \?\? \[\], \[\$marker\]\)\s*$/.exec(sql);
+  if (untag) {
+    const r = executionRows.get(String(params?.execution_id));
+    if (r) r.tags = ((r.tags as string[] | undefined) ?? []).filter((t) => t !== params?.marker);
+    return [[{ id: `execution:${String(params?.execution_id)}` }]];
+  }
   const sel = /^\s*SELECT\s+([\s\S]+?)\s+FROM\s+type::thing\(\s*'execution'\s*,\s*\$execution_id\s*\)/i.exec(sql);
   if (sel) {
     const row = executionRows.get(String(params?.execution_id));
@@ -337,6 +351,35 @@ describe('CONTROLS — the late verdict is the one grading of a walk awaiting it
     const d = appliedTo(arm, ins.from);
     expect(d.lines).toBe(1);
     expect(d.alpha).toBeGreaterThan(0);
+  });
+});
+
+describe('MUST-FAIL (D1) — a walk awaiting its verdict is graded by /reach alone, beta included', () => {
+  test('goal-host walk, top-level, failed task, no reach tag; then reached:true ⇒ α once, β 0, no insert stamp', async () => {
+    const arm = 'fixture-vessel:awaiting-failed-task-arm';
+    const id = 'exec-awaiting-failed-task-1';
+    const ins = await postTrace(body(id, arm, { ...FAILED, tags: ['dispatcher_used:goal-host'] }));
+    expect(ins.status).toBe(200);
+    expect(appliedTo(arm, ins.from)).toEqual({ alpha: 0, beta: 0, lines: 0 });
+    expect(executionRows.get(id)?.tags ?? []).not.toContain('insert_graded:true');
+    const reach = await postReach(id, { reached: true });
+    expect(reach.status).toBe(200);
+    const d = appliedTo(arm, ins.from);
+    expect(d.lines).toBe(1);
+    expect(d.alpha).toBeGreaterThan(0);
+    expect(d.beta).toBeLessThan(d.alpha);
+    expect(infos.slice(ins.from).filter((i) => HANDED_TO_VPM.has(i.msg) && i.meta.activity_id === arm && Number(i.meta.beta_delta) >= 1)).toEqual([]);
+  });
+});
+
+describe('CONTROL (D1) — a child run that inherits the goal-host tag keeps its blame', () => {
+  test('lifecycle-subscriber shape (parent_execution_id set), failed task ⇒ β 1 at insert and stamped', async () => {
+    const arm = 'fixture-vessel:subscriber-failed-task-arm';
+    const id = 'exec-subscriber-failed-task-1';
+    const ins = await postTrace(body(id, arm, { ...FAILED, tags: ['dispatcher_used:goal-host'], parent_execution_id: 'exec-parent-walk-1' }));
+    expect(ins.status).toBe(200);
+    expect(appliedTo(arm, ins.from)).toEqual({ alpha: 0, beta: 1, lines: 1 });
+    expect(executionRows.get(id)?.tags ?? []).toContain('insert_graded:true');
   });
 });
 

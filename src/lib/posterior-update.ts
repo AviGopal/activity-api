@@ -85,6 +85,14 @@ export interface TraceForPosterior {
    * org on its OWN execution row.
    */
   org_defaulted?: boolean;
+  /**
+   * The trace insert's positive statement that this row is a walk AWAITING its late reach verdict: a goal-host-tagged
+   * TOP-LEVEL run (no parent execution, no composition chain: the run a goal-host dispatch record names and POST /reach
+   * grades; a lifecycle subscriber or nested child always carries its parent) with no reach tag, not a satellite. The
+   * ungraded-failure arm DEFERS to the verdict for such a row (ungraded => no write, beta included). Absent: not stated,
+   * the arm is unchanged (every other caller, and every child run, keeps its blame).
+   */
+  awaiting_verdict?: boolean;
   /** Trace tags carrying the walk's persisted reach verdict ('reached:true'/'reached:false'/'dispatcher_used:goal-host'). Absent => legacy success-based (fail-open). */
   tags?: string[];
   /**
@@ -1315,7 +1323,7 @@ export async function applyVariantThompsonDelta(
  *   graded = the trace hands a verdict to the posterior: classifyReach is reached / not-reached, or the ungraded-failure
  *            arm blames it. An observe execution is never graded (applyOutcomeToPosteriors returns before grading it).
  */
-export function posteriorGrade(trace: Pick<TraceForPosterior, 'success' | 'execution_id' | 'activity_id' | 'tags'> & { tasks?: unknown }): {
+export function posteriorGrade(trace: Pick<TraceForPosterior, 'success' | 'execution_id' | 'activity_id' | 'tags' | 'awaiting_verdict'> & { tasks?: unknown }): {
   reachVerdict: ReturnType<typeof classifyReach>;
   ungraded: boolean;
   failedByTask: boolean;
@@ -1339,7 +1347,8 @@ export function posteriorGrade(trace: Pick<TraceForPosterior, 'success' | 'execu
   // about tasks, and reading that absence as "zero tasks" blamed every such failure beta 1 although the walk is
   // AWAITING its reach verdict, ungraded in both directions (reach-classify.ts). With evidence the arm is unchanged.
   const hasTaskEvidence = typeof (trace as any).failure_count === 'number' || typeof (trace as any).task_count === 'number' || 'tasks' in trace;
-  const failedByTask = ungraded && hasTaskEvidence && !isReachInapplicable(trace) && !isObserveTrace(trace) && trace.success === false && (((trace as any).failure_count ?? 0) > 0 || ((trace as any).task_count ?? 0) === 0);
+  // A walk the insert states is AWAITING its verdict is not blamed here: POST /reach grades it, once.
+  const failedByTask = ungraded && hasTaskEvidence && trace.awaiting_verdict !== true && !isReachInapplicable(trace) && !isObserveTrace(trace) && trace.success === false && (((trace as any).failure_count ?? 0) > 0 || ((trace as any).task_count ?? 0) === 0);
   const effectiveSuccess = reachVerdict === 'reached';
   return { reachVerdict, ungraded, failedByTask, effectiveSuccess, graded: !isObserveTrace(trace) && (!ungraded || failedByTask) };
 }

@@ -40,6 +40,22 @@ export const REACH_RETRACTED_PREFIX = 'reach_retracted:';
  * one execution, one grading writer. Not a verdict itself, and not read by classifyReach.
  */
 export const INSERT_GRADED_TAG = 'insert_graded:true';
+
+/**
+ * A row AWAITING its late reach verdict, as the trace insert can state it: tagged dispatcher_used:goal-host, no reach
+ * tag, not a satellite, and TOP-LEVEL (no parent execution, no composition chain). The executor's own top-level rule
+ * (`!parentExecutionId && compositionChain.length === 0`) is what makes it the run a goal-host dispatch record names
+ * and POST /reach grades; a lifecycle subscriber inherits the parent's tags but always carries the parent, so it is
+ * never awaiting and keeps the ungraded-failure arm's blame.
+ */
+export function isAwaitingVerdict(t: { execution_id?: string; activity_id?: string; tags?: string[]; parent_execution_id?: unknown; composition_chain?: unknown }): boolean {
+  const tags = t.tags ?? [];
+  if (!tags.includes('dispatcher_used:goal-host') || tags.includes('reached:true') || tags.includes('reached:false')) return false;
+  if (isHollowSatellite(t)) return false;
+  const hasParent = typeof t.parent_execution_id === 'string' && t.parent_execution_id.length > 0;
+  const hasChain = Array.isArray(t.composition_chain) && t.composition_chain.length > 0;
+  return !hasParent && !hasChain;
+}
 export function isReachRetracted(t: { tags?: string[] }): boolean {
   return (t.tags ?? []).some((tag) => typeof tag === 'string' && tag.startsWith(REACH_RETRACTED_PREFIX) && tag.length > REACH_RETRACTED_PREFIX.length);
 }
