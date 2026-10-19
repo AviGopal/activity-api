@@ -598,21 +598,29 @@ async function queryExecutions(
     ${input.execution_id ? '' : 'ORDER BY executed_at DESC'}
   `;
   let legacyRows: RawExecutionRow[] = [];
-  try {
-    const legacyIdResult = await db.query(legacyIdSql, params);
-    const legacyIdSet = Array.isArray(legacyIdResult) && legacyIdResult.length > 0 ? legacyIdResult[0] : [];
-    const legacyIds = (Array.isArray(legacyIdSet) ? (legacyIdSet as RawExecutionRow[]) : [])
-      .map((r) => r.execution_id)
-      .filter((x) => x != null);
-    if (legacyIds.length > 0) {
-      const legacyResult = await db.query(legacyHydrateSql, { ...params, legacyIds });
-      const legacySet = Array.isArray(legacyResult) && legacyResult.length > 0 ? legacyResult[0] : [];
-      legacyRows = Array.isArray(legacySet) ? (legacySet as RawExecutionRow[]) : [];
+  // An execution_id the live-table point lookup already found needs no legacy read: the view is a
+  // projection of that same table, so it can only return the row again. Reading it anyway (a filter on
+  // a DEFINE TABLE AS view under the tenant disjunction, SurrealDB 2.3.10, ~245k rows) held the call at
+  // 4.7-7.0 s, and ribosome-extract's acquire_trace_signature timed out at 8 s on every reached trace.
+  // The legacy read stays the fallback for ids the live table does not hold, and for the window path.
+  const legacyNeeded = !(input.execution_id && paradigmRows.length > 0);
+  if (legacyNeeded) {
+    try {
+      const legacyIdResult = await db.query(legacyIdSql, params);
+      const legacyIdSet = Array.isArray(legacyIdResult) && legacyIdResult.length > 0 ? legacyIdResult[0] : [];
+      const legacyIds = (Array.isArray(legacyIdSet) ? (legacyIdSet as RawExecutionRow[]) : [])
+        .map((r) => r.execution_id)
+        .filter((x) => x != null);
+      if (legacyIds.length > 0) {
+        const legacyResult = await db.query(legacyHydrateSql, { ...params, legacyIds });
+        const legacySet = Array.isArray(legacyResult) && legacyResult.length > 0 ? legacyResult[0] : [];
+        legacyRows = Array.isArray(legacySet) ? (legacySet as RawExecutionRow[]) : [];
+      }
+    } catch (err) {
+      logger.warn('[execution-trace-with-signatures] legacy execution query failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
-  } catch (err) {
-    logger.warn('[execution-trace-with-signatures] legacy execution query failed', {
-      error: err instanceof Error ? err.message : String(err),
-    });
   }
 
   // The v_paradigm compat view no longer projects `tasks` (migration-167).
