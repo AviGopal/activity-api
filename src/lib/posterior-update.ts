@@ -1307,6 +1307,43 @@ export async function applyVariantThompsonDelta(
   return outcome;
 }
 
+/**
+ * THE ONE GRADING DECISION applyOutcomeToPosteriors makes for a trace, as a pure function, so a caller that must know
+ * BEFORE the write whether this execution will be graded (the trace insert, which stamps insert_graded:true so the late
+ * POST /reach does not grade the same execution a second time) asks the same question rather than a copy of it.
+ *
+ *   graded = the trace hands a verdict to the posterior: classifyReach is reached / not-reached, or the ungraded-failure
+ *            arm blames it. An observe execution is never graded (applyOutcomeToPosteriors returns before grading it).
+ */
+export function posteriorGrade(trace: Pick<TraceForPosterior, 'success' | 'execution_id' | 'activity_id' | 'tags'> & { tasks?: unknown }): {
+  reachVerdict: ReturnType<typeof classifyReach>;
+  ungraded: boolean;
+  failedByTask: boolean;
+  effectiveSuccess: boolean;
+  graded: boolean;
+} {
+  const reachVerdict = classifyReach({
+    success: trace.success,
+    execution_id: trace.execution_id,
+    activity_id: trace.activity_id,
+    tags: trace.tags,
+  });
+  const ungraded = reachVerdict === 'ungraded';
+
+  // The ungraded-failure arm (be6b5cd) blames an ungraded run whose tasks failed, so a template whose
+  // tasks throw cannot hide behind "ungraded". A reach-INAPPLICABLE run (telemetry:/declined:) is
+  // ungraded for a different reason — it was never attempting a goal — and is neither credited nor blamed.
+  // ABSENT IS NOT ZERO. The arm needs task EVIDENCE: a failure_count/task_count, or a `tasks` field. The trace POST
+  // always passes `tasks` (null when none were posted — a real "no tasks", which be6b5cd blames). A caller that omits
+  // the field entirely (POST /v2/goal-paths and POST /executions send only a synthetic goal-host tag) has said nothing
+  // about tasks, and reading that absence as "zero tasks" blamed every such failure beta 1 although the walk is
+  // AWAITING its reach verdict, ungraded in both directions (reach-classify.ts). With evidence the arm is unchanged.
+  const hasTaskEvidence = typeof (trace as any).failure_count === 'number' || typeof (trace as any).task_count === 'number' || 'tasks' in trace;
+  const failedByTask = ungraded && hasTaskEvidence && !isReachInapplicable(trace) && !isObserveTrace(trace) && trace.success === false && (((trace as any).failure_count ?? 0) > 0 || ((trace as any).task_count ?? 0) === 0);
+  const effectiveSuccess = reachVerdict === 'reached';
+  return { reachVerdict, ungraded, failedByTask, effectiveSuccess, graded: !isObserveTrace(trace) && (!ungraded || failedByTask) };
+}
+
 export async function applyOutcomeToPosteriors(
   trace: TraceForPosterior,
   db: DBQueryable,
@@ -1336,25 +1373,7 @@ export async function applyOutcomeToPosteriors(
   // fall through to success-based behavior (unchanged). {0,0} for ungraded is idiomatic
   // (matches computeDeltas' 'cascading'/'user_abort') and suppresses S1-S4 via their
   // existing (alphaDelta!==0||betaDelta!==0) guards for free.
-  const reachVerdict = classifyReach({
-    success: trace.success,
-    execution_id: trace.execution_id,
-    activity_id: trace.activity_id,
-    tags: trace.tags,
-  });
-  const ungraded = reachVerdict === 'ungraded';
-
-  // The ungraded-failure arm (be6b5cd) blames an ungraded run whose tasks failed, so a template whose
-  // tasks throw cannot hide behind "ungraded". A reach-INAPPLICABLE run (telemetry:/declined:) is
-  // ungraded for a different reason — it was never attempting a goal — and is neither credited nor blamed.
-  // ABSENT IS NOT ZERO. The arm needs task EVIDENCE: a failure_count/task_count, or a `tasks` field. The trace POST
-  // always passes `tasks` (null when none were posted — a real "no tasks", which be6b5cd blames). A caller that omits
-  // the field entirely (POST /v2/goal-paths and POST /executions send only a synthetic goal-host tag) has said nothing
-  // about tasks, and reading that absence as "zero tasks" blamed every such failure beta 1 although the walk is
-  // AWAITING its reach verdict, ungraded in both directions (reach-classify.ts). With evidence the arm is unchanged.
-  const hasTaskEvidence = typeof (trace as any).failure_count === 'number' || typeof (trace as any).task_count === 'number' || 'tasks' in trace;
-  const failedByTask = ungraded && hasTaskEvidence && !isReachInapplicable(trace) && trace.success === false && (((trace as any).failure_count ?? 0) > 0 || ((trace as any).task_count ?? 0) === 0);
-  const effectiveSuccess = reachVerdict === 'reached';
+  const { reachVerdict, ungraded, failedByTask, effectiveSuccess } = posteriorGrade(trace);
   const { alphaDelta, betaDelta } = (ungraded && !failedByTask)
     ? { alphaDelta: 0, betaDelta: 0 }
     : computeDeltas(effectiveSuccess, trace.failure_mode, warnings, trace, yieldRefs);

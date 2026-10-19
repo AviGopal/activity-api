@@ -28,11 +28,11 @@ import {
 import { resolveLearningTrack, type LearningTrack } from '../lib/learning-track';
 import { incrementExemplarBurstCounter } from '../services/exemplar-selector';
 import { incrementTraceStoreCounter } from '../lib/trace-store-counters';
-import { applyOutcomeToPosteriors, applyVariantThompsonDelta } from '../lib/posterior-update';
+import { applyOutcomeToPosteriors, applyVariantThompsonDelta, posteriorGrade } from '../lib/posterior-update';
 import { writeContextDelta } from '../lib/posterior-aggregator';
 import { applySubscriberCounts, subscriberCountsProblem, type SubscriberCountsBatch, type SubscriberCountsDeps, type SubscriberCountEntry } from '../lib/subscriber-run-counts';
 import { resolveTraceOrg } from '../lib/trace-org';
-import { classifyReach, isObserveTrace, isReachRetracted, noteObserveSkip, observeSkipCount } from '../lib/reach-classify';
+import { classifyReach, INSERT_GRADED_TAG, isObserveTrace, isReachRetracted, noteObserveSkip, observeSkipCount } from '../lib/reach-classify';
 import { failureClassOf } from '../lib/failure-class';
 import { updateSuccessorFeatures } from '../lib/successor-features';
 import { applyClusterPosterior } from '../lib/cluster-posterior';
@@ -2727,6 +2727,26 @@ app.post('/', async (c) => {
     if (observeAtInsert && !insertTags.includes('reach_observe:true')) {
       (trace as any).tags = [...(Array.isArray((trace as any).tags) ? ((trace as any).tags as string[]) : insertTags), 'reach_observe:true'];
     }
+    // ONE WRITER PER EXECUTION. When this insert grades the execution (posteriorGrade: the same decision
+    // applyOutcomeToPosteriors makes below, with the same arguments), the row is stamped insert_graded:true IN the
+    // authoritative write, so a late POST /reach for it grades nothing: before this the insert credited a trace that
+    // arrived with its verdict (or blamed a failure) and the late verdict credited the same execution again. Stamped
+    // before the write, not after the credit, so no /reach can read the row between the two. reach_graded:true is NOT
+    // reused: its readers (the shape-counter seed, reach-correction) read it as "POST /reach credited this row".
+    // The marker is decided here only: a poster-supplied copy is dropped, so no caller can pre-empt the late verdict.
+    {
+      const tagsNow: string[] = Array.isArray((trace as any).tags) ? ((trace as any).tags as string[]) : [];
+      const others = tagsNow.filter((t) => t !== INSERT_GRADED_TAG);
+      const insertGrades = !observeAtInsert && !betaWithheldAtInsert && posteriorGrade({
+        success: trace.success as boolean,
+        execution_id: trace.execution_id as string | undefined,
+        activity_id: trace.variant_id as string,
+        tags: others,
+        tasks: trace.tasks,
+      }).graded;
+      if (insertGrades) (trace as any).tags = [...others, INSERT_GRADED_TAG];
+      else if (others.length !== tagsNow.length) (trace as any).tags = others;
+    }
 
     // ========================================================================
     // TASK #3: Activity Shape Validation
@@ -5062,6 +5082,15 @@ app.post('/reach', async (c) => {
         activity_id: preActivityId || null,
         reached: body.reached,
         observe_skips: skips,
+      });
+    } else if (preReadOk && preRow && preTags.includes(INSERT_GRADED_TAG)) {
+      // ONE WRITER PER EXECUTION: the insert already graded this execution (stamped insert_graded:true in the same
+      // write). The verdict is still persisted below; crediting it here would grade the same execution twice.
+      logger.info('[reach-patch] posterior grading skipped; insert path already graded this trace', {
+        execution_id: String(execId),
+        activity_id: preActivityId || null,
+        reached: body.reached,
+        marker: INSERT_GRADED_TAG,
       });
     } else if (preReadOk && preRow && preActivityId && !preIsSatellite && !preTags.includes('reach_graded:true') && !preTags.includes('reach_withheld:true') && !betaWithheld) {
       const preVerdict = classifyReach({

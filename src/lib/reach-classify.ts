@@ -33,6 +33,13 @@ export function isReachInapplicable(t: { tags?: string[] }): boolean {
  * per-task shapes a fresh verdict would need were never stored, so the row can only go back to ungraded.
  */
 export const REACH_RETRACTED_PREFIX = 'reach_retracted:';
+
+/**
+ * The trace insert GRADED this execution (POST /execution-traces stamps it in the authoritative write when
+ * posteriorGrade says the insert hands a verdict to the posterior). POST /reach grades nothing for a row carrying it:
+ * one execution, one grading writer. Not a verdict itself, and not read by classifyReach.
+ */
+export const INSERT_GRADED_TAG = 'insert_graded:true';
 export function isReachRetracted(t: { tags?: string[] }): boolean {
   return (t.tags ?? []).some((tag) => typeof tag === 'string' && tag.startsWith(REACH_RETRACTED_PREFIX) && tag.length > REACH_RETRACTED_PREFIX.length);
 }
