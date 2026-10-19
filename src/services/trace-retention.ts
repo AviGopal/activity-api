@@ -36,6 +36,7 @@ import { withDeadline } from '../lib/deadline';
 import { logger } from '../utils/logger';
 import { decrementTraceStoreCounter, TRACE_STORE_COUNTER_ID } from '../lib/trace-store-counters';
 import { PRUNE_MARKERS_SQL } from '../lib/shape-score-counter';
+import { INSERT_GRADED_TAG } from '../lib/reach-classify';
 
 // WRITE-FLIP/decommission: retention now bounds the canonical `execution`
 // table (root path). AET is the DUAL_WRITE shadow; when DUAL_WRITE is off it
@@ -559,7 +560,9 @@ async function computeEffectiveCeiling(cfg: TraceRetentionConfig): Promise<{ cei
 // (trace-retention.evidence-compaction.test.ts) pins the contract kept here.
 //
 // PROTECTED ("graded or labelled evidence"): `reached` is a boolean (reached:false is evidence too), or the
-// tags carry 'reach_graded:true', or the id is a goal_verification_labels execution_id, or the id is the
+// tags carry 'reach_graded:true' (POST /reach credited it) or 'insert_graded:true' (the trace insert graded it: a
+// failed run blamed at insert has no reach tag and `reached` NONE, so only this marker says it is evidence), or the
+// id is a goal_verification_labels execution_id, or the id is the
 // execution_id of a trace_evidence_ref whose `open` is not false.
 //
 // Two rules:
@@ -588,7 +591,7 @@ async function computeEffectiveCeiling(cfg: TraceRetentionConfig): Promise<{ cei
 // select and the id-loop select into table scans in record-id order. The binary form below is the same
 // predicate (CONTAINSNOT on a NONE tags is true, as !(NONE CONTAINS x) is) and keeps the index plan.
 const PROTECTED_REFS_LET = `LET $__prot = array::union((SELECT VALUE execution_id FROM goal_verification_labels), (SELECT VALUE execution_id FROM trace_evidence_ref WHERE open != false));`;
-const UNGRADED_WHERE = `type::is::bool(reached) = false AND tags CONTAINSNOT 'reach_graded:true'`;
+const UNGRADED_WHERE = `type::is::bool(reached) = false AND tags CONTAINSNOT 'reach_graded:true' AND tags CONTAINSNOT '${INSERT_GRADED_TAG}'`;
 /** The ids of `candVar` (an id list) that are not in $__prot, as records: the in-memory protection filter. */
 const UNPROTECTED_OF = (candVar: string) => `array::map(array::complement(array::map(${candVar}, |$i| meta::id($i)), $__prot), |$e| type::thing('${TABLE}', $e))`;
 /**
@@ -600,7 +603,7 @@ const UNPROTECTED_OF = (candVar: string) => `array::map(array::complement(array:
 export const COMPACT_SQL = (idsVar: string) => `${PROTECTED_REFS_LET}
 FOR $__r IN (SELECT id, reached, tags, success, metadata.reach_retraction AS retraction FROM ${idsVar}) {
   LET $__eid = meta::id($__r.id);
-  LET $__graded = type::is::bool($__r.reached) OR ($__r.tags CONTAINS 'reach_graded:true');
+  LET $__graded = type::is::bool($__r.reached) OR ($__r.tags CONTAINS 'reach_graded:true') OR ($__r.tags CONTAINS '${INSERT_GRADED_TAG}');
   IF $__graded OR $__eid INSIDE $__prot {
     LET $__label = (SELECT VALUE verdict FROM goal_verification_labels WHERE execution_id = $__eid LIMIT 1)[0];
     UPSERT type::thing('execution_observation', $__eid) SET

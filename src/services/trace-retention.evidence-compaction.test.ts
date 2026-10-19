@@ -152,8 +152,8 @@ async function declare(list: string | null) {
   clearTuning();
 }
 
-type Kind = 'graded_reached' | 'graded_not_reached' | 'labelled' | 'gap_ref' | 'ledger_ref' | 'ungraded' | 'telemetry';
-const PROTECTED_KINDS: ReadonlySet<Kind> = new Set(['graded_reached', 'graded_not_reached', 'labelled', 'gap_ref', 'ledger_ref']);
+type Kind = 'graded_reached' | 'graded_not_reached' | 'insert_graded' | 'labelled' | 'gap_ref' | 'ledger_ref' | 'ungraded' | 'telemetry';
+const PROTECTED_KINDS: ReadonlySet<Kind> = new Set(['graded_reached', 'graded_not_reached', 'insert_graded', 'labelled', 'gap_ref', 'ledger_ref']);
 /** Every protected execution id seeded in the current test. */
 let protectedIds = new Set<string>();
 
@@ -177,6 +177,8 @@ async function seed(kind: Kind, n: number, opts: { prefix: string; activity?: st
     };
     if (kind === 'graded_reached') { r['reached'] = true; r['tags'] = ['reach_graded:true', 'reached:true']; }
     if (kind === 'graded_not_reached') { r['reached'] = false; r['tags'] = ['reach_graded:true', 'reached:false']; }
+    // Graded at INSERT (a failed run blamed by the ungraded-failure arm): no reach tag, `reached` NONE, only the marker.
+    if (kind === 'insert_graded') r['tags'] = ['insert_graded:true'];
     if (kind === 'telemetry') r['tags'] = ['telemetry:auth'];
     rows.push(r);
   }
@@ -429,6 +431,30 @@ describe('retention compacts graded/labelled evidence before any delete (real Su
       expect(await total()).toBe(51);
     });
   }
+
+  // ── A row the INSERT graded (insert_graded:true, reached NONE) is evidence too (D8a; must-fail at 8caf050) ──
+
+  check('EVIDENCE-RETENTION PROTECTED: a row the insert graded (insert_graded:true, reached NONE) survives the valve; the ungraded rows still go', async () => {
+    const [g] = await seed('insert_graded', 1, { prefix: 'ig', ageDays: 5, success: false }); // the oldest row in the store
+    const ungraded = await seed('ungraded', 60, { prefix: 'iu', ageDays: 3 });
+    const r = await measured(() => M.runCeilingDrainTick(cfgFor(51))); // surplus 10
+    expect(r.protectedDeleted).toEqual([]);
+    expect(await exists(g!)).toBe(true);
+    expect(await total()).toBe(51);
+    const ungradedSet = new Set(ungraded);
+    expect(r.deleted.length).toBe(10);
+    expect(r.deleted.every((e) => ungradedSet.has(e))).toBe(true); // a truly ungraded row is still prunable
+  });
+
+  check('EVIDENCE-RETENTION COMPACTION: an insert-graded row the reservoir deletes is compacted first, observed not-reached', async () => {
+    await seed('insert_graded', 40, { prefix: 'ic', activity: 'insert-graded-act', ageDays: 3, success: false });
+    const r = await measured(() => M.runTraceRetentionSweep(strataCfg(['insert-graded-act'], 10)));
+    expect(r.removed).toBeGreaterThan(0);
+    expect(r.uncompacted).toEqual([]);
+    const obs = await q<Record<string, unknown>>('SELECT * FROM execution_observation WHERE execution_id IN $ids', { ids: r.protectedDeleted });
+    expect(obs.length).toBe(r.removed);
+    expect(obs.every((o) => o['instrument'] === 'reach_verdict' && o['observation'] === false)).toBe(true);
+  });
 
   // ── CONTROLS (green at base, must stay green under the fix) ─────────────────────────────────────
 
