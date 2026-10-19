@@ -14,7 +14,8 @@
  *     charges the repair row beta once.
  *
  * Harness: the insert-beta-withheld pattern (spies on the real exports, restored afterAll; no mock.module), with
- * POSTERIOR_COALESCE=0 so each cts delta is applied as its own UPSERT, read back from a recorded cts table.
+ * POSTERIOR_COALESCE left as the process has it: each cts delta, applied directly or in the lane flush settle() forces, is
+ * read back from a recorded cts table.
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
@@ -26,7 +27,10 @@ process.env.SURREALDB_DATABASE ??= 'learning_loop';
 process.env.SURREALDB_URL ??= STUB_ORIGIN;
 process.env.SURREALDB_USERNAME ??= 'test';
 process.env.SURREALDB_PASSWORD ??= 'test';
-process.env.POSTERIOR_COALESCE ??= '0';
+// POSTERIOR_COALESCE is deliberately NOT set: posterior-aggregator fixes its mode at its first import, so a file that
+// sets it to '0' and happens to import the aggregator first turns coalescing off for every later file in the process
+// (context-lane-concurrency.real.test.ts then fails). These tests read ENQUEUED and APPLIED lines alike and settle()
+// flushes, so they hold in either mode.
 process.env.PRIOR_SEED_ENABLED ??= 'false';
 process.env.RELEVANCE_SINK_ENDPOINT ??= STUB_ORIGIN;
 

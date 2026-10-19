@@ -26,7 +26,10 @@ process.env.SURREALDB_DATABASE ??= 'learning_loop';
 process.env.SURREALDB_URL ??= STUB_ORIGIN;
 process.env.SURREALDB_USERNAME ??= 'test';
 process.env.SURREALDB_PASSWORD ??= 'test';
-process.env.POSTERIOR_COALESCE ??= '0';
+// POSTERIOR_COALESCE is deliberately NOT set: posterior-aggregator fixes its mode at its first import, so a file that
+// sets it to '0' and happens to import the aggregator first turns coalescing off for every later file in the process
+// (context-lane-concurrency.real.test.ts then fails). These tests read ENQUEUED and APPLIED lines alike and settle()
+// flushes, so they hold in either mode.
 process.env.PRIOR_SEED_ENABLED ??= 'false';
 process.env.RELEVANCE_SINK_ENDPOINT ??= STUB_ORIGIN;
 
