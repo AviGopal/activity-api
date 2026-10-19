@@ -932,28 +932,11 @@ app.post('/templates', async (c) => {
     // Caller-without-accountId still lands at the legacy `<variant>` key.
     const metricsRecordIdSlug = variantMetricsRecordId(activityId, accountId);
 
-    // Reconcile Thompson posteriors from execution counters so failures grow beta.
-    // Some paths historically only credited successes (alpha) and ignored failures,
-    // leaving thompson_beta stagnant. This UPDATE derives alpha/beta from the
-    // durable counters on every learning write, so a run with success=false or
-    // reached=false increases beta via failed_executions.
-    try {
-      await surrealDB.query(
-        `LET $id = type::thing('variant_performance_metrics', $slug);
-         UPDATE $id SET
-           thompson_alpha = (IF successful_executions = NONE THEN 0 ELSE successful_executions END) + 1,
-           thompson_beta  = (IF failed_executions     = NONE THEN 0 ELSE failed_executions     END) + 1,
-           updated_at     = time::now()
-         WHERE thompson_alpha != ((IF successful_executions = NONE THEN 0 ELSE successful_executions END) + 1)
-            OR thompson_beta  != ((IF failed_executions     = NONE THEN 0 ELSE failed_executions     END) + 1);`,
-        { slug: metricsRecordIdSlug },
-      );
-    } catch (e) {
-      logger.warn('[learning] Variant performance posterior reconcile failed', {
-        error: (e as Error).message,
-        metrics_record: metricsRecordIdSlug,
-      });
-    }
+    // NO POSTERIOR RECONCILE FROM EXECUTION COUNTERS (D8a). A reconcile here overwrote thompson_alpha/beta with
+    // (successful_executions + 1, failed_executions + 1) on every (re-)registration. Those counters count EXIT STATUS,
+    // so it replaced the reach-graded posterior with exit-status alpha, no verdict anywhere. It was added because beta
+    // did not grow on failures; the reach-gated writer (applyOutcomeToPosteriors) now charges beta for a not-reached
+    // or failed execution, so the counters have nothing to correct. The UPSERT below keeps an existing posterior.
     const insertMetricsQuery = metricsProjectId
       ? `
       UPSERT variant_performance_metrics:\`${metricsRecordIdSlug}\` SET
