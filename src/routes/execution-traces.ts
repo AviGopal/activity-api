@@ -249,6 +249,7 @@ export function normalizePersistedTask(task: any): {
   resolver_id?: string;
   resolver_tier?: string;
   success?: boolean;
+  resolved?: boolean;
   cost_usd?: number;
   consumed_from_task_ids?: string[];
   consumed_provenance?: Array<{ impulse_id: string; producer_execution_id: string | null; origin?: string }>;
@@ -257,6 +258,7 @@ export function normalizePersistedTask(task: any): {
   output_shapes?: string[];
   resolved_config?: Record<string, unknown>;
   budget_ms?: number;
+  budget_exhausted?: boolean;
   attempts?: Array<{ n: number; started_at?: string; duration_ms: number; ok: boolean; error?: string; code?: string }>;
 } {
   const { input_impulse_ids: inputImpulseIds, output_impulse_ids: outputImpulseIds } =
@@ -292,6 +294,13 @@ export function normalizePersistedTask(task: any): {
   }
   if (typeof task?.cost_usd === 'number') {
     out.cost_usd = task.cost_usd;
+  }
+  // Carry through producer-added task-level signals (bounded, explicit).
+  if (typeof task?.budget_exhausted === 'boolean') {
+    out.budget_exhausted = task.budget_exhausted;
+  }
+  if (typeof task?.resolved === 'boolean') {
+    out.resolved = task.resolved;
   }
   // Per-task ATTEMPTS and BUDGET (light-dispatch abort-budget fix): how many requests a task really
   // sent and under what abort budget. A retried task is otherwise indistinguishable from a single
