@@ -51,11 +51,31 @@ export interface LabelWriteResult {
  * scope is decided where keys are issued (identity-vessel), and changes there take effect here.
  * Unknown, missing or malformed means NOT a human-verdict principal (fail closed).
  *
- * Non-human labelers (automated, deterministic) are unaffected: any authenticated caller may still
- * write them, as before.
+ * Non-human labelers (automated, deterministic) need no verdict scope, only the write grant below.
  */
 export const HUMAN_VERDICT_SCOPE = 'verdict:human';
 export const ADMIN_SCOPE = 'admin';
+
+/**
+ * WHO MAY WRITE A LABEL AT ALL.
+ *
+ * Every label is oracle corpus: goal-host's consumer corrects reach on human labels, and the
+ * deterministic and automated labels are what reach and the learning loop are graded against.
+ * Authentication alone admitted them, so a key identity issued with exactly [read] wrote a label
+ * (HTTP 200, through discovery's /resolve forward). A label now needs a credential whose
+ * server-validated scopes carry WRITE_SCOPE, or ADMIN_SCOPE. The scopes are the same JwtAuthContext field isHumanVerdictPrincipal reads, set
+ * by the auth middleware from identity's answer, never from the pointer. The node's own key has
+ * no shortcut here: it is validated by identity like any other key and passes by the write scope
+ * it was issued with. Identity unreachable never reaches this check: the middleware answers 503
+ * and no context is set. Missing or malformed scopes are refused (fail closed); reads of the
+ * labels (goal_verification_label) are unaffected.
+ */
+export const WRITE_SCOPE = 'write';
+
+export function mayWriteLabel(ctx: JwtAuthContext): boolean {
+  const scopes = Array.isArray(ctx.scopes) ? ctx.scopes : [];
+  return scopes.includes(WRITE_SCOPE) || scopes.includes(ADMIN_SCOPE);
+}
 
 export function isHumanVerdictPrincipal(ctx: JwtAuthContext | null | undefined): boolean {
   if (!ctx) return false;
@@ -85,6 +105,44 @@ export function labeledByPrincipal(ctx: JwtAuthContext): LabeledByPrincipal {
   };
 }
 
+/**
+ * WHO WROTE A LABEL, stamped on EVERY label (migration 226). Before it, only a human label named
+ * its writer (labeled_by_principal), so an automated or deterministic row could not be attributed
+ * to any credential, and `labeler` is whatever the caller declared. Both fields are built from the
+ * server-validated JwtAuthContext only; a principal_kind or principal_key_id on the pointer is never
+ * read (the CREATE names its fields explicitly and binds these values).
+ *   principal_kind    'obo' (arrived through a federation ingress on behalf of a peer node's
+ *                     caller), 'admin' (validated with the admin scope), 'key' (an identity-validated
+ *                     API key), 'session' (a verified JWT), else the auth type. The node's own key
+ *                     is not told apart: activity-api validates it through identity like any other
+ *                     key, so it is 'key'.
+ *   principal_key_id  the validated key id MASKED to "key_" plus the next 8 characters (6 collide
+ *                     across the fleet's keys); an id without that prefix keeps its first 8
+ *                     characters after any record-table prefix. Absent when there is no key id.
+ */
+export interface LabelWriter {
+  principal_kind: string;
+  principal_key_id: string | null;
+}
+
+export function maskKeyId(keyId: unknown): string | null {
+  if (typeof keyId !== 'string' || keyId.trim().length === 0) return null;
+  const k = keyId.trim();
+  const bare = k.includes(':') ? k.slice(k.lastIndexOf(':') + 1) : k;
+  if (bare.length === 0) return null;
+  return bare.startsWith('key_') ? `key_${bare.slice(4, 12)}` : bare.slice(0, 8);
+}
+
+export function labelWriter(ctx: JwtAuthContext): LabelWriter {
+  const scopes = Array.isArray(ctx.scopes) ? ctx.scopes : [];
+  const kind = ctx.obo ? 'obo'
+    : scopes.includes(ADMIN_SCOPE) ? 'admin'
+    : ctx.authType === 'apikey' ? 'key'
+    : ctx.authType === 'jwt' ? 'session'
+    : (ctx.authType ?? 'unknown');
+  return { principal_kind: kind, principal_key_id: maskKeyId(ctx.keyId) };
+}
+
 export async function resolveGoalVerificationLabelWrite(
   jwtAuthOrNull: JwtAuthContext | null | undefined,
   pointer: Record<string, unknown>,
@@ -94,6 +152,20 @@ export async function resolveGoalVerificationLabelWrite(
     return { status: 401, body: { success: false, error: 'Authentication required for destructive operations' } as ImpulseResolveResponse };
   }
   const jwtAuth = jwtAuthOrNull;
+
+  // The write grant (mayWriteLabel above), checked before anything else: refused 403 with nothing
+  // written. The refusal names the scope needed, not the caller's key.
+  if (!mayWriteLabel(jwtAuth)) {
+    logger.warn('goal_verification_label_write REFUSED: a credential without the write scope', {
+      key_id: jwtAuth.keyId ?? null,
+      auth_type: jwtAuth.authType ?? null,
+      obo: jwtAuth.obo ? true : false,
+    });
+    return { status: 403, body: {
+      success: false,
+      error: `goal_verification_label_write requires a credential issued with the "${WRITE_SCOPE}" scope (or "${ADMIN_SCOPE}"); a read-only credential may read labels but not write them`,
+    } as ImpulseResolveResponse };
+  }
 
   const gvlPointer = pointer as {
     goal?: string;
@@ -145,6 +217,7 @@ export async function resolveGoalVerificationLabelWrite(
     } as ImpulseResolveResponse };
   }
   const gvlPrincipal = gvlHuman ? labeledByPrincipal(jwtAuth) : null;
+  const gvlWriter = labelWriter(jwtAuth);
 
   // GROUNDING (migration 192). A label recorded only a conclusion — verdict, confidence,
   // labeler — never the evidence behind it, so a self-confirming verdict was
@@ -267,6 +340,8 @@ export async function resolveGoalVerificationLabelWrite(
         expected: IF $expected IS NULL THEN NONE ELSE $expected END,
         observed: IF $observed IS NULL THEN NONE ELSE $observed END,
         evidence: IF $evidence IS NULL THEN NONE ELSE $evidence END,
+        principal_kind: $principal_kind,
+        principal_key_id: IF $principal_key_id_masked IS NULL THEN NONE ELSE $principal_key_id_masked END,
         ${gvlCalibrationContent}${gvlPrincipalContent}grounded: $grounded,
         created_at: time::now()
       }`),
@@ -294,6 +369,9 @@ export async function resolveGoalVerificationLabelWrite(
         window_id: gvlNonEmpty(gvlG.window_id) ? String(gvlG.window_id).slice(0, 200) : null,
         sample_draw_id: gvlNonEmpty(gvlG.sample_draw_id) ? String(gvlG.sample_draw_id).slice(0, 200) : null,
         grounded: gvlGrounded,
+        // WHO WROTE IT (labelWriter above): server-derived, on every label.
+        principal_kind: gvlWriter.principal_kind,
+        principal_key_id_masked: gvlWriter.principal_key_id,
         ...(gvlPrincipal ? { labeled_by_principal: gvlPrincipal, principal_key_id: gvlPrincipal.key_id } : {}),
       },
     );
