@@ -37,6 +37,18 @@ const FALLBACK: SeededPrior = { alpha0: 1, beta0: 1, source: 'fallback' };
 let conceptDbUrlCache: { url: string | null; expiresAt: number } | null = null;
 const CONCEPT_DB_URL_TTL_MS = 60_000;
 
+function isMachineIdentifier(s: string): boolean {
+  // Identifiers carry no natural-language signal; skip FTS queries on them.
+  if (!s) return false;
+  if (s.startsWith('sigcl_')) return true;
+  // Raw hex strings (hashes, bucket signatures)
+  if (/^[a-fA-F0-9]{16,}$/.test(s)) return true;
+  // RFC4122 UUID
+  if (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(s)) return true;
+  return false;
+}
+
+
 export async function resolveConceptDbUrl(): Promise<string | null> {
   const override = process.env['CONCEPT_DB_URL'];
   if (override) return override;
@@ -92,6 +104,18 @@ export async function seedPriorFromConcepts(
   const K = parseInt(process.env.PRIOR_SEED_K ?? '5', 10);
   const kappa = parseFloat(process.env.PRIOR_SEED_KAPPA ?? '10');
   const timeoutMs = parseInt(process.env.PRIOR_SEED_TIMEOUT_MS ?? '10000', 10);
+
+  // If the signature is a machine identifier (e.g., hex/UUID/sigcl_), do not
+  // issue a full-text search — there is no natural language to search.
+  if (signature && isMachineIdentifier(signature)) {
+    logger.debug('prior_seed_identifier_query_skipped', {
+      event: 'prior_seed_identifier_query_skipped',
+      template_id: templateId,
+      signature,
+      org_id: orgId,
+    });
+    return FALLBACK;
+  }
 
   const query = signature ? `${templateId} ${signature}` : templateId;
 
