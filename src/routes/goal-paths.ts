@@ -26,7 +26,7 @@ import {
   type RecommendedPath,
 } from '../models/schemas';
 import { applyOutcomeToPosteriors } from '../lib/posterior-update';
-import { resolveTraceOrg } from '../lib/trace-org';
+import { resolveTraceOrg, ORG_MISMATCH } from '../lib/trace-org';
 import { getJwtAuthFromContext } from '../middleware/jwtAuth';
 import type { SessionData } from '../models/schemas';
 
@@ -412,16 +412,18 @@ app.post('/', async (c) => {
   try {
     const body = await c.req.json();
     const validated = PathRecordRequestSchema.parse(body);
-    // The org, resolved exactly as the trace POST resolves it (body, then JWT, then session; non-empty strings only).
+    // The org, resolved exactly as the trace POST resolves it (the authenticated JWT, then session; non-empty strings
+    // only; a body org_id naming another org is refused 403, never stored).
     // With none it is the 'public' DEFAULT and `pathOrgDefaulted` is true: the path row is still stored under it (no
     // reader keys learning on goal_execution_paths.org_id; dropping the record would be its own harm), but no leaf
     // posterior may be learned under a guessed org (see the applyOutcomeToPosteriors call below).
     const session = ((c.get as any)('session') as SessionData | undefined) || { session_id: 'internal', org_id: null, project_id: null, api_key: null, latest_job_id: null };
-    const { org: pathOrgId, defaulted: pathOrgDefaulted } = resolveTraceOrg({
+    const { org: pathOrgId, defaulted: pathOrgDefaulted, refused: pathOrgRefused } = resolveTraceOrg({
       bodyOrg: (body as any).org_id,
       jwtOrg: getJwtAuthFromContext(c)?.orgId,
       sessionOrg: session?.org_id,
     });
+    if (pathOrgRefused) return c.json({ error: { code: ORG_MISMATCH, message: pathOrgRefused } }, 403);
     for (const k of ["expected_output_shapes", "endpoint_output_shapes"] as const) { const v = (validated as Record<string, unknown>)[k]; if (Array.isArray(v)) (validated as Record<string, unknown>)[k] = [...new Set(v.map(String))]; }
 
     const goalHash = hashGoal(validated.goal_text);

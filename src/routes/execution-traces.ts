@@ -31,7 +31,7 @@ import { incrementTraceStoreCounter } from '../lib/trace-store-counters';
 import { applyOutcomeToPosteriors, applyVariantThompsonDelta, posteriorGrade } from '../lib/posterior-update';
 import { writeContextDelta } from '../lib/posterior-aggregator';
 import { applySubscriberCounts, subscriberCountsProblem, type SubscriberCountsBatch, type SubscriberCountsDeps, type SubscriberCountEntry } from '../lib/subscriber-run-counts';
-import { resolveTraceOrg } from '../lib/trace-org';
+import { resolveTraceOrg, ORG_MISMATCH } from '../lib/trace-org';
 import { classifyReach, INSERT_GRADED_TAG, isAwaitingVerdict, isObserveTrace, isReachRetracted, noteObserveSkip, observeSkipCount } from '../lib/reach-classify';
 import { failureClassOf } from '../lib/failure-class';
 import { updateSuccessorFeatures } from '../lib/successor-features';
@@ -2477,7 +2477,8 @@ app.post('/subscriber-counts', async (c) => {
     try { body = await c.req.json(); } catch { return c.json({ error: 'invalid JSON body' }, 400); }
     const problem = subscriberCountsProblem(body);
     if (problem) return c.json({ error: problem }, 400);
-    const { org, defaulted } = resolveTraceOrg({ bodyOrg: (body as { org_id?: unknown }).org_id, jwtOrg: jwtAuth?.orgId, sessionOrg: session?.org_id });
+    const { org, defaulted, refused } = resolveTraceOrg({ bodyOrg: (body as { org_id?: unknown }).org_id, jwtOrg: jwtAuth?.orgId, sessionOrg: session?.org_id });
+    if (refused) return c.json({ error: { code: ORG_MISMATCH, message: refused } }, 403);
     if (defaulted) return c.json({ error: 'org unresolved: subscriber counts are org-keyed learning writes and are refused, as a defaulted-org trace is' }, 400);
     const r = await applySubscriberCounts(body as SubscriberCountsBatch, org, subscriberCountsDeps);
     return c.json({ success: true, ...r }, 200);
@@ -2550,17 +2551,18 @@ app.post('/', async (c) => {
           ? (body as any).tasks
           : null;
 
-    // FIX: Use org_id from request body if provided, otherwise fall back to JWT/session
-    // This allows MiniBob to explicitly set org_id when sending traces
+    // The org is the AUTHENTICATED one (JWT, else session). A body org_id is only a claim that must match it: one
+    // that names another org is refused, never stored under either (resolveTraceOrg).
     // NO LEARNING WRITE TO A DEFAULT ORG. With no org supplied the trace is still STORED under 'public'
     // (execution.org_id is a required string), but that org is a guess: traceOrgDefaulted gates every
     // org-keyed learning write below (skip, never redirect), and the stored row records metadata.org_defaulted
     // so later readers (POST /reach, chain credit to this execution as a producer) treat it as org-unresolved.
-    const { org: traceOrgId, defaulted: traceOrgDefaulted } = resolveTraceOrg({
+    const { org: traceOrgId, defaulted: traceOrgDefaulted, refused: traceOrgRefused } = resolveTraceOrg({
       bodyOrg: body.org_id,
       jwtOrg: jwtAuth?.orgId,
       sessionOrg: session?.org_id,
     });
+    if (traceOrgRefused) return c.json({ error: { code: ORG_MISMATCH, message: traceOrgRefused } }, 403);
     const traceProjectId = body.project_id || jwtAuth?.projectId || session?.project_id || null;
     // Phase B2: account_id from JWT auth context (sessions don't carry one).
     // Schema is option<string>; null is acceptable when caller has no claim.

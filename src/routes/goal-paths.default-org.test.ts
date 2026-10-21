@@ -13,8 +13,8 @@
  *      The positive control is the learner's own SKIPPED/APPLIED log line for the same activity, so a run where the
  *      credit call never happened cannot pass.
  *   B. CONTRACT (child `bun test` probe — it mocks ../lib/posterior-update, which must not leak into this file's
- *      process): the org handed to applyOutcomeToPosteriors is resolved like the trace POST (body, then JWT, then
- *      session), and with none it carries org_defaulted:true. CONTROL: an explicit org is passed through, unflagged.
+ *      process): the org handed to applyOutcomeToPosteriors is resolved like the trace POST (JWT, then session; a
+ *      body org must match it or the POST is refused), and with none it carries org_defaulted:true. CONTROL: an explicit org is passed through, unflagged.
  *      This is asserted at the contract and not at the write because, once (A) is fixed, this route produces no
  *      leaf delta for any org — the control can only be the call it makes.
  */
@@ -103,7 +103,7 @@ if (ISOLATED) {
     }, 30_000);
   });
 
-  type Call = { orgId: string; org_defaulted?: boolean; activity_id?: string };
+  type Call = { orgId?: string; org_defaulted?: boolean; activity_id?: string; refused?: number };
 
   /** Child `bun test` process: mocks posterior-update there, so the mock cannot leak into this file's process. */
   function contractProbe(cases: Array<{ name: string; body: Record<string, unknown>; jwtOrg?: string; sessionOrg?: string }>): Record<string, Call[]> {
@@ -134,6 +134,7 @@ if (ISOLATED) {
             app.route('/', gp);
             calls.length = 0;
             const res = await app.request('/', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(k.body) });
+            if (res.status === 403) { out[k.name] = [{ refused: 403 }]; continue; }
             if (res.status !== 200) throw new Error(k.name + ': status ' + res.status + ' ' + (await res.text()));
             for (let i = 0; i < 50 && calls.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
             out[k.name] = [...calls];
@@ -164,20 +165,20 @@ if (ISOLATED) {
     test('no body/JWT/session org ⇒ org_defaulted:true; an explicit org (body, JWT or session) is passed unflagged', () => {
       const out = contractProbe([
         { name: 'none', body: pathBody() },
-        { name: 'body', body: pathBody({ org_id: 'organizations:substrate' }) },
+        { name: 'body', body: pathBody({ org_id: 'organizations:substrate' }), jwtOrg: 'organizations:substrate' },
         { name: 'jwt', body: pathBody(), jwtOrg: 'organizations:jwt-org' },
         { name: 'session', body: pathBody(), sessionOrg: 'organizations:session-org' },
-        { name: 'body-wins', body: pathBody({ org_id: 'organizations:body-org' }), jwtOrg: 'organizations:jwt-org' },
+        { name: 'body-mismatch', body: pathBody({ org_id: 'organizations:body-org' }), jwtOrg: 'organizations:jwt-org' },
       ]);
       // MUST-FAIL: with no org at all the learner is told the org is a guess.
       expect(out.none).toEqual([{ orgId: 'public', org_defaulted: true, activity_id: LEAF }]);
-      // CONTROL: an explicit body org is passed through and NOT flagged (its leaf delta is applied for that org).
+      // CONTROL: an explicit body org matching the caller's is passed through and NOT flagged (its leaf delta is applied for that org).
       expect(out.body).toEqual([{ orgId: 'organizations:substrate', activity_id: LEAF }]);
       // MUST-FAIL: the JWT and session orgs were ignored, so these walks were credited under 'public'.
       expect(out.jwt).toEqual([{ orgId: 'organizations:jwt-org', activity_id: LEAF }]);
       expect(out.session).toEqual([{ orgId: 'organizations:session-org', activity_id: LEAF }]);
-      // Precedence unchanged from the trace POST: body before JWT.
-      expect(out['body-wins']).toEqual([{ orgId: 'organizations:body-org', activity_id: LEAF }]);
+      // As the trace POST: the org is the caller's, so a body org naming another org is refused and credits no one.
+      expect(out['body-mismatch']).toEqual([{ refused: 403 }]);
     }, 120_000);
   });
 }

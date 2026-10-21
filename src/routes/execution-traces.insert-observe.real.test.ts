@@ -152,6 +152,8 @@ beforeAll(async () => {
     AGG = await import('../lib/posterior-aggregator');
     LANE = await import('../lib/context-posterior-lane');
     app = new Hono();
+    // The caller's authenticated org (the session's here): the trace POST takes the org from the credential.
+    app.use('*', async (c, next) => { (c as any).set('session', { session_id: 't', org_id: ORG, project_id: null, api_key: null, latest_job_id: null }); await next(); });
     app.route('/v2/activities/execution-traces', ET);
     await db.sql(`${USE} ${[vpm(OBS), vpm(LEARN), exec('ins-parent-obs', PARENT), exec('ins-parent-learn', PARENT), selection(OBS, 'ins-obs-corr'), selection(LEARN, 'ins-learn-corr')].join('\n')}`);
 

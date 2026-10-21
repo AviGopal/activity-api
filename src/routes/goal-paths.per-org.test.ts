@@ -11,6 +11,10 @@
  *   [MUST-FAIL] org A and org B record the same goal and path -> two rows, each with its own counters (org-scoped ones too).
  *   [MUST-FAIL] a GET as org A returns only org A's rows, and a caller-supplied org_id cannot widen it.
  *   [CONTROL]   the same org recording twice updates its one row; a fresh row's org-scoped counters equal its first run.
+ * The org is the CALLER'S (the session's here, the JWT's in production), never the body's: the POST used to take a
+ * body org_id first, so any authenticated caller could write another org's counters by naming it.
+ *   [MUST-FAIL] an org-A caller posting body org_id org-B is refused 403 and creates or changes no org-B row.
+ *   [CONTROL]   an org-A caller posting no body org records under org A.
  */
 import { describe, expect, test } from 'bun:test';
 import { relative as pathRelative, join as pathJoin } from 'node:path';
@@ -18,7 +22,7 @@ import { relative as pathRelative, join as pathJoin } from 'node:path';
 const ISOLATED_ENV = 'ACTIVITY_API_ISOLATED_TEST';
 const ISOLATED = process.env[ISOLATED_ENV] === import.meta.path;
 if (!ISOLATED) {
-  test('runs isolated in its own bun process (3 cases)', () => {
+  test('runs isolated in its own bun process (5 cases)', () => {
     const root = pathJoin(import.meta.dir, '..', '..');
     const r = Bun.spawnSync(['bun', 'test', './' + pathRelative(root, import.meta.path)], {
       cwd: root,
@@ -28,7 +32,7 @@ if (!ISOLATED) {
     const out = (r.stdout.toString() + '\n' + r.stderr.toString()).replace(/\x1b\[[0-9;]*m/g, '');
     const count = (k: string) => Number(out.match(new RegExp(`^\\s*(\\d+) ${k}\\s*$`, 'm'))?.[1] ?? -1);
     expect({ exit: r.exitCode, pass: count('pass'), fail: count('fail') }, out.split('\n').filter((l) => !l.startsWith('{') && !/^\d{4}-\d\d-\d\dT/.test(l)).join('\n').slice(-4000))
-      .toEqual({ exit: 0, pass: 3, fail: 0 });
+      .toEqual({ exit: 0, pass: 5, fail: 0 });
   }, 250_000);
 }
 
@@ -88,9 +92,8 @@ if (ISOLATED) {
   describe('goal paths are per org', () => {
     test('[MUST-FAIL] two orgs recording the same goal and path get two rows with their own counters', async () => {
       store.length = 0;
-      const app = await appAs(null);
-      expect((await post(app, body('org-a', true))).status).toBeLessThan(300);
-      expect((await post(app, body('org-b', false))).status).toBeLessThan(300);
+      expect((await post(await appAs('org-a'), body('org-a', true))).status).toBeLessThan(300);
+      expect((await post(await appAs('org-b'), body('org-b', false))).status).toBeLessThan(300);
       expect(store.length).toBe(2);
       const a = store.find((r) => r.org_id === 'org-a')!; const b = store.find((r) => r.org_id === 'org-b')!;
       expect([a.successful_executions, a.failed_executions, a.org_successful_executions, a.org_failed_executions]).toEqual([1, 0, 1, 0]);
@@ -110,12 +113,32 @@ if (ISOLATED) {
     });
 
     test('[CONTROL] the same org recording again updates its own row only', async () => {
-      const app = await appAs(null);
+      const app = await appAs('org-a');
       expect((await post(app, body('org-a', true))).status).toBeLessThan(300);
       expect(store.length).toBe(2);
       const a = store.find((r) => r.org_id === 'org-a')!;
       expect([a.total_executions, a.org_successful_executions]).toEqual([2, 2]);
       expect(store.find((r) => r.org_id === 'org-b')!.total_executions).toBe(1);
+    });
+
+    test('[MUST-FAIL] an org-A caller naming org B in the body is refused and writes no org-B row', async () => {
+      const r = await post(await appAs('org-a'), body('org-b', true));
+      // The landing first: the defect is the org-B counter moving, the 403 is how the fix answers.
+      expect(store.length).toBe(2);
+      const b = store.find((r) => r.org_id === 'org-b')!;
+      expect([b.total_executions, b.successful_executions, b.org_successful_executions]).toEqual([1, 0, 0]);
+      expect(store.find((r) => r.org_id === 'org-a')!.total_executions).toBe(2);
+      expect(r.status).toBe(403);
+      expect(((await r.json()) as { error?: { code?: string } }).error?.code).toBe('ORG_MISMATCH');
+    });
+
+    test('[CONTROL] an org-A caller with no body org records under org A', async () => {
+      const { org_id: _drop, ...noOrg } = body('org-a', true);
+      const before = { a: store.find((r) => r.org_id === 'org-a')!.total_executions, b: store.find((r) => r.org_id === 'org-b')!.total_executions };
+      expect((await post(await appAs('org-a'), noOrg)).status).toBeLessThan(300);
+      expect(store.length).toBe(2);
+      expect(store.find((r) => r.org_id === 'org-a')!.total_executions).toBe(before.a + 1);
+      expect(store.find((r) => r.org_id === 'org-b')!.total_executions).toBe(before.b);
     });
   });
 }

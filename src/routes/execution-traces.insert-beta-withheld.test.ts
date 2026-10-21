@@ -202,6 +202,9 @@ afterAll(() => {
 const executionTracesRouter = (await import('./execution-traces')).default;
 const { flushPosteriors } = await import('../lib/posterior-aggregator');
 const app = new Hono();
+// The caller's authenticated org (the session's here, the JWT's in production): the trace POST takes the org from the
+// credential, and a body org_id must match it.
+app.use('*', async (c, next) => { (c as any).set('session', { session_id: 't', org_id: ORG, project_id: null, api_key: null, latest_job_id: null }); await next(); });
 app.route('/v2/activities/execution-traces', executionTracesRouter);
 
 async function settle(): Promise<void> {

@@ -133,10 +133,25 @@ afterAll(() => {
   for (const s of spies.splice(0)) s.mockRestore();
 });
 
-const executionTracesRouter = (await import('./execution-traces')).default;
+const executionTracesMod = await import('./execution-traces');
+const executionTracesRouter = executionTracesMod.default;
 const { flushPosteriors } = await import('../lib/posterior-aggregator');
 
+// The org-keyed writes POST /subscriber-counts makes, by the org each was aimed at.
+const subscriberWriteOrgs: string[] = [];
+stub(executionTracesMod.subscriberCountsDeps, 'vpmCounters', async (_v: string, org: string) => { subscriberWriteOrgs.push(org); return true; });
+stub(executionTracesMod.subscriberCountsDeps, 'thompson', async (_v: string, org: string) => { subscriberWriteOrgs.push(org); return 'ok'; });
+stub(executionTracesMod.subscriberCountsDeps, 'resolveParents', async () => new Map<string, string>());
+stub(executionTracesMod.subscriberCountsDeps, 'edge', async (_p: string, _c: string, _r: number, _o: number, org: string) => { subscriberWriteOrgs.push(org); });
+
 const app = new Hono();
+// The caller's AUTHENTICATED org, as the route reads it (the session's; the JWT's in production). A request without
+// the test header carries no credential org.
+app.use('*', async (c, next) => {
+  const org = c.req.header('x-test-session-org');
+  if (org) (c as any).set('session', { session_id: 't', org_id: org, project_id: null, api_key: null, latest_job_id: null });
+  await next();
+});
 app.route('/v2/activities/execution-traces', executionTracesRouter);
 
 /** Wait until the fire-and-forget credit calls have stopped issuing queries, then drain the aggregator. */
@@ -173,10 +188,10 @@ function traceBody(executionId: string, extra: Row = {}): Row {
   };
 }
 
-async function postTrace(body: Row): Promise<Response> {
+async function postTrace(body: Row, callerOrg?: string): Promise<Response> {
   const res = await app.request('/v2/activities/execution-traces', {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...(callerOrg ? { 'x-test-session-org': callerOrg } : {}) },
     body: JSON.stringify(body),
   });
   await settle();
@@ -202,11 +217,12 @@ beforeEach(() => {
   executionRows.clear();
   executions.length = 0;
   shapeScoreCalls.length = 0;
+  subscriberWriteOrgs.length = 0;
 });
 
 describe('POST /execution-traces with no known org stores the trace and writes no learning row', () => {
   test('CONTROL: a trace with a known org writes every org-keyed learning sink under that org', async () => {
-    const res = await postTrace(traceBody('exec-org-known-1', { org_id: 'org-fixture' }));
+    const res = await postTrace(traceBody('exec-org-known-1', { org_id: 'org-fixture' }), 'org-fixture');
     expect(res.status).toBe(200);
     expect(executions).toHaveLength(1);
     expect(executions[0]!.org_id).toBe('org-fixture');
@@ -285,5 +301,63 @@ describe('POST /reach on a stored org_defaulted execution grades no leaf posteri
     expect(res.status).toBe(200);
     expect(queries.some((q) => /reach_graded:true/.test(q.sql))).toBe(true);
     expect(leafVpm()).toEqual([]);
+  });
+});
+
+// THE ORG IS THE CALLER'S, NEVER THE BODY'S. The org used to be resolved body first, so any authenticated caller could
+// store a trace, and aim its posterior writes, in another org by naming it in body.org_id. A body org is now only a
+// claim that must equal the authenticated org; one that names another org is refused 403 and stores nothing.
+describe('a trace or subscriber-count write whose body org is not the caller org lands in no org', () => {
+  const orgBWrites = () => queries.filter((q) => JSON.stringify(q.params ?? {}).includes('org-b'));
+
+  test('MUST-FAIL: an org-A caller posting a trace with body org_id org-B is refused and stores nothing under org-B', async () => {
+    const res = await postTrace(traceBody('exec-org-cross-1', { org_id: 'org-b' }), 'org-a');
+    // The landing first: the defect is the org-B row, the 403 is how the fix answers.
+    expect(executions.filter((e) => e.org_id === 'org-b').map((e) => e.org_id)).toEqual([]);
+    expect(orgBWrites().map((q) => q.sql.trim().split('\n')[0])).toEqual([]);
+    expect(executions).toEqual([]);
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error?: { code?: string } }).error?.code).toBe('ORG_MISMATCH');
+  });
+
+  test('MUST-FAIL: a trace naming a body org with no authenticated org to vouch for it is refused', async () => {
+    const res = await postTrace(traceBody('exec-org-cross-2', { org_id: 'org-b' }));
+    expect(executions.map((e) => e.org_id)).toEqual([]);
+    expect(orgBWrites().map((q) => q.sql.trim().split('\n')[0])).toEqual([]);
+    expect(res.status).toBe(403);
+  });
+
+  test('MUST-FAIL: an org-A caller posting subscriber counts with body org_id org-B writes no org-B counter', async () => {
+    const res = await app.request('/v2/activities/execution-traces/subscriber-counts', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-test-session-org': 'org-a' },
+      body: JSON.stringify({ batch_id: 'org-cross-batch-1', org_id: 'org-b', entries: [{ template_id: TEMPLATE, runs: 2, ok: 1, fail: 1 }] }),
+    });
+    expect(subscriberWriteOrgs).toEqual([]);
+    expect(res.status).toBe(403);
+  });
+
+  test('CONTROL: an org-A caller posting a trace with no body org stores it, and learns, under org-A', async () => {
+    const res = await postTrace(traceBody('exec-org-caller-1'), 'org-a');
+    expect(res.status).toBe(200);
+    expect(executions.map((e) => e.org_id)).toEqual(['org-a']);
+    expect(learningWrites().vpm.length).toBeGreaterThan(0);
+  });
+
+  test("CONTROL: a body org equal to the caller's (either spelling) lands exactly as posted", async () => {
+    const res = await postTrace(traceBody('exec-org-caller-2', { org_id: 'organizations:org-a' }), 'org-a');
+    expect(res.status).toBe(200);
+    expect(executions.map((e) => e.org_id)).toEqual(['organizations:org-a']);
+  });
+
+  test('CONTROL: an org-A caller posting subscriber counts with no body org writes them under org-A', async () => {
+    const res = await app.request('/v2/activities/execution-traces/subscriber-counts', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-test-session-org': 'org-a' },
+      body: JSON.stringify({ batch_id: 'org-caller-batch-1', entries: [{ template_id: TEMPLATE, runs: 2, ok: 1, fail: 1 }] }),
+    });
+    expect(res.status).toBe(200);
+    expect(subscriberWriteOrgs.length).toBeGreaterThan(0);
+    expect(new Set(subscriberWriteOrgs)).toEqual(new Set(['org-a']));
   });
 });

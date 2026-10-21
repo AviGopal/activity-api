@@ -44,7 +44,12 @@ async function boot() {
   const { config } = await import('../config');
   if (config.surrealdb.url !== SCRATCH || config.surrealdb.database !== TEST_DB) throw new Error('not the scratch DB — refusing');
   db = (await import('../db/surreal')).surrealDB;
-  ET = (await import('./execution-traces')).default as typeof ET;
+  // Behind the caller's authenticated org (the session's here): the trace POST takes the org from the credential.
+  const { Hono } = await import('hono');
+  const authed = new Hono();
+  authed.use('*', async (c, next) => { (c as any).set('session', { session_id: 't', org_id: ORG, project_id: null, api_key: null, latest_job_id: null }); await next(); });
+  authed.route('/', (await import('./execution-traces')).default);
+  ET = authed as unknown as typeof ET;
   if (typeof db.query !== 'function' || typeof ET?.request !== 'function') throw new Error('modules are mocked — run this file on its own');
 }
 
