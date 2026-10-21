@@ -776,6 +776,9 @@ export const GoalExecutionPathSchema = z.object({
   // name — declaring the request name silently yields nothing, which is the same
   // read-side invisibility this block exists to fix.
   last_inference_confidence: z.number().nullable().optional(),
+  // The reach verdict of the most recent recorded run (migration 227); absent when that run
+  // carried none. Declared here for the same strip-on-parse reason as the fields above.
+  reached: z.boolean().nullable().optional(),
 
   // Timestamps
   last_executed_at: TimestampSchema.optional(),
@@ -788,6 +791,10 @@ export const PathRecordRequestSchema = z.object({
   goal_category: z.enum(['feature', 'bugfix', 'refactor', 'tool', 'infrastructure', 'meta']),
   path_activities: z.array(z.string()).min(1),
   success: z.boolean(),
+  // The dispatch's graded REACH verdict (goal-host recordGoalPath sends it beside success).
+  // success is the exit status; the path's alpha/beta are credited from THIS, and an absent
+  // verdict (a sender that predates it) is not a reach. DB field is migration 227.
+  reached: z.boolean().nullable().optional(),
   duration_ms: z.number().int(),
   cost_usd: z.number(),
   token_usage: z.number().int().optional(),

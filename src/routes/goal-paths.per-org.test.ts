@@ -75,7 +75,7 @@ if (ISOLATED) {
     if (/SELECT \* FROM goal_execution_paths/.test(sql)) return store.filter((r) => matches(sql, v, r));
     return [];
   }
-  const body = (org: string, success: boolean) => ({ goal_text: 'count the ts files under repos/x/src', goal_category: 'meta', path_activities: ['satisfier:shellResult'], success, duration_ms: 10, cost_usd: 0, expected_output_shapes: ['shellResult'], org_id: org });
+  const body = (org: string, success: boolean) => ({ goal_text: 'count the ts files under repos/x/src', goal_category: 'meta', path_activities: ['satisfier:shellResult'], success, reached: success, duration_ms: 10, cost_usd: 0, expected_output_shapes: ['shellResult'], org_id: org });
 
   async function appAs(sessionOrg: string | null) {
     const { surrealDB } = await import('../db/surreal');

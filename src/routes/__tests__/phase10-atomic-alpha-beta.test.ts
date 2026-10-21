@@ -211,6 +211,8 @@ describe('Phase 10 P1 — atomic α/β increments', () => {
         goal_category: 'feature',
         path_activities: ['a1', 'a2'],
         success: true,
+        // The path is credited from the reach verdict (migration 227), not success.
+        reached: true,
         duration_ms: 200,
         cost_usd: 0.05,
         token_usage: 1200,

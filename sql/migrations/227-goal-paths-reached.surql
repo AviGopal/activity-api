@@ -1,0 +1,17 @@
+-- Migration 227: reached on goal_execution_paths — the reach verdict the path was credited from.
+--
+-- goal-host recordGoalPath sends the dispatch's graded reach verdict as `reached` beside `success` (the exit status),
+-- and POST /v2/goal-paths now credits the path's counters and thompson_alpha/beta from `reached`, not `success`: a
+-- hollow completion (success, not reached) credits beta, and an absent verdict (a sender that predates the field) is
+-- not a reach. The row is an AGGREGATE over every run of the path, so this field holds the verdict of the MOST RECENT
+-- recorded run, and is NONE when that run carried none (the UPDATE writes `reached = $reached`, never `?? reached`, so
+-- an absent verdict cannot inherit an earlier run's true).
+--
+-- WHY A NEW FIELD AND NOT success / goal_achieved. Both are declared on this table (sql/schemas/012-composition.surql)
+-- and no writer in this vessel sets either; `success` names the exit status this change stops crediting from, and the
+-- request field the sender posts is `reached`, so the stored name matches the verdict it records.
+--
+-- SCHEMAFULL MATTERS HERE, as for migrations 181 and 204: an undeclared field is silently dropped on write, so without
+-- this definition the verdict would be accepted and lost. Create-only and idempotent: IF NOT EXISTS defines the field
+-- once and is a no-op on every later boot; no row is written.
+DEFINE FIELD IF NOT EXISTS reached ON goal_execution_paths TYPE option<bool>;

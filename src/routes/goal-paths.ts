@@ -524,8 +524,21 @@ app.post('/', async (c) => {
       goal_hash: goalHash,
       path: validated.path_activities,
       success: validated.success,
+      reached: validated.reached,
       endpoint_output_shapes: endpointOutputShapes,
     });
+
+    // THE PATH IS CREDITED FROM THE REACH VERDICT, NOT THE EXIT STATUS. success is whether the
+    // walk's process exited cleanly; reached is the dispatch's graded verdict that the goal was
+    // actually reached (goal-host recordGoalPath sends both). Hollow completion (success with no
+    // reach) is common, and every counter and posterior below feeds path ranking and
+    // isProvenFailing, so crediting alpha from success would rank and prove paths by completion.
+    // A missing reached (a sender that predates the field) is NOT a reach: it credits beta.
+    const pathReached = validated.reached === true;
+    // Stored as the most recent run's verdict (option<bool>, migration 227). An absent verdict is
+    // passed as undefined (NONE), never null: an explicit NULL to an option<> field fails the
+    // whole CREATE/UPDATE, the trap documented on last_inference_confidence below.
+    const reachedParam = typeof validated.reached === 'boolean' ? validated.reached : undefined;
 
     // Check if this goal+path combination exists
     const checkQuery = `
@@ -557,8 +570,8 @@ app.post('/', async (c) => {
       // expressions now compute against the row's pre-update state in a
       // single SQL statement, so the second UPDATE sees the first's
       // increments rather than overwriting them.
-      const successDelta = validated.success ? 1 : 0;
-      const failureDelta = validated.success ? 0 : 1;
+      const successDelta = pathReached ? 1 : 0;
+      const failureDelta = pathReached ? 0 : 1;
       const tokenUsage = validated.token_usage !== undefined ? validated.token_usage : null;
       // success_rate below divides in FLOAT deliberately (the `* 1.0`). Both counters are
       // TYPE int (sql/003-goal-execution-paths.surql:40,44) and SurrealDB 2.3.3 divides
@@ -617,6 +630,7 @@ app.post('/', async (c) => {
           thompson_beta = (thompson_beta ?? 1) + $failure_delta,
           last_inference_confidence = $inference_confidence ?? last_inference_confidence,
           success_rate = $success_rate,
+          reached = $reached,
           avg_duration_ms = (((avg_duration_ms ?? 0) * (total_executions ?? 0)) + $duration_ms) / ((total_executions ?? 0) + 1),
           avg_cost_usd = (((avg_cost_usd ?? 0) * (total_executions ?? 0)) + $cost_usd) / ((total_executions ?? 0) + 1),
           avg_token_usage = IF $token_usage IS NULL
@@ -650,6 +664,7 @@ app.post('/', async (c) => {
         success_delta: successDelta,
         failure_delta: failureDelta,
         success_rate: nextSuccessRate,
+        reached: reachedParam,
         duration_ms: validated.duration_ms,
         cost_usd: validated.cost_usd,
         token_usage: tokenUsage,
@@ -684,9 +699,9 @@ app.post('/', async (c) => {
       });
     } else {
       // Create new path
-      const thompsonAlpha = validated.success ? 2.0 : 1.0;
-      const thompsonBeta = validated.success ? 1.0 : 2.0;
-      const successRate = validated.success ? 1.0 : 0.0;
+      const thompsonAlpha = pathReached ? 2.0 : 1.0;
+      const thompsonBeta = pathReached ? 1.0 : 2.0;
+      const successRate = pathReached ? 1.0 : 0.0;
       
       const createQuery = `
         CREATE goal_execution_paths CONTENT {
@@ -709,6 +724,7 @@ app.post('/', async (c) => {
           thompson_alpha: $thompson_alpha,
           thompson_beta: $thompson_beta,
           success_rate: $success_rate,
+          reached: $reached,
           avg_duration_ms: $avg_duration_ms,
           avg_cost_usd: $avg_cost_usd,
           avg_token_usage: $avg_token_usage,
@@ -735,11 +751,12 @@ app.post('/', async (c) => {
         path_activities: validated.path_activities,
         path_signature: pathSignature,
         endpoint_output_shapes: endpointOutputShapes,
-        successful_executions: validated.success ? 1 : 0,
-        failed_executions: validated.success ? 0 : 1,
+        successful_executions: pathReached ? 1 : 0,
+        failed_executions: pathReached ? 0 : 1,
         thompson_alpha: thompsonAlpha,
         thompson_beta: thompsonBeta,
         success_rate: successRate,
+        reached: reachedParam,
         avg_duration_ms: validated.duration_ms,
         avg_cost_usd: validated.cost_usd,
         avg_token_usage: validated.token_usage || 0,
@@ -771,11 +788,12 @@ app.post('/', async (c) => {
         endpoint_output_shapes: endpointOutputShapes,
         path_signature: pathSignature,
         total_executions: 1,
-        successful_executions: validated.success ? 1 : 0,
-        failed_executions: validated.success ? 0 : 1,
+        successful_executions: pathReached ? 1 : 0,
+        failed_executions: pathReached ? 0 : 1,
         thompson_alpha: thompsonAlpha,
         thompson_beta: thompsonBeta,
         success_rate: successRate,
+        reached: reachedParam,
         avg_duration_ms: validated.duration_ms,
         avg_cost_usd: validated.cost_usd,
         avg_token_usage: validated.token_usage || 0,
