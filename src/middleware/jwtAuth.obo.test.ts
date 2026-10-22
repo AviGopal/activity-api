@@ -45,6 +45,7 @@ mock.module('../services/auth', () => ({
 // The DB session the middleware opens. Records which token it was opened with and
 // answers the $token claims query with what that token would carry.
 const sessionTokens: string[] = [];
+const sessionQueries: string[] = [];
 let tokenClaims: Record<string, unknown> = {};
 let sessionAuthenticateFails = false;
 const rootQueries: string[] = [];
@@ -63,7 +64,10 @@ mock.module('../db/surreal', () => ({
     sessionTokens.push(jwt);
     if (sessionAuthenticateFails) throw new Error('There was a problem with authentication');
     return {
-      query: async () => [tokenClaims],
+      query: async (sql: string) => {
+        sessionQueries.push(sql);
+        return [tokenClaims];
+      },
       close: async () => {},
     };
   },
@@ -124,6 +128,7 @@ beforeEach(() => {
   validateBearerViaIdentityImpl.mockReset();
   validateBearerViaIdentityImpl.mockImplementation(async () => ({ authenticated: false, reason: 'unset' }));
   sessionTokens.length = 0;
+  sessionQueries.length = 0;
   rootQueries.length = 0;
   sessionAuthenticateFails = false;
   tokenClaims = { org_id: 'org-A', user_id: 'u-1', role: 'member', scopes: ['read', 'write'] };
@@ -361,5 +366,65 @@ describe('controls: ApiKey and ordinary JWT paths are unchanged', () => {
     expect(body.jwtAuth.authType).toBe('jwt');
     expect(body.jwtAuth.obo).toBeUndefined();
     expect(validateBearerViaIdentityImpl).not.toHaveBeenCalled();
+  });
+});
+
+describe('OBO Bearer: the caller\'s credential kind reaches the request context', () => {
+  // A person signed in on a surface: identity validated a login token as the CALLER, so the
+  // OBO names no caller key, and the database token identity signed for it carries
+  // caller_type 'session' and the actor (the surface's key) beside the person's user id.
+  test('MUST-FAIL: a session caller\'s OBO carries callerType "session", read from the database token\'s claims', async () => {
+    identityAccepts('goal_verification_label_write', { keyId: undefined, userId: 'person-1' });
+    tokenClaims = { org_id: 'org-A', user_id: 'person-1', role: 'member', scopes: ['read', 'write'], caller_type: 'session', act: { sub: 'u-surface', key_id: 'surface-key' } };
+    const res = await app().request('/v2/impulses/resolve', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${obo('goal_verification_label_write', NODE, { user_id: 'person-1', caller_type: 'session' })}`, 'Content-Type': 'application/json' },
+      body: transportBody('goal_verification_label_write'),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // The claims query names the field: SurrealDB returns only what the RETURN selects.
+    expect(sessionQueries.some((q) => /caller_type:\s*\$token\.caller_type/.test(q))).toBe(true);
+    expect(body.jwtAuth.obo).toEqual({ node: NODE, shape: 'goal_verification_label_write', actorKeyId: 'transport-key', callerType: 'session' });
+    expect(body.jwtAuth.userId).toBe('person-1');
+    expect(body.jwtAuth.keyId).toBeUndefined();
+  });
+
+  test('MUST-FAIL: a key caller\'s OBO carries callerType "api_key", so a key is never read as a person', async () => {
+    identityAccepts('goal_verification_label_write');
+    tokenClaims = { org_id: 'org-A', user_id: 'u-1', role: 'member', scopes: ['read', 'write'], caller_type: 'api_key' };
+    const res = await app().request('/v2/impulses/resolve', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${obo('goal_verification_label_write')}`, 'Content-Type': 'application/json' },
+      body: transportBody('goal_verification_label_write'),
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).jwtAuth.obo.callerType).toBe('api_key');
+  });
+
+  test('CONTROL: an OBO whose database token names no caller_type carries no callerType (never "session")', async () => {
+    identityAccepts('goal_verification_label_write');
+    tokenClaims = { org_id: 'org-A', user_id: 'u-1', role: 'member', scopes: ['read', 'write'] };
+    const res = await app().request('/v2/impulses/resolve', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${obo('goal_verification_label_write')}`, 'Content-Type': 'application/json' },
+      body: transportBody('goal_verification_label_write'),
+    });
+    expect(res.status).toBe(200);
+    const o = (await res.json()).jwtAuth.obo;
+    expect(o.node).toBe(NODE);
+    expect(o.callerType).toBeUndefined();
+  });
+
+  test('MUST-FAIL: the actor key falls back to the database token\'s act when identity\'s answer omits it', async () => {
+    identityAccepts('goal_verification_label_write', { obo: { node: NODE, shape: 'goal_verification_label_write', expires_at: new Date(Date.now() + 60_000).toISOString() } });
+    tokenClaims = { org_id: 'org-A', user_id: 'person-1', caller_type: 'session', act: { sub: 'u-surface', key_id: 'surface-key' } };
+    const res = await app().request('/v2/impulses/resolve', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${obo('goal_verification_label_write')}`, 'Content-Type': 'application/json' },
+      body: transportBody('goal_verification_label_write'),
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).jwtAuth.obo.actorKeyId).toBe('surface-key');
   });
 });

@@ -73,8 +73,12 @@ export interface JwtAuthContext {
    * Set when the caller arrived through a federation ingress with an on-behalf-of
    * token: the node and the one shape it was granted, and the ingress (actor) that
    * obtained it. The caller's own identity is in orgId/userId/keyId.
+   *
+   * callerType is the kind of credential the CALLER presented to identity when the
+   * token was minted ('session' for a signed-in person's login token, 'api_key' for a
+   * key), read from the identity-signed database token, never from the request.
    */
-  obo?: { node: string; shape: string; actorKeyId?: string };
+  obo?: { node: string; shape: string; actorKeyId?: string; callerType?: string };
 }
 
 /**
@@ -423,6 +427,9 @@ type SessionClaims = {
   project_id?: string;
   instance_id?: string;
   role?: string;
+  // On-behalf-of database tokens only (identity's mintOboDbToken keeps the OBO claims).
+  caller_type?: string;
+  act?: { sub?: string; key_id?: string };
 };
 
 /**
@@ -455,7 +462,9 @@ async function readSessionClaims(token: string): Promise<SessionClaims | null> {
       project_ids: $auth.project_ids ?? $token.project_ids,
       project_id: $auth.project_id ?? $token.project_id,
       instance_id: $auth.instance_id ?? $token.instance_id,
-      role: $auth.role ?? $token.role
+      role: $auth.role ?? $token.role,
+      caller_type: $token.caller_type,
+      act: $token.act
     }`);
   const auth = result[0] || null;
 
@@ -518,7 +527,7 @@ function unverifiedJwtPayload(token: string): Record<string, unknown> | null {
  * when it asks identity for an on-behalf-of token (FED_SUBSTRATE_ID, else hostname),
  * so the audience identity checks is the audience the token was minted for.
  */
-function thisNode(): string {
+export function thisNode(): string {
   return process.env['FED_SUBSTRATE_ID'] || hostname();
 }
 
@@ -613,7 +622,11 @@ async function authenticateOboBearer(c: Context, next: Next, token: string): Pro
   }
   ctx.keyId = verdict.keyId ?? ctx.keyId;
   ctx.userId = ctx.userId ?? verdict.userId;
-  ctx.obo = { node, shape, actorKeyId: verdict.obo.actor_key_id };
+  // The caller's credential kind comes from the database token identity signed for this
+  // OBO (mintOboDbToken carries caller_type and act), so a person signed in on a surface
+  // is told apart from a key without a second identity round trip.
+  const callerType = typeof claims?.caller_type === 'string' && claims.caller_type ? claims.caller_type : undefined;
+  ctx.obo = { node, shape, actorKeyId: verdict.obo.actor_key_id ?? claims?.act?.key_id, callerType };
 
   const expiresAt = Date.parse(String(verdict.obo.expires_at ?? verdict.jwtExpiresAt ?? ''));
   const until = Math.min(Number.isFinite(expiresAt) ? expiresAt - 5_000 : 0, Date.now() + OBO_CACHE_MAX_MS);
