@@ -12,6 +12,7 @@
 
 import type { ImpulseResolveResponse } from '../models/schemas';
 import type { JwtAuthContext } from '../middleware/jwtAuth';
+import { thisNode } from '../middleware/jwtAuth';
 import { logger } from '../utils/logger';
 
 /** The query runner impulses.ts hands in (its executeAsAuth). */
@@ -46,8 +47,15 @@ export interface LabelWriteResult {
  *     human verdict here. identity's obo exchange strips "admin" but not other scopes, and a peer
  *     node's grant is not the operator at this node. Revisit if cross-node operator feedback is
  *     wanted.
- * It does NOT read role or userId: both are identical for the operator and the walk (deployment,
- * above). There is no key-id allow-list and no env or constant gate (law 1): who holds the verdict
+ * A SIGNED-IN PERSON is the one on-behalf-of caller that is a human verdict
+ * (isPersonSessionPrincipal): identity validated the person's login token as the caller (obo
+ * callerType 'session', read from the identity-signed database token, never the pointer), the
+ * token was minted for THIS node and this shape, and it names the person's user id. That caller
+ * has no key id of its own (the surface's key is the actor), so the key id rule does not apply
+ * to it. Every other on-behalf-of caller stays refused: a key behind a federation ingress, or a
+ * token for another node or shape.
+ * Otherwise it does NOT read role or userId: both are identical for the operator and the walk
+ * (deployment, above). There is no key-id allow-list and no env or constant gate (law 1): who holds the verdict
  * scope is decided where keys are issued (identity-vessel), and changes there take effect here.
  * Unknown, missing or malformed means NOT a human-verdict principal (fail closed).
  *
@@ -77,9 +85,19 @@ export function mayWriteLabel(ctx: JwtAuthContext): boolean {
   return scopes.includes(WRITE_SCOPE) || scopes.includes(ADMIN_SCOPE);
 }
 
+export const LABEL_WRITE_SHAPE = 'goal_verification_label_write';
+
+export function isPersonSessionPrincipal(ctx: JwtAuthContext | null | undefined): boolean {
+  const o = ctx?.obo;
+  if (!o) return false;
+  if (o.callerType !== 'session') return false;
+  if (o.node !== thisNode() || o.shape !== LABEL_WRITE_SHAPE) return false;
+  return typeof ctx.userId === 'string' && ctx.userId.trim().length > 0;
+}
+
 export function isHumanVerdictPrincipal(ctx: JwtAuthContext | null | undefined): boolean {
   if (!ctx) return false;
-  if (ctx.obo) return false;
+  if (ctx.obo) return isPersonSessionPrincipal(ctx);
   if (typeof ctx.keyId !== 'string' || ctx.keyId.trim().length === 0) return false;
   const scopes = Array.isArray(ctx.scopes) ? ctx.scopes : [];
   return scopes.includes(HUMAN_VERDICT_SCOPE) || scopes.includes(ADMIN_SCOPE);
@@ -89,15 +107,27 @@ export function isHumanVerdictPrincipal(ctx: JwtAuthContext | null | undefined):
  * The principal stamped on a human label, built from the server-validated context only. A
  * `labeled_by_principal` the caller puts on the pointer is never read: the CREATE names its fields
  * explicitly and binds this object. goal-host's consumer acts on a human label only when this stamp
- * carries the verdict scope (or admin).
+ * carries the verdict scope (or admin), or names a signed-in person.
+ *
+ * A signed-in person (isPersonSessionPrincipal) is stamped with the person, not a key (migration
+ * 228): user_id, caller_type 'session', the actor key the surface presented, and the audience
+ * `<node>/<shape>` the token was bound to.
  */
-export interface LabeledByPrincipal {
-  key_id: string;
-  auth_type: string;
-  scopes: string[];
-}
+export type LabeledByPrincipal =
+  | { key_id: string; auth_type: string; scopes: string[] }
+  | { user_id: string; caller_type: 'session'; actor_key_id: string | null; aud: string; auth_type: string; scopes: string[] };
 
 export function labeledByPrincipal(ctx: JwtAuthContext): LabeledByPrincipal {
+  if (isPersonSessionPrincipal(ctx)) {
+    return {
+      user_id: String(ctx.userId),
+      caller_type: 'session',
+      actor_key_id: ctx.obo?.actorKeyId ?? null,
+      aud: `${ctx.obo!.node}/${ctx.obo!.shape}`,
+      auth_type: ctx.authType ?? 'unknown',
+      scopes: (Array.isArray(ctx.scopes) ? ctx.scopes : []).map(String),
+    };
+  }
   return {
     key_id: String(ctx.keyId),
     auth_type: ctx.authType ?? 'unknown',
@@ -111,8 +141,9 @@ export function labeledByPrincipal(ctx: JwtAuthContext): LabeledByPrincipal {
  * to any credential, and `labeler` is whatever the caller declared. Both fields are built from the
  * server-validated JwtAuthContext only; a principal_kind or principal_key_id on the pointer is never
  * read (the CREATE names its fields explicitly and binds these values).
- *   principal_kind    'obo' (arrived through a federation ingress on behalf of a peer node's
- *                     caller), 'admin' (validated with the admin scope), 'key' (an identity-validated
+ *   principal_kind    'session' (a signed-in person on behalf of whom a surface wrote, see
+ *                     isPersonSessionPrincipal), 'obo' (any other on-behalf-of caller, such as a
+ *                     peer node's caller through a federation ingress), 'admin' (validated with the admin scope), 'key' (an identity-validated
  *                     API key), 'session' (a verified JWT), else the auth type. The node's own key
  *                     is not told apart: activity-api validates it through identity like any other
  *                     key, so it is 'key'.
@@ -135,7 +166,8 @@ export function maskKeyId(keyId: unknown): string | null {
 
 export function labelWriter(ctx: JwtAuthContext): LabelWriter {
   const scopes = Array.isArray(ctx.scopes) ? ctx.scopes : [];
-  const kind = ctx.obo ? 'obo'
+  const kind = isPersonSessionPrincipal(ctx) ? 'session'
+    : ctx.obo ? 'obo'
     : scopes.includes(ADMIN_SCOPE) ? 'admin'
     : ctx.authType === 'apikey' ? 'key'
     : ctx.authType === 'jwt' ? 'session'
@@ -213,7 +245,7 @@ export async function resolveGoalVerificationLabelWrite(
     });
     return { status: 403, body: {
       success: false,
-      error: `labeler "human" requires a credential issued with the "${HUMAN_VERDICT_SCOPE}" scope (or "${ADMIN_SCOPE}"), attributable by key id and not on-behalf-of a peer node`,
+      error: `labeler "human" requires a credential issued with the "${HUMAN_VERDICT_SCOPE}" scope (or "${ADMIN_SCOPE}"), attributable by key id and not on-behalf-of a peer node, or a signed-in person's session on behalf of this node`,
     } as ImpulseResolveResponse };
   }
   const gvlPrincipal = gvlHuman ? labeledByPrincipal(jwtAuth) : null;
@@ -317,7 +349,11 @@ export async function resolveGoalVerificationLabelWrite(
   if (gvlCalibrationKeys.length > 0) {
     gvlChecks.push(`IF ${gvlGuard} { THROW "calibration fields were not stored on goal_verification_labels (migration 216 not applied)" };`);
   }
-  if (gvlPrincipal) {
+  const gvlPerson = gvlPrincipal && 'user_id' in gvlPrincipal ? gvlPrincipal : null;
+  if (gvlPerson) {
+    // A person's stamp has no key id; what must land is the person (migration 228).
+    gvlChecks.push(`IF $c[0].labeled_by_principal.user_id != $principal_user_id OR $c[0].labeled_by_principal.caller_type != 'session' { THROW "labeled_by_principal person fields were not stored on goal_verification_labels (migration 228 not applied)" };`);
+  } else if (gvlPrincipal) {
     gvlChecks.push(`IF $c[0].labeled_by_principal.key_id != $principal_key_id { THROW "labeled_by_principal was not stored on goal_verification_labels (migration 219 not applied)" };`);
   }
   const gvlWrap = (createSql: string): string => gvlChecks.length === 0
@@ -372,7 +408,8 @@ export async function resolveGoalVerificationLabelWrite(
         // WHO WROTE IT (labelWriter above): server-derived, on every label.
         principal_kind: gvlWriter.principal_kind,
         principal_key_id_masked: gvlWriter.principal_key_id,
-        ...(gvlPrincipal ? { labeled_by_principal: gvlPrincipal, principal_key_id: gvlPrincipal.key_id } : {}),
+        ...(gvlPerson ? { labeled_by_principal: gvlPerson, principal_user_id: gvlPerson.user_id }
+          : gvlPrincipal && 'key_id' in gvlPrincipal ? { labeled_by_principal: gvlPrincipal, principal_key_id: gvlPrincipal.key_id } : {}),
       },
     );
 
