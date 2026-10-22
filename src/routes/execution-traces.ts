@@ -28,7 +28,7 @@ import {
 import { resolveLearningTrack, type LearningTrack } from '../lib/learning-track';
 import { incrementExemplarBurstCounter } from '../services/exemplar-selector';
 import { incrementTraceStoreCounter } from '../lib/trace-store-counters';
-import { applyOutcomeToPosteriors, applyVariantThompsonDelta, gradeReach, posteriorGrade } from '../lib/posterior-update';
+import { applyOutcomeToPosteriors, applyVariantThompsonDelta, gradeReach, posteriorGrade, traceRecordedAt, traceVesselIds } from '../lib/posterior-update';
 import { writeContextDelta } from '../lib/posterior-aggregator';
 import { applySubscriberCounts, subscriberCountsProblem, type SubscriberCountsBatch, type SubscriberCountsDeps, type SubscriberCountEntry } from '../lib/subscriber-run-counts';
 import { resolveTraceOrg, ORG_MISMATCH } from '../lib/trace-org';
@@ -3797,6 +3797,10 @@ app.post('/', async (c) => {
           ...(awaitingVerdictAtInsert ? { awaiting_verdict: true } : {}),
           success: trace.success as boolean,
           failure_mode: (body.failure_mode ?? null) as any,
+          // The trace's own time and vessels: an external-condition window is judged at the time the trace was
+          // recorded, not when it arrived (a spool replay arrives after the outage it was recorded in).
+          ...(traceRecordedAt(body) ? { recorded_at: traceRecordedAt(body)! } : {}),
+          vessel_ids: traceVesselIds(body),
           ...(typeof (body.metadata as { information_yield?: unknown } | undefined)?.information_yield === 'string'
             ? { metadata: { information_yield: (body.metadata as { information_yield: string }).information_yield } }
             : {}),
@@ -5031,7 +5035,7 @@ app.post('/reach', async (c) => {
     let preReadOk = false;
     try {
       const preRes = await surrealDB.query<any>(
-        `SELECT variant_id, activity_id, success, tags, cost_usd, org_id, metadata.org_defaulted AS org_defaulted, signature, signature_version, composition_chain, failure_mode, resolver_tier, trace.tasks AS tasks, metadata FROM type::thing('execution', $execution_id)`,
+        `SELECT variant_id, activity_id, success, tags, cost_usd, org_id, metadata.org_defaulted AS org_defaulted, signature, signature_version, composition_chain, failure_mode, resolver_tier, trace.tasks AS tasks, metadata, executed_at, vessel_id, resolved_by_vessel_id FROM type::thing('execution', $execution_id)`,
         { execution_id: String(execId) },
       );
       preRow = Array.isArray(preRes) && preRes.length > 0
@@ -5197,6 +5201,10 @@ app.post('/reach', async (c) => {
             execution_id: String(execId),
             tags: gradedTags,
             grading_occasion: 'reach',
+            // A late verdict is judged against the condition window of the execution's own time (its stored
+            // executed_at), not the verdict's arrival.
+            ...(preRow.executed_at != null ? { recorded_at: preRow.executed_at instanceof Date ? preRow.executed_at.toISOString() : String(preRow.executed_at) } : {}),
+            vessel_ids: traceVesselIds(preRow),
             ...(preRow.metadata ? { metadata: preRow.metadata as any } : {}),
             // The stored row's org is a default (or absent): grade no leaf row under it; chain credit still runs.
             // A bare 'public' is the default too, flagged or not: rows stored before the poster fix carry the
