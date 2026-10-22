@@ -37,6 +37,13 @@ process.env.SURREALDB_PASSWORD ??= 'test';
 // flushes, so they hold in either mode.
 process.env.PRIOR_SEED_ENABLED ??= 'false';
 process.env.RELEVANCE_SINK_ENDPOINT ??= STUB_ORIGIN;
+// This node has NO identity here, whatever an earlier file in the process left behind (a file that sets
+// FED_SUBSTRATE_ID at module scope and never restores it): with one, the learner's external-condition step reads this
+// node's development-vessel pool on every eligible failure, which the network guard below forbids, so this file's
+// verdict would depend on which file ran before it. Windows are condition-window.test.ts's; restored afterAll.
+const originalIdentity = { FED_SUBSTRATE_ID: process.env.FED_SUBSTRATE_ID, SUBSTRATE_ID: process.env.SUBSTRATE_ID };
+delete process.env.FED_SUBSTRATE_ID;
+delete process.env.SUBSTRATE_ID;
 
 // ---- Network guard ----------------------------------------------------------
 // The database is a recorder below, so nothing here needs the network. A fetch outside the stub origin, or any
@@ -212,6 +219,7 @@ afterAll(() => {
   for (const s of spies.splice(0)) s.mockRestore();
   globalThis.fetch = originalFetch;
   (globalThis as any).WebSocket = originalWebSocket;
+  for (const [k, v] of Object.entries(originalIdentity)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
 });
 
 const executionTracesRouter = (await import('./execution-traces')).default;
