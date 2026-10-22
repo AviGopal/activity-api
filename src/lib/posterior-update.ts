@@ -434,21 +434,75 @@ const ENVIRONMENTAL_FAILURE_PATTERNS: RegExp[] = [
   /fetch failed/i,
   /failed to fetch/i,
   /request timed? ?out/i,
+  // Bun's own fetch and AbortSignal messages carry no errno. A peer mid-restart (a deliberate restart, or
+  // self-recovery's) refuses the connection as "Unable to connect. Is the computer able to access the url?" or drops
+  // it as "The socket connection was closed unexpectedly"; a caller's deadline cuts a step off as "The operation timed
+  // out." (AbortSignal.timeout) or "The operation was aborted." (an abort controller). None names the arm.
+  /\bunable to connect\b/i,
+  /socket connection was closed unexpectedly/i,
+  /\boperation timed out\b/i,
+  /\boperation was aborted\b/i,
   // Status codes only in an explicit HTTP context. A bare /\b50[234]\b/ was tried and
   // its own negative control caught it matching "returned 5031 rows, expected 502" —
   // an arm-fault message that would then have escaped blame. Gateway errors in practice
-  // always carry either the HTTP prefix or the phrase forms below.
-  /\bHTTP[\/ ]?\s*(?:502|503|504)\b/i,
-  /\bstatus\s*(?:code\s*)?(?:502|503|504)\b/i,
+  // always carry either the HTTP prefix or the phrase forms below. 402 and 429 are the
+  // LLM plane refusing the call (out of credit, rate-limited): the provider's account
+  // state, not the arm, so the same anchoring applies ("returned 4021 rows, expected 402"
+  // stays the arm's fault).
+  /\bHTTP[\/ ]?\s*(?:402|429|502|503|504)\b/i,
+  /\bstatus\s*(?:code\s*)?(?:402|429|502|503|504)\b/i,
   /bad gateway/i,
   /service unavailable/i,
   /gateway time-?out/i,
   /upstream connect error/i,
+  // The provider-refusal phrases, as llm-resolver-vessel's provider-errors.ts reads them for failover.
+  /too many requests/i,
+  /\brate[ _-]?limit(?:ed|_error| exceeded| reached)\b/i,
+  /credit balance/i,
+  /insufficient[ _](?:credits|quota|funds)/i,
+  /exceeded your current quota/i,
+  /\bquota (?:exceeded|exhausted)\b/i,
+  // goal-host's SPEND-RATE BREAKER refusing a dispatch (its window is full: the receiver's state, not the arm), by its
+  // two exact messages: /run-goal's "deterministic:spend-rate-refused - <decision>" and /resolve's "spend-rate breaker:
+  // <decision>", where the decision is dispatchRateDecision's own sentence. Anchored on the whole sentence, so an arm's
+  // message that merely mentions a spend rate keeps its blame.
+  /(?:deterministic:spend-rate-refused -|spend-rate breaker:) \d+ dispatches (?:of goal \S+ )?in the last \d+ s \((?:per_hash_max|global_max) \d+, dispatchRatePolicy\)/,
 ];
 
 export function isEnvironmentalFailureReason(reason: unknown): boolean {
   if (typeof reason !== 'string' || reason.length === 0) return false;
   return ENVIRONMENTAL_FAILURE_PATTERNS.some((re) => re.test(reason));
+}
+
+/**
+ * An INFRA-CLASS failure: the execution's failure_mode is an execution_error whose reason is environmental
+ * (isEnvironmentalFailureReason: transport, a peer mid-restart, a caller deadline, a gateway error, the LLM plane's
+ * 402 / 429 / quota refusal, the spend-rate breaker). It is evidence about the environment, not about the arm, so
+ * gradeReach leaves it UNGRADED: no alpha, no beta, and no other reach-gated sink (retirement, the first-execution seed,
+ * psi) reads it as a not-reached run. The same condition under which computeDeltas abstains on an execution_error.
+ * Absent or non-object failure_mode: false (a failure without a stated cause keeps its blame).
+ *
+ * VERDICT LOGIC LIVES HERE, in this closed module, never in a lane-editable one: whether a failure is the environment's
+ * decides whether the arm is blamed, so a lane landing that could widen it could excuse its own arms.
+ */
+export function isInfraFailure(t: { failure_mode?: unknown }): boolean {
+  const fm = t.failure_mode;
+  if (fm == null || typeof fm !== 'object' || Array.isArray(fm)) return false;
+  const { type, reason } = fm as { type?: unknown; reason?: unknown };
+  return type === 'execution_error' && isEnvironmentalFailureReason(reason);
+}
+
+/**
+ * classifyReach (reach-classify.ts), then an INFRA-CLASS failure (isInfraFailure) is ungraded instead of not-reached:
+ * ahead of both failure arms (a reached:false verdict and the untagged failure), so the arm is neither blamed for an
+ * outage nor taught to avoid whatever ran during one. Only a not-reached verdict is demoted: reached:true is still
+ * honoured, and every reason classifyReach already answers ungraded for (observe, a retraction, telemetry, a satellite,
+ * a pending walk) stays ungraded. The infra decision is taken HERE, not inside classifyReach, so the predicate never
+ * leaves this closed module. Every reach-gated sink that has the execution's failure_mode calls this, not classifyReach.
+ */
+export function gradeReach(t: Parameters<typeof classifyReach>[0] & { failure_mode?: unknown }): ReturnType<typeof classifyReach> {
+  const verdict = classifyReach({ success: t.success, execution_id: t.execution_id, activity_id: t.activity_id, tags: t.tags });
+  return verdict === 'not-reached' && isInfraFailure(t) ? 'ungraded' : verdict;
 }
 
 // Exported for direct test: the delta this returns IS the blame decision, and asserting
@@ -1323,20 +1377,25 @@ export async function applyVariantThompsonDelta(
  *   graded = the trace hands a verdict to the posterior: classifyReach is reached / not-reached, or the ungraded-failure
  *            arm blames it. An observe execution is never graded (applyOutcomeToPosteriors returns before grading it).
  */
-export function posteriorGrade(trace: Pick<TraceForPosterior, 'success' | 'execution_id' | 'activity_id' | 'tags' | 'awaiting_verdict'> & { tasks?: unknown }): {
+export function posteriorGrade(trace: Pick<TraceForPosterior, 'success' | 'execution_id' | 'activity_id' | 'tags' | 'awaiting_verdict' | 'failure_mode'> & { tasks?: unknown }): {
   reachVerdict: ReturnType<typeof classifyReach>;
   ungraded: boolean;
   failedByTask: boolean;
   effectiveSuccess: boolean;
   graded: boolean;
+  infraFailure: boolean;
 } {
-  const reachVerdict = classifyReach({
+  const reachVerdict = gradeReach({
     success: trace.success,
     execution_id: trace.execution_id,
     activity_id: trace.activity_id,
     tags: trace.tags,
+    failure_mode: trace.failure_mode,
   });
   const ungraded = reachVerdict === 'ungraded';
+  // An infra-class failure (isInfraFailure) is ungraded by gradeReach, and the ungraded-failure arm below does not
+  // blame it either: an outage, a restart or a provider refusal is never charged to the arm.
+  const infraFailure = reachVerdict !== 'reached' && isInfraFailure(trace);
 
   // The ungraded-failure arm (be6b5cd) blames an ungraded run whose tasks failed, so a template whose
   // tasks throw cannot hide behind "ungraded". A reach-INAPPLICABLE run (telemetry:/declined:) is
@@ -1348,9 +1407,9 @@ export function posteriorGrade(trace: Pick<TraceForPosterior, 'success' | 'execu
   // AWAITING its reach verdict, ungraded in both directions (reach-classify.ts). With evidence the arm is unchanged.
   const hasTaskEvidence = typeof (trace as any).failure_count === 'number' || typeof (trace as any).task_count === 'number' || 'tasks' in trace;
   // A walk the insert states is AWAITING its verdict is not blamed here: POST /reach grades it, once.
-  const failedByTask = ungraded && hasTaskEvidence && trace.awaiting_verdict !== true && !isReachInapplicable(trace) && !isObserveTrace(trace) && trace.success === false && (((trace as any).failure_count ?? 0) > 0 || ((trace as any).task_count ?? 0) === 0);
+  const failedByTask = ungraded && hasTaskEvidence && trace.awaiting_verdict !== true && !infraFailure && !isReachInapplicable(trace) && !isObserveTrace(trace) && trace.success === false && (((trace as any).failure_count ?? 0) > 0 || ((trace as any).task_count ?? 0) === 0);
   const effectiveSuccess = reachVerdict === 'reached';
-  return { reachVerdict, ungraded, failedByTask, effectiveSuccess, graded: !isObserveTrace(trace) && (!ungraded || failedByTask) };
+  return { reachVerdict, ungraded, failedByTask, effectiveSuccess, graded: !isObserveTrace(trace) && (!ungraded || failedByTask), infraFailure };
 }
 
 export async function applyOutcomeToPosteriors(
@@ -1382,7 +1441,7 @@ export async function applyOutcomeToPosteriors(
   // fall through to success-based behavior (unchanged). {0,0} for ungraded is idiomatic
   // (matches computeDeltas' 'cascading'/'user_abort') and suppresses S1-S4 via their
   // existing (alphaDelta!==0||betaDelta!==0) guards for free.
-  const { reachVerdict, ungraded, failedByTask, effectiveSuccess } = posteriorGrade(trace);
+  const { reachVerdict, ungraded, failedByTask, effectiveSuccess, infraFailure } = posteriorGrade(trace);
   const { alphaDelta, betaDelta } = (ungraded && !failedByTask)
     ? { alphaDelta: 0, betaDelta: 0 }
     : computeDeltas(effectiveSuccess, trace.failure_mode, warnings, trace, yieldRefs);
@@ -1458,7 +1517,7 @@ export async function applyOutcomeToPosteriors(
     logger.info('posterior variant update SKIPPED', {
       activity_id: activityId,
       execution_id: trace.execution_id ?? null,
-      reason: skipVariantUpdate ? (tierClass === 'all_deterministic' ? 'all_deterministic' : 'information_yield_idle') : ((ungraded && !failedByTask) ? 'reach_ungraded' : ((alphaDelta === 0 && betaDelta === 0) ? 'zero_deltas' : 'org_defaulted')),
+      reason: skipVariantUpdate ? (tierClass === 'all_deterministic' ? 'all_deterministic' : 'information_yield_idle') : ((ungraded && !failedByTask) ? (infraFailure ? 'infra_failure' : 'reach_ungraded') : ((alphaDelta === 0 && betaDelta === 0) ? 'zero_deltas' : 'org_defaulted')),
       vpm: orgDefaulted ? 'skipped_org_defaulted' : 'skipped',
       signature_row: orgDefaulted ? 'skipped_org_defaulted' : 'skipped',
       reach_verdict: reachVerdict,

@@ -28,7 +28,7 @@ import {
 import { resolveLearningTrack, type LearningTrack } from '../lib/learning-track';
 import { incrementExemplarBurstCounter } from '../services/exemplar-selector';
 import { incrementTraceStoreCounter } from '../lib/trace-store-counters';
-import { applyOutcomeToPosteriors, applyVariantThompsonDelta, posteriorGrade } from '../lib/posterior-update';
+import { applyOutcomeToPosteriors, applyVariantThompsonDelta, gradeReach, posteriorGrade } from '../lib/posterior-update';
 import { writeContextDelta } from '../lib/posterior-aggregator';
 import { applySubscriberCounts, subscriberCountsProblem, type SubscriberCountsBatch, type SubscriberCountsDeps, type SubscriberCountEntry } from '../lib/subscriber-run-counts';
 import { resolveTraceOrg, ORG_MISMATCH } from '../lib/trace-org';
@@ -2767,6 +2767,7 @@ app.post('/', async (c) => {
         tags: others,
         tasks: trace.tasks,
         awaiting_verdict: awaitingVerdictAtInsert,
+        failure_mode: (body.failure_mode ?? null) as any,
       });
       if (insertGrade?.graded) (trace as any).tags = [...others, INSERT_GRADED_TAG];
       else if (others.length !== tagsNow.length) (trace as any).tags = others;
@@ -3770,11 +3771,13 @@ app.post('/', async (c) => {
       // this handler (applyOutcomeToPosteriors, successor-features, context-bucket, the
       // dual-write INSERT seed) so an ungraded/hollow outcome is neither credited nor
       // blamed on ANY of them — the gate boundary must match the side-effect cluster.
-      const reachVerdict = classifyReach({
+      const reachVerdict = gradeReach({
         success: trace.success as boolean,
         execution_id: trace.execution_id as string | undefined,
         activity_id: trace.variant_id as string,
         tags: Array.isArray((trace as any).tags) ? ((trace as any).tags as string[]) : undefined,
+        // An infra-class failure is ungraded on every sink in this cluster, as applyOutcomeToPosteriors grades it.
+        failure_mode: body.failure_mode ?? null,
       });
       // A caller-withheld verdict is ungraded on every sink in this cluster (posterior, retirement, psi).
       const reachUngraded = reachVerdict === 'ungraded' || betaWithheldAtInsert;
@@ -4033,11 +4036,12 @@ app.post('/', async (c) => {
       });
 
       // Honest-reach verdict (local to the INSERT-seed scope) for first-execution seeding.
-      const seedReach = classifyReach({
+      const seedReach = gradeReach({
       success: trace.success as boolean,
       execution_id: trace.execution_id as string | undefined,
       activity_id: trace.variant_id as string,
       tags: Array.isArray((trace as any).tags) ? ((trace as any).tags as string[]) : undefined,
+      failure_mode: body.failure_mode ?? null,
     });
       const seedUngraded = seedReach === 'ungraded';
       const seedEffectiveSuccess = seedReach === 'reached';
