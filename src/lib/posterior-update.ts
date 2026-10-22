@@ -32,6 +32,8 @@ import { GOAL_DIRECTION_SIGNATURE_VERSION, goalDirectionSignature } from './goal
 import { getTuningParam } from './tuning-params';
 import { classifyReach, isObserveTrace, isReachInapplicable, noteObserveSkip } from './reach-classify';
 import { countShapeOutcome } from './shape-score-counter';
+// UNTRUSTED candidate list only (lane-open): every record it names is re-read by id and judged here (judgeExternalCondition).
+import { readExternalConditionCandidates } from './external-condition';
 import { recordDecisionOutcome, recordExecutionDecisionOutcome } from './decision-credit';
 
 // Install the SIGTERM/SIGINT flush hook once on module load so buffered α/β
@@ -128,6 +130,15 @@ export interface TraceForPosterior {
    * absence simply means the backfill job will pick the signature up later.
    */
   input_impulse_shapes?: string[];
+  /**
+   * The execution's OWN time (ISO), when the caller has it: the trace's stated completion time at insert, or the stored
+   * row's executed_at for a late verdict. The blame step judges an external-condition window against THIS time, so a
+   * trace recorded during an outage and replayed later is judged by the window of its original time. Never later than
+   * the arrival time (a later or unparseable value reads as arrival). Absent: arrival time.
+   */
+  recorded_at?: string;
+  /** The vessels the trace names (vessel_id, resolved_by_vessel_id): which unit-scoped condition windows can cover it. */
+  vessel_ids?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +304,7 @@ export interface UpdateSummary {
    * than informative signal (M4 tier-restricted bandit).
    * Absent when the UPDATE ran normally.
    */
-    skipped_reason?: 'all_deterministic' | 'ungraded_reach' | 'idle_yield' | 'observe';
+    skipped_reason?: 'all_deterministic' | 'ungraded_reach' | 'idle_yield' | 'observe' | 'environment_condition' | 'condition_review';
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +514,226 @@ export function isInfraFailure(t: { failure_mode?: unknown }): boolean {
 export function gradeReach(t: Parameters<typeof classifyReach>[0] & { failure_mode?: unknown }): ReturnType<typeof classifyReach> {
   const verdict = classifyReach({ success: t.success, execution_id: t.execution_id, activity_id: t.activity_id, tags: t.tags });
   return verdict === 'not-reached' && isInfraFailure(t) ? 'ungraded' : verdict;
+}
+
+// ---------------------------------------------------------------------------
+// EXTERNAL CONDITIONS: a failure inside an observed outage window is the environment's, not the arm's
+// ---------------------------------------------------------------------------
+
+/**
+ * An EXTERNAL-CONDITION RECORD is an operator-written, observed outage window on this node: the trust-root pool shape
+ * `externalCondition` on this node's development-vessel (only an admin credential writes one; dv stamps and signs the
+ * writer as `attested`). Its body follows research's infra-events record, plus provenance:
+ *
+ *   { kind, node, unit ('ALL' = the whole node, else a vessel name), down, up (ISO, OBSERVED), times: 'observed',
+ *     source: { observer, method }, evidence: <pointer: a URI or a path, never prose>,
+ *     attribution_rule: CONDITION_ATTRIBUTION_RULE verbatim, confirmed: true }
+ *
+ * Reasons and an outage are different signals: isEnvironmentalFailureReason recognises a failure by its message, but a
+ * failure with no reason, or a run that ended reached:false because its hub-bound steps returned nothing, carries no
+ * message to recognise. During an outage those were all charged to whichever arms ran.
+ *
+ * THE TRUST RULE (user ruling, verbatim in CONDITION_ATTRIBUTION_RULE), as the code applies it:
+ *   - a confirmed window moves a failure only to "unattributed (environment)": alpha 0, beta 0. Never alpha: a success
+ *     inside a window keeps its credit, and a condition is consulted only for a delta that is pure blame.
+ *   - it never overrides a red check: only an execution_error or a failure with no failure_mode (including a
+ *     reached:false verdict) is eligible. verifier_negative, safety_breach, prediction_disagreement and budget_exhausted
+ *     keep their blame. (A revert carries no trace-visible marker today, so there is nothing for a record to override.)
+ *   - unconfirmed → REVIEW: an attested record that is not confirmed, whose times are not observed, whose up is unknown,
+ *     which has no evidence pointer or source, or which does not carry the rule verbatim, WITHHOLDS the write (no alpha,
+ *     no beta) and is COUNTED and LOGGED with the trace id, for later remediation by the compensation pattern.
+ *   - the holder is stamped from the credential: it is the attestation's key id, never a body field. A row without a
+ *     verified operator attestation is REFUSED (ignored: the arm keeps its blame), whatever its body claims.
+ *
+ * TRUST BOUNDARY. The candidate list comes from external-condition.ts, which is lane-open; every record it names is
+ * RE-READ HERE by id from this node's development-vessel (loopback, never discovery) and judged on that copy. A record
+ * the node does not hold is refused; a forged field is overwritten by the real one. So no edit outside this closed module
+ * can make a failure unattributed.
+ */
+export const EXTERNAL_CONDITION_SHAPE = 'externalCondition';
+export const CONDITION_ATTRIBUTION_RULE = 'a condition moves blame only to "unattributed (environment)", never to success; never overrides a red check or a revert; unconfirmed → REVIEW; holder/reporter stamped from the credential.';
+/** This node's development-vessel, for the authoritative re-read (never discovery: a peer's row is not this node's). */
+const CONDITION_VERIFY_URL = 'http://127.0.0.1:8090/v2/impulses/resolve';
+const CONDITION_VERIFY_TIMEOUT_MS = 3_000;
+/** At most this many candidate records are re-read for one failure. */
+const CONDITION_MAX_CANDIDATES = 5;
+
+export type ConditionVerdict =
+  | { verdict: 'unattributed'; record_id: string; holder: string; kind: string; unit: string }
+  | { verdict: 'review'; record_id: string; holder: string | null; why: string }
+  | { verdict: 'refused'; record_id: string | null; why: string }
+  | { verdict: 'no_match'; record_id: string; why: string };
+
+export interface ConditionContext {
+  /** This node's identity (the trace-origin identity): a record applies on the node it names. */
+  node: string | null;
+  /** The vessels the trace names: a unit-scoped record covers only these. */
+  vessels: string[];
+  /** The execution's own time (conditionTimeMs). */
+  atMs: number;
+}
+
+const nonEmpty = (v: unknown): v is string => typeof v === 'string' && v.trim().length > 0;
+const timeMs = (v: unknown): number => (typeof v === 'string' ? Date.parse(v) : NaN);
+
+/** An evidence POINTER: a URI (scheme:rest) or a path, one string or a non-empty list, no whitespace. Prose is not one. */
+export function isEvidencePointer(v: unknown): boolean {
+  const one = (x: unknown) => typeof x === 'string' && x.length > 0 && x.length <= 512 && !/\s/.test(x) && (/^[a-z][a-z0-9+.-]*:\S+$/i.test(x) || x.includes('/'));
+  return Array.isArray(v) ? v.length > 0 && v.every(one) : one(v);
+}
+
+/** The time a condition window is judged at: the trace's own recorded_at, bounded by arrival (nowMs). */
+export function conditionTimeMs(recordedAt: unknown, nowMs: number = Date.now()): number {
+  const t = timeMs(recordedAt);
+  return Number.isFinite(t) && t <= nowMs ? t : nowMs;
+}
+
+/**
+ * The trace's OWN time, as the poster states it: completed_at, else started_at plus duration_ms; null when it states
+ * neither. The learner judges an external-condition window against it (posterior-update.ts conditionTimeMs, which also
+ * bounds it by arrival), so a trace recorded during an outage and replayed later is judged by its original time.
+ * Here, in the closed module, beside the judge that reads it.
+ */
+export function traceRecordedAt(body: unknown): string | null {
+  const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+  const completed = typeof b.completed_at === 'string' ? Date.parse(b.completed_at) : NaN;
+  if (Number.isFinite(completed)) return new Date(completed).toISOString();
+  const started = typeof b.started_at === 'string' ? Date.parse(b.started_at) : NaN;
+  const dur = typeof b.duration_ms === 'number' && Number.isFinite(b.duration_ms) && b.duration_ms >= 0 ? b.duration_ms : NaN;
+  if (Number.isFinite(started) && Number.isFinite(dur)) return new Date(started + dur).toISOString();
+  return null;
+}
+
+/** The vessels a trace names (vessel_id, resolved_by_vessel_id), for unit-scoped condition windows. */
+export function traceVesselIds(row: unknown): string[] {
+  const r = (row && typeof row === 'object' ? row : {}) as Record<string, unknown>;
+  return [r.vessel_id, r.resolved_by_vessel_id].filter((v): v is string => typeof v === 'string' && v.length > 0);
+}
+
+/** This node's identity, read at use time (bootstrap identity: FED_SUBSTRATE_ID, else SUBSTRATE_ID). */
+export function conditionNodeIdentity(env: Record<string, string | undefined> = process.env): string | null {
+  return (env.FED_SUBSTRATE_ID || env.SUBSTRATE_ID || '').trim() || null;
+}
+
+/** Whether a record body's window covers the context (node, unit, time). Pure; used on the authoritative copy. */
+function windowCovers(b: Record<string, unknown>, ctx: ConditionContext): { covers: boolean; why: string; openEnded: boolean } {
+  if (ctx.node === null || b.node !== ctx.node) return { covers: false, why: `the record names node '${String(b.node)}', this node is '${String(ctx.node)}'`, openEnded: false };
+  if (b.unit !== 'ALL' && !ctx.vessels.includes(String(b.unit))) return { covers: false, why: `the record covers unit '${String(b.unit)}', the trace names ${JSON.stringify(ctx.vessels)}`, openEnded: false };
+  const down = timeMs(b.down);
+  const up = timeMs(b.up);
+  if (ctx.atMs < down) return { covers: false, why: 'the execution precedes the window', openEnded: false };
+  if (Number.isFinite(up) && ctx.atMs > up) return { covers: false, why: 'the execution follows the window', openEnded: false };
+  return { covers: true, why: '', openEnded: !Number.isFinite(up) };
+}
+
+/**
+ * Judge ONE external-condition row (as this node's development-vessel served it) for one failure. Pure.
+ *   refused       not an open externalCondition row, no verified operator attestation, or a malformed window
+ *   no_match      the window does not cover this node / unit / time
+ *   review        it covers the failure, but is not confirmed (see the trust rule above)
+ *   unattributed  it covers the failure and is confirmed: the failure is the environment's
+ */
+export function judgeExternalCondition(row: unknown, ctx: ConditionContext): ConditionVerdict {
+  const r = (row && typeof row === 'object' && !Array.isArray(row) ? row : {}) as Record<string, any>;
+  const id = nonEmpty(r.id) ? r.id : null;
+  if (!id || r.shape !== EXTERNAL_CONDITION_SHAPE || r.status !== 'open') return { verdict: 'refused', record_id: id, why: 'not an open externalCondition row' };
+  // The credential, never the body: only dv's verified operator stamp makes a row a record at all.
+  if (r.attested?.by !== 'operator') return { verdict: 'refused', record_id: id, why: 'the record is not operator-attested (a body-supplied holder or source is not a credential)' };
+  if (r.attested_verified !== true) return { verdict: 'refused', record_id: id, why: "development-vessel did not verify the record's operator attestation" };
+  const b = (r.body && typeof r.body === 'object' && !Array.isArray(r.body) ? r.body : null) as Record<string, unknown> | null;
+  if (!b) return { verdict: 'refused', record_id: id, why: 'the record has no body' };
+  if (!nonEmpty(b.node) || !nonEmpty(b.unit) || !Number.isFinite(timeMs(b.down))) return { verdict: 'refused', record_id: id, why: 'malformed window: node, unit and a parseable down are required' };
+  if (Number.isFinite(timeMs(b.up)) && timeMs(b.up) < timeMs(b.down)) return { verdict: 'refused', record_id: id, why: 'malformed window: up precedes down' };
+  const w = windowCovers(b, ctx);
+  if (!w.covers) return { verdict: 'no_match', record_id: id, why: w.why };
+  const holder = nonEmpty(r.attested?.key_id) ? String(r.attested.key_id) : null;
+  const src = (b.source && typeof b.source === 'object' ? b.source : {}) as Record<string, unknown>;
+  const unconfirmed: string[] = [];
+  if (b.confirmed !== true) unconfirmed.push('not confirmed');
+  if (b.times !== 'observed') unconfirmed.push(`times are '${String(b.times)}', not observed`);
+  if (w.openEnded) unconfirmed.push('up is not observed');
+  if (!nonEmpty(src.observer) || !nonEmpty(src.method)) unconfirmed.push('no source (observer and method)');
+  if (!isEvidencePointer(b.evidence)) unconfirmed.push('evidence is not a pointer');
+  if (b.attribution_rule !== CONDITION_ATTRIBUTION_RULE) unconfirmed.push('attribution_rule is not the trust rule verbatim');
+  if (!holder) unconfirmed.push('the credential carried no key id');
+  if (unconfirmed.length > 0) return { verdict: 'review', record_id: id, holder, why: unconfirmed.join('; ') };
+  return { verdict: 'unattributed', record_id: id, holder: holder!, kind: String(b.kind ?? ''), unit: String(b.unit) };
+}
+
+/**
+ * Whether a computed delta may be moved by a condition at all: pure blame (alpha 0, beta > 0) on a failure that is not a
+ * check's verdict. A success (any alpha) is never touched, so a window can never grant or remove credit.
+ */
+export function conditionEligible(effectiveSuccess: boolean, failureMode: FailureMode | null | undefined, d: Deltas): boolean {
+  if (effectiveSuccess || d.alphaDelta !== 0 || !(d.betaDelta > 0)) return false;
+  return failureMode == null || (failureMode as { type?: unknown }).type === 'execution_error';
+}
+
+/** The authoritative copy of one pool row, by id, from this node's development-vessel; null when it holds none. */
+async function readConditionRowById(id: string): Promise<unknown | null> {
+  const res = await fetch(CONDITION_VERIFY_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ impulse: { type: 'poolImpulse', id } }),
+    signal: AbortSignal.timeout(CONDITION_VERIFY_TIMEOUT_MS),
+  });
+  const j = (await res.json().catch(() => null)) as { body?: { impulses?: unknown } } | null;
+  if (!res.ok || !Array.isArray(j?.body?.impulses)) throw new Error(`pool read by id unreadable (HTTP ${res.status})`);
+  return (j!.body!.impulses as Array<Record<string, unknown>>).find((x) => x?.id === id) ?? null;
+}
+
+let conditionUnattributed = 0;
+let conditionReviewWithheld = 0;
+let conditionRefused = 0;
+/** Failures moved to unattributed (environment), withheld for REVIEW, and records refused, since process start. */
+export function externalConditionCounters(): { unattributed: number; review_withheld: number; refused: number } {
+  return { unattributed: conditionUnattributed, review_withheld: conditionReviewWithheld, refused: conditionRefused };
+}
+
+/**
+ * The condition verdict for one eligible failure, or null when no record covers it. Candidates come from the untrusted
+ * reader and are narrowed by their CLAIMED window (which can only hide a record); each is then re-read here by id and
+ * judged on the authoritative copy. unattributed beats review beats refused. Never throws: an unreadable pool is null
+ * for the list, and refused for a candidate whose re-read fails, so the arm keeps its blame.
+ */
+export async function conditionForFailure(trace: Pick<TraceForPosterior, 'recorded_at' | 'vessel_ids' | 'grading_occasion'>, nowMs: number = Date.now()): Promise<ConditionVerdict | null> {
+  // A LATE verdict arrives long after the execution ran, so arrival says nothing about when it failed: with no parseable
+  // time of its own it is judged by no window (the arm keeps its blame), never at the verdict's arrival.
+  if (trace.grading_occasion === 'reach' && !Number.isFinite(timeMs(trace.recorded_at))) return null;
+  const ctx: ConditionContext = {
+    node: conditionNodeIdentity(),
+    vessels: (trace.vessel_ids ?? []).filter(nonEmpty),
+    atMs: conditionTimeMs(trace.recorded_at, nowMs),
+  };
+  // A node with no identity can be named by no record: nothing to read.
+  if (ctx.node === null) return null;
+  let claimed: unknown[] = [];
+  try { claimed = await readExternalConditionCandidates(nowMs); } catch { claimed = []; }
+  const ids: string[] = [];
+  for (const c of Array.isArray(claimed) ? claimed : []) {
+    const cr = (c && typeof c === 'object' ? c : {}) as Record<string, any>;
+    if (!nonEmpty(cr.id) || ids.includes(cr.id)) continue;
+    const cb = (cr.body && typeof cr.body === 'object' ? cr.body : {}) as Record<string, unknown>;
+    if (!windowCovers(cb, ctx).covers) continue;
+    ids.push(cr.id);
+    if (ids.length >= CONDITION_MAX_CANDIDATES) break;
+  }
+  if (ids.length === 0) return null;
+  const verdicts: ConditionVerdict[] = [];
+  for (const id of ids) {
+    let row: unknown | null;
+    try { row = await readConditionRowById(id); } catch (err) {
+      verdicts.push({ verdict: 'refused', record_id: id, why: `re-read failed: ${err instanceof Error ? err.message : String(err)}` });
+      continue;
+    }
+    verdicts.push(row === null ? { verdict: 'refused', record_id: id, why: "this node's development-vessel holds no such record" } : judgeExternalCondition(row, ctx));
+  }
+  for (const v of verdicts) {
+    if (v.verdict !== 'refused') continue;
+    conditionRefused++;
+    logger.info('external condition REFUSED (the arm keeps its blame)', { event: 'external_condition_refused', record_id: v.record_id, why: v.why, refused_total: conditionRefused });
+  }
+  return verdicts.find((v) => v.verdict === 'unattributed') ?? verdicts.find((v) => v.verdict === 'review') ?? verdicts.find((v) => v.verdict === 'refused') ?? null;
 }
 
 // Exported for direct test: the delta this returns IS the blame decision, and asserting
@@ -1441,10 +1672,33 @@ export async function applyOutcomeToPosteriors(
   // fall through to success-based behavior (unchanged). {0,0} for ungraded is idiomatic
   // (matches computeDeltas' 'cascading'/'user_abort') and suppresses S1-S4 via their
   // existing (alphaDelta!==0||betaDelta!==0) guards for free.
-  const { reachVerdict, ungraded, failedByTask, effectiveSuccess, infraFailure } = posteriorGrade(trace);
-  const { alphaDelta, betaDelta } = (ungraded && !failedByTask)
+  const { reachVerdict, ungraded: reachUngraded, failedByTask, effectiveSuccess, infraFailure } = posteriorGrade(trace);
+  const graded = (reachUngraded && !failedByTask)
     ? { alphaDelta: 0, betaDelta: 0 }
     : computeDeltas(effectiveSuccess, trace.failure_mode, warnings, trace, yieldRefs);
+  // EXTERNAL CONDITION (judgeExternalCondition): pure blame on an eligible failure recorded inside a covering record's
+  // window is withheld. Confirmed: unattributed (environment). Otherwise REVIEW, counted and logged with the trace id.
+  // Either way {0,0}, and the trace is treated as ungraded below, so no chain credit, impulse penalty or decision
+  // outcome is written for it either. A refused record (or none) leaves the delta as graded.
+  const condition = conditionEligible(effectiveSuccess, trace.failure_mode, graded) ? await conditionForFailure(trace) : null;
+  const conditionWithheld = condition?.verdict === 'unattributed' || condition?.verdict === 'review';
+  if (condition?.verdict === 'unattributed') {
+    conditionUnattributed++;
+    logger.info('posterior update UNATTRIBUTED (environment): the failure is inside a confirmed external condition', {
+      event: 'external_condition_unattributed', activity_id: activityId, execution_id: trace.execution_id ?? null,
+      record_id: condition.record_id, holder: condition.holder, kind: condition.kind, unit: condition.unit,
+      recorded_at: trace.recorded_at ?? null, beta_withheld: graded.betaDelta, unattributed_total: conditionUnattributed,
+    });
+  } else if (condition?.verdict === 'review') {
+    conditionReviewWithheld++;
+    logger.warn('posterior update WITHHELD for REVIEW: the failure is inside an unconfirmed external condition', {
+      event: 'external_condition_review', activity_id: activityId, execution_id: trace.execution_id ?? null,
+      record_id: condition.record_id, holder: condition.holder, why: condition.why,
+      recorded_at: trace.recorded_at ?? null, beta_withheld: graded.betaDelta, review_withheld_total: conditionReviewWithheld,
+    });
+  }
+  const ungraded = reachUngraded || conditionWithheld;
+  const { alphaDelta, betaDelta } = conditionWithheld ? { alphaDelta: 0, betaDelta: 0 } : graded;
   const failureModeType = trace.failure_mode?.type ?? null;
   // NO LEARNING WRITE TO A DEFAULT ORG. The trace's org is a guess (no org was supplied; it was stored under
   // 'public'), so every leaf write keyed on it is skipped, never redirected: the VPM delta, the signature row, the
@@ -1517,7 +1771,7 @@ export async function applyOutcomeToPosteriors(
     logger.info('posterior variant update SKIPPED', {
       activity_id: activityId,
       execution_id: trace.execution_id ?? null,
-      reason: skipVariantUpdate ? (tierClass === 'all_deterministic' ? 'all_deterministic' : 'information_yield_idle') : ((ungraded && !failedByTask) ? (infraFailure ? 'infra_failure' : 'reach_ungraded') : ((alphaDelta === 0 && betaDelta === 0) ? 'zero_deltas' : 'org_defaulted')),
+      reason: skipVariantUpdate ? (tierClass === 'all_deterministic' ? 'all_deterministic' : 'information_yield_idle') : conditionWithheld ? (condition?.verdict === 'review' ? 'condition_review' : 'environment_condition') : ((ungraded && !failedByTask) ? (infraFailure ? 'infra_failure' : 'reach_ungraded') : ((alphaDelta === 0 && betaDelta === 0) ? 'zero_deltas' : 'org_defaulted')),
       vpm: orgDefaulted ? 'skipped_org_defaulted' : 'skipped',
       signature_row: orgDefaulted ? 'skipped_org_defaulted' : 'skipped',
       reach_verdict: reachVerdict,
@@ -1736,7 +1990,7 @@ export async function applyOutcomeToPosteriors(
     failure_mode_type: failureModeType,
     impulse_relevance_writes: impulseRelevanceWrites,
     warnings,
-    skipped_reason: ungraded ? 'ungraded_reach' : (skipVariantUpdate ? (trace.metadata?.information_yield === 'idle' ? 'idle_yield' : 'all_deterministic') : undefined),
+    skipped_reason: conditionWithheld ? (condition?.verdict === 'review' ? 'condition_review' : 'environment_condition') : ungraded ? 'ungraded_reach' : (skipVariantUpdate ? (trace.metadata?.information_yield === 'idle' ? 'idle_yield' : 'all_deterministic') : undefined),
   };
 
   emitPosteriorUpdateMetric(summary);

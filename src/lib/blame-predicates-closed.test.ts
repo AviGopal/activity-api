@@ -2,9 +2,11 @@
  * THE PREDICATES THAT DECIDE BLAME LIVE IN THE CLOSED MODULE (qa ruling, option (i)).
  *
  * Whether a failure is the environment's decides whether the arm is charged beta, so the environment classifier
- * (ENVIRONMENTAL_FAILURE_PATTERNS / isEnvironmentalFailureReason / isInfraFailure / gradeReach) is verdict logic. It
- * lives in src/lib/posterior-update.ts, which the autonomy scope excludes. If it were defined in, or imported from, a
- * lane-open module (reach-classify.ts, for instance), a lane landing there could widen it and excuse its own arms.
+ * (ENVIRONMENTAL_FAILURE_PATTERNS / isEnvironmentalFailureReason / isInfraFailure / gradeReach) is verdict logic, and
+ * so is the external-condition judge (which records count, which failures they may move, the time they are judged at).
+ * They live in src/lib/posterior-update.ts, which the autonomy scope excludes. If one were defined in, or imported from,
+ * a lane-open module (reach-classify.ts, external-condition.ts), a lane landing there could widen it and excuse its own
+ * arms. From the lane-open reader the closed module takes only the untrusted candidate list.
  *
  * MUST-FAIL: every blame predicate is DEFINED in posterior-update.ts and nowhere else under src/; posterior-update.ts
  *   takes no predicate binding from another module; the route's reach-gated sinks take gradeReach / posteriorGrade from
@@ -23,9 +25,16 @@ import ts from 'typescript';
 const ROOT = join(import.meta.dir, '..', '..');
 const CLOSED = 'src/lib/posterior-update.ts';
 /** The blame predicates: each must be declared in CLOSED, and only there. */
-export const BLAME_PREDICATES = ['ENVIRONMENTAL_FAILURE_PATTERNS', 'isEnvironmentalFailureReason', 'isInfraFailure', 'gradeReach'];
+export const BLAME_PREDICATES = [
+  'ENVIRONMENTAL_FAILURE_PATTERNS', 'isEnvironmentalFailureReason', 'isInfraFailure', 'gradeReach',
+  // The external-condition judge: which records count, which failures they may move, and the time they are judged at.
+  'judgeExternalCondition', 'conditionForFailure', 'conditionEligible', 'conditionTimeMs', 'isEvidencePointer',
+  'CONDITION_ATTRIBUTION_RULE', 'EXTERNAL_CONDITION_SHAPE', 'traceRecordedAt',
+];
 /** A binding name that is (or wraps) a blame predicate. */
-const PREDICATE = /environmentalfailure|infrafailure|^gradereach$|judgeexternalcondition|conditionverdict|istransient/i;
+const PREDICATE = /environmentalfailure|infrafailure|^gradereach$|judgeexternalcondition|condition(?:forfailure|eligible|verdict|timems)|evidencepointer|attributionrule|recordedat|istransient/i;
+/** The one binding posterior-update.ts takes from the lane-open reader: the untrusted candidate list. */
+const READER = 'src/lib/external-condition.ts';
 
 const sourceFile = (name: string, text: string): ts.SourceFile => ts.createSourceFile(name, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
 function walk(n: ts.Node, visit: (n: ts.Node) => void): void { visit(n); n.forEachChild((c) => walk(c, visit)); }
@@ -107,6 +116,11 @@ describe('MUST-FAIL — the blame predicates are the closed module\'s', () => {
   test('posterior-update.ts takes no predicate binding from another module', () => {
     const bad = importBindings(CLOSED, read(CLOSED)).flatMap((b) => b.names.filter((n) => PREDICATE.test(n)).map((n) => `${n} from ${b.target}`));
     expect(bad).toEqual([]);
+  });
+
+  test('from the lane-open reader it takes only the candidate list', () => {
+    const fromReader = importBindings(CLOSED, read(CLOSED)).filter((b) => b.target === READER).flatMap((b) => b.names);
+    expect(fromReader).toEqual(['readExternalConditionCandidates']);
   });
 
   test('the route\'s reach-gated sinks take gradeReach and posteriorGrade from posterior-update.ts', () => {
