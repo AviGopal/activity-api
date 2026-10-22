@@ -12,6 +12,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, mock, spyOn, test } 
 import { discoveryClient } from '../services/discovery-client';
 import { config } from '../config';
 
+// Restored afterAll: a later file in the same process must not inherit this node identity (the learner reads it at use time).
+const originalNode = process.env.FED_SUBSTRATE_ID;
 process.env.FED_SUBSTRATE_ID = 'syzygy-hub';
 const pulledFrom: string[] = [];
 
@@ -58,6 +60,7 @@ afterAll(() => {
   for (const s of spies) s.mockRestore();
   config.discovery.vesselId = realVesselId;
   globalThis.fetch = realFetch;
+  if (originalNode === undefined) delete process.env.FED_SUBSTRATE_ID; else process.env.FED_SUBSTRATE_ID = originalNode;
 });
 
 describe('trace replication: never pull from your own substrate', () => {

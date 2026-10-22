@@ -20,11 +20,14 @@
  *   - the ApiKey and ordinary JWT paths are unchanged and never consult the new path.
  */
 
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { afterAll, describe, test, expect, mock, beforeEach } from 'bun:test';
 import { Hono } from 'hono';
 
 const NODE = 'obo-node-a';
+// Restored afterAll: a later file in the same process must not inherit this node identity (the learner reads it at use time).
+const originalNode = process.env.FED_SUBSTRATE_ID;
 process.env.FED_SUBSTRATE_ID = NODE;
+afterAll(() => { if (originalNode === undefined) delete process.env.FED_SUBSTRATE_ID; else process.env.FED_SUBSTRATE_ID = originalNode; });
 
 const validateApiKeyWithFallbackImpl = mock(async (_apiKey: string) => ({ authenticated: false, reason: 'unset' } as any));
 const generateJwtTokenImpl = mock(async (_ctx: unknown) => 'locally-minted-general-session' as string | null);

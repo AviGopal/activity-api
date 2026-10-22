@@ -12,6 +12,8 @@ import { discoveryClient } from '../services/discovery-client';
 import { config } from '../config';
 
 const FAKE_KEY = 'mb-test-activity-api-transport-hop-0123456789';
+// Restored afterAll: a later file in the same process must not inherit this node identity (the learner reads it at use time).
+const originalNode = process.env.FED_SUBSTRATE_ID;
 process.env.FED_SUBSTRATE_ID = 'this-substrate';
 
 // No mock.module (it would outlive this file; see mock-module-completeness.test.ts). With no
@@ -47,6 +49,7 @@ afterAll(() => {
   for (const s of spies) s.mockRestore();
   config.discovery.vesselId = realVesselId;
   globalThis.fetch = realFetch;
+  if (originalNode === undefined) delete process.env.FED_SUBSTRATE_ID; else process.env.FED_SUBSTRATE_ID = originalNode;
   if (realKeys.m === undefined) delete process.env.METABOB_API_KEY; else process.env.METABOB_API_KEY = realKeys.m;
   if (realKeys.a !== undefined) process.env.ACTIVITY_API_KEY = realKeys.a;
 });

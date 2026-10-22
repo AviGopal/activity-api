@@ -14,6 +14,8 @@ import { logger } from '../utils/logger';
 
 // As the sibling replication tests do: this process's substrate id is set before the tick module is first imported (it
 // reads it once, at import), so whichever file imports first gives a non-empty echo-suppression origin.
+// Restored afterAll: a later file in the same process must not inherit this node identity (the learner reads it at use time).
+const originalNode = process.env.FED_SUBSTRATE_ID;
 process.env.FED_SUBSTRATE_ID = process.env.FED_SUBSTRATE_ID || 'this-substrate';
 
 const asked: string[] = [];
@@ -40,7 +42,7 @@ beforeAll(async () => {
   }) as typeof fetch;
   mod = await import('./trace-replication-tick');
 });
-afterAll(() => { for (const s of spies) s.mockRestore(); warnSpy.mockRestore(); config.discovery.vesselId = realVesselId; globalThis.fetch = realFetch; });
+afterAll(() => { for (const s of spies) s.mockRestore(); warnSpy.mockRestore(); config.discovery.vesselId = realVesselId; globalThis.fetch = realFetch; if (originalNode === undefined) delete process.env.FED_SUBSTRATE_ID; else process.env.FED_SUBSTRATE_ID = originalNode; });
 beforeEach(() => { asked.length = 0; warns.length = 0; answer = () => new Response(JSON.stringify({ content: { rows: [] } }), { status: 200 }); });
 
 const peer = (id: string, ma: string, extra: Record<string, unknown> = {}) => ({ vesselId: id, protocol: 'libp2p', libp2p_multiaddr: [ma], ...extra });
