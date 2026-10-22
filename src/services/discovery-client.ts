@@ -9,6 +9,7 @@ import { readFileSync, existsSync } from 'fs';
 import { resolve, join } from 'path';
 import { config } from '../config';
 import { logger } from '../utils/logger';
+import { thisNode } from '../middleware/jwtAuth';
 import packageJson from '../../package.json';
 
 interface VesselRegistration {
@@ -164,6 +165,10 @@ export class DiscoveryClient {
           environment: this.detectEnvironment(),
           podId: process.env.HOSTNAME || 'unknown',
           port: config.port,
+          // The node this vessel serves as for on-behalf-of tokens: the audience a surface
+          // must ask identity for, which the label writer holds an OBO to (thisNode). podId
+          // is the hostname and differs from it wherever the node has its own substrate id.
+          node: thisNode(),
         },
       };
 
