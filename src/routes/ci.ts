@@ -2,7 +2,7 @@
  * CI/CD Integration Routes
  *
  * Implements webhook endpoint for CI/CD systems to report build and deployment results.
- * Updates execution traces with CI status and feeds data to Thompson Sampling for learning.
+ * Updates execution traces with CI status and records CI counters on the variant (no posterior write: see the route).
  *
  * Workflow:
  * 1. Activity execution completes -> execution trace stored
@@ -10,7 +10,7 @@
  * 3. CI/CD runs (build, typecheck, test)
  * 4. CI webhook calls this endpoint with results
  * 5. Backend updates execution trace with CI status
- * 6. Thompson Sampling metrics updated based on CI success/failure
+ * 6. The CI counters on the variant's metrics row are updated (never its posterior: see below)
  * 7. On success, deployment task enqueued to boredom queue
  */
 
@@ -103,7 +103,7 @@ export type CIResultResponse = z.infer<typeof CIResultResponseSchema>;
  * 1. Validate request body
  * 2. Load execution trace from database
  * 3. Update execution trace with CI status
- * 4. Update Thompson Sampling metrics (success contributes positively, failure negatively)
+ * 4. Update the CI counters on the variant's metrics row (no alpha/beta: a CI result is not a reach verdict)
  * 5. Broadcast CI result via WebSocket for live dashboard updates
  * 6. If CI succeeded, enqueue staging deployment to boredom queue
  * 7. Return confirmation response
@@ -199,8 +199,11 @@ router.post('/ci-result', async (c) => {
       ci_success: request.success,
     });
 
-    // Update Thompson Sampling metrics
-    // CI success/failure affects template selection probability
+    // CI COUNTERS ONLY, NO POSTERIOR (D8a: no alpha/beta without a graded verdict, one grading writer). This added
+    // +0.5 alpha on a pass / +0.5 beta on a fail straight to the variant row: a second writer beside the reach-gated
+    // one (applyOutcomeToPosteriors), so an execution graded reached by POST /reach and then sent a CI pass was credited
+    // twice, and a CI pass credited an arm with no reach verdict at all. Whether a CI result is itself a verdict is a
+    // ruling; until it is one, it enters the posterior only through the graded writer, which this route does not call.
     let metricsUpdated = false;
 
     if (template_id && normalizedTemplateId) {
@@ -226,21 +229,10 @@ router.post('/ci-result', async (c) => {
         if (metricsResult.length > 0) {
           const metrics = metricsResult[0];
 
-          // Update Thompson Sampling parameters based on CI result
-          // CI success adds a small boost to alpha (success parameter)
-          // CI failure adds a small penalty to beta (failure parameter)
-          const alphaBoost = request.success ? 0.5 : 0;
-          const betaPenalty = request.success ? 0 : 0.5;
-
-          const newAlpha = metrics.thompson_alpha + alphaBoost;
-          const newBeta = metrics.thompson_beta + betaPenalty;
-
-          // Also track CI-specific metrics
+          // Track the CI-specific metrics; thompson_alpha/beta are not written here (see above).
           const updateMetricsQuery = `
             UPDATE variant_performance_metrics
             SET
-              thompson_alpha = $thompson_alpha,
-              thompson_beta = $thompson_beta,
               ci_pass_count = $ci_pass_count,
               ci_fail_count = $ci_fail_count,
               ci_success_rate = $ci_success_rate,
@@ -254,18 +246,16 @@ router.post('/ci-result', async (c) => {
 
           await surrealDB.query(updateMetricsQuery, {
             variant_id: normalizedTemplateId,
-            thompson_alpha: newAlpha,
-            thompson_beta: newBeta,
             ci_pass_count: ciPassCount,
             ci_fail_count: ciFailCount,
             ci_success_rate: ciSuccessRate,
             updated_at: now,
           });
 
-          logger.info('Updated Thompson Sampling metrics with CI result', {
+          logger.info('Updated CI counters with CI result (posterior untouched)', {
             template_id,
-            thompson_alpha: newAlpha,
-            thompson_beta: newBeta,
+            ci_pass_count: ciPassCount,
+            ci_fail_count: ciFailCount,
             ci_success_rate: ciSuccessRate,
           });
 
@@ -281,12 +271,12 @@ router.post('/ci-result', async (c) => {
           await redis.getClient().del('activity:templates:list');
 
         } else {
-          logger.warn('Template metrics not found, cannot update Thompson Sampling', {
+          logger.warn('Template metrics not found, cannot update CI counters', {
             template_id,
           });
         }
       } catch (error: any) {
-        logger.error('Failed to update Thompson Sampling metrics', {
+        logger.error('Failed to update CI counters', {
           template_id,
           error: error.message,
         });
