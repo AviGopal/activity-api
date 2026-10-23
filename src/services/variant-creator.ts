@@ -10,6 +10,11 @@ import { surrealDB } from '../db/surreal';
 import { logger } from '../utils/logger';
 import { accountIdScopedWhere } from '../routes/activities';
 import { getTuningParam } from '../lib/tuning-params';
+import {
+  VPM_TENANT_SCOPE_SQL,
+  RETIREMENT_MIN_EXECUTIONS_DEFAULT,
+  RETIREMENT_SUCCESS_FLOOR_DEFAULT,
+} from '../lib/posterior-retirement';
 
 export interface VariantCreationResult {
   variantId: string;
@@ -465,8 +470,11 @@ export async function checkAndRetireTemplate(
  *     its own catch, and returns false. It has never once completed its own body.
  *
  * This function reads variant_performance_metrics instead: the table `applyOutcomeToPosteriors`
- * already maintains, keyed by variant, indexed, O(1). Tenancy scoping and the variant_id spellings
- * mirror the working reader in db/paradigm.ts (`activity:⟨…⟩` and bare ids both occur).
+ * already maintains, keyed by variant, indexed, O(1). The variant_id spellings mirror the working
+ * reader in db/paradigm.ts (`activity:⟨…⟩` and bare ids both occur). The tenant clause is
+ * VPM_TENANT_SCOPE_SQL: it compares org_id with the prefix stripped on both sides, because the
+ * stored org_id is prefixed on nearly every row and comparing it raw to the stripped org matched
+ * almost nothing, so this function found no row and retired no arm.
  *
  * IT DELIBERATELY DOES NOT SWEEP. It is called only when a trace has just added blame to this arm,
  * so arms retire one fresh failure at a time. A retroactive pass over the same predicate would
@@ -489,7 +497,7 @@ export async function checkAndRetireByPosterior(
     }>(
       `SELECT total_executions, thompson_alpha, thompson_beta
        FROM variant_performance_metrics
-       WHERE ((account_id = $account_id) OR (account_id IS NONE AND org_id = $org_id))
+       WHERE ${VPM_TENANT_SCOPE_SQL}
          AND (variant_id = $bare_id OR variant_id = $bracketed_id OR activity_id = $bare_id)
        LIMIT 1`,
       {
@@ -506,8 +514,9 @@ export async function checkAndRetireByPosterior(
     // Thresholds are read at use time from substrate_tuning_param (falling back to the 20 / 0.3
     // this replaces), NOT frozen into constants — a retirement threshold is behaviour, and
     // behaviour the system cannot observe or adjust is behaviour it cannot learn.
-    const minExecutions = await getTuningParam('RETIREMENT_MIN_EXECUTIONS', undefined, 20);
-    const successFloor = await getTuningParam('RETIREMENT_SUCCESS_FLOOR', undefined, 0.3);
+    // The dry-run in lib/posterior-retirement.ts binds the same two names.
+    const minExecutions = await getTuningParam('RETIREMENT_MIN_EXECUTIONS', undefined, RETIREMENT_MIN_EXECUTIONS_DEFAULT);
+    const successFloor = await getTuningParam('RETIREMENT_SUCCESS_FLOOR', undefined, RETIREMENT_SUCCESS_FLOOR_DEFAULT);
 
     const totalExecutions = typeof row.total_executions === 'number' ? row.total_executions : 0;
     if (totalExecutions < minExecutions) return false;

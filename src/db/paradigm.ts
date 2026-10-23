@@ -14,6 +14,7 @@ import { surrealDB, queryWithAuth } from './surreal';
 import { logger } from '../utils/logger';
 import { localEmbeddingService, getEmbeddingProvider } from '../services/embedding-service';
 import { resolveLearningTrack } from '../lib/learning-track';
+import { VPM_TENANT_SCOPE_SQL } from '../lib/posterior-retirement';
 
 // =============================================================================
 // FEATURE FLAGS (P4.1: Dual-write control)
@@ -2180,10 +2181,11 @@ export async function getVariantScores(
           avg_cost_usd
         FROM variant_performance_metrics
         WHERE variant_id IN $variant_ids
-          AND ((account_id = $account_id) OR (account_id IS NONE AND org_id = $org_id))
+          AND ${VPM_TENANT_SCOPE_SQL}
       `;
 
-      // Legacy table may have org_id without prefix
+      // The stored org_id is prefixed on nearly every row and bare on a legacy few;
+      // VPM_TENANT_SCOPE_SQL strips the prefix on both sides, so either form matches.
       const legacyOrgId = orgId.startsWith('organizations:')
         ? orgId.replace('organizations:', '')
         : orgId;
