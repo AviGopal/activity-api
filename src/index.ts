@@ -253,6 +253,8 @@ app.get('/v2/health/db-pool', async (c) => {
 // single-row trace_store_counters:activity_execution_traces counter
 // (migration 156, openspec/changes/2026-07-08-substrate-self-managed-db-reconciliation)
 // — an O(1) read, NEVER a COUNT() over activity_execution_traces.
+// And `grading`: the per-process counters of records the grading writers deliberately did not grade
+// (lib/grading-counters.ts), e.g. goal-path records with no reach verdict (reach_ungraded).
 app.get('/metrics/db', async (c) => {
   try {
     const { getDbStats, surrealDB } = await import('./db/surreal');
@@ -281,7 +283,16 @@ app.get('/metrics/db', async (c) => {
       });
     }
 
-    return c.json({ ...stats, traceStore });
+    // The grading writers' not-graded counters (lib/grading-counters.ts): advisory, never fail /metrics/db on them.
+    let grading: unknown = null;
+    try {
+      const { gradingCounters } = await import('./lib/grading-counters');
+      grading = await gradingCounters();
+    } catch (e) {
+      logger.warn('grading counters read failed for /metrics/db', { error: e instanceof Error ? e.message : String(e) });
+    }
+
+    return c.json({ ...stats, traceStore, grading });
   } catch (e) {
     return c.json({ error: 'db metrics unavailable', message: e instanceof Error ? e.message : String(e) }, 500);
   }
