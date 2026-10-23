@@ -4979,6 +4979,70 @@ export function insertGradeStampsWithdrawnCount(): number { return insertGradeSt
 /** Observe traces and verdicts recorded without any learning write (module lifetime; lib/reach-classify.ts). */
 export function reachObserveSkips(): number { return observeSkipCount(); }
 
+/** A declined outcome as POST /reach accepts it: goal-host's durable-trace contract (declined:<class> + metadata.decline). */
+export type DeclinedOutcome = { class: string; reason_text?: string; decliner_id?: string };
+/** A decline class is a tag suffix: a short identifier (goal-host writes e.g. decomposition_refused, needs_information). */
+const DECLINE_CLASS_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$/;
+/** Declined outcomes recorded by POST /reach, ungraded (module lifetime). */
+let declinedOutcomesRecorded = 0;
+export function declinedOutcomesRecordedCount(): number { return declinedOutcomesRecorded; }
+
+/** Read { outcome: 'declined', decline: {...} } from a POST /reach body; a refusal names what is wrong. */
+export function parseDeclinedOutcome(body: any): DeclinedOutcome | { error: string } {
+  if (body?.reached !== undefined && body?.reached !== null) {
+    return { error: "a declined outcome carries no reached verdict: send outcome:'declined' without reached" };
+  }
+  const d = body?.decline;
+  const cls = d && typeof d === 'object' && typeof d.class === 'string' ? d.class.trim() : '';
+  if (!DECLINE_CLASS_RE.test(cls)) {
+    return { error: "outcome:'declined' requires decline.class, a short identifier ([A-Za-z0-9_.:-], at most 80 chars)" };
+  }
+  const out: DeclinedOutcome = { class: cls };
+  if (typeof d.reason_text === 'string' && d.reason_text.trim()) out.reason_text = d.reason_text.trim().slice(0, 600);
+  if (typeof d.decliner_id === 'string' && d.decliner_id.trim()) out.decliner_id = d.decliner_id.trim().slice(0, 200);
+  return out;
+}
+
+/**
+ * Persist a declined outcome on the authoritative `execution` row: the declined:<class> tag (a union, so a latched tag
+ * is never dropped) and metadata.decline. Nothing is graded: no posterior call, no reach_graded stamp, no reached
+ * column write. The same decline (class and reason) on a row that already holds it is not written again, so a
+ * redelivery does not look like a fresh update; it is reported as persisted. `preTags` is the pre-read's tags (null
+ * when the pre-read failed or found no row), read only for the log.
+ */
+async function recordDeclinedOutcome(execId: string, d: DeclinedOutcome, preTags: string[] | null): Promise<Record<string, unknown>> {
+  const tag = `declined:${d.class}`;
+  const params = { execution_id: execId, declined_tag: tag, decline: d, decline_class: d.class, decline_reason: d.reason_text };
+  const held = `tags CONTAINS $declined_tag AND metadata.decline.class = $decline_class AND metadata.decline.reason_text = $decline_reason`;
+  let updated = 0;
+  let idempotent = false;
+  try {
+    const res = await surrealDB.query(
+      `UPDATE type::thing('execution', $execution_id) SET tags = array::union(tags ?? [], [$declined_tag]), metadata.decline = $decline WHERE !(${held})`,
+      params,
+    );
+    updated = Array.isArray(res) && Array.isArray(res[0]) ? (res[0] as unknown[]).length : (Array.isArray(res) ? res.length : 0);
+    if (updated === 0) {
+      const same = await surrealDB.query(`SELECT VALUE id FROM type::thing('execution', $execution_id) WHERE ${held}`, params);
+      const sameRows = Array.isArray(same) && Array.isArray(same[0]) ? (same[0] as unknown[]) : (Array.isArray(same) ? same : []);
+      if (sameRows.length > 0) { updated = 1; idempotent = true; }
+    }
+  } catch (e) {
+    logger.warn('[reach-patch] declined outcome write failed', { execution_id: execId, error: e instanceof Error ? e.message : String(e) });
+    return { success: false, execution_id: execId, outcome: 'declined', declined: d.class, reached: null, updated: 0, error: e instanceof Error ? e.message : String(e) };
+  }
+  if (updated > 0 && !idempotent) declinedOutcomesRecorded++;
+  logger.info('[reach] DECLINED outcome — recorded, ungraded (no posterior or learning write)', {
+    execution_id: execId,
+    declined: d.class,
+    updated,
+    idempotent,
+    already_graded: preTags ? preTags.includes('reach_graded:true') || preTags.includes(INSERT_GRADED_TAG) : null,
+    declined_recorded: declinedOutcomesRecorded,
+  });
+  return { success: true, execution_id: execId, outcome: 'declined', declined: d.class, reached: null, updated, ...(idempotent ? { idempotent: true } : {}) };
+}
+
 // Patch the reach-gate verdict onto an already-persisted trace. POST '/' INSERTs
 // the trace BEFORE the goal-host reach gate runs (the gate is post-execution), so
 // `reached` / `completion_shapes` can only be written back here, keyed by
@@ -4991,7 +5055,17 @@ app.post('/reach', async (c) => {
   try {
     const body = await c.req.json();
     const execId = body.execution_id;
-    if (!execId || typeof body.reached !== 'boolean') {
+    // A DECLINED OUTCOME ON THE WIRE (REALIGNMENT §2.2: an outcome is reached, failed or DECLINED, and credit moves only
+    // on a graded verdict). A run that correctly refused is neither: { outcome: 'declined', decline: { class,
+    // reason_text?, decliner_id? } } records it as the same contract goal-host writes on its durable trace, the
+    // declined:<class> tag plus metadata.decline, so isReachInapplicable ungrades it. `reached` is left as it was (NONE
+    // on a fresh row), no posterior, counter or successor-feature write is made, and nothing is graded. A body without
+    // outcome:'declined' is the boolean verdict, unchanged.
+    const declined = body?.outcome === 'declined' ? parseDeclinedOutcome(body) : null;
+    if (declined && 'error' in declined) {
+      return c.json({ error: declined.error }, 400);
+    }
+    if (!execId || (!declined && typeof body.reached !== 'boolean')) {
       return c.json({ error: 'execution_id (string) and reached (bool) required' }, 400);
     }
     const completion_shapes: string[] = Array.isArray(body.completion_shapes)
@@ -5073,6 +5147,9 @@ app.post('/reach', async (c) => {
     }
     const preTags: string[] = Array.isArray(preRow?.tags) ? (preRow.tags as string[]) : [];
     const observeVerdict = observeByBody || isObserveTrace({ tags: preTags });
+    if (declined) {
+      return c.json(await recordDeclinedOutcome(String(execId), declined, preReadOk && preRow ? preTags : null), 200);
+    }
     // A RETRACTED reach:false IS NOT RE-LATCHED BY A REDELIVERY. A recorded correction (lib/reach-correction.ts)
     // set this row's `reached` to NONE and tagged it reach_retracted:<list_sha>; a retry or spool drain of the
     // same not-reached verdict would set the column back to false while the tag says retracted, so every
