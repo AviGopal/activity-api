@@ -44,7 +44,9 @@ function transportHopHeaders(): Record<string, string> {
     ...(apiKey ? { Authorization: `ApiKey ${apiKey}` } : {}),
   };
 }
-const SELF_ORIGIN =
+// Read at use time, like ownSubstrateId below: frozen at module load, a tick loaded before the node identity
+// was set would never send exclude_origin, and echo suppression would be off with nothing to show it.
+const selfOrigin = (): string =>
   process.env.FED_SUBSTRATE_ID || process.env.SUBSTRATE_ID || '';
 const PULL_LIMIT = Math.max(
   1,
@@ -170,7 +172,7 @@ async function pullFromPeer(peer: PeerVessel): Promise<{ pulled: number; stored:
             type: 'executionReplicationPull',
             since,
             limit: PULL_LIMIT,
-            exclude_origin: SELF_ORIGIN || undefined,
+            exclude_origin: selfOrigin() || undefined,
           },
         }),
         signal: AbortSignal.timeout(30000),
