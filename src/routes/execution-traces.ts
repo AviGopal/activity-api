@@ -12,7 +12,7 @@ import { createHash } from 'node:crypto';
 import { surrealDB, queryWithAuth } from '../db/surreal';
 import { logger } from '../utils/logger';
 import type { SessionData } from '../models/schemas';
-import { getJwtAuthFromContext, hasJwtAuth } from '../middleware/jwtAuth';
+import { getJwtAuthFromContext, hasJwtAuth, presentsThisNodesKey } from '../middleware/jwtAuth';
 import { config } from '../config';
 import { insertExecution, isDualWriteEnabled, normalizeActivityId, updateShapeActivityScores, type ParadigmExecution } from '../db/paradigm';
 // Phase B2: dual-tenant helpers (defined in routes/activities.ts in B1).
@@ -4986,6 +4986,46 @@ const DECLINE_CLASS_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$/;
 /** Declined outcomes recorded by POST /reach, ungraded (module lifetime). */
 let declinedOutcomesRecorded = 0;
 export function declinedOutcomesRecordedCount(): number { return declinedOutcomesRecorded; }
+/** Declined outcomes POST /reach refused, by reason (module lifetime). */
+const declinedOutcomesRefused = { forbidden: 0, already_graded: 0, not_found: 0, unverified: 0 };
+export function declinedOutcomesRefusedCounts(): Readonly<typeof declinedOutcomesRefused> { return { ...declinedOutcomesRefused }; }
+
+/**
+ * A row that already carries a verdict or a grading stamp cannot be declined: a decline is never a retroactive
+ * ungrade. reach_graded:true / insert_graded:true mean a grading writer ran; reached:true / reached:false mean a
+ * verdict is latched (tags are only ever unioned). Corrections to a graded row go only through the compensation path.
+ */
+const DECLINE_BLOCKING_TAGS: readonly string[] = ['reach_graded:true', INSERT_GRADED_TAG, 'reached:true', 'reached:false'];
+export function declineBlockedBy(tags: string[]): string | null {
+  return DECLINE_BLOCKING_TAGS.find((t) => tags.includes(t)) ?? null;
+}
+
+/**
+ * WHO MAY DECLINE AN EXECUTION: the principal that owns it, or this node's own key. A decline makes a run ungradable,
+ * so a caller that could decline any execution could exempt any arm from blame. The owner is read from the row's own
+ * stamps, written from the inserting caller's credential (POST / resolves them with resolveTraceOrg, never the body):
+ * the caller's authenticated org (JWT, else session) must equal the row's org_id (compared without the
+ * `organizations:` prefix), and where both name an account_id they must be equal. A row stored under a defaulted org
+ * (metadata.org_defaulted, or a bare 'public') has no known owner, so only this node's key may decline it.
+ */
+export function declineCallerOwns(
+  caller: { orgId?: unknown; accountId?: unknown; sessionOrg?: unknown; isThisNode: boolean },
+  row: { org_id?: unknown; account_id?: unknown; org_defaulted?: unknown },
+): { ok: true; via: 'node_key' | 'owner' } | { ok: false; why: string } {
+  if (caller.isThisNode) return { ok: true, via: 'node_key' };
+  const isStr = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
+  const bare = (o: string) => o.replace(/^organizations:/, '');
+  const callerOrg = [caller.orgId, caller.sessionOrg].find(isStr);
+  if (!callerOrg) return { ok: false, why: 'the caller has no authenticated org' };
+  if (!isStr(row.org_id) || row.org_defaulted === true || row.org_id === 'public') {
+    return { ok: false, why: 'the execution has no known owner (defaulted org); only this node may decline it' };
+  }
+  if (bare(callerOrg) !== bare(row.org_id)) return { ok: false, why: "the execution belongs to another org" };
+  if (isStr(caller.accountId) && isStr(row.account_id) && caller.accountId !== row.account_id) {
+    return { ok: false, why: 'the execution belongs to another account' };
+  }
+  return { ok: true, via: 'owner' };
+}
 
 /** Read { outcome: 'declined', decline: {...} } from a POST /reach body; a refusal names what is wrong. */
 export function parseDeclinedOutcome(body: any): DeclinedOutcome | { error: string } {
@@ -5007,18 +5047,19 @@ export function parseDeclinedOutcome(body: any): DeclinedOutcome | { error: stri
  * Persist a declined outcome on the authoritative `execution` row: the declined:<class> tag (a union, so a latched tag
  * is never dropped) and metadata.decline. Nothing is graded: no posterior call, no reach_graded stamp, no reached
  * column write. The same decline (class and reason) on a row that already holds it is not written again, so a
- * redelivery does not look like a fresh update; it is reported as persisted. `preTags` is the pre-read's tags (null
- * when the pre-read failed or found no row), read only for the log.
+ * redelivery does not look like a fresh update; it is reported as persisted. The write also re-checks the grading
+ * guard in its own WHERE, so a grading that lands between the route's pre-read and this write is not overwritten
+ * by a decline: that comes back `conflict` (the route answers 409). `preTags` is the pre-read's tags, for the log.
  */
 async function recordDeclinedOutcome(execId: string, d: DeclinedOutcome, preTags: string[] | null): Promise<Record<string, unknown>> {
   const tag = `declined:${d.class}`;
-  const params = { execution_id: execId, declined_tag: tag, decline: d, decline_class: d.class, decline_reason: d.reason_text };
+  const params = { execution_id: execId, declined_tag: tag, decline: d, decline_class: d.class, decline_reason: d.reason_text, blocking_tags: [...DECLINE_BLOCKING_TAGS] };
   const held = `tags CONTAINS $declined_tag AND metadata.decline.class = $decline_class AND metadata.decline.reason_text = $decline_reason`;
   let updated = 0;
   let idempotent = false;
   try {
     const res = await surrealDB.query(
-      `UPDATE type::thing('execution', $execution_id) SET tags = array::union(tags ?? [], [$declined_tag]), metadata.decline = $decline WHERE !(${held})`,
+      `UPDATE type::thing('execution', $execution_id) SET tags = array::union(tags ?? [], [$declined_tag]), metadata.decline = $decline WHERE !(${held}) AND !((tags ?? []) CONTAINSANY $blocking_tags)`,
       params,
     );
     updated = Array.isArray(res) && Array.isArray(res[0]) ? (res[0] as unknown[]).length : (Array.isArray(res) ? res.length : 0);
@@ -5026,6 +5067,7 @@ async function recordDeclinedOutcome(execId: string, d: DeclinedOutcome, preTags
       const same = await surrealDB.query(`SELECT VALUE id FROM type::thing('execution', $execution_id) WHERE ${held}`, params);
       const sameRows = Array.isArray(same) && Array.isArray(same[0]) ? (same[0] as unknown[]) : (Array.isArray(same) ? same : []);
       if (sameRows.length > 0) { updated = 1; idempotent = true; }
+      else return { success: false, execution_id: execId, outcome: 'declined', declined: d.class, reached: null, updated: 0, conflict: true };
     }
   } catch (e) {
     logger.warn('[reach-patch] declined outcome write failed', { execution_id: execId, error: e instanceof Error ? e.message : String(e) });
@@ -5037,7 +5079,6 @@ async function recordDeclinedOutcome(execId: string, d: DeclinedOutcome, preTags
     declined: d.class,
     updated,
     idempotent,
-    already_graded: preTags ? preTags.includes('reach_graded:true') || preTags.includes(INSERT_GRADED_TAG) : null,
     declined_recorded: declinedOutcomesRecorded,
   });
   return { success: true, execution_id: execId, outcome: 'declined', declined: d.class, reached: null, updated, ...(idempotent ? { idempotent: true } : {}) };
@@ -5109,7 +5150,7 @@ app.post('/reach', async (c) => {
     let preReadOk = false;
     try {
       const preRes = await surrealDB.query<any>(
-        `SELECT variant_id, activity_id, success, tags, cost_usd, org_id, metadata.org_defaulted AS org_defaulted, signature, signature_version, composition_chain, failure_mode, resolver_tier, trace.tasks AS tasks, metadata, executed_at, vessel_id, resolved_by_vessel_id FROM type::thing('execution', $execution_id)`,
+        `SELECT variant_id, activity_id, success, tags, cost_usd, org_id, account_id, metadata.org_defaulted AS org_defaulted, signature, signature_version, composition_chain, failure_mode, resolver_tier, trace.tasks AS tasks, metadata, executed_at, vessel_id, resolved_by_vessel_id FROM type::thing('execution', $execution_id)`,
         { execution_id: String(execId) },
       );
       preRow = Array.isArray(preRes) && preRes.length > 0
@@ -5148,7 +5189,28 @@ app.post('/reach', async (c) => {
     const preTags: string[] = Array.isArray(preRow?.tags) ? (preRow.tags as string[]) : [];
     const observeVerdict = observeByBody || isObserveTrace({ tags: preTags });
     if (declined) {
-      return c.json(await recordDeclinedOutcome(String(execId), declined, preReadOk && preRow ? preTags : null), 200);
+      // Two guards before anything is written. A decline that could not be checked is refused, never written blind.
+      const refuse = (reason: keyof typeof declinedOutcomesRefused, status: 403 | 404 | 409 | 503, error: string) => {
+        declinedOutcomesRefused[reason]++;
+        logger.warn('[reach] DECLINED outcome refused', { execution_id: String(execId), declined: declined.class, reason, error });
+        return c.json({ success: false, execution_id: String(execId), outcome: 'declined', refused: reason, error, updated: 0 }, status);
+      };
+      if (!preReadOk) return refuse('unverified', 503, 'the execution could not be read, so its owner and grading are unverified');
+      if (!preRow) return refuse('not_found', 404, 'no such execution');
+      // (a) CALLER: the execution's owner, or this node's own key.
+      const jwtAuthDecl = getJwtAuthFromContext(c);
+      const sessionDecl = (c.get as any)('session') as SessionData | undefined;
+      const owns = declineCallerOwns(
+        { orgId: jwtAuthDecl?.orgId, accountId: jwtAuthDecl?.accountId, sessionOrg: sessionDecl?.org_id, isThisNode: presentsThisNodesKey(c) },
+        preRow,
+      );
+      if (!owns.ok) return refuse('forbidden', 403, `only the execution's owner or this node may decline it: ${owns.why}`);
+      // (b) ALREADY GRADED: never a retroactive ungrade.
+      const blockedBy = declineBlockedBy(preTags);
+      if (blockedBy) return refuse('already_graded', 409, `the execution already carries ${blockedBy}; a graded execution is corrected only through the compensation path, never declined`);
+      const written = await recordDeclinedOutcome(String(execId), declined, preTags);
+      if (written.conflict === true) return refuse('already_graded', 409, 'the execution was graded (or removed) while the decline was being written; it was not declined');
+      return c.json(written, written.success === false ? 500 : 200);
     }
     // A RETRACTED reach:false IS NOT RE-LATCHED BY A REDELIVERY. A recorded correction (lib/reach-correction.ts)
     // set this row's `reached` to NONE and tagged it reach_retracted:<list_sha>; a retry or spool drain of the

@@ -155,6 +155,16 @@ function isEmittedKey(presented: string | undefined): boolean {
   return timingSafeEqual(a, b);
 }
 
+/**
+ * True when the request authenticated with THIS node's own API key (the fleet's emitted METABOB_API_KEY), read from
+ * the same `ApiKey <key>` header the middleware validated and compared in constant time. False for a JWT, another
+ * key, or no header. For write routes that admit the node itself beside the principal that owns a row.
+ */
+export function presentsThisNodesKey(c: Context): boolean {
+  const m = (c.req.header('Authorization') ?? '').match(/^ApiKey\s+(.+)$/i);
+  return isEmittedKey(m?.[1]);
+}
+
 type ConnectedEntry = { first_at: string; remote: string; key_id: string | null; auth_type: string | null; emitted_key: boolean };
 
 async function writeConnectedEntry(path: string, keyLabel: string, keyId: string | null, entry: ConnectedEntry): Promise<void> {

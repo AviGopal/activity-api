@@ -7,6 +7,8 @@
 //   [MUST-FAIL] outcome:'declined' ⇒ the row carries declined:<class> and metadata.decline {class, reason_text,
 //               decliner_id}; reached stays NONE; no reached:* or reach_graded tag; the arm's vpm row is unchanged.
 //   [MUST-FAIL] the same decline redelivered ⇒ idempotent, updated 1, the row unchanged.
+//   [MUST-FAIL] another org's caller ⇒ 403, the row unchanged.
+//   [MUST-FAIL] a decline after a reached:false verdict was graded ⇒ 409, the row unchanged.
 //   [CONTROL]   a row with no decline keeps its tags and metadata as seeded.
 process.env.SURREALDB_NAMESPACE ??= 'activity-system';
 process.env.SURREALDB_DATABASE ??= 'learning_loop';
@@ -25,6 +27,7 @@ let db: RealSurreal | null = null;
 let ET: { request: (path: string, init?: RequestInit) => Response | Promise<Response> };
 let startError = '';
 let restoreModules: () => void = () => {};
+let callerOrg = ORG;
 
 function exec(id: string): string {
   return `CREATE execution:\`${id}\` CONTENT { activity_id: '${ARM}', input_impulses: [], output_impulses: [], success: false, duration_ms: 10, cost_usd: 0.0, tokens_in: 0, tokens_out: 0, org_id: '${ORG}', executed_at: time::now() - 1m, created_at: time::now(), status: 'failed', tags: ['dispatcher_used:goal-host'] };`;
@@ -37,7 +40,8 @@ async function arm(): Promise<Array<{ a: number; b: number }>> {
   const v = await db!.sql(`${USE} SELECT thompson_alpha AS a, thompson_beta AS b FROM variant_performance_metrics WHERE variant_id = '${ARM}' AND org_id = '${ORG}';`);
   return v[v.length - 1].result;
 }
-async function reach(body: Record<string, unknown>): Promise<{ status: number; json: Record<string, unknown> }> {
+async function reach(body: Record<string, unknown>, org = ORG): Promise<{ status: number; json: Record<string, unknown> }> {
+  callerOrg = org;
   const res = await ET.request('/reach', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
   return { status: res.status, json: (await res.json()) as Record<string, unknown> };
 }
@@ -49,8 +53,13 @@ beforeAll(async () => {
       'src/db/paradigm', 'src/websocket/broadcaster', 'src/services/variant-creator']);
     db = await startRealSurreal();
     await db.connectModuleClient();
-    ET = (await import('./execution-traces')).default as typeof ET;
-    await db.sql(`${USE} ${exec('declined-1')} ${exec('plain-1')} CREATE variant_performance_metrics CONTENT { variant_id: '${ARM}', activity_id: '${ARM}', org_id: '${ORG}', total_executions: 3, successful_executions: 2, failed_executions: 1, success_rate: 0.66, avg_duration_ms: 10.0, avg_cost_usd: 0.0, thompson_alpha: 4.0, thompson_beta: 2.0, total_selections: 3, created_at: time::now(), updated_at: time::now() };`);
+    const routes = (await import('./execution-traces')).default;
+    const { Hono } = await import('hono');
+    const h = new Hono();
+    h.use('*', async (c, next) => { (c as any).set('jwtAuth', { jwtToken: 't', orgId: callerOrg, authType: 'apikey', keyId: 'k' }); await next(); });
+    h.route('/', routes);
+    ET = h;
+    await db.sql(`${USE} ${exec('declined-1')} ${exec('plain-1')} ${exec('graded-1')} ${exec('foreign-1')} CREATE variant_performance_metrics CONTENT { variant_id: '${ARM}', activity_id: '${ARM}', org_id: '${ORG}', total_executions: 3, successful_executions: 2, failed_executions: 1, success_rate: 0.66, avg_duration_ms: 10.0, avg_cost_usd: 0.0, thompson_alpha: 4.0, thompson_beta: 2.0, total_selections: 3, created_at: time::now(), updated_at: time::now() };`);
   } catch (e) {
     startError = `cannot start: ${e instanceof Error ? e.message : String(e)}`;
   }
@@ -85,6 +94,24 @@ describe('POST /reach on the real engine: a declined outcome is persisted, ungra
     expect(r.status).toBe(200);
     expect(r.json).toMatchObject({ success: true, updated: 1, idempotent: true });
     expect(await row('declined-1')).toEqual(before);
+  }, 60_000);
+
+  it("[MUST-FAIL] another org's caller ⇒ 403, the row unchanged", async () => {
+    const before = await row('foreign-1');
+    const r = await reach({ execution_id: 'foreign-1', outcome: 'declined', decline: DECLINE }, 'organizations:someone-else');
+    expect(r.status).toBe(403);
+    expect(await row('foreign-1')).toEqual(before);
+  }, 60_000);
+
+  it('[MUST-FAIL] a decline after a graded reached:false ⇒ 409, the row unchanged', async () => {
+    const g = await reach({ execution_id: 'graded-1', reached: false, completion_shapes: [] });
+    expect(g.status).toBe(200);
+    await Bun.sleep(300);
+    const before = await row('graded-1');
+    expect(before.tags).toEqual(expect.arrayContaining(['reach_graded:true', 'reached:false']));
+    const r = await reach({ execution_id: 'graded-1', outcome: 'declined', decline: DECLINE });
+    expect(r.status).toBe(409);
+    expect(await row('graded-1')).toEqual(before);
   }, 60_000);
 
   it('[CONTROL] a row with no decline keeps its tags and metadata as seeded', async () => {
