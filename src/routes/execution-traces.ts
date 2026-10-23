@@ -120,6 +120,23 @@ const NON_COMPLETING_FAILURE_MODES = new Set(['execution_error']);
  * those 430 rows exist only because the patch skips the downgrade, so applying it uniformly
  * would cut recorded reaches 478 -> ~48 and harden the wrong answer.
  */
+/**
+ * THE JUDGE'S REACH VERDICT, AS RECEIVED, for the execution_completed event (and nothing else). goal-host's judge
+ * hands activity-api its verdict either with the trace (a pre-verdict: the body's `reached`, or a reached:true /
+ * reached:false tag the poster set) or later on POST /reach. This reads only that: never `success`, never `status`,
+ * never the failure mode. Absent (undefined) means UNGRADED: no verdict yet, a retracted one, or one the caller
+ * withheld (beta_withheld / reach_withheld:true: goal-host judged it not creditable, so no consumer may charge it).
+ * Consumers credit only an explicit boolean (concept-db's execution observer credits recalled concepts from it).
+ */
+export function judgeReachVerdict(t: { reached?: unknown; tags?: unknown }, opts: { withheld?: boolean } = {}): boolean | undefined {
+  const tags = Array.isArray(t.tags) ? (t.tags as unknown[]).filter((x): x is string => typeof x === 'string') : [];
+  if (opts.withheld || tags.includes('reach_withheld:true') || isReachRetracted({ tags })) return undefined;
+  if (typeof t.reached === 'boolean') return t.reached;
+  if (tags.includes('reached:true')) return true;
+  if (tags.includes('reached:false')) return false;
+  return undefined;
+}
+
 export function reachedVerdict(
   claimed: boolean | undefined,
   failureModeType: string | undefined,
@@ -4218,6 +4235,15 @@ app.post('/', async (c) => {
           cost: trace.cost_usd || 0,
           completed_at: new Date().toISOString(),
           org_id: traceOrgId || null,
+          // The judge's reach verdict when the trace arrived with one (judgeReachVerdict), else ABSENT: a walk awaiting
+          // its verdict is ungraded here, and POST /reach emits execution_completed again carrying it.
+          ...(() => {
+            const r = judgeReachVerdict(
+              { reached: typeof (body as any).reached === 'boolean' ? (body as any).reached : (trace as any).reached, tags: (trace as any).tags },
+              { withheld: betaWithheldAtInsert },
+            );
+            return typeof r === 'boolean' ? { reached: r } : {};
+          })(),
         },
       });
     }).catch(() => { /* non-fatal */ });
@@ -5150,7 +5176,7 @@ app.post('/reach', async (c) => {
     let preReadOk = false;
     try {
       const preRes = await surrealDB.query<any>(
-        `SELECT variant_id, activity_id, success, tags, cost_usd, org_id, account_id, metadata.org_defaulted AS org_defaulted, signature, signature_version, composition_chain, failure_mode, resolver_tier, trace.tasks AS tasks, metadata, executed_at, vessel_id, resolved_by_vessel_id FROM type::thing('execution', $execution_id)`,
+        `SELECT variant_id, activity_id, success, tags, cost_usd, duration_ms, org_id, account_id, metadata.org_defaulted AS org_defaulted, signature, signature_version, composition_chain, failure_mode, resolver_tier, trace.tasks AS tasks, metadata, executed_at, vessel_id, resolved_by_vessel_id FROM type::thing('execution', $execution_id)`,
         { execution_id: String(execId) },
       );
       preRow = Array.isArray(preRes) && preRes.length > 0
@@ -5512,6 +5538,43 @@ app.post('/reach', async (c) => {
       }
     } catch (e) {
       logger.warn('[reach-patch] execution mirror update failed (non-fatal)', { error: e instanceof Error ? e.message : String(e) });
+    }
+    // THE VERDICT REACHES execution_completed. POST / broadcast execution_completed when the trace arrived, which for a
+    // goal-host walk is BEFORE its judge verdict exists, so that event carried no `reached` (ungraded). The verdict is
+    // this route's: when it is the execution's FIRST verdict (the pre-read row carried no reached:* tag) and it was
+    // newly persisted (not an idempotent redelivery), execution_completed is emitted again, carrying it as `reached`
+    // and `verdict: true` so a consumer can tell the graded event from the arrival one. Never for an observe verdict,
+    // and never with a value the caller withheld (beta_withheld, reach_withheld:true) or a correction retracted: those
+    // stay ungraded (judgeReachVerdict). Consumers already see execution_completed more than once per execution (WS
+    // delivery plus replay) and dedupe by execution_id; concept-db credits recalled concepts once, from a boolean only.
+    if (!observeVerdict && preReadOk && preRow && mirrored > 0 && !idempotent
+      && !preTags.includes('reached:true') && !preTags.includes('reached:false')) {
+      const verdictForEvent = judgeReachVerdict({ reached: body.reached, tags: preTags }, { withheld: betaWithheld });
+      if (typeof verdictForEvent === 'boolean') {
+        const tasks = Array.isArray(preRow.tasks) ? (preRow.tasks as Array<{ status?: string }>) : [];
+        const activityForEvent = preActivityId || '';
+        void import('../websocket/broadcaster').then(({ broadcaster }) => {
+          broadcaster.emit({
+            type: 'execution_completed',
+            timestamp: new Date().toISOString(),
+            data: {
+              execution_id: String(execId),
+              activity_id: activityForEvent,
+              variant_id: typeof preRow.variant_id === 'string' ? preRow.variant_id : activityForEvent,
+              success: preRow.success === true,
+              task_count: tasks.length,
+              completed_task_count: tasks.filter((t) => t?.status === 'completed' || t?.status === 'success').length,
+              failed_task_count: tasks.filter((t) => t?.status === 'failed' || t?.status === 'failure').length,
+              duration_ms: typeof preRow.duration_ms === 'number' ? preRow.duration_ms : 0,
+              cost: typeof preRow.cost_usd === 'number' ? preRow.cost_usd : 0,
+              completed_at: new Date().toISOString(),
+              org_id: typeof preRow.org_id === 'string' ? preRow.org_id : null,
+              reached: verdictForEvent,
+              verdict: true,
+            },
+          } as any);
+        }).catch(() => { /* non-fatal */ });
+      }
     }
     // `updated` is the caller's persistence signal: goal-host logs MATCHED NO ROW
     // and abandons the verdict whenever it is 0, so the mirror must be counted.

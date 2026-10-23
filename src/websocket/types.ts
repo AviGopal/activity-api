@@ -52,6 +52,11 @@ export interface ExecutionCompletedMessage extends WebSocketMessage {
     duration_ms: number;
     cost: number;
     completed_at: string;
+    /** The judge's reach verdict (goal-host's, as received with the trace or on POST /reach), never the exit status.
+     *  ABSENT means ungraded: no verdict yet, or one withheld or retracted. */
+    reached?: boolean;
+    /** True on the event POST /reach emits when an execution's first verdict lands (the arrival event had none). */
+    verdict?: boolean;
   };
 }
 
