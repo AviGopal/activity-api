@@ -793,7 +793,7 @@ export const PathRecordRequestSchema = z.object({
   success: z.boolean(),
   // The dispatch's graded REACH verdict (goal-host recordGoalPath sends it beside success).
   // success is the exit status; the path's alpha/beta are credited from THIS, and an absent
-  // verdict (a sender that predates it) is not a reach. DB field is migration 227.
+  // verdict (a sender that predates it) is ungraded: the record writes nothing. DB field is migration 227.
   reached: z.boolean().nullable().optional(),
   duration_ms: z.number().int(),
   cost_usd: z.number(),

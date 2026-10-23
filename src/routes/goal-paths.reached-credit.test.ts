@@ -9,10 +9,11 @@
  * In-process (child bun), surrealDB.query replaced by a recorder that returns an existing row only when the case
  * says so, so each case drives exactly one branch: CREATE (first run of a path) or UPDATE (a repeat run).
  *   [MUST-FAIL] success:true, reached:false credits beta, not alpha — on CREATE and on UPDATE.
- *   [MUST-FAIL] success:true with NO reached (a sender that predates the field) credits beta: absent is not a reach.
+ *   [MUST-FAIL] success:true with NO reached (a sender that predates the field) is ungraded: nothing is written
+ *               (it credited beta until the ungraded rule; goal-paths.ungraded-skip.test.ts pins that rule).
  *   [MUST-FAIL] success:false, reached:true credits alpha: the verdict decides, not the exit status.
  *   [CONTROL]   success:true, reached:true credits alpha — on CREATE and on UPDATE (as before this change).
- *   [MUST-FAIL] the verdict is persisted: both writes carry `reached` (an absent one as NONE, never NULL), migration
+ *   [MUST-FAIL] the verdict is persisted: both writes carry `reached`, migration
  *               227 declares it on the SCHEMAFULL table, and the response schema does not strip it.
  */
 import { describe, expect, test } from 'bun:test';
@@ -56,7 +57,9 @@ if (ISOLATED) {
     return [];
   }
 
-  async function record(body: Record<string, unknown>, existingRow: Record<string, any> | null): Promise<Write> {
+  async function record(body: Record<string, unknown>, existingRow: Record<string, any> | null): Promise<Write>;
+  async function record(body: Record<string, unknown>, existingRow: Record<string, any> | null, expectWrites: 0): Promise<undefined>;
+  async function record(body: Record<string, unknown>, existingRow: Record<string, any> | null, expectWrites = 1): Promise<Write | undefined> {
     const { surrealDB } = await import('../db/surreal');
     (surrealDB as unknown as { query: unknown }).query = fakeQuery;
     const { Hono } = await import('hono');
@@ -68,8 +71,8 @@ if (ISOLATED) {
     existing = existingRow;
     const res = await app.request('/', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
     expect(res.status).toBe(200);
-    expect(writes.length).toBe(1);
-    return writes[0]!;
+    expect(writes.length).toBe(expectWrites);
+    return writes[0];
   }
 
   const body = (verdict: { success: boolean; reached?: boolean }) => ({
@@ -90,9 +93,9 @@ if (ISOLATED) {
       expect(updated(await record(body({ success: true, reached: false }), ROW))).toEqual({ kind: 'UPDATE', success_delta: 0, failure_delta: 1 });
     }, 30_000);
 
-    test('[MUST-FAIL] success:true with no reached is not a reach: beta on CREATE and on UPDATE', async () => {
-      expect(created(await record(body({ success: true }), null))).toEqual({ kind: 'CREATE', alpha: 1, beta: 2, ok: 0, failed: 1, rate: 0 });
-      expect(updated(await record(body({ success: true }), ROW))).toEqual({ kind: 'UPDATE', success_delta: 0, failure_delta: 1 });
+    test('[MUST-FAIL] success:true with no reached is not a reach: nothing is written, on CREATE or on UPDATE', async () => {
+      expect(await record(body({ success: true }), null, 0)).toBeUndefined();
+      expect(await record(body({ success: true }), ROW, 0)).toBeUndefined();
     }, 30_000);
 
     test('[MUST-FAIL] success:false, reached:true credits alpha: the verdict decides, not the exit status', async () => {
@@ -107,13 +110,11 @@ if (ISOLATED) {
   });
 
   describe('the verdict is persisted', () => {
-    test('[MUST-FAIL] both writes carry reached; an absent verdict is NONE (undefined), never NULL', async () => {
+    test('[MUST-FAIL] both writes carry reached', async () => {
       const c = await record(body({ success: true, reached: false }), null);
       expect([/\breached: \$reached\b/.test(c.sql), c.vars.reached]).toEqual([true, false]);
       const u = await record(body({ success: false, reached: true }), ROW);
       expect([/\breached = \$reached\b/.test(u.sql), u.vars.reached]).toEqual([true, true]);
-      const a = await record(body({ success: true }), ROW);
-      expect(['reached' in a.vars, a.vars.reached === undefined]).toEqual([true, true]);
     }, 30_000);
 
     test('[MUST-FAIL] migration 227 declares reached on the SCHEMAFULL table, and the response schema keeps it', async () => {

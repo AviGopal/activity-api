@@ -169,6 +169,8 @@ describe('POST /goal-paths persists endpoint_output_shapes', () => {
         goal_category: 'bugfix',
         path_activities: ['activity:a', 'activity:b'],
         success: true,
+        // The reach verdict goal-host sends beside success; a record without one writes no row.
+        reached: true,
         duration_ms: 1234,
         cost_usd: 0.05,
       }),
@@ -225,6 +227,8 @@ describe('POST /goal-paths persists endpoint_output_shapes', () => {
         goal_category: 'bugfix',
         path_activities: ['activity:a'],
         success: true,
+        // The reach verdict goal-host sends beside success; a record without one writes no row.
+        reached: true,
         duration_ms: 800,
         cost_usd: 0.02,
       }),

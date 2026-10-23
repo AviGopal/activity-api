@@ -32,6 +32,10 @@ import type { SessionData } from '../models/schemas';
 
 const app = new Hono();
 
+/** Goal-path records with no reach verdict, written nowhere (module lifetime; POST / below). */
+let goalPathUngradedSkips = 0;
+export function goalPathUngradedSkipCount(): number { return goalPathUngradedSkips; }
+
 /**
  * Accumulate (and deduplicate) the terminal output shapes produced by
  * executing the activities in `pathActivities`, in path order.
@@ -533,7 +537,12 @@ app.post('/', async (c) => {
     // actually reached (goal-host recordGoalPath sends both). Hollow completion (success with no
     // reach) is common, and every counter and posterior below feeds path ranking and
     // isProvenFailing, so crediting alpha from success would rank and prove paths by completion.
-    // A missing reached (a sender that predates the field) is NOT a reach: it credits beta.
+    // A MISSING reached IS NO VERDICT, so the record is UNGRADED: the path row is not written at all (no counter, no
+    // posterior, no row created; a created row is a recommend candidate). It used to credit beta, which blamed a path
+    // on the absence of a verdict, and bumping total_executions alone would be blame too (success_rate's denominator,
+    // isProvenFailing's execs >= 3). So every counter on the row counts graded runs (REALIGNMENT §2.2: credit only on a
+    // graded verdict) and its readers need no change. `success` is never read for grading, in either direction.
+    const pathUngraded = typeof validated.reached !== 'boolean';
     const pathReached = validated.reached === true;
     // Stored as the most recent run's verdict (option<bool>, migration 227). An absent verdict is
     // passed as undefined (NONE), never null: an explicit NULL to an option<> field fails the
@@ -558,7 +567,21 @@ app.post('/', async (c) => {
     
     let path: GoalExecutionPath;
     
-    if (existing && existing.length > 0 && existing[0]) {
+    if (pathUngraded) {
+      // The same SKIPPED form the learner and the subscriber counts log, under this row's own message.
+      goalPathUngradedSkips++;
+      path = (existing && existing.length > 0 && existing[0] ? existing[0] : null) as unknown as GoalExecutionPath;
+      logger.info('goal-path posterior SKIPPED', {
+        goal_hash: goalHash,
+        path_signature: pathSignature,
+        reason: 'reach_ungraded',
+        success: validated.success,
+        row: path ? 'existing' : 'none',
+        alpha_delta: 0,
+        beta_delta: 0,
+        ungraded_skips: goalPathUngradedSkips,
+      });
+    } else if (existing && existing.length > 0 && existing[0]) {
       // Update existing path
       const current = existing[0];
 
@@ -838,6 +861,7 @@ app.post('/', async (c) => {
     return c.json({
       success: true,
       path,
+      ...(pathUngraded ? { skipped: 'reach_ungraded' } : {}),
     });
     
   } catch (error: any) {
