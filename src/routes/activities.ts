@@ -228,6 +228,29 @@ export function accountIdRecordRef(accountId: string | undefined | null): string
  *
  * Exported for unit tests in `routes/templates-pagination.test.ts`.
  */
+export const BUILTIN_RESOLVER_IDS = [
+  'file-read',
+  'bash',
+  'llm',
+  'llm-prompt',
+  'impulse_preparation',
+  'iteration',
+  'impulse_pool_selection',
+  'producer_selection',
+  'impulse-resolve',
+  'validation',
+  'activity',
+  'learning_signal_writer',
+  'compose',
+  'compose_parallel',
+  'activity_recommendation',
+  'impulse_cooccurrence',
+] as const;
+
+export function builtinResolverIds(): string[] {
+  return Array.from(BUILTIN_RESOLVER_IDS);
+}
+
 export function parsePaginationOffset(raw: string | undefined | null): number {
   if (raw === undefined || raw === null || raw === '') return 0;
   const parsed = parseInt(raw, 10);
