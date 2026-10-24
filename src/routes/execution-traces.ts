@@ -16,9 +16,8 @@ import { getJwtAuthFromContext, hasJwtAuth, presentsThisNodesKey } from '../midd
 import { config } from '../config';
 import { insertExecution, isDualWriteEnabled, normalizeActivityId, updateShapeActivityScores, type ParadigmExecution } from '../db/paradigm';
 // Phase B2: dual-tenant helpers (defined in routes/activities.ts in B1).
-// Reuse so we don't duplicate the `accountIdScopedWhere()` fragment or the
-// `accountIdRecordRef()` record-id formatter across route modules.
-import { accountIdScopedWhere, variantMetricsRecordId } from './activities';
+// Reuse so we don't duplicate the `accountIdRecordRef()` record-id formatter across route modules.
+import { variantMetricsRecordId } from './activities';
 import {
   extractOutputShapes,
   validateOutputShapes,
@@ -1004,8 +1003,18 @@ app.get('/', async (c) => {
     if (needsWhereOrgFilter) {
       if (effectiveOrgId) {
         if (effectiveAccountId) {
-          // Account-scoped path: match account records + untagged org records.
-          whereConditions.push(`(${accountIdScopedWhere()} OR org_id = NULL)`);
+          // Account-scoped path: the caller's org, and within it the caller's account records plus untagged ones
+          // (account_id NONE, which is every row the trace writers leave unaccounted). ONE org equality and no OR:
+          // the shared accountIdScopedWhere() fragment, OR-ed again with `org_id = NULL`, made SurrealDB 2.3.10 union
+          // index scans (idx_execution_account_id, and idx_execution_org, which covers about the whole table) instead
+          // of walking one executed_at range, so one cockpit trace read cost the database tens of seconds. The account
+          // test is a coalesce, not a disjunction: a NONE account_id compares as the caller's own. Nothing is widened:
+          // a row of another org (whatever its account) and a row of another account are still excluded, and the
+          // `org_id = NULL` rows the old clause also let in (org_id is a required string, so none can be stored) and
+          // the caller's account rows filed under another org are no longer matched. This branch runs only on the
+          // root-credential path (needsWhereOrgFilter); a JWT read goes through queryWithAuth and its PERMISSIONS.
+          whereConditions.push('org_id = $org_id');
+          whereConditions.push('(account_id ?? $account_id) = $account_id');
           params.org_id = effectiveOrgId;
           params.account_id = effectiveAccountId;
         } else {
@@ -1139,8 +1148,8 @@ app.get('/', async (c) => {
         error_message, failed_task_id,
         parent_execution_id,
         vessel_id, vessel_version, tags,
-        failure_mode.type AS failure_mode_type,
-        (metadata.task_count ?? 0) AS task_count`
+        failure_mode_type,
+        task_count`
       : `
         id, execution_id, activity_id, variant_id, org_id, account_id,
         status, success, error, executed_at, duration_ms, cost_usd,
@@ -1150,14 +1159,20 @@ app.get('/', async (c) => {
         failure_mode, metadata, tags,
         output_impulse_shapes, input_impulse_shapes,
         (metadata.task_count ?? 0) AS task_count`;
+    // The inner select carries the fat columns only for the default (wide) projection. The summary projection reads
+    // two scalars out of them, so its inner select computes those scalars and leaves the columns behind.
+    const innerFat = summaryProjection
+      ? `vessel_id,
+          vessel_version, tags, failure_mode.type AS failure_mode_type, (metadata.task_count ?? 0) AS task_count,`
+      : `composition_chain, vessel_id,
+          vessel_version, failure_mode, metadata, tags, output_impulse_shapes, input_impulse_shapes,`;
     const query = `
       SELECT${selectFields}
       -- Read execution directly: the v_paradigm_execution_traces view froze or vanished (09-22..09-28),
       -- so the listing and every detector reading it saw no new traces. Fields the view derived are computed here.
       FROM (
         SELECT id, meta::id(id) AS execution_id, activity_id, org_id, account_id, success, error,
-          executed_at, duration_ms, cost_usd, parent_execution_id, composition_chain, vessel_id,
-          vessel_version, failure_mode, metadata, tags, output_impulse_shapes, input_impulse_shapes,
+          executed_at, duration_ms, cost_usd, parent_execution_id, ${innerFat}
           (variant_id ?? activity_id) AS variant_id,
           (status ?? (IF success = true { 'success' } ELSE { 'failure' })) AS status,
           error.message AS error_message,
