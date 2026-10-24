@@ -31,6 +31,9 @@ mock.module('../db/surreal', () => ({
   },
   queryWithAuth: async (_token: string, sql: string, params: any) => { surrealQueries.push({ sql, params }); return []; },
   createAuthenticatedClient: async () => ({}),
+  // The replacement outlives this file, so every real export stays (mock-module-completeness.test.ts).
+  dbStats: { snapshot: () => ({}) },
+  getDbStats: () => ({}),
 }));
 
 mock.module('../db/redis', () => ({
