@@ -87,7 +87,12 @@ export async function seedPriorFromConcepts(
   }
 
   const url = await resolveConceptDbUrl();
-  if (!url) return FALLBACK;
+  // A signature that is a long hex string or a sig-cluster hash is a machine
+  // identifier not present in the concept full-text search index. Skip the
+  // query and fall back to Beta(1,1).
+  if (!url || (signature && /^(?:[0-9a-f]{12,}|sigcl_[0-9a-f]{16,})$/i.test(signature))) {
+    return FALLBACK;
+  }
 
   const K = parseInt(process.env.PRIOR_SEED_K ?? '5', 10);
   const kappa = parseFloat(process.env.PRIOR_SEED_KAPPA ?? '10');
