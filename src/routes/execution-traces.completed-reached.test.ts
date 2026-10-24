@@ -18,6 +18,9 @@
  *   [CONTROL]   no judge verdict yet ⇒ `reached` is ABSENT from the arrival event (not false); a reached:true trace
  *               carries reached:true.
  *   [MUST-FAIL] no second graded event for a redelivery, a correction, an observe verdict or a withheld one.
+ *   [MUST-FAIL] SINGLE SOURCE: the event's reached is the stored column read back after the write. A claimed reach that
+ *               reachedVerdict downgrades (a non-completing failure that produced nothing) is stored false, so the
+ *               event says false; and an event never says what the row does not (read back after a /reach write).
  *
  * Harness: the insert-beta-withheld pattern (spies on the real exports, restored afterAll; no mock.module), with the
  * broadcaster's emit recorded instead of discarded.
@@ -110,6 +113,8 @@ function answer(sql: string, params: any): any {
     return [[{ id: `execution:${String(params?.execution_id)}` }]];
   }
   if (/^\s*UPDATE type::thing\('execution', \$execution_id\) SET reached = \$reached/.test(sql)) {
+    const mr = executionRows.get(String(params?.execution_id));
+    if (mr) mr.reached = params?.reached;
     addTag(String(params?.execution_id), params?.reached === true ? 'reached:true' : 'reached:false');
     return [[{ id: `execution:${String(params?.execution_id)}` }]];
   }
@@ -165,6 +170,8 @@ stub(paradigmMod, 'insertExecution', async (e: Row) => {
     trace: e.trace,
     metadata: e.metadata,
     failure_mode: e.failure_mode ?? null,
+    // The stored verdict column, as the authoritative write stores it (reachedVerdict's output).
+    ...(typeof e.reached === 'boolean' ? { reached: e.reached } : {}),
   });
   return null;
 });
@@ -328,6 +335,47 @@ describe('MUST-FAIL — the verdict that arrives later is emitted on a second ex
     await postTrace(walkBody('walk-declined'));
     await postReach('walk-declined', { outcome: 'declined', decline: { class: 'needs_information' } });
     expect(completedFor('walk-declined').filter((e) => 'reached' in e.data)).toEqual([]);
+  });
+});
+
+describe('MUST-FAIL — single source: the event reads the stored column back', () => {
+  test('a downgraded claimed reach (non-completing failure, no shapes) is stored false and announced false', async () => {
+    await postTrace(completedBody('exec-downgraded', {
+      reached: true, status: 'failure', success: false, output_impulse_shapes: [],
+      failure_mode: { type: 'execution_error', reason: 'threw before producing anything' },
+    }));
+    const stored = executionRows.get('exec-downgraded')?.reached;
+    expect(stored).toBe(false);
+    const ev = completedFor('exec-downgraded');
+    expect(ev).toHaveLength(1);
+    expect(ev[0]!.data.reached).toBe(stored);
+  });
+
+  test('the /reach event carries what the row holds after the write, read back', async () => {
+    await postTrace(walkBody('walk-readback'));
+    const reads = () => queries.filter((q) => /SELECT reached, tags FROM type::thing\('execution', \$execution_id\)/.test(q.sql) && q.params?.execution_id === 'walk-readback').length;
+    const before = reads();
+    await postReach('walk-readback', { reached: true });
+    expect(reads()).toBeGreaterThan(before);
+    const ev = completedFor('walk-readback');
+    expect(ev.map((e) => e.data.reached)).toEqual([undefined, executionRows.get('walk-readback')?.reached]);
+    expect(executionRows.get('walk-readback')?.reached).toBe(true);
+  });
+
+  test('a stored verdict that cannot be read back is absent, never guessed', async () => {
+    await postTrace(walkBody('walk-unreadable'));
+    const { surrealDB } = await import('../db/surreal');
+    const q = (surrealDB as any).query;
+    (surrealDB as any).query = async (sql: string, params: any) => {
+      if (/SELECT reached, tags FROM type::thing/.test(sql)) throw new Error('read failed');
+      return q(sql, params);
+    };
+    try {
+      await postReach('walk-unreadable', { reached: false, reason: 'deterministic:y' });
+    } finally {
+      (surrealDB as any).query = q;
+    }
+    expect(completedFor('walk-unreadable').filter((e) => 'reached' in e.data)).toEqual([]);
   });
 });
 

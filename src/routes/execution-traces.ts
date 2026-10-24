@@ -121,7 +121,8 @@ const NON_COMPLETING_FAILURE_MODES = new Set(['execution_error']);
  * would cut recorded reaches 478 -> ~48 and harden the wrong answer.
  */
 /**
- * THE JUDGE'S REACH VERDICT, AS RECEIVED, for the execution_completed event (and nothing else). goal-host's judge
+ * WHETHER THE JUDGE HAS GIVEN A VERDICT, as received, for the execution_completed event (and nothing else): it decides
+ * whether an event is graded at all; the value the event carries is the stored column (storedReachForEvent). goal-host's judge
  * hands activity-api its verdict either with the trace (a pre-verdict: the body's `reached`, or a reached:true /
  * reached:false tag the poster set) or later on POST /reach. This reads only that: never `success`, never `status`,
  * never the failure mode. Absent (undefined) means UNGRADED: no verdict yet, a retracted one, or one the caller
@@ -135,6 +136,29 @@ export function judgeReachVerdict(t: { reached?: unknown; tags?: unknown }, opts
   if (tags.includes('reached:true')) return true;
   if (tags.includes('reached:false')) return false;
   return undefined;
+}
+
+/**
+ * THE EVENT'S `reached` IS THE STORED COLUMN, READ BACK AFTER THE WRITE (single source). Both execution_completed emits
+ * (POST / on arrival, POST /reach on an execution's first verdict) read `reached` and `tags` from the authoritative
+ * `execution` row after their own write, so an event can never say what the row does not: a claimed reach that
+ * reachedVerdict downgraded (a non-completing failure that produced nothing) is stored false and announced false.
+ * ABSENT when the column holds no boolean (no verdict yet, or a retraction that cleared it), when the row is withheld
+ * (reach_withheld:true, or the caller's own withheld flag) or retracted, and when the read itself fails: an event is
+ * never graded by a guess.
+ */
+export async function storedReachForEvent(execId: string, opts: { withheld?: boolean } = {}): Promise<boolean | undefined> {
+  if (opts.withheld) return undefined;
+  try {
+    const res = await surrealDB.query<any>(`SELECT reached, tags FROM type::thing('execution', $execution_id)`, { execution_id: execId });
+    const row = Array.isArray(res) && res.length > 0 ? (Array.isArray(res[0]) ? res[0][0] : res[0]) : null;
+    if (!row || typeof row.reached !== 'boolean') return undefined;
+    const tags: string[] = Array.isArray(row.tags) ? row.tags.filter((t: unknown): t is string => typeof t === 'string') : [];
+    if (tags.includes('reach_withheld:true') || isReachRetracted({ tags })) return undefined;
+    return row.reached;
+  } catch {
+    return undefined;
+  }
 }
 
 export function reachedVerdict(
@@ -4194,7 +4218,16 @@ app.post('/', async (c) => {
 
     // Emit execution_completed so external WS observers (e.g. development-vessel
     // topology chain) can react without polling. Non-blocking; failure is silent.
-    void import('../websocket/broadcaster').then(({ broadcaster }) => {
+    void import('../websocket/broadcaster').then(async ({ broadcaster }) => {
+      // The verdict as STORED, read back after the authoritative write (storedReachForEvent), only when the trace
+      // arrived with a judge verdict: a walk awaiting its verdict is ungraded here, and POST /reach emits again.
+      const judgeAtInsert = judgeReachVerdict(
+        { reached: typeof (body as any).reached === 'boolean' ? (body as any).reached : (trace as any).reached, tags: (trace as any).tags },
+        { withheld: betaWithheldAtInsert },
+      );
+      const storedReached = typeof judgeAtInsert === 'boolean'
+        ? await storedReachForEvent(String(trace.execution_id), { withheld: betaWithheldAtInsert })
+        : undefined;
       broadcaster.emit({
         type: 'execution_completed',
         timestamp: new Date().toISOString(),
@@ -4235,15 +4268,8 @@ app.post('/', async (c) => {
           cost: trace.cost_usd || 0,
           completed_at: new Date().toISOString(),
           org_id: traceOrgId || null,
-          // The judge's reach verdict when the trace arrived with one (judgeReachVerdict), else ABSENT: a walk awaiting
-          // its verdict is ungraded here, and POST /reach emits execution_completed again carrying it.
-          ...(() => {
-            const r = judgeReachVerdict(
-              { reached: typeof (body as any).reached === 'boolean' ? (body as any).reached : (trace as any).reached, tags: (trace as any).tags },
-              { withheld: betaWithheldAtInsert },
-            );
-            return typeof r === 'boolean' ? { reached: r } : {};
-          })(),
+          // The stored verdict (read back above), else ABSENT.
+          ...(typeof storedReached === 'boolean' ? { reached: storedReached } : {}),
         },
       });
     }).catch(() => { /* non-fatal */ });
@@ -5549,11 +5575,13 @@ app.post('/reach', async (c) => {
     // delivery plus replay) and dedupe by execution_id; concept-db credits recalled concepts once, from a boolean only.
     if (!observeVerdict && preReadOk && preRow && mirrored > 0 && !idempotent
       && !preTags.includes('reached:true') && !preTags.includes('reached:false')) {
-      const verdictForEvent = judgeReachVerdict({ reached: body.reached, tags: preTags }, { withheld: betaWithheld });
-      if (typeof verdictForEvent === 'boolean') {
+      if (typeof judgeReachVerdict({ reached: body.reached, tags: preTags }, { withheld: betaWithheld }) === 'boolean') {
         const tasks = Array.isArray(preRow.tasks) ? (preRow.tasks as Array<{ status?: string }>) : [];
         const activityForEvent = preActivityId || '';
-        void import('../websocket/broadcaster').then(({ broadcaster }) => {
+        void import('../websocket/broadcaster').then(async ({ broadcaster }) => {
+          // Single source: the column the mirror above just wrote, read back (storedReachForEvent), never body.reached.
+          const verdictForEvent = await storedReachForEvent(String(execId), { withheld: betaWithheld });
+          if (typeof verdictForEvent !== 'boolean') return;
           broadcaster.emit({
             type: 'execution_completed',
             timestamp: new Date().toISOString(),
