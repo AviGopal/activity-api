@@ -372,8 +372,10 @@ describe('Phase B3: runExecutionTraceWithSignatures threads account_id', () => {
 
     const exec = seen.find((q) => /FROM\s+execution\b/i.test(q.sql))!;
     expect(exec).toBeDefined();
-    expect(exec.sql).toContain('account_id = $account_id');
-    expect(exec.sql).toMatch(/account_id IS NONE\s+AND\s+org_id\s*=\s*\$orgId/);
+    // One org equality and an account coalesce (untagged rows compare as the caller's own), not a disjunction:
+    // see test/signature-reader-tenant-scope.real.test.ts for the plan and the rows.
+    expect(exec.sql).toContain('org_id = $orgId');
+    expect(exec.sql).toContain('(account_id ?? $account_id) = $account_id');
     expect(exec.params.account_id).toBe('acc-acme-001');
     expect(exec.params.orgId).toBe('org-acme');
   });

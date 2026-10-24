@@ -448,11 +448,18 @@ async function queryExecutions(
     : ['executed_at >= type::datetime($since)'];
 
   if (auth.authType === 'apikey') {
-    // Phase B3: dual-tenant scoping. Match on account_id when present;
-    // legacy rows fall back to org_id via the disjunction.
-    where.push(
-      '(account_id = $account_id OR (account_id IS NONE AND org_id = $orgId))',
-    );
+    // Tenant scope: the caller's org, and in it the caller's account rows plus untagged ones (account_id NONE).
+    // ONE org equality and a coalesce, never a disjunction: SurrealDB 2.3.10 planned the former
+    // `(account_id = $account_id OR (account_id IS NONE AND org_id = $orgId))` as a union of index iterations
+    // (idx_execution_account_id twice, idx_execution_org, which covers about the whole table, and the
+    // executed_at range) on `execution`, and as a full table scan on v_paradigm_execution_traces, so one
+    // windowed read walked the whole trace store twice and ran for minutes on a contended database while its
+    // callers had long since given up. This form plans as the single idx_execution_executed_at range and the
+    // idx_vpet_org_time prefix range. Nothing is widened: another org's rows and another account's rows stay
+    // excluded, and the caller's account rows filed under ANOTHER org, which the disjunction let in, no longer are.
+    // Same clause as the trace list (execution-traces.ts, account-scoped branch).
+    where.push('org_id = $orgId');
+    where.push('(account_id ?? $account_id) = $account_id');
     params.orgId = auth.orgId;
     params.account_id = auth.accountId ?? null;
   }
@@ -693,20 +700,25 @@ async function queryImpulseSignatures(
   if (impulseIds.length === 0) return map;
 
   const params: Record<string, unknown> = { ids: impulseIds };
-  let whereOrg = '';
+  // The id lookup runs ALONE in the inner select, so it is planned on idx_impulse_id (one point read per id);
+  // the tenant scope filters the found rows outside it. Put beside the id test, the scope made the engine
+  // iterate idx_impulse_org as well: the disjunction unioned it in, and even the equality form picks it over
+  // the id index, and that index covers every impulse of the org.
+  let sql = `
+    SELECT id, pointer, shape, summary
+    FROM impulse
+    WHERE id IN $ids
+  `;
   if (auth.authType === 'apikey') {
-    // Phase B3: dual-tenant scoping (account_id with org_id fallback).
-    whereOrg =
-      ' AND (account_id = $account_id OR (account_id IS NONE AND org_id = $orgId))';
+    // Tenant scope, same clause as queryExecutions() above.
+    sql = `
+    SELECT id, pointer, shape, summary
+    FROM (SELECT id, pointer, shape, summary, org_id, account_id FROM impulse WHERE id IN $ids)
+    WHERE org_id = $orgId AND (account_id ?? $account_id) = $account_id
+  `;
     params.orgId = auth.orgId;
     params.account_id = auth.accountId ?? null;
   }
-
-  const sql = `
-    SELECT id, pointer, shape, summary
-    FROM impulse
-    WHERE id IN $ids${whereOrg}
-  `;
 
   try {
     const result = await db.query(sql, params);
