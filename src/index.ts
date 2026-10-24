@@ -8,7 +8,7 @@
 
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { logger as honoLogger } from 'hono/logger';
+import { accessLog } from './middleware/access-log';
 import { config } from './config';
 import { logger } from './utils/logger';
 import { jwtAuthMiddleware, JwtAuthContext } from './middleware/jwtAuth';
@@ -81,8 +81,8 @@ app.use('/*', cors({
   ],
 }));
 
-// Request logging
-app.use('/*', honoLogger());
+// Request logging (hono/logger's lines, plus the authenticated caller; see middleware/access-log.ts)
+app.use('/*', accessLog());
 
 // Authentication middleware (applies to all routes except /health and /v2/auth)
 // JWT auth only (Redis session auth removed)

@@ -27,6 +27,7 @@
  * succeeded in SurrealDB.
  */
 
+import { createHash } from 'node:crypto';
 import { RedisClient } from '../db/redis';
 import { logger } from './logger';
 import { getTuningParam } from '../lib/tuning-params';
@@ -139,6 +140,36 @@ export async function getTemplateCatalogue<T>(
     });
     return null;
   }
+}
+
+// CATALOGUE VERSION (ETag). A pager that walks the whole catalogue on every run (dev-vessel's
+// reachable-unlearned report: ~30 pages of 100) re-reads an unchanged list. The listing route
+// answers a weak ETag naming the catalogue version of the caller's visibility key and, given a
+// matching If-None-Match, a 304 with no body. The tag is a fingerprint of the loaded catalogue
+// (rows, their enrichment metrics, total) and of the key, computed once per cached entry:
+//   - a 304 is only answered from a LIVE entry, so it costs no database query and is never staler
+//     than the cache itself (the TTL still bounds writers that bypass the helpers below and the
+//     metrics that change without an invalidation);
+//   - a reload that finds the same rows gives the same tag, so an unchanged catalogue keeps
+//     answering 304 across TTL windows, and any write that changes a row gives a new one;
+//   - the key is part of the fingerprint, so one tenant's tag never matches another's.
+const catalogueEtags = new WeakMap<object, string>();
+
+export function templateCatalogueEtag(key: string, catalogue: TemplateCatalogue<unknown>): string {
+  let tag = catalogueEtags.get(catalogue);
+  if (!tag) {
+    const digest = createHash('sha256').update(key).update('\0').update(JSON.stringify(catalogue)).digest('hex');
+    tag = `W/"tc-${digest.slice(0, 32)}"`;
+    catalogueEtags.set(catalogue, tag);
+  }
+  return tag;
+}
+
+/** True when an If-None-Match header (one tag, a comma-separated list, or `*`) names `etag`. */
+export function ifNoneMatchHits(header: string | null | undefined, etag: string): boolean {
+  if (!header) return false;
+  const bare = (t: string) => t.trim().replace(/^W\//, '');
+  return header.split(',').some((t) => t.trim() === '*' || bare(t) === bare(etag));
 }
 
 /**

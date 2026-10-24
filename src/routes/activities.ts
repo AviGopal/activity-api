@@ -1482,13 +1482,17 @@ app.get('/templates', async (c) => {
     // count query's result, so everything after this point behaves as on a DB page. RBAC-JWT
     // queries are not cached: their rows depend on $auth. A disabled cache, a failed load or a
     // catalogue at the row cap leaves catalogueRows null and takes the DB path unchanged.
+    // CATALOGUE VERSION: a catalogue slice carries the catalogue's ETag (utils/template-cache.ts
+    // templateCatalogueEtag), and a matching If-None-Match answers 304 with no body and no further
+    // query, whatever page was asked. The FTS and RBAC-JWT paths are not cached, so they carry none.
     let catalogueRows: ActivityTemplate[] | null = null;
     let catalogueTotal: number | null = null;
     if (!useRbacJwtQuery) {
-      const { getTemplateCatalogue, templateCatalogueKey, TEMPLATE_CATALOGUE_MAX_ROWS } = await import('../utils/template-cache');
+      const { getTemplateCatalogue, templateCatalogueKey, templateCatalogueEtag, ifNoneMatchHits, TEMPLATE_CATALOGUE_MAX_ROWS } = await import('../utils/template-cache');
       const accountId = jwtAuth?.accountId ?? null;
+      const catalogueKey = templateCatalogueKey({ orgId, projectId, accountId, scope: scopeFilter, executionType });
       const catalogue = await getTemplateCatalogue<ActivityTemplate>(
-        templateCatalogueKey({ orgId, projectId, accountId, scope: scopeFilter, executionType }),
+        catalogueKey,
         async () => {
           const [rows, count] = await Promise.all([
             listAllTemplatesFromDB(TEMPLATE_CATALOGUE_MAX_ROWS, orgId, projectId, null, scopeFilter, executionType, 0, accountId),
@@ -1498,6 +1502,11 @@ app.get('/templates', async (c) => {
         },
       );
       if (catalogue && catalogue.templates.length < TEMPLATE_CATALOGUE_MAX_ROWS) {
+        const etag = templateCatalogueEtag(catalogueKey, catalogue);
+        c.header('ETag', etag);
+        if (ifNoneMatchHits(c.req.header('If-None-Match'), etag)) {
+          return c.body(null, 304);
+        }
         catalogueRows = catalogue.templates.slice(offset, offset + (paginating ? limit : limit * 2));
         catalogueTotal = catalogue.total;
       }
