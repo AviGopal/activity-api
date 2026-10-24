@@ -30,10 +30,19 @@ mock.module('../services/auth', () => ({
       : { authenticated: false, reason: 'invalid' },
   generateJwtToken: async () => 'fixture-jwt',
   validateBearerViaIdentity: async () => ({ authenticated: false, reason: 'not used by this test' }),
+  // The replacement outlives this file, so every real export stays (mock-module-completeness.test.ts).
+  isTransientIdentityFailure: () => false,
+  validateJwtToken: async () => ({ valid: false, error: 'not used by this test' }),
+  validateApiKeyViaIdentityVessel: async () => ({ authenticated: false, reason: 'not used by this test' }),
 }));
 
 mock.module('../db/surreal', () => ({
   createAuthenticatedClient: async () => ({ query: async () => [], close: async () => {} }),
+  // The replacement outlives this file, so every real export stays (mock-module-completeness.test.ts).
+  surrealDB: { query: async () => [], getInstance: async () => ({}) },
+  queryWithAuth: async () => [],
+  dbStats: { snapshot: () => ({}) },
+  getDbStats: () => ({}),
 }));
 
 const accessLogModule = await import('./access-log').catch(() => null);

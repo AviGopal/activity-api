@@ -36,6 +36,9 @@ mock.module('../db/surreal', () => ({
   },
   queryWithAuth: async (_t: string, sql: string, params: any) => { surrealQueries.push({ sql, params }); return []; },
   createAuthenticatedClient: async () => ({}),
+  // The replacement outlives this file, so every real export stays (mock-module-completeness.test.ts).
+  dbStats: { snapshot: () => ({}) },
+  getDbStats: () => ({}),
 }));
 
 mock.module('../db/redis', () => ({
@@ -65,11 +68,27 @@ mock.module('../db/paradigm', () => ({
   getVariantScores: async () => ({ data: [], path: 'legacy' as const }),
   buildVariantTree: async () => null,
   normalizeActivityId: (id: string) => id.replace(/^activity:/, '').replace(/[⟨⟩`]/g, ''),
+  // The replacement outlives this file, so every real export stays (mock-module-completeness.test.ts).
+  isParadigmReadEnabled: () => false,
+  getParadigmReadPercentage: () => 0,
+  shouldUseParadigmRead: () => false,
+  shouldSkipLegacyFallback: () => false,
+  logDualWriteConfig: () => {},
+  computeAdmissionLimit: (limit: number, cap = 1000) => Math.max(limit, cap),
+  transformLegacyTemplate: (t: any) => t,
+  computeShapeSignature: (shapes: string[]) => [...new Set(shapes)].sort(),
+  queryActivitiesByEmbeddingDense: async () => ({ data: [], path: 'legacy' as const }),
+  updateShapeActivityScores: async () => null,
+  getActivityShapePatterns: async () => ({ data: [], path: 'legacy' as const }),
 }));
 
 mock.module('../services/variant-creator', () => ({
   autoCreateVariantIfNeeded: async () => null,
   checkAndRetireTemplate: async () => false,
+  // The replacement outlives this file, so every real export stays (mock-module-completeness.test.ts).
+  shouldCreateVariant: async () => false,
+  createVariant: async () => null,
+  checkAndRetireByPosterior: async () => false,
 }));
 
 const activitiesRouter = (await import('./activities')).default;
