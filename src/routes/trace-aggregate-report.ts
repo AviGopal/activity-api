@@ -25,7 +25,16 @@
  *     window_hours?: number,    // default 24, clamped [1, 720]
  *     limit?: number,           // default 10, clamped [1, MAX_GROUPS] (20000)
  *     order?: "desc" | "asc",   // default desc (highest first)
+ *     tag?: string,             // only rows whose tags CONTAIN this exact tag (e.g. "state_signature:<sig>")
+ *     group_by_tag?: string,    // a tag key (e.g. "dispatcher_used"): also group by the value of the row's first
+ *                               // "<key>:<value>" tag; each row then carries tag_value (the value, or null when none)
+ *     exclude_observe?: boolean, // default true: observe executions are not counted (false counts them too)
+ *     success_rule?: "success_flag" | "status_or_flag" | "reached",
+ *                               // what success_count / failure_count count as a success; default success_flag
  *   }
+ * Every one of the last four is optional and a call without them is unchanged. A present but malformed one is refused
+ * (measured: false + reason), never dropped: a tag filter silently ignored would count the whole window as if it
+ * matched.
  *
  * Returns a structured object the format step can render directly:
  *   {
@@ -54,6 +63,10 @@ export interface TraceAggregateReportInput {
   failure_class?: string;
   reason_contains?: string;
   until_hours_ago?: number;
+  tag?: unknown;
+  group_by_tag?: unknown;
+  exclude_observe?: unknown;
+  success_rule?: unknown;
 }
 
 export interface TraceAggregateAuthContext {
@@ -65,6 +78,8 @@ export interface TraceAggregateAuthContext {
 export interface TraceAggregateRow {
   key: string;
   value: number;
+  /** Only when group_by_tag was asked: the value of the row group's `<group_by_tag>:<value>` tag, null when none. */
+  tag_value?: string | null;
 }
 
 export interface TraceAggregateReport {
@@ -84,10 +99,22 @@ export interface TraceAggregateReport {
   measured: boolean;
   matched_total: number | null;
   reason?: string;
+  // Echoed only when the caller supplied them, so a call without them returns the same object as before they existed.
+  tag?: string;
+  group_by_tag?: string;
+  exclude_observe?: boolean;
+  success_rule?: string;
 }
 
 const GROUP_FIELDS = new Set(['activity_id', 'status', 'variant_id', 'failure_class', 'goal_hash']);
 const METRICS = new Set(['count', 'failure_count', 'success_count', 'cost_sum']);
+// What success_count / failure_count count as a success. success_flag is the stored `success` boolean (the default, and
+// the only rule before these existed). status_or_flag is the rule boredom-vessel's posterior fetchers apply to the trace
+// list: status success|completed, or success = true. reached is the stored reach verdict (`reached`, option<bool>): a
+// row with no verdict (NONE) is neither a success nor a failure under it.
+const SUCCESS_RULES = new Set(['success_flag', 'status_or_flag', 'reached']);
+const SUCCESS_STATUSES = ['success', 'completed'];
+const TAG_KEY = /^[A-Za-z0-9_.-]+$/;
 
 // The most groups one report returns. The query groups EVERY matching row in the database either way (the cap is
 // applied in JS below), so this bounds the response, not the database work. It was 1000, which is below the number
@@ -123,6 +150,26 @@ export async function runTraceAggregateReport(
   const order = String(input.order) === 'asc' ? 'ASC' : 'DESC';
   const untilHoursAgo = clampInt(input.until_hours_ago, 0, 0, 720);
 
+  // The optional filters and dimensions. Each is read only when present; a present malformed one is refused below.
+  const echo: Partial<Pick<TraceAggregateReport, 'tag' | 'group_by_tag' | 'exclude_observe' | 'success_rule'>> = {};
+  let invalid: string | undefined;
+  const tag = input.tag === undefined ? undefined : typeof input.tag === 'string' && input.tag ? input.tag : null;
+  if (tag === null) invalid = 'invalid_tag';
+  else if (tag !== undefined) echo.tag = tag;
+  const groupByTagRaw = input.group_by_tag === undefined ? undefined
+    : typeof input.group_by_tag === 'string' ? input.group_by_tag.replace(/:$/, '') : '';
+  const groupByTag = groupByTagRaw === undefined ? undefined : TAG_KEY.test(groupByTagRaw) ? groupByTagRaw : null;
+  if (groupByTag === null) invalid ??= 'invalid_group_by_tag';
+  else if (groupByTag !== undefined) echo.group_by_tag = groupByTag;
+  const excludeObserve = input.exclude_observe === undefined ? true
+    : typeof input.exclude_observe === 'boolean' ? input.exclude_observe : null;
+  if (excludeObserve === null) invalid ??= 'invalid_exclude_observe';
+  else if (input.exclude_observe !== undefined) echo.exclude_observe = excludeObserve;
+  const successRule = input.success_rule === undefined ? 'success_flag'
+    : typeof input.success_rule === 'string' && SUCCESS_RULES.has(input.success_rule) ? input.success_rule : null;
+  if (successRule === null) invalid ??= 'unserved_success_rule';
+  else if (input.success_rule !== undefined) echo.success_rule = successRule;
+
   // Refuse unserved group_by rather than silently falling back to activity_id.
   if (!GROUP_FIELDS.has(groupBy)) {
     return {
@@ -142,6 +189,25 @@ export async function runTraceAggregateReport(
       reason: 'unserved_group_by',
     };
   }
+  if (invalid) {
+    return {
+      shape: 'traceAggregateReport',
+      metric,
+      group_by: groupBy,
+      window_hours: windowHours,
+      until_hours_ago: untilHoursAgo,
+      generated_at: new Date().toISOString(),
+      rows: [],
+      total_groups: 0,
+      truncated: false,
+      empty: true,
+      query_ms: -1,
+      measured: false,
+      matched_total: null,
+      reason: invalid,
+      ...echo,
+    };
+  }
 
   const nowMs = Date.now();
   const untilMs = nowMs - untilHoursAgo * 3600_000;
@@ -158,15 +224,26 @@ export async function runTraceAggregateReport(
 
   // success_count / failure_count pre-filter on the indexed `success` column so
   // the GROUP BY only touches matching rows (idx_aet_activity_success_time).
-  if (metric === 'failure_count') where.push('success = false');
+  // Under another success_rule the pre-filter is that rule's predicate (status and reached carry no index).
+  if (successRule === 'status_or_flag') {
+    if (metric === 'success_count') where.push('(success = true OR status IN $success_statuses)');
+    else if (metric === 'failure_count') where.push('success = false AND status NOT IN $success_statuses');
+    if (metric === 'success_count' || metric === 'failure_count') params.success_statuses = [...SUCCESS_STATUSES];
+  } else if (successRule === 'reached') {
+    if (metric === 'success_count') where.push('reached = true');
+    else if (metric === 'failure_count') where.push('reached = false');
+  } else if (metric === 'failure_count') where.push('success = false');
     else if (metric === 'success_count') where.push('success = true');
 
   // OBSERVE (lib/reach-classify.ts isObserveTrace): an observe execution (goal-host's learning_mode "observe" probe) is
   // a measurement, not evidence about an arm, so no count in this report includes it — its failure class above all, which
   // the gap detectors read. The same tags isObserveTrace reads, bound as a parameter. BINARY form on purpose: a unary
   // `!` makes SurrealDB 2.3.10 fall back to a full table scan. A row with no tags (NONE) contains none and is counted.
-  where.push('(tags CONTAINSANY $observe_tags) = false');
-  params.observe_tags = [...OBSERVE_TRACE_TAGS];
+  // exclude_observe: false (explicit only) counts them too, as the trace list route does.
+  if (excludeObserve) {
+    where.push('(tags CONTAINSANY $observe_tags) = false');
+    params.observe_tags = [...OBSERVE_TRACE_TAGS];
+  }
 
   // Filter by failure class and reason text if provided.
   if (typeof input.failure_class === 'string' && input.failure_class) {
@@ -176,6 +253,12 @@ export async function runTraceAggregateReport(
   if (typeof input.reason_contains === 'string' && input.reason_contains) {
     where.push('failure_mode.reason CONTAINS $reason_contains');
     params.reason_contains = input.reason_contains;
+  }
+  // One exact tag, e.g. state_signature:<sig>. Binary CONTAINS on a bound value; `tags` carries no index, so this is a
+  // residual on the executed_at range, and a NONE tags field contains nothing.
+  if (tag !== undefined) {
+    where.push('tags CONTAINS $tag');
+    params.tag = tag;
   }
 
   // API-key callers can't pass SurrealDB PERMISSIONS (self-signed JWT); apply an
@@ -220,12 +303,21 @@ export async function runTraceAggregateReport(
     // goal_hash is nested. Alias to flatten it for JS.
     selectExpr = 'metadata.goal_hash AS goal_hash';
   }
+  // A second dimension: the row's first `<group_by_tag>:` tag, aliased to its own name and grouped by that alias (the
+  // failure_class form above), so each group is one (groupBy, tag) pair. The prefix is stripped in JS.
+  let groupExpr = groupBy;
+  const tagPrefix = groupByTag ? `${groupByTag}:` : undefined;
+  if (tagPrefix) {
+    selectExpr += ', array::first((tags ?? [])[WHERE string::starts_with($this, $group_tag_prefix)]) AS group_tag';
+    groupExpr = `${groupBy}, group_tag`;
+    params.group_tag_prefix = tagPrefix;
+  }
 
   const sql = `
     SELECT ${selectExpr}, ${valueExpr}
     FROM execution
     WHERE ${where.join(' AND ')}
-    GROUP BY ${groupBy}
+    GROUP BY ${groupExpr}
   `;
 
   const startedAt = Date.now();
@@ -265,7 +357,12 @@ export async function runTraceAggregateReport(
         // keep it explicit as 0 (an empty group simply won't appear).
         const value =
           typeof rawVal === 'number' ? rawVal : Number(rawVal ?? 0) || 0;
-        return { key, value };
+        if (!tagPrefix) return { key, value };
+        // In a GROUP BY the engine (2.3.10) hands the grouped expression back as a one-element array (an empty one for
+        // a row with no such tag), so read either form.
+        const t = Array.isArray(r.group_tag) ? r.group_tag[0] : r.group_tag;
+        const tag_value = typeof t === 'string' && t.startsWith(tagPrefix) ? t.slice(tagPrefix.length) : null;
+        return { key, value, tag_value };
       })
       .filter((r) => r.key !== '(none)' || r.value > 0);
     // Sort + cap in JS (ORDER BY/LIMIT over the aggregate triggers SurrealDB's
@@ -306,5 +403,6 @@ export async function runTraceAggregateReport(
     matched_total: matchedTotal,
     ...(reason ? { reason } : {}),
     query_ms: queryOk ? queryMs : -1,
+    ...echo,
   };
 }
