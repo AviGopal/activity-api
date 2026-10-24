@@ -57,6 +57,9 @@ export interface ExecutionCompletedMessage extends WebSocketMessage {
     reached?: boolean;
     /** True on the event POST /reach emits when an execution's first verdict lands (the arrival event had none). */
     verdict?: boolean;
+    /** The concept ids the walk recalled, forwarded from the request that carried the verdict (never stored).
+     *  ABSENT when the request named none. */
+    recalled_concept_ids?: string[];
   };
 }
 

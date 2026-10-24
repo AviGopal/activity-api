@@ -138,6 +138,22 @@ export function judgeReachVerdict(t: { reached?: unknown; tags?: unknown }, opts
 }
 
 /**
+ * THE CONCEPTS THE WALK RECALLED, FORWARDED onto execution_completed (never stored). goal-host's concept recalls name
+ * its DISPATCH id, while the verdict names the TRACE id, so concept-db's recall ledger (keyed by the id the recall
+ * named) never met the verdict that should credit it. goal-host now sends the ids it recalled for the dispatch on the
+ * request that carries the verdict (`recalled_concept_ids`), and the event carries them on, so the consumer credits
+ * them from the event itself. Strings only, deduplicated, capped; ABSENT when the request named none. This reads the
+ * request only: no column is written, and the event's `reached` is still the stored column (storedReachForEvent).
+ */
+export const RECALLED_CONCEPT_IDS_CAP = 50;
+export function recalledConceptIdsForEvent(body: unknown): string[] | undefined {
+  const raw = body && typeof body === 'object' ? (body as { recalled_concept_ids?: unknown }).recalled_concept_ids : undefined;
+  if (!Array.isArray(raw)) return undefined;
+  const ids = [...new Set(raw.filter((x): x is string => typeof x === 'string' && x.length > 0))].slice(0, RECALLED_CONCEPT_IDS_CAP);
+  return ids.length > 0 ? ids : undefined;
+}
+
+/**
  * THE EVENT'S `reached` IS THE STORED COLUMN, READ BACK AFTER THE WRITE (single source). Both execution_completed emits
  * (POST / on arrival, POST /reach on an execution's first verdict) read `reached` and `tags` from the authoritative
  * `execution` row after their own write, so an event can never say what the row does not: a claimed reach that
@@ -4233,6 +4249,7 @@ app.post('/', async (c) => {
 
     // Emit execution_completed so external WS observers (e.g. development-vessel
     // topology chain) can react without polling. Non-blocking; failure is silent.
+    const recalledForEvent = recalledConceptIdsForEvent(body);
     void import('../websocket/broadcaster').then(async ({ broadcaster }) => {
       // The verdict as STORED, read back after the authoritative write (storedReachForEvent), only when the trace
       // arrived with a judge verdict: a walk awaiting its verdict is ungraded here, and POST /reach emits again.
@@ -4285,6 +4302,8 @@ app.post('/', async (c) => {
           org_id: traceOrgId || null,
           // The stored verdict (read back above), else ABSENT.
           ...(typeof storedReached === 'boolean' ? { reached: storedReached } : {}),
+          // The concepts the walk recalled, as the request named them (forwarded, never stored), else ABSENT.
+          ...(recalledForEvent ? { recalled_concept_ids: recalledForEvent } : {}),
         },
       });
     }).catch(() => { /* non-fatal */ });
@@ -5593,6 +5612,7 @@ app.post('/reach', async (c) => {
       if (typeof judgeReachVerdict({ reached: body.reached, tags: preTags }, { withheld: betaWithheld }) === 'boolean') {
         const tasks = Array.isArray(preRow.tasks) ? (preRow.tasks as Array<{ status?: string }>) : [];
         const activityForEvent = preActivityId || '';
+        const recalledForEvent = recalledConceptIdsForEvent(body);
         void import('../websocket/broadcaster').then(async ({ broadcaster }) => {
           // Single source: the column the mirror above just wrote, read back (storedReachForEvent), never body.reached.
           const verdictForEvent = await storedReachForEvent(String(execId), { withheld: betaWithheld });
@@ -5614,6 +5634,8 @@ app.post('/reach', async (c) => {
               org_id: typeof preRow.org_id === 'string' ? preRow.org_id : null,
               reached: verdictForEvent,
               verdict: true,
+              // The concepts this walk recalled, forwarded from this request (never stored), else ABSENT.
+              ...(recalledForEvent ? { recalled_concept_ids: recalledForEvent } : {}),
             },
           } as any);
         }).catch(() => { /* non-fatal */ });
