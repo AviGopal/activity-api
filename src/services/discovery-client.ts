@@ -258,8 +258,11 @@ export class DiscoveryClient {
       // interval tick leaves this vessel unroutable for up to a full
       // heartbeatIntervalMs.
       this.registered = false;
-      // re-registration deferred to heartbeat manager interval
-
+      try {
+        await this.register();
+      } catch {
+        // next interval tick retries via startHeartbeatManager
+      }
       return false;
     }
   }
