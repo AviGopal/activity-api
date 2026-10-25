@@ -197,23 +197,6 @@ export async function applyReachCorrection(db: QueryDb, c: ReachCorrection): Pro
     await correctDecisionOutcome(db, eid, tags, prov, false);
     return { execution_id: eid, status: 'already_retracted' };
   }
-  // Inverse guarantee: a later not-reached cannot retract an earlier reached:true.
-  // Check lightweight history signals if present (best-effort; rows from older writers may omit these fields).
-  {
-    const hraw = (row as unknown as { history?: unknown; superseded_verdicts?: unknown; metadata?: { superseded_verdicts?: unknown } | null }).history
-      ?? (row as unknown as { superseded_verdicts?: unknown }).superseded_verdicts
-      ?? (row as unknown as { metadata?: { superseded_verdicts?: unknown } | null }).metadata?.superseded_verdicts;
-    const hist = Array.isArray(hraw) ? (hraw as unknown[]) : [];
-    const priorTrue = hist.some((e) => {
-      if (!e || typeof e !== 'object') return false;
-      const anyE = e as Record<string, unknown>;
-      if (anyE['verdict'] === 'reach:true') return true;
-      if (anyE['prior_reached'] === true) return true;
-      const r = anyE['retraction'];
-      return !!(r && typeof r === 'object' && (r as Record<string, unknown>)['prior_reached'] === true);
-    });
-    if (priorTrue) return { execution_id: eid, refused: 'reached_true', detail: 'a prior reached:true verdict exists in history; a correction of reach:false never retracts it' };
-  }
   if (tags.includes('reached:true')) return { execution_id: eid, refused: 'reached_true', detail: 'the row holds reached:true; a correction of reach:false never retracts it' };
   if (!tags.includes('reached:false')) return { execution_id: eid, refused: 'not_reach_false', detail: 'the row holds no reached:false verdict' };
   if (!tags.includes('reach_graded:true')) return { execution_id: eid, refused: 'not_latched', detail: 'the verdict was never credited (no reach_graded:true); POST /reach still decides it' };
