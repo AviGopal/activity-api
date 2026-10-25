@@ -12,8 +12,17 @@ import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from 'bun:te
 import { DiscoveryClient } from './discovery-client';
 
 function stubDiscovery(heartbeatOk: boolean): void {
-  globalThis.fetch = mock(async (url: any) => {
+  globalThis.fetch = mock(async (url: any, options: any) => {
     const urlStr = url.toString();
+    // afterEach's shutdown() deregisters while this stub is still installed. It must succeed so the
+    // shared singleton leaves this file unregistered: a later file's shutdown() would otherwise
+    // deregister against the real endpoint with real backoff and time out its afterEach hook.
+    if (options?.method === 'DELETE' && urlStr.includes('/vessels/')) {
+      return new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
     if (urlStr.endsWith('/register')) {
       return new Response(
         JSON.stringify({ success: true, vesselId: 'activity-api-test', expiresAt: Date.now() + 300000 }),
@@ -50,6 +59,8 @@ describe('DiscoveryClient re-registration after a failed heartbeat', () => {
     await client.shutdown();
     delete (client as any).sleep;
     globalThis.fetch = originalFetch;
+    // Nothing of this file's registration may outlive it in the shared singleton.
+    expect(client.isRegistered()).toBe(false);
   });
 
   it('a failed heartbeat calls register() before sendHeartbeat() returns', async () => {
