@@ -18,7 +18,8 @@ import { startRealSurreal, NS, DB, type RealSurreal } from '../support/real-surr
  * migration 229 accepts either form.
  *   [MUST-FAIL] a session OBO human label with a prefixed $token.org_id and an unprefixed row org_id is stored with
  *               the person's stamp.
- *   [CONTROL]   a token session for one org cannot write a row for another org (different slug): refused, nothing stored.
+ *   [CONTROL]   a token session for one org cannot write a row for another org (different slug): refused, nothing stored,
+ *               and the error names the table permissions and the org, not a migration.
  *   [CONTROL]   a token whose org_id is already unprefixed still writes (the form 101 accepted).
  * Writes only. Reads are NOT checked here because FOR select does not scope them: a database token with no `id` claim
  * authenticates as a system user with the default Viewer role, and on SurrealDB 2.3.10 a Viewer reads every row of the
@@ -123,6 +124,10 @@ describe('goal_verification_label_write: a person label through a token session 
     const token = await dbToken(`organizations:${OTHER_SLUG}`);
     const r = await W!.resolveGoalVerificationLabelWrite(personCtx(SLUG, token), label(id), exec as never);
     expect(r.status).toBe(500);
+    // The engine's refusal is reported as one, naming the org, not as a missing migration.
+    const error = String((r.body as { error?: string }).error);
+    expect(error).toContain(`refused by table permissions for org ${SLUG}`);
+    expect(error).not.toMatch(/migration/);
     expect(await rootRows(id)).toEqual([]);
   });
 

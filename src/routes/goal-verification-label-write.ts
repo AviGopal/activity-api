@@ -175,6 +175,12 @@ export function labelWriter(ctx: JwtAuthContext): LabelWriter {
   return { principal_kind: kind, principal_key_id: maskKeyId(ctx.keyId) };
 }
 
+/** What a token session's empty CREATE means: the table's PERMISSIONS refused the row for this org. */
+export function gvlRefusedMessage(orgId: unknown): string {
+  return `goal_verification_labels write was refused by table permissions for org ${String(orgId ?? '')}: `
+    + `the session's $token.org_id does not admit a row with this org_id`;
+}
+
 export async function resolveGoalVerificationLabelWrite(
   jwtAuthOrNull: JwtAuthContext | null | undefined,
   pointer: Record<string, unknown>,
@@ -356,6 +362,16 @@ export async function resolveGoalVerificationLabelWrite(
   } else if (gvlPrincipal) {
     gvlChecks.push(`IF $c[0].labeled_by_principal.key_id != $principal_key_id { THROW "labeled_by_principal was not stored on goal_verification_labels (migration 219 not applied)" };`);
   }
+  // REFUSED BY PERMISSIONS, SAID AS SUCH. A token session (anything executeAsAuth does not route to root) runs the
+  // CREATE under the table's PERMISSIONS, and a refused CREATE returns an empty result with NO error (migration 121).
+  // The field checks above then read $c[0] as NONE and blamed a missing migration, which sent the reader to the wrong
+  // cause. So when the CREATE is wrapped, a token session's emptiness check runs FIRST and names what refused the
+  // write; a bare CREATE (no checks) keeps its statement, and its empty result is refused the same way in JS below
+  // instead of answering 200 with no id.
+  const gvlTokenSession = jwtAuth.authType !== 'apikey';
+  const gvlRefused = gvlRefusedMessage(jwtAuth.orgId);
+  const gvlRefusedCheck = gvlTokenSession && gvlChecks.length > 0;
+  if (gvlRefusedCheck) gvlChecks.unshift(`IF array::len($c) = 0 { THROW $gvl_refused };`);
   const gvlWrap = (createSql: string): string => gvlChecks.length === 0
     ? createSql
     : `{ LET $c = (${createSql}); ${gvlChecks.join(' ')} RETURN $c; }`;
@@ -382,6 +398,7 @@ export async function resolveGoalVerificationLabelWrite(
         created_at: time::now()
       }`),
       {
+        ...(gvlRefusedCheck ? { gvl_refused: gvlRefused } : {}),
         org_id: jwtAuth.orgId,
         goal: gvlPointer.goal,
         execution_id: gvlPointer.execution_id,
@@ -414,6 +431,7 @@ export async function resolveGoalVerificationLabelWrite(
     );
 
     const row = (created || [])[0];
+    if (!row && gvlTokenSession) throw new Error(gvlRefused);
     const recordId = row ? String(row.id) : null;
 
     return { status: 200, body: {
