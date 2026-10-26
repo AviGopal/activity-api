@@ -31,7 +31,8 @@ import {
   formatImpulseRelevanceAsMarkdown,
   formatPreValidationResultAsMarkdown,
 } from '../services/impulse-formatters';
-import { getJwtAuthFromContext, type JwtAuthContext } from '../middleware/jwtAuth';
+import { getJwtAuthFromContext, bindDelegatedAuth, type JwtAuthContext } from '../middleware/jwtAuth';
+import { resolveTraceOrg, ORG_MISMATCH } from '../lib/trace-org';
 import { normalizeRecordId } from '../utils/surrealdb-types';
 // The SAME normalizer the posterior WRITE path uses (posterior-update.ts:825).
 // Reads were not normalizing, so `activity:foo` and `foo` were different keys.
@@ -58,9 +59,23 @@ import { newestFirstSql } from '../lib/newest-first-sql';
 const router = new Hono();
 
 /**
- * Delegate a write resolver to the appropriate REST handler, forwarding auth.
+ * Delegate a write resolver to the appropriate REST handler.
  * Used by `*_write` impulse shapes so activities can invoke learning-loop
  * writes through POST /v2/impulses/resolve instead of hardcoding REST calls.
+ *
+ * AUTH IS THE OUTER REQUEST'S, PASSED, NEVER RE-DERIVED. The target sub-app has
+ * no auth middleware. This used to forward the Bearer header (which nothing
+ * inside ever checked) and let a caller-set body.org_id win, so any
+ * authenticated caller could write traces, feedback and posteriors into an org
+ * it chose. Now the outer request's already-verified context is bound to the
+ * delegated Request (bindDelegatedAuth), the handler reads it through
+ * getJwtAuthFromContext, and no credential header is forwarded at all.
+ *
+ * The org comes ONLY from that context. A body org_id is a claim checked the way
+ * every org-keyed write route checks it (resolveTraceOrg): equal to the
+ * authenticated org (compared without the `organizations:` prefix) it is kept as
+ * written; different, the write is refused 403 ORG_MISMATCH before the handler
+ * runs. With no verified context the delegation is refused 401.
  *
  * Returns the raw JSON body from the target handler along with its status.
  * Callers wrap this into the impulse-resolve envelope.
@@ -72,32 +87,27 @@ async function delegateWriteToRouter(
   body: unknown,
 ): Promise<{ status: number; data: any }> {
   const jwtAuth = getJwtAuthFromContext(c);
+  if (!jwtAuth) {
+    return { status: 401, data: { error: { code: 'UNAUTHENTICATED', message: 'a delegated write needs the verified auth context of the request that carries it' } } };
+  }
+  const bodyObj: Record<string, unknown> = typeof body === 'object' && body !== null && !Array.isArray(body) ? { ...(body as Record<string, unknown>) } : {};
+  const { org, refused } = resolveTraceOrg({ bodyOrg: bodyObj.org_id, jwtOrg: jwtAuth.orgId });
+  if (refused) {
+    logger.warn('delegated write refused: body org_id is not the caller\'s', { path, caller_org: jwtAuth.orgId });
+    return { status: 403, data: { error: { code: ORG_MISMATCH, message: refused } } };
+  }
+  // Handlers that read only the body (e.g. impulse-relevance's last fallback) see the authenticated org too.
+  if (!jwtAuth.orgId) delete bodyObj.org_id; else bodyObj.org_id = org;
+
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (jwtAuth?.jwtToken) headers['Authorization'] = `Bearer ${jwtAuth.jwtToken}`;
-
-  const internalApiKey = c.req.header('x-internal-api-key');
-  if (internalApiKey) headers['X-Internal-Api-Key'] = internalApiKey;
-
   const sessionId = c.req.header('x-session-id');
   if (sessionId) headers['X-Session-ID'] = sessionId;
 
-  // The inner sub-app has no auth middleware, so getJwtAuthFromContext() returns
-  // null inside the delegated handler. Always inject org_id from the outer
-  // context so the handler doesn't fall back to 'public'. body.org_id takes
-  // priority if already set (caller knows best).
-  let enrichedBody = body ?? {};
-  if (jwtAuth?.orgId) {
-    const bodyObj = typeof enrichedBody === 'object' && enrichedBody !== null ? enrichedBody : {};
-    if (!('org_id' in bodyObj)) {
-      enrichedBody = { ...bodyObj, org_id: jwtAuth.orgId };
-    }
-  }
-
-  const req = new Request(`http://internal${path}`, {
+  const req = bindDelegatedAuth(new Request(`http://internal${path}`, {
     method: 'POST',
     headers,
-    body: JSON.stringify(enrichedBody),
-  });
+    body: JSON.stringify(bodyObj),
+  }), jwtAuth);
 
   const res = await target.fetch(req);
   const data = await res.json().catch(() => ({}));
@@ -2236,12 +2246,16 @@ router.post('/resolve', async (c) => {
         // Call internal recommendation logic (reusing existing /recommend endpoint logic)
         // This is essentially an internal API call to avoid code duplication
         try {
+          // DEFERRED: recommend org-scoping. This delegate deliberately passes NO auth context and NO org, so
+          // /recommend runs exactly as before (no caller org: its FTS tier admits global templates only, and the
+          // Thompson scores are not org-keyed). Binding the caller's verified context here would scope the candidate
+          // set to the caller's org, which is a ranking change on the demo's goal path; it is deferred and reviewed
+          // after 10:00Z. No credential header is forwarded either: nothing inside ever checked one, and
+          // delegatedSubAppGuard refuses an unbound credential header.
           const recommendRequest = new Request(`http://internal/recommend`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
-              // Forward auth headers
-              ...(jwtAuth?.jwtToken ? { 'Authorization': `Bearer ${jwtAuth.jwtToken}` } : {}),
             },
             body: JSON.stringify({
               task_description: goalDescription,

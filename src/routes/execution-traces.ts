@@ -12,7 +12,7 @@ import { createHash } from 'node:crypto';
 import { surrealDB, queryWithAuth } from '../db/surreal';
 import { logger } from '../utils/logger';
 import type { SessionData } from '../models/schemas';
-import { getJwtAuthFromContext, hasJwtAuth, presentsThisNodesKey } from '../middleware/jwtAuth';
+import { getJwtAuthFromContext, hasJwtAuth, presentsThisNodesKey, delegatedSubAppGuard } from '../middleware/jwtAuth';
 import { config } from '../config';
 import { insertExecution, isDualWriteEnabled, normalizeActivityId, updateShapeActivityScores, type ParadigmExecution } from '../db/paradigm';
 // Phase B2: dual-tenant helpers (defined in routes/activities.ts in B1).
@@ -37,6 +37,8 @@ import { updateSuccessorFeatures } from '../lib/successor-features';
 import { applyClusterPosterior } from '../lib/cluster-posterior';
 
 const app = new Hono();
+// In-process delegated fetches (impulses.ts) carry their verified auth bound to the Request; see delegatedSubAppGuard.
+app.use('*', delegatedSubAppGuard);
 
 /**
  * Normalize a minibob-sent task object into the persisted shape. Preserves

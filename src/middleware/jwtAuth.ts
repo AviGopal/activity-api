@@ -829,7 +829,40 @@ export async function jwtAuthMiddleware(c: Context, next: Next) {
  * Helper to extract JWT auth context from request
  */
 export function getJwtAuthFromContext(c: Context): JwtAuthContext | null {
-  return c.get('jwtAuth') as JwtAuthContext | null;
+  const set = c.get('jwtAuth') as JwtAuthContext | null | undefined;
+  if (set !== undefined) return set;
+  // A sub-app fetched in-process (impulses.ts delegateWriteToRouter) runs in a fresh context that no middleware
+  // touched: the outer request's VERIFIED context arrives bound to the delegated Request object itself.
+  return delegatedAuth.get(c.req.raw) ?? null;
+}
+
+/**
+ * The verified auth context of a request delegated to a sub-app in-process, keyed by the Request object the
+ * delegate builds. Only code holding that object can bind it, so a header on the delegated request can never
+ * stand in for it: the sub-app has no auth middleware and must not re-derive auth from headers it cannot check.
+ */
+const delegatedAuth = new WeakMap<Request, JwtAuthContext>();
+
+/** Bind the outer request's already-verified auth context to a Request about to be fetched by a sub-app. */
+export function bindDelegatedAuth(req: Request, ctx: JwtAuthContext): Request {
+  delegatedAuth.set(req, ctx);
+  return req;
+}
+
+/**
+ * A sub-app's guard for in-process fetches. Mounted under the main app, the global middleware has already set
+ * `jwtAuth` (a context, or null on a public path), so this passes through. Fetched directly, a request with a
+ * bound context passes; one that carries a credential header with nothing bound is refused, because nothing
+ * here can verify that header and the handlers would otherwise take the request body's org as the caller's.
+ * A request with no credential at all keeps the handlers' anonymous behaviour.
+ */
+export async function delegatedSubAppGuard(c: Context, next: Next): Promise<Response | void> {
+  if (c.get('jwtAuth') === undefined && !delegatedAuth.has(c.req.raw)) {
+    if (c.req.header('Authorization') || c.req.header('X-Internal-Api-Key')) {
+      return c.json({ error: { code: 'UNVERIFIED_DELEGATED_AUTH', message: 'a delegated request carries a credential header but no verified auth context' } }, 401);
+    }
+  }
+  return next();
 }
 
 // ---------------------------------------------------------------------------

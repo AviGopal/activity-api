@@ -80,7 +80,7 @@ import {
   validateDiscoverByShapesInput,
 } from '../services/discover-by-shapes';
 import type { SessionData } from '../models/schemas';
-import { getJwtAuthFromContext, hasJwtAuth, getExecutionScopeFromContext, type JwtAuthContext } from '../middleware/jwtAuth';
+import { getJwtAuthFromContext, hasJwtAuth, getExecutionScopeFromContext, delegatedSubAppGuard, type JwtAuthContext } from '../middleware/jwtAuth';
 import {
   applyCompatibilityFilter,
   generatePointerRecommendations,
@@ -180,6 +180,8 @@ export function selectDedupTarget(
 }
 
 const app = new Hono();
+// In-process delegated fetches (impulses.ts) carry their verified auth bound to the Request; see delegatedSubAppGuard.
+app.use('*', delegatedSubAppGuard);
 
 // D5.2 — partial-pooling minimum-sample threshold for the leaf signature posterior.
 // When the leaf signature has fewer than this many observed samples
