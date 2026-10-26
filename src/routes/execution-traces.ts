@@ -293,6 +293,9 @@ const traceListCache = new Map<string, { body: unknown; expiresAt: number }>();
 const RESOLVED_CONFIG_MAX_CHARS = 4000;
 /** Trust-boundary cap on a task's stored attempts (light-dispatch retries at most 3). */
 const ATTEMPTS_MAX = 10;
+/** Trust-boundary caps on a task's stored unbound template variable names. */
+const UNBOUND_TEMPLATE_VARIABLES_MAX = 50;
+const UNBOUND_TEMPLATE_VARIABLE_MAX_CHARS = 200;
 
 export function normalizePersistedTask(task: any): {
   task_id: string;
@@ -316,6 +319,7 @@ export function normalizePersistedTask(task: any): {
   budget_ms?: number;
   budget_exhausted?: boolean;
   attempts?: Array<{ n: number; started_at?: string; duration_ms: number; ok: boolean; error?: string; code?: string }>;
+  unbound_template_variables?: string[];
 } {
   const { input_impulse_ids: inputImpulseIds, output_impulse_ids: outputImpulseIds } =
     extractTaskImpulseIds(task);
@@ -411,6 +415,20 @@ export function normalizePersistedTask(task: any): {
   if (_inShapes) out.input_shapes = _inShapes.filter((x: unknown) => typeof x === 'string');
   const _outShapes = Array.isArray(task?.output_shapes) ? task.output_shapes : Array.isArray(task?.outputShapes) ? task.outputShapes : null;
   if (_outShapes) out.output_shapes = _outShapes.filter((x: unknown) => typeof x === 'string');
+
+  // Per-task UNBOUND TEMPLATE VARIABLES: the plain {{name}} tokens in the task's template that had
+  // no run-variable binding when the executor interpolated it (ias-executor's
+  // unboundTemplateVariables, deduplicated, first-occurrence order). Without it a task that ran
+  // with a literal placeholder is indistinguishable from one whose inputs were all bound, and the
+  // count cannot be observed from the trace. Kept only as a whole array of strings: a mixed or
+  // non-array value is a malformed producer, and keeping part of it would misreport the count.
+  // An empty array is kept: it declares that every token was bound. Bounded at the trust boundary.
+  const _unbound = task?.unboundTemplateVariables ?? task?.unbound_template_variables;
+  if (Array.isArray(_unbound) && _unbound.every((x: unknown) => typeof x === 'string')) {
+    out.unbound_template_variables = (_unbound as string[])
+      .slice(0, UNBOUND_TEMPLATE_VARIABLES_MAX)
+      .map((x) => x.slice(0, UNBOUND_TEMPLATE_VARIABLE_MAX_CHARS));
+  }
 
   // Per-task RESOLVED CONFIG (2026-08-17): the arguments the resolver was actually
   // called with, post-interpolation. This is the same defect class as the shapes fix
