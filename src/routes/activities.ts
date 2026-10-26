@@ -81,6 +81,7 @@ import {
 } from '../services/discover-by-shapes';
 import type { SessionData } from '../models/schemas';
 import { getJwtAuthFromContext, hasJwtAuth, getExecutionScopeFromContext, delegatedSubAppGuard, type JwtAuthContext } from '../middleware/jwtAuth';
+import { holdsAdminScope, scopeRefusal, DB_ADMIN_SCOPE, TEMPLATES_ADMIN_SCOPE } from '../lib/admin-scopes';
 import {
   applyCompatibilityFilter,
   generatePointerRecommendations,
@@ -3677,6 +3678,8 @@ app.get('/topology-coverage', async (c) => {
  * inspected before it retires anything.
  */
 app.post('/templates/retire-malformed', async (c) => {
+  const adminCtx = getJwtAuthFromContext(c);
+  if (!holdsAdminScope(adminCtx, TEMPLATES_ADMIN_SCOPE)) return c.json(scopeRefusal(TEMPLATES_ADMIN_SCOPE), 403);
   try {
     const body = await c.req.json().catch(() => ({}));
     const dry_run = body.dry_run !== false;   // default DRY: retiring rows is not a thing to do by accident
@@ -3733,6 +3736,8 @@ app.post('/templates/retire-malformed', async (c) => {
 });
 
 app.post('/templates/auto-promote', async (c) => {
+  const adminCtx = getJwtAuthFromContext(c);
+  if (!holdsAdminScope(adminCtx, TEMPLATES_ADMIN_SCOPE)) return c.json(scopeRefusal(TEMPLATES_ADMIN_SCOPE), 403);
   try {
     const body = await c.req.json().catch(() => ({}));
     const min_samples = Math.max(1, Math.floor(body.min_samples ?? parseInt(process.env.AUTO_PROMOTE_MIN_SAMPLES ?? '20')));
@@ -4090,6 +4095,8 @@ app.post('/templates/auto-promote', async (c) => {
 });
 
 app.post('/templates/:templateId/promote', async (c) => {
+  const adminCtx = getJwtAuthFromContext(c);
+  if (!holdsAdminScope(adminCtx, TEMPLATES_ADMIN_SCOPE)) return c.json(scopeRefusal(TEMPLATES_ADMIN_SCOPE), 403);
   try {
     const templateId = c.req.param('templateId');
     if (!templateId || templateId.trim() === '') {
@@ -11688,9 +11695,11 @@ app.post('/relevance-feedback', async (c) => {
 // indexes against the full corpus). The gateway would time out waiting for a
 // synchronous rebuild response (sequential REBUILD blocks for each index until
 // SurrealDB confirms completion). Fire-and-forget avoids the gateway timeout.
-// Requires standard API-key auth (no admin scope needed — rebuild is read-safe).
+// Requires the db:admin scope (or admin): a REBUILD of every FTS index is node-wide load, not a tenant read.
 // ============================================================================
 app.post('/internal/fts-rebuild', async (c) => {
+  const adminCtx = getJwtAuthFromContext(c);
+  if (!holdsAdminScope(adminCtx, DB_ADMIN_SCOPE)) return c.json(scopeRefusal(DB_ADMIN_SCOPE), 403);
   // Use the shared rebuild job so the HTTP endpoint and the periodic scheduler
   // (index.ts setInterval) share the same in-process concurrency guard.
   // If a rebuild is already running this returns 202 without starting a second

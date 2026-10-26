@@ -33,6 +33,7 @@ import {
 } from '../services/impulse-formatters';
 import { getJwtAuthFromContext, bindDelegatedAuth, type JwtAuthContext } from '../middleware/jwtAuth';
 import { resolveTraceOrg, ORG_MISMATCH } from '../lib/trace-org';
+import { holdsAdminScope, scopeRefusal, DB_ADMIN_SCOPE } from '../lib/admin-scopes';
 import { normalizeRecordId } from '../utils/surrealdb-types';
 // The SAME normalizer the posterior WRITE path uses (posterior-update.ts:825).
 // Reads were not normalizing, so `activity:foo` and `foo` were different keys.
@@ -5095,12 +5096,18 @@ router.post('/resolve', async (c) => {
       }
 
       case 'db_admin': {
-        // Substrate self-management of its own SurrealDB. Requires
-        // authentication (the operation set spans full write authority); the
+        // Substrate self-management of its own SurrealDB. Requires the
+        // db:admin scope (the operation set spans full write authority); the
         // resolver itself enforces the operation/pattern whitelists, dry_run
         // defaults, max_rows bound, catastrophic-op rejection, and audit trail.
         const authCheck = requireAuthenticated(c);
         if (authCheck) return c.json({ success: false, error: authCheck.error } as ImpulseResolveResponse, authCheck.status);
+        // Authentication alone used to suffice: any key of any org could run DDL. The db:admin scope (or admin) is
+        // required now, read from identity's validated scopes (lib/admin-scopes.ts).
+        if (!holdsAdminScope(jwtAuthCtx, DB_ADMIN_SCOPE)) {
+          const refusal = scopeRefusal(DB_ADMIN_SCOPE);
+          return c.json({ success: false, error: refusal.error.message, code: refusal.error.code, required_scope: DB_ADMIN_SCOPE } as unknown as ImpulseResolveResponse, 403);
+        }
         const actor = jwtAuthCtx?.keyId || jwtAuthCtx?.userId || jwtAuthCtx?.orgId || null;
         const result = await resolveDbAdmin(pointer, actor);
         return c.json(result.body as ImpulseResolveResponse, result.status as any);
