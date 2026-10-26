@@ -145,6 +145,8 @@ export function judgeReachVerdict(t: { reached?: unknown; tags?: unknown }, opts
  * them from the event itself. Strings only, deduplicated, capped; ABSENT when the request named none. This reads the
  * request only: no column is written, and the event's `reached` is still the stored column (storedReachForEvent).
  */
+/** Stamped once the recalled ids for a verdict graded at insert were emitted (POST /reach): never twice. */
+export const RECALL_CREDITED_TAG = 'recall_credited:true';
 export const RECALLED_CONCEPT_IDS_CAP = 50;
 export function recalledConceptIdsForEvent(body: unknown): string[] | undefined {
   const raw = body && typeof body === 'object' ? (body as { recalled_concept_ids?: unknown }).recalled_concept_ids : undefined;
@@ -5625,38 +5627,86 @@ app.post('/reach', async (c) => {
     // and never with a value the caller withheld (beta_withheld, reach_withheld:true) or a correction retracted: those
     // stay ungraded (judgeReachVerdict). Consumers already see execution_completed more than once per execution (WS
     // delivery plus replay) and dedupe by execution_id; concept-db credits recalled concepts once, from a boolean only.
-    if (!observeVerdict && preReadOk && preRow && mirrored > 0 && !idempotent
-      && !preTags.includes('reached:true') && !preTags.includes('reached:false')) {
+    // The graded event, one shape for both emits below. `reached` is the column the mirror above just wrote, read back
+    // (storedReachForEvent), never body.reached; org_id is the trace's own stored org, never the caller's.
+    const emitGradedCompleted = (recalledForEvent: string[] | undefined) => {
+      const tasks = Array.isArray(preRow.tasks) ? (preRow.tasks as Array<{ status?: string }>) : [];
+      const activityForEvent = preActivityId || '';
+      void import('../websocket/broadcaster').then(async ({ broadcaster }) => {
+        const verdictForEvent = await storedReachForEvent(String(execId), { withheld: betaWithheld });
+        if (typeof verdictForEvent !== 'boolean') return;
+        broadcaster.emit({
+          type: 'execution_completed',
+          timestamp: new Date().toISOString(),
+          data: {
+            execution_id: String(execId),
+            activity_id: activityForEvent,
+            variant_id: typeof preRow.variant_id === 'string' ? preRow.variant_id : activityForEvent,
+            success: preRow.success === true,
+            task_count: tasks.length,
+            completed_task_count: tasks.filter((t) => t?.status === 'completed' || t?.status === 'success').length,
+            failed_task_count: tasks.filter((t) => t?.status === 'failed' || t?.status === 'failure').length,
+            duration_ms: typeof preRow.duration_ms === 'number' ? preRow.duration_ms : 0,
+            cost: typeof preRow.cost_usd === 'number' ? preRow.cost_usd : 0,
+            completed_at: new Date().toISOString(),
+            org_id: typeof preRow.org_id === 'string' ? preRow.org_id : null,
+            reached: verdictForEvent,
+            verdict: true,
+            // The concepts this walk recalled, forwarded from this request (never stored), else ABSENT.
+            ...(recalledForEvent ? { recalled_concept_ids: recalledForEvent } : {}),
+          },
+        } as any);
+      }).catch(() => { /* non-fatal */ });
+    };
+    // The once-marker's conditional write: returns the rows it changed (0 when the row already holds the marker).
+    const claimRecallCredit = async (): Promise<number> => {
+      const cres = await surrealDB.query(
+        `UPDATE type::thing('execution', $execution_id) SET tags = array::union(tags ?? [], [$marker]) WHERE (tags ?? []) CONTAINSNOT $marker`,
+        { execution_id: String(execId), marker: RECALL_CREDITED_TAG },
+      );
+      return Array.isArray(cres) && Array.isArray(cres[0]) ? (cres[0] as unknown[]).length : (Array.isArray(cres) ? cres.length : 0);
+    };
+    const firstVerdict = !preTags.includes('reached:true') && !preTags.includes('reached:false');
+    if (!observeVerdict && preReadOk && preRow && mirrored > 0 && !idempotent && firstVerdict) {
       if (typeof judgeReachVerdict({ reached: body.reached, tags: preTags }, { withheld: betaWithheld }) === 'boolean') {
-        const tasks = Array.isArray(preRow.tasks) ? (preRow.tasks as Array<{ status?: string }>) : [];
-        const activityForEvent = preActivityId || '';
-        const recalledForEvent = recalledConceptIdsForEvent(body);
-        void import('../websocket/broadcaster').then(async ({ broadcaster }) => {
-          // Single source: the column the mirror above just wrote, read back (storedReachForEvent), never body.reached.
-          const verdictForEvent = await storedReachForEvent(String(execId), { withheld: betaWithheld });
-          if (typeof verdictForEvent !== 'boolean') return;
-          broadcaster.emit({
-            type: 'execution_completed',
-            timestamp: new Date().toISOString(),
-            data: {
-              execution_id: String(execId),
-              activity_id: activityForEvent,
-              variant_id: typeof preRow.variant_id === 'string' ? preRow.variant_id : activityForEvent,
-              success: preRow.success === true,
-              task_count: tasks.length,
-              completed_task_count: tasks.filter((t) => t?.status === 'completed' || t?.status === 'success').length,
-              failed_task_count: tasks.filter((t) => t?.status === 'failed' || t?.status === 'failure').length,
-              duration_ms: typeof preRow.duration_ms === 'number' ? preRow.duration_ms : 0,
-              cost: typeof preRow.cost_usd === 'number' ? preRow.cost_usd : 0,
-              completed_at: new Date().toISOString(),
-              org_id: typeof preRow.org_id === 'string' ? preRow.org_id : null,
-              reached: verdictForEvent,
-              verdict: true,
-              // The concepts this walk recalled, forwarded from this request (never stored), else ABSENT.
-              ...(recalledForEvent ? { recalled_concept_ids: recalledForEvent } : {}),
-            },
-          } as any);
-        }).catch(() => { /* non-fatal */ });
+        const recalledFirst = recalledConceptIdsForEvent(body);
+        // A first verdict that carries ids spends the recall credit: stamp the marker so a retried /reach (whose
+        // pre-row then holds a reached:* tag) never credits the same ids again below. Recorded, never a gate here.
+        if (recalledFirst) {
+          try { await claimRecallCredit(); } catch (e) {
+            logger.warn('[reach-patch] recall-credit marker write failed on a first verdict', { error: e instanceof Error ? e.message : String(e) });
+          }
+        }
+        emitGradedCompleted(recalledFirst);
+      }
+    }
+    // RECALL CREDIT FOR A VERDICT GRADED AT INSERT, ONCE. goal-host stamps a reached walk reached:true at insert, so
+    // POST / emits its graded event then, with no recalled ids (the trace body carries none), and the first-verdict emit
+    // above never fires for it: a reached walk credited none of the concepts it recalled, and only failures (inserted
+    // ungraded) were credited. When this request names recalled concepts and the insert already graded the execution
+    // (insert_graded:true plus a reached:* tag, and no marker: the ids never went out on a graded event), the
+    // graded event is emitted once more with those ids. ONCE PER EXECUTION, ATOMICALLY: concept-db does not dedupe ids
+    // across events, so a recall_credited:true tag is stamped by a conditional UPDATE that matches only a row without
+    // it, and the event goes out only when that UPDATE changed the row; a retried or concurrent /reach matches nothing. An
+    // idempotent not-reached redelivery still qualifies: the verdict is unchanged, but the ids were never credited.
+    // `tags` is a declared field of the SCHEMAFULL execution table, so the marker persists with no migration.
+    const recalledAtInsertGraded = recalledConceptIdsForEvent(body);
+    if (!observeVerdict && preReadOk && preRow && mirrored > 0 && !firstVerdict && recalledAtInsertGraded
+      && preTags.includes(INSERT_GRADED_TAG) && !preTags.includes(RECALL_CREDITED_TAG)
+      && typeof judgeReachVerdict({ reached: body.reached, tags: preTags }, { withheld: betaWithheld }) === 'boolean') {
+      let claimed = 0;
+      try {
+        claimed = await claimRecallCredit();
+      } catch (e) {
+        logger.warn('[reach-patch] recall-credit marker write failed; no recall credit emitted', { error: e instanceof Error ? e.message : String(e) });
+      }
+      if (claimed > 0) {
+        emitGradedCompleted(recalledAtInsertGraded);
+        logger.info('[reach-patch] recall credit emitted for a verdict graded at insert', {
+          execution_id: String(execId),
+          recalled: recalledAtInsertGraded.length,
+          marker: RECALL_CREDITED_TAG,
+        });
       }
     }
     // `updated` is the caller's persistence signal: goal-host logs MATCHED NO ROW
