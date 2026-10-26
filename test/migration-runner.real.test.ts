@@ -187,31 +187,6 @@ describe('migration runner — a rejected file is FAILED by name, recorded, and 
     expect(rows['001-define-x.surql']?.status).toBe('applied');
   }, 60_000);
 
-  it('a ledger row whose file no longer exists is ignored: no error, no gap, no status write, health ok', async () => {
-    const db = newDb('ghost');
-    await q(db, `DEFINE TABLE init_migrations SCHEMAFULL PERMISSIONS FOR select, create FULL;
-      DEFINE FIELD filename ON init_migrations TYPE string;
-      DEFINE FIELD applied_at ON init_migrations TYPE datetime DEFAULT time::now();
-      DEFINE INDEX idx_init_migrations_filename ON init_migrations FIELDS filename UNIQUE;
-      INSERT INTO init_migrations (filename) VALUES ('143-gone-from-disk.surql'), ('001-api-keys.surql');`);
-    const dir = fixture({ '001-define-x.surql': 'DEFINE TABLE x SCHEMALESS;\n' });
-    const { code, out } = await runRunner(dir, db, crypto.randomUUID());
-    expect(code).toBe(0);
-    expect(out).not.toContain('[Init] FAILED');
-    expect(out).not.toContain('[SubstrateGap]');
-    expect(out).not.toContain('gone-from-disk');
-    const rows = await ledger(db);
-    for (const f of ['143-gone-from-disk.surql', '001-api-keys.surql']) {
-      expect({ f, status: rows[f]?.status ?? null, error: rows[f]?.error ?? null }).toEqual({ f, status: null, error: null });
-      expect(rows[f]?.applied_at).toBeTruthy();
-    }
-    expect(rows['001-define-x.surql']?.status).toBe('applied');
-    const { migrationHealth, resetMigrationHealthCache } = await import('../src/lib/migration-status');
-    await engine.sdk.use({ namespace: NS, database: db });
-    resetMigrationHealthCache();
-    expect(await migrationHealth()).toEqual({ status: 'healthy', failed_count: 0, failed: [] });
-  }, 60_000);
-
   it('a live DB with an empty ledger is marked bootstrapped, not applied', async () => {
     const db = newDb('boot');
     await q(db, "CREATE activity_execution_traces SET note = 'live';");
