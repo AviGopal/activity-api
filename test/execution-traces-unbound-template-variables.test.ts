@@ -9,11 +9,13 @@
  *
  *   [MUST-FAIL] a task carrying unboundTemplateVariables keeps it as unbound_template_variables;
  *               a malformed value is dropped whole; the list and each name are bounded.
+ *               The trace read projection surfaces the stored list, so it is observable on read.
  *   [CONTROL]   a task without the field normalizes exactly as before, with no such key.
  */
 import { describe, expect, test } from 'bun:test';
 import { readFileSync, readdirSync } from 'node:fs';
 import { normalizePersistedTask } from '../src/routes/execution-traces';
+import { _internals as readInternals } from '../src/routes/execution-trace-with-signatures';
 
 const baseTask = {
   task_id: 'task-a',
@@ -82,5 +84,16 @@ describe('normalizePersistedTask: unbound template variables', () => {
     const lastStar = defs.filter((l) => /\btasks\.\*\s+ON/i.test(l)).pop();
     expect(lastStar).toBeDefined();
     expect(lastStar!).toMatch(/\bFLEXIBLE\b/);
+  });
+
+  test('[MUST-FAIL] the trace read surfaces the stored list; a task without it reads without the key', () => {
+    const stored = [
+      normalizePersistedTask({ ...baseTask, unboundTemplateVariables: ['goal'] }),
+      normalizePersistedTask({ ...baseTask, task_id: 'task-b' }),
+    ];
+    const read = readInternals.extractTasks({ trace: { tasks: stored } } as any);
+    expect(read).toHaveLength(2);
+    expect(read[0]!.unbound_template_variables).toEqual(['goal']);
+    expect('unbound_template_variables' in read[1]!).toBe(false);
   });
 });

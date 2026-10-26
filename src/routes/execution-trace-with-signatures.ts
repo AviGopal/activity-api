@@ -101,6 +101,10 @@ export interface ExecutionTraceTaskEntry {
   description?: string;
   input_shapes?: string[];
   output_shapes?: string[];
+  /** The plain {{name}} template tokens that had no run-variable binding when the executor
+   *  interpolated this task, as normalizePersistedTask persists them. Present only when the
+   *  stored task carries the list; an empty list means every token was bound. */
+  unbound_template_variables?: string[];
 }
 
 export interface ExecutionTraceHydrated {
@@ -384,6 +388,10 @@ function extractTasks(row: RawExecutionRow): ExecutionTraceTaskEntry[] {
       // Store drops per-task outputShapes; a shape-routed step's produced shape IS its
       // resolver, so default to [resolver] when empty (discovery + reuse depend on it).
       output_shapes: outShapes.length > 0 ? outShapes : (resolverName && !META_RESOLVERS.has(resolverName) ? [resolverName] : []),
+      // Surfaced only when stored, so an absent list stays distinguishable from an empty one.
+      ...(Array.isArray(tt.unbound_template_variables)
+        ? { unbound_template_variables: toStringArray(tt.unbound_template_variables) }
+        : {}),
     });
   }
   return out;
