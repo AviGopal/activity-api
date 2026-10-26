@@ -108,24 +108,84 @@ export function rejectCatastrophicSql(sql: string): string | null {
 }
 
 /**
- * For apply_migration: caller-supplied DEFINE statements only. Reject anything
- * that is not an additive/idempotent DEFINE (IF NOT EXISTS / OVERWRITE), and
- * reject any DROP/DELETE/REMOVE outright.
+ * For apply_migration: ONE caller-supplied schema statement per entry, PARSED, not prefix-matched.
+ *
+ * The statements run on the module client, which is DB ROOT. The old check (starts with DEFINE, carries
+ * IF NOT EXISTS / OVERWRITE, no DELETE/REMOVE/DROP) admitted `DEFINE USER x ON ROOT ...`, `DEFINE ACCESS ...`, and a
+ * harmless DEFINE chained with `;` to anything. db:admin is granted to the fleet key, so this check is the only thing
+ * between that scope and root. It now:
+ *   - scans the text outside string literals and quoted identifiers, and refuses any comment and any `;` other than
+ *     one trailing terminator, so an entry is exactly ONE statement;
+ *   - admits only `DEFINE TABLE | FIELD | INDEX | EVENT`, with OVERWRITE or IF NOT EXISTS, on the current
+ *     namespace/database (FIELD, INDEX and EVENT must name `ON [TABLE] <table>`);
+ *   - refuses, anywhere outside literals, the words that reach beyond one table's schema or write data: USER, ACCESS,
+ *     NAMESPACE, DATABASE, ROOT, PARAM, FUNCTION, ANALYZER, REMOVE, DELETE, DROP, UPDATE, UPSERT, INSERT, CREATE,
+ *     RELATE, KILL, LET, RETURN, USE, BEGIN, COMMIT, CANCEL, INFO, SLEEP, THROW, and the network functions (http::);
+ * so an EVENT body cannot write rows or call out either. It fails closed: an identifier spelled like one of those
+ * words is refused too.
  */
-function validateMigrationStatement(stmt: string): string | null {
-  const s = stmt.trim();
+const MIGRATION_KINDS = ['TABLE', 'FIELD', 'INDEX', 'EVENT'] as const;
+const MIGRATION_FORBIDDEN_WORDS = [
+  'USER', 'ACCESS', 'NAMESPACE', 'NS', 'DATABASE', 'DB', 'ROOT', 'PARAM', 'FUNCTION', 'ANALYZER', 'MODEL', 'CONFIG',
+  'REMOVE', 'DELETE', 'DROP', 'UPDATE', 'UPSERT', 'INSERT', 'CREATE', 'RELATE', 'KILL', 'LIVE',
+  'LET', 'RETURN', 'USE', 'BEGIN', 'COMMIT', 'CANCEL', 'TRANSACTION', 'INFO', 'SLEEP', 'THROW', 'REBUILD', 'ALTER',
+];
+
+/** The statement text with every string literal and quoted identifier blanked, or an error for a comment / bad quoting. */
+function maskLiterals(s: string): { masked: string } | { error: string } {
+  let out = '';
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i]!;
+    const next = s[i + 1];
+    if (ch === '-' && next === '-') return { error: 'comments are not accepted' };
+    if (ch === '/' && (next === '/' || next === '*')) return { error: 'comments are not accepted' };
+    if (ch === '#') return { error: 'comments are not accepted' };
+    const close = ch === "'" ? "'" : ch === '"' ? '"' : ch === '`' ? '`' : ch === '⟨' ? '⟩' : null;
+    if (close) {
+      let j = i + 1;
+      let closed = false;
+      while (j < s.length) {
+        if (s[j] === '\\') { j += 2; continue; }
+        if (s[j] === close) { closed = true; break; }
+        j++;
+      }
+      if (!closed) return { error: 'an unterminated string or quoted identifier' };
+      out += ' x ';
+      i = j + 1;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return { masked: out };
+}
+
+export function validateMigrationStatement(stmt: string): string | null {
+  const s = typeof stmt === 'string' ? stmt.trim() : '';
   if (!s) return null;
+  const quote = s.slice(0, 80);
+  const m = maskLiterals(s);
+  if ('error' in m) return `apply_migration refuses ${m.error}: "${quote}"`;
+  // Exactly one statement: at most one `;`, and only as the terminator.
+  const body = m.masked.trim().replace(/;\s*$/, '');
+  if (body.includes(';')) return `apply_migration accepts exactly one statement per entry: "${quote}"`;
   const cat = rejectCatastrophicSql(s);
   if (cat) return cat;
-  if (/\b(DELETE|REMOVE|DROP)\b/i.test(s)) {
-    return `apply_migration rejects DELETE/REMOVE/DROP statements: "${s.slice(0, 80)}"`;
+  const words = body.toUpperCase().match(/[A-Z_][A-Z0-9_]*/g) ?? [];
+  const bad = words.find((w) => MIGRATION_FORBIDDEN_WORDS.includes(w));
+  if (bad) return `apply_migration refuses ${bad} in a migration statement: "${quote}"`;
+  if (/\bhttp\s*::/i.test(body)) return `apply_migration refuses network functions (http::): "${quote}"`;
+  // DEFINE <kind> [OVERWRITE | IF NOT EXISTS] <name> ...
+  const head = body.match(/^DEFINE\s+([A-Za-z]+)\s+(OVERWRITE\s+|IF\s+NOT\s+EXISTS\s+)?/i);
+  if (!head) return `apply_migration only accepts DEFINE statements: "${quote}"`;
+  const kind = head[1]!.toUpperCase();
+  if (!(MIGRATION_KINDS as readonly string[]).includes(kind)) {
+    return `apply_migration accepts only DEFINE ${MIGRATION_KINDS.join(' / ')}, not DEFINE ${kind}: "${quote}"`;
   }
-  // Must be a DEFINE; must carry IF NOT EXISTS or OVERWRITE so re-run is safe.
-  if (!/^DEFINE\b/i.test(s)) {
-    return `apply_migration only accepts DEFINE statements: "${s.slice(0, 80)}"`;
-  }
-  if (!/\b(IF\s+NOT\s+EXISTS|OVERWRITE)\b/i.test(s)) {
-    return `apply_migration DEFINE must be idempotent (IF NOT EXISTS / OVERWRITE): "${s.slice(0, 80)}"`;
+  if (!head[2]) return `apply_migration DEFINE must be idempotent (IF NOT EXISTS / OVERWRITE): "${quote}"`;
+  if (kind !== 'TABLE' && !/^\S+\s+ON\s+(TABLE\s+)?\S+/i.test(body.slice(head[0].length))) {
+    return `apply_migration DEFINE ${kind} must name ON [TABLE] <table>: "${quote}"`;
   }
   return null;
 }
