@@ -84,8 +84,7 @@ export function schemaFiles(): string[] {
   return [...list('sql/'), ...list('sql/schemas/'), ...list('sql/migrations/')];
 }
 
-/** `schema: false` starts an empty engine (for checks that bring their own schema, e.g. the migration runner's). */
-export async function startRealSurreal(opts: { schema?: boolean } = {}): Promise<RealSurreal> {
+export async function startRealSurreal(): Promise<RealSurreal> {
   const port = 19_000 + Math.floor(Math.random() * 900);
   const url = `http://127.0.0.1:${port}`;
   const rpcUrl = `ws://127.0.0.1:${port}/rpc`; // the SDK's engine: WebSocket, so no fetch (see the header)
@@ -118,7 +117,7 @@ export async function startRealSurreal(opts: { schema?: boolean } = {}): Promise
   if (!up) { proc.kill(); throw new Error('surreal did not answer /health within 8 s'); }
 
   const jwt = crypto.randomUUID();
-  for (const f of opts.schema === false ? [] : schemaFiles()) {
+  for (const f of schemaFiles()) {
     const text = readFileSync(ROOT + f, 'utf8').replaceAll('__JWT_SECRET__', jwt).replaceAll("'dev-secret-change-in-production'", `'${jwt}'`);
     await raw(text);
   }

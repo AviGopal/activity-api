@@ -225,16 +225,7 @@ app.get('/health', async (c) => {
     };
   }
 
-  // Migrations the runner recorded FAILED (scripts/init-database.ts). Degraded, never 503:
-  // a 503 makes watchdogs restart the vessel, and a restart re-runs the same failing file.
-  let migrationsDegraded = false;
-  try {
-    const { migrationHealth } = await import('./lib/migration-status');
-    healthStatus.checks.migrations = await migrationHealth();
-    migrationsDegraded = healthStatus.checks.migrations.status === 'degraded';
-  } catch { /* advisory */ }
-
-  healthStatus.status = !allHealthy ? 'unhealthy' : migrationsDegraded ? 'degraded' : 'healthy';
+  healthStatus.status = allHealthy ? 'healthy' : 'unhealthy';
 
   // Return 503 Service Unavailable if any critical dependency is unhealthy
   // Discovery is non-critical, so it won't affect health status
@@ -788,11 +779,6 @@ if (discoveryClient.isEnabled()) {
 } else {
   logger.info('[Discovery] Discovery integration disabled');
 }
-
-// Failed migrations: file one gap per file once the listener is up (unref'd timers).
-import('./lib/migration-status')
-  .then(({ scheduleMigrationGapFiling }) => scheduleMigrationGapFiling())
-  .catch((error) => logger.warn('[Migrations] gap filing not scheduled', { error: error instanceof Error ? error.message : String(error) }));
 
 // ============================================================================
 // Local Embedding Service — async init + optional backfill

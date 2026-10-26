@@ -371,16 +371,12 @@ async function runCreateIndex(pointer: any): Promise<{ ok: boolean; error?: stri
 //                       they STOP re-running every restart (the 1332-failure fix)
 // ---------------------------------------------------------------------------
 
-async function recordMigrationApplied(filename: string, status: 'applied' | 'reconciled'): Promise<void> {
-  // Mirrors scripts/init-database.ts recordMigrationStatus: update the file's row or create
-  // it. An upsert, not INSERT IGNORE: a row the runner recorded `failed` must flip, or the
-  // runner keeps re-running it. `reconciled` says the file was marked WITHOUT running, so
-  // the row never claims the file's statements took effect.
+async function recordMigrationApplied(filename: string): Promise<void> {
+  // Mirrors scripts/init-database.ts markMigrationApplied (INSERT IGNORE on the
+  // UNIQUE filename index).
   await surrealDB.query<any>(
-    `IF array::len(SELECT id FROM init_migrations WHERE filename = $f) > 0 ` +
-    `{ UPDATE init_migrations SET status = $s, error = NONE, applied_at = time::now() WHERE filename = $f; } ` +
-    `ELSE { CREATE init_migrations SET filename = $f, status = $s, applied_at = time::now(); };`,
-    { f: filename, s: status },
+    `INSERT IGNORE INTO init_migrations (filename, applied_at) VALUES ($f, time::now())`,
+    { f: filename },
   );
 }
 
@@ -399,7 +395,7 @@ async function runApplyMigration(pointer: any): Promise<{ ok: boolean; error?: s
     }
     const reconciled: string[] = [];
     for (const f of filenames) {
-      await recordMigrationApplied(f, 'reconciled');
+      await recordMigrationApplied(f);
       reconciled.push(f);
     }
     return { ok: true, result: { mode, reconciled }, impact: reconciled.length };
@@ -424,7 +420,7 @@ async function runApplyMigration(pointer: any): Promise<{ ok: boolean; error?: s
       applied.push(s.slice(0, 120));
     }
     if (filename && /^[\w.\-]+\.surql$/.test(filename)) {
-      await recordMigrationApplied(filename, 'applied');
+      await recordMigrationApplied(filename);
     }
     return { ok: true, result: { mode, statements_applied: applied.length, filename: filename ?? null }, impact: applied.length };
   }
