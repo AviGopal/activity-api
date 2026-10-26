@@ -107,18 +107,74 @@ async function runSQL(sql: string): Promise<SQLResult[]> {
   }
 }
 
-async function ensureMigrationsTable(): Promise<void> {
-  await runSQL(`
+// ── Per-file status ──────────────────────────────────────────────────────────
+// Every row carries a `status`, so the ledger says what happened to each file:
+//   applied       its statements ran and none errored
+//   failed        the engine rejected it; `error` holds the engine's text
+//   bootstrapped  marked without running on a live DB whose ledger was empty
+//   reconciled    marked without running by db-admin apply_migration reconcile
+// A row with no status predates this field. It is read as applied (its history
+// is not rewritten here), which is why a row claiming applied is not proof the
+// file took effect: rows written by bootstrap or reconcile never ran.
+// `applied_at` has no default, so a failed row never carries an applied time.
+const STATUS_FIELDS = ['status', 'error', 'failed_at'];
+
+async function ensureMigrationsTable(): Promise<boolean> {
+  const res = await runSQL(`
     DEFINE TABLE IF NOT EXISTS init_migrations SCHEMAFULL
       PERMISSIONS FOR select, create FULL;
     DEFINE FIELD IF NOT EXISTS filename ON init_migrations TYPE string;
-    DEFINE FIELD IF NOT EXISTS applied_at ON init_migrations TYPE datetime DEFAULT time::now();
+    DEFINE FIELD OVERWRITE applied_at ON init_migrations TYPE option<datetime>;
+    DEFINE FIELD IF NOT EXISTS status ON init_migrations TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS error ON init_migrations TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS failed_at ON init_migrations TYPE option<datetime>;
     DEFINE INDEX IF NOT EXISTS idx_init_migrations_filename ON init_migrations FIELDS filename UNIQUE;
   `);
+  const errs = res.filter((r) => r.status !== 'OK');
+  if (res.length === 0 || errs.length > 0) {
+    console.error(`[Init] ✗ init_migrations definition had errors: ${JSON.stringify(errs).slice(0, 400)}`);
+  }
+  // The table is SCHEMAFULL: if the status field did not land, a "failed" row
+  // would be stored as a bare filename and read back as APPLIED. Confirm the
+  // fields exist before any status is written.
+  const info = await runSQL('INFO FOR TABLE init_migrations;');
+  const fields = info[0]?.status === 'OK' ? (info[0].result?.fields ?? {}) : {};
+  const missing = STATUS_FIELDS.filter((f) => !(f in fields));
+  if (missing.length > 0) {
+    console.error(
+      `[Init] ✗ init_migrations lacks field(s) ${missing.join(', ')}: per-file status will NOT be ` +
+      'recorded this run (a failed file is still reported FAILED below and stays unrecorded).'
+    );
+    return false;
+  }
+  return true;
+}
+
+/** SurrealQL single-quoted literal. */
+function sqlString(s: string): string {
+  return `'${s.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+}
+
+/**
+ * Engine error text made safe to log, store and file. Files 064/069/112 carry the
+ * JWT secret after substitution and a parse error echoes the statement, so the
+ * secret is redacted first. Control characters become spaces; length is bounded.
+ */
+function cleanError(text: string): string {
+  let t = String(text ?? '');
+  if (JWT_SECRET) t = t.split(JWT_SECRET).join('[REDACTED]');
+  return t.replace(/[\x00-\x1F\x7F]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 600);
+}
+
+/** The stable gap id for a file that failed to apply. */
+function gapIdFor(filename: string): string {
+  return `migration-apply-failed-${filename.replace(/\.(surql|sql)$/, '')}`;
 }
 
 async function getAppliedMigrations(): Promise<Set<string> | null> {
-  const results = await runSQL('SELECT filename FROM init_migrations;');
+  // A failed row is not applied: it is re-run on the next start. A row with no
+  // status predates per-file status and is read as applied (history kept as is).
+  const results = await runSQL("SELECT filename FROM init_migrations WHERE status IS NONE OR status != 'failed';");
   // Distinguish a genuine empty result from a FAILED read (timeout/contention).
   // Returning an empty Set on failure is what let a contended-startup timeout
   // trigger the live-DB bootstrap, which marks every pending migration (e.g. a
@@ -141,23 +197,6 @@ async function getAppliedMigrations(): Promise<Set<string> | null> {
   } catch {
     // If we can't read the directory, just return the DB-derived set.
     return applied;
-  }
-
-  function parseDefinedTables(sqlText: string): string[] {
-    const tables = new Set<string>();
-    const re = /DEFINE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_]+)/gi;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(sqlText)) !== null) {
-      const name = m[1];
-      if (name) tables.add(name);
-    }
-    return [...tables];
-  }
-
-  async function tableExists(name: string): Promise<boolean> {
-    // SurrealDB returns status OK for existing tables; non-existent typically ERR.
-    const res = await runSQL(`INFO FOR TABLE ${name};`);
-    return res[0]?.status === 'OK';
   }
 
   async function failureCountFor(filename: string): Promise<number> {
@@ -193,27 +232,11 @@ async function getAppliedMigrations(): Promise<Set<string> | null> {
       continue;
     }
 
-    // Convergence: if all tables defined in this file already exist, record and skip.
-    try {
-      const sqlText = await readFile(join(SQL_DIR, f), 'utf8').catch(() => '');
-      if (sqlText && sqlText.length > 0) {
-        const tables = parseDefinedTables(sqlText);
-        if (tables.length > 0) {
-          let allExist = true;
-          for (const t of tables) {
-            const ok = await tableExists(t);
-            if (!ok) { allExist = false; break; }
-          }
-          if (allExist) {
-            await markMigrationApplied(f);
-            applied.add(f);
-            continue;
-          }
-        }
-      }
-    } catch {
-      // Ignore convergence errors; fall through to bump failure for this start.
-    }
+    // No convergence marking. An earlier pass recorded a file as applied when every
+    // table it names already existed, without running it, so a file whose own
+    // statements were rejected (DEFINE TABLE <existing> OVERWRITE, a parse error)
+    // was recorded applied on the next start and never retried. A previously failed
+    // file is now re-applied; the escalation above bounds how often.
 
     // Count this start as a failure attempt preflight; a successful application in this
     // same start will be followed by markMigrationApplied(), which clears the counter.
@@ -223,10 +246,37 @@ async function getAppliedMigrations(): Promise<Set<string> | null> {
   return applied;
 }
 
-async function markMigrationApplied(filename: string): Promise<void> {
-  await runSQL(
-    `INSERT IGNORE INTO init_migrations (filename) VALUES ('${filename.replace(/'/g, "\\'")}');\nDELETE FROM init_migration_failures WHERE filename = '${filename.replace(/'/g, "\\'")}';`
+/**
+ * Write a file's status row: update the existing row, or create one. A failed
+ * result only updates a row that is itself failed, so it never downgrades a row
+ * that already claims applied.
+ */
+async function recordMigrationStatus(
+  filename: string,
+  status: 'applied' | 'failed' | 'bootstrapped',
+  error?: string,
+): Promise<boolean> {
+  const f = sqlString(filename);
+  const set = status === 'failed'
+    ? `status = 'failed', error = ${sqlString(error ?? '')}, failed_at = time::now()`
+    : `status = '${status}', error = NONE, applied_at = time::now()`;
+  // failed: only over a row that is itself failed. bootstrapped: never over an existing
+  // row (it did not run the file, so it must not overwrite a recorded outcome).
+  const update = status === 'bootstrapped'
+    ? 'RETURN NONE;'
+    : `UPDATE init_migrations SET ${set} WHERE filename = $f${status === 'failed' ? " AND status = 'failed'" : ''};`;
+  const res = await runSQL(
+    `LET $f = ${f};\n` +
+    `IF array::len(SELECT id FROM init_migrations WHERE filename = $f) > 0 ` +
+    `{ ${update} } ` +
+    `ELSE { CREATE init_migrations SET filename = $f, ${set}; };\n` +
+    (status === 'failed' ? '' : `DELETE FROM init_migration_failures WHERE filename = $f;`)
   );
+  return res.length > 0 && res.every((r) => r.status === 'OK');
+}
+
+async function markMigrationApplied(filename: string): Promise<void> {
+  await recordMigrationStatus(filename, 'applied');
 }
 
 async function bootstrapMigrationsTable(allFiles: string[]): Promise<boolean> {
@@ -254,13 +304,16 @@ async function bootstrapMigrationsTable(allFiles: string[]): Promise<boolean> {
   );
   for (const file of allFiles) {
     const filename = file.split('/').pop()!;
-    await markMigrationApplied(filename);
+    // `bootstrapped`, not `applied`: this run did not execute the file.
+    await recordMigrationStatus(filename, 'bootstrapped');
   }
   console.log('[Init] ✓ init_migrations bootstrapped — this run will skip all existing migrations.');
   return true; // caller should skip all migrations this run
 }
 
-async function applySQLFile(filePath: string): Promise<boolean> {
+interface ApplyOutcome { ok: boolean; error?: string }
+
+async function applySQLFile(filePath: string): Promise<ApplyOutcome> {
   const fileName = filePath.split('/').pop();
   console.log(`\n[Migration] Applying ${fileName}...`);
 
@@ -272,7 +325,9 @@ async function applySQLFile(filePath: string): Promise<boolean> {
     const looksLikeSQL = /(CREATE|DEFINE|UPDATE|DELETE|INSERT|RELATE|SELECT|USE|BEGIN|COMMIT|CANCEL|IF|LET)\s/i.test(sqlContent) || sqlContent.includes(';');
     if (hasCtlChars || !looksLikeSQL) {
       console.warn(`[Migration] Skipping unparseable file ${fileName}: does not look like SQL${hasCtlChars ? ' (binary/control chars detected)' : ''}.`);
-      return false;
+      // Not an engine failure: comment-only files (005-impulse-data, 049) land here.
+      // Not recorded, not counted failed — the same as before.
+      return { ok: false };
     }
 
     // Substitute the JWT_SECRET placeholder in schema files that DEFINE
@@ -304,7 +359,7 @@ async function applySQLFile(filePath: string): Promise<boolean> {
         'after substitution. This would leak a non-functional JWT KEY into ' +
         'SurrealDB and break authentication. Aborting.'
       );
-      return false;
+      return { ok: false, error: `${JWT_SECRET_PLACEHOLDER} still present after substitution` };
     }
 
     const headers = buildHeaders();
@@ -334,9 +389,14 @@ async function applySQLFile(filePath: string): Promise<boolean> {
     });
 
     if (!response.ok) {
+      // A parse error rejects the whole request (HTTP 400): none of the file's
+      // statements ran. The engine's own text is in `information`.
       const text = await response.text();
-      console.error(`[Migration] HTTP ${response.status}: ${text}`);
-      return false;
+      let detail = text;
+      try { const j = JSON.parse(text); detail = j?.information ?? j?.description ?? text; } catch { /* raw text */ }
+      const error = cleanError(`HTTP ${response.status}: ${detail}`);
+      console.error(`[Migration] ✗ ${fileName} FAILED: ${error}`);
+      return { ok: false, error };
     }
 
     const results: SQLResult[] = await response.json();
@@ -351,11 +411,19 @@ async function applySQLFile(filePath: string): Promise<boolean> {
       );
 
       if (criticalErrors.length > 0) {
-        console.error(`[Migration] ✗ ${fileName} failed with ${criticalErrors.length} error(s):`);
-        criticalErrors.slice(0, 3).forEach(err => {
-          console.error(`  - ${err.result}`);
-        });
-        return false;
+        // Root causes first: inside a transaction every later statement reports only
+        // "not executed due to a failed transaction", which names nothing.
+        const cascade = /not executed due to a failed transaction/i;
+        const ordered = [
+          ...criticalErrors.filter((e) => !cascade.test(String(e.result))),
+          ...criticalErrors.filter((e) => cascade.test(String(e.result))),
+        ];
+        const error = cleanError(
+          `${criticalErrors.length} statement error(s): ` +
+          ordered.slice(0, 3).map((e) => String(e.result)).join(' | ')
+        );
+        console.error(`[Migration] ✗ ${fileName} FAILED: ${error}`);
+        return { ok: false, error };
       } else {
         console.log(`[Migration] ⚠ ${fileName} - ${errors.length} statements already exist (skipped)`);
       }
@@ -363,11 +431,13 @@ async function applySQLFile(filePath: string): Promise<boolean> {
 
     const successCount = results.filter(r => r.status === 'OK').length;
     console.log(`[Migration] ✓ ${fileName} applied successfully (${successCount} statements)`);
-    return true;
+    return { ok: true };
 
   } catch (error) {
-    console.error(`[Migration] ✗ ${fileName} error:`, error);
-    return false;
+    // Timeout or network error: the outcome is unknown, so it is a failure too.
+    const msg = cleanError(error instanceof Error ? `${error.name}: ${error.message}` : String(error));
+    console.error(`[Migration] ✗ ${fileName} FAILED: ${msg}`);
+    return { ok: false, error: msg };
   }
 }
 
@@ -485,7 +555,7 @@ async function main() {
   // Ensure the tracking table exists, then load the set of applied migrations.
   // On a live DB where the table is brand-new (empty), bootstrap it by marking
   // all current files as already applied — they were applied by prior deploys.
-  await ensureMigrationsTable();
+  const statusRecordable = await ensureMigrationsTable();
 
   // ── Load-bearing denormalized fields: ensure FIRST, before the migration loop ──
   // endpoint_output_shapes (mig 092) + expected_output_shapes (mig 188/189) on
@@ -538,6 +608,7 @@ async function main() {
   // Apply each migration
   let successCount = 0;
   let skippedCount = 0;
+  const failed: Array<{ filename: string; error: string }> = [];
 
   if (appliedMigrations === null) {
     // Still unreadable after retries: do NOT bootstrap (which would mark every
@@ -550,7 +621,14 @@ async function main() {
       'migration pass this run to avoid a false bootstrap. Next start retries.'
     );
   } else {
-    if (appliedMigrations.size === 0) {
+    // Bootstrap only over an EMPTY ledger. The applied set excludes failed rows, so a
+    // ledger holding only failed rows is not empty and must not be marked over.
+    const ledgerRows = appliedMigrations.size === 0
+      ? await runSQL('SELECT count() AS c FROM init_migrations GROUP ALL;')
+      : [];
+    const ledgerEmpty = appliedMigrations.size === 0 &&
+      ledgerRows[0]?.status === 'OK' && !((ledgerRows[0].result?.[0]?.c ?? 0) > 0);
+    if (ledgerEmpty) {
       bootstrapped = await bootstrapMigrationsTable(sqlFiles);
       if (bootstrapped) {
         appliedMigrations = (await getAppliedMigrations()) ?? new Set<string>();
@@ -568,13 +646,23 @@ async function main() {
       }
 
       const filePath = join(SQL_DIR, file);
-      const success = await applySQLFile(filePath);
-      if (success) {
+      const outcome = await applySQLFile(filePath);
+      if (outcome.ok) {
         successCount++;
         await markMigrationApplied(filename);
+      } else if (outcome.error !== undefined) {
+        // Continue past a failure (later files are independent), but never record
+        // it as applied: record it FAILED with the engine's text, and say which.
+        failed.push({ filename, error: outcome.error });
+        const recorded = statusRecordable && await recordMigrationStatus(filename, 'failed', outcome.error);
+        // The gap signal. activity-api's server files one substrateGap per failed row
+        // (src/lib/migration-status.ts) once it is up; this line is the record when it is not.
+        console.error(
+          `[SubstrateGap] ${gapIdFor(filename)} filename=${filename} recorded=${recorded ? 'yes' : 'no'} ` +
+          `error="${outcome.error.replace(/"/g, "'")}"`
+        );
       } else {
-        // Continue even on failure (for idempotency)
-        console.warn(`[Init] ⚠ Migration ${file} had errors but continuing...`);
+        console.warn(`[Init] ⚠ Migration ${file} skipped (not SQL); continuing...`);
       }
     }
   }
@@ -605,8 +693,21 @@ async function main() {
   );
   console.log('='.repeat(80));
 
-  if (successCount < sqlFiles.length) {
-    console.warn('[Init] Some migrations had errors (this may be okay if re-running)');
+  if (failed.length > 0) {
+    // FAILED, by name — but exit 0. A non-zero exit is ignored by the systemd unit
+    // (ExecStartPre `-`) and is pod-blocking for the helm initContainer, where the
+    // files that fail on every fresh engine would refuse every deploy. A failed
+    // migration is visible instead: recorded `failed` in init_migrations, reported
+    // `degraded` by /health, and filed as one gap per file.
+    console.error(
+      `[Init] FAILED: ${failed.length} migration(s) did not apply: ` +
+      failed.map((f) => f.filename).join(', ')
+    );
+    for (const f of failed) console.error(`[Init]   ✗ ${f.filename}: ${f.error}`);
+  } else if (successCount < sqlFiles.length) {
+    console.warn('[Init] Some files were skipped (not SQL); 0 migrations failed');
+  } else {
+    console.log('[Init] 0 migrations failed');
   }
 }
 
