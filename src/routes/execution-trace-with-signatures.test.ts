@@ -514,6 +514,32 @@ describe('runExecutionTraceWithSignatures - edge cases', () => {
     expect(report.traces[0].impulses_by_id).toEqual({});
     expect(report.traces[0].tasks).toEqual([]);
   });
+
+  test('exact execution lookup exposes only the selected drafter arm for ribosome extraction', async () => {
+    const execution = {
+      id: 'exec-drafter-floor',
+      activity_id: 'feature_compose',
+      success: true,
+      executed_at: '2026-10-28T09:00:00.000Z',
+      // SurrealDB returns this as the selected projection alias, not as the
+      // source metadata object.
+      drafter_variant: 'floor',
+      metadata: { drafter_variant: 'floor', private_operator_note: 'must not leave the row' },
+      input_impulses: [],
+      output_impulses: [],
+    };
+    const { db, calls } = makeDb({
+      rowsByTable: { type: [{ id: 'execution:exec-drafter-floor' }], execution: [execution], impulse: [] },
+    });
+
+    const report = await runExecutionTraceWithSignatures(db, { execution_id: 'exec-drafter-floor' }, apikeyAuth);
+
+    expect(report.traces[0]?.drafter_variant).toBe('floor');
+    expect(report.traces[0]).not.toHaveProperty('metadata');
+    const hydrate = calls.find((c) => c.table === 'execution' && c.sql.includes('activity_id'))!;
+    expect(hydrate.sql).toMatch(/metadata\.drafter_variant\s+AS\s+drafter_variant/);
+    expect(hydrate.sql).not.toMatch(/SELECT\s+metadata\s*(,|FROM)/i);
+  });
 });
 
 // ---------------------------------------------------------------------------

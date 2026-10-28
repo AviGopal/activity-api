@@ -119,6 +119,8 @@ export interface ExecutionTraceHydrated {
   success_count?: number;
   failure_count?: number;
   parent_execution_id?: string | null;
+  /** Selected drafter arm recorded by feature_compose, when present. */
+  drafter_variant?: string;
   composition_chain?: string[];
   impulse_resolutions?: unknown[];
   input_impulses: string[];
@@ -416,6 +418,7 @@ interface RawExecutionRow {
   trace?: unknown;
   tasks?: unknown;
   org_id?: unknown;
+  drafter_variant?: unknown;
   [key: string]: unknown;
 }
 
@@ -525,6 +528,7 @@ async function queryExecutions(
       parent_execution_id,
       composition_chain,
       impulse_resolutions,
+      metadata.drafter_variant AS drafter_variant,
       trace,
       org_id
     FROM execution
@@ -874,6 +878,9 @@ export async function runExecutionTraceWithSignatures(
       failure_count: tasks.filter((t) => t.status === 'failure' || t.status === 'failed').length,
       parent_execution_id:
         typeof row.parent_execution_id === 'string' ? row.parent_execution_id : null,
+      ...(typeof row.drafter_variant === 'string' && row.drafter_variant.length > 0
+        ? { drafter_variant: row.drafter_variant }
+        : {}),
       composition_chain: toStringArray(row.composition_chain),
       impulse_resolutions: Array.isArray(row.impulse_resolutions)
         ? (row.impulse_resolutions as unknown[])
