@@ -334,8 +334,14 @@ describe('runExecutionTraceWithSignatures - round trip', () => {
     expect(exec2.input_impulses).toEqual(['imp-4', 'imp-5']);
     expect(Object.keys(exec2.impulses_by_id).sort()).toEqual(['imp-4', 'imp-5']);
 
-    // Two DB round trips: one for execution, one for impulse
-    expect(calls.map((c) => c.table).sort()).toEqual(['execution', 'impulse']);
+    // The live table uses a narrow id query plus hydration; the compatibility
+    // view remains a fallback for legacy traces, then impulses are hydrated.
+    expect(calls.map((c) => c.table)).toEqual([
+      'execution',
+      'execution',
+      'v_paradigm_execution_traces',
+      'impulse',
+    ]);
   });
 
   test('groups tasks per execution preserving order and ids', async () => {
