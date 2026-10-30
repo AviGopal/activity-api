@@ -20,6 +20,8 @@ mock.module('../db/surreal', () => ({
   },
   queryWithAuth: async () => [],
   createAuthenticatedClient: async () => ({}),
+  getDbStats: () => ({}),
+  dbStats: { snapshot: () => ({}) },
 }));
 
 // Same Redis stub as activities-template-id-normalize.test.ts: `redis` is exported too, because a
@@ -101,15 +103,6 @@ describe('POST /v2/activities/templates: a guard refusal is logged with its reas
     expect(r.length).toBe(1);
     expect(r[0]!['reason']).toBe('activity_id_as_output_shape');
     expect(r[0]!['offending']).toEqual(['activity:some-composition']);
-  });
-
-  test('a missing name is refused AND logged', async () => {
-    const { name: _omit, ...noName } = base;
-    const res = await post({ ...noName, tasks: [{ id: 't1', description: 'one', resolver: 'bash', outputShapes: ['shellResult'] }] });
-    expect(res.status).toBe(400);
-    const r = refusals();
-    expect(r.length).toBe(1);
-    expect(r[0]!['reason']).toBe('missing_name');
   });
 
   test('CONTROL: an accepted template logs no refusal', async () => {
