@@ -28,7 +28,6 @@ import {
 import { applyOutcomeToPosteriors } from '../lib/posterior-update';
 import { resolveTraceOrg, ORG_MISMATCH } from '../lib/trace-org';
 import { getJwtAuthFromContext } from '../middleware/jwtAuth';
-import { ubiquitousTargetShapes, shapeCover } from '../lib/ubiquitous-shapes';
 import type { SessionData } from '../models/schemas';
 
 const app = new Hono();
@@ -53,9 +52,10 @@ export function goalPathUngradedSkipCount(): number { return goalPathUngradedSki
 /** How the walk denotes a satisfier pseudo-activity; the suffix IS the shape. */
 export const SATISFIER_PREFIX = 'satisfier:';
 
-// ANSWER PRODUCERS: the shapes an LLM answer is carried in. The walk's inferred targets add one to almost any goal
-// (the prose answer), so a borrowed path that overlaps a goal ONLY there shares the goal's answer channel, not its
-// purpose: targets [llm_completion_dispatch, human_surface:ui_view] reached cover 0.50 against a one-step llm
+// ANSWER PRODUCERS: the shapes an LLM answer is carried in. A borrowed path that overlaps a goal ONLY there shares
+// the goal's answer channel, not its purpose. That is cover arithmetic, not frequency (the shape is in ~7% of recorded
+// target sets): any two-target goal with the answer producer as one target reaches 0.50 against an answer-only path.
+// Measured: targets [llm_completion_dispatch, human_surface:ui_view] reached cover 0.50 against a one-step llm
 // satisfier pathway and borrowed it, as did an unrelated goal minutes later. No helper in activity-api names these
 // shapes, so the set lives here, beside the one rule that reads it.
 export const ANSWER_PRODUCER_SHAPES: ReadonlySet<string> = new Set(['llm_completion_dispatch', 'llm_completion', 'llmCompletion', 'llmTextCompletion']);
@@ -1158,14 +1158,12 @@ app.post('/recommend', async (c) => {
         goal_hash: goalHash,
       });
       const targetSet = new Set(targetShapes);
-      // A shape in most recent goals' target sets (measured; lib/ubiquitous-shapes.ts) carries no information
-      // about what THIS goal wants, so it never counts toward cover. Fail-open: no measurement, no exclusion.
-      const ubiquitous = await ubiquitousTargetShapes(targetShapes);
       const scored = ((shapeRows ?? []) as any[])
         .filter((p) => !isProvenFailing(p))
         .map((p) => {
           const have: string[] = Array.isArray(p.endpoint_output_shapes) ? p.endpoint_output_shapes.map(String) : [];
-          p.__shape_cover = shapeCover(have, targetSet, ubiquitous);
+          const covered = have.filter((s) => targetSet.has(s)).length;
+          p.__shape_cover = targetSet.size > 0 ? covered / targetSet.size : 0;
           p.__match_mode = 'shape_signature';
           return p;
         })
@@ -1173,7 +1171,7 @@ app.post('/recommend', async (c) => {
         // candidate to cover at least half of what the walk is trying to produce,
         // so first/last-mile adaptation has a real body to adapt rather than a
         // coincidence to chase. And an overlap ONLY on an answer producer (ANSWER_PRODUCER_SHAPES) never qualifies:
-        // it is the answer channel nearly every goal carries, not a body to adapt. That holds for a borrower whose
+        // it is the goal's answer channel, not a body to adapt. That holds for a borrower whose
         // only target IS the answer: a generic prose path is not a learned pathway for its goal.
         .filter((p) => p.__shape_cover >= 0.5 && coversNonAnswerTarget(Array.isArray(p.endpoint_output_shapes) ? p.endpoint_output_shapes.map(String) : [], targetSet))
         .sort((a, b) => (b.__shape_cover - a.__shape_cover)
@@ -1187,7 +1185,6 @@ app.post('/recommend', async (c) => {
           target_shapes: targetShapes,
           candidates: shapeMatched,
           best_cover: scored[0].__shape_cover,
-          ubiquitous_excluded: [...ubiquitous],
         });
       }
     }

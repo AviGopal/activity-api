@@ -3,10 +3,10 @@
  *
  * Measured 2026-10-30: targets [llm_completion_dispatch, human_surface:ui_view] borrowed a one-step
  * [satisfier:llm_completion_dispatch] donor (12/12) at cover 0.50, and an unrelated goal borrowed the
- * same donor minutes later. The overlap was the answer channel (llm_completion_dispatch, which the
- * walk's inferred targets add to almost any goal), not the goal's purpose. Recorded target-set shares
- * show llm_completion_dispatch in only ~7% of rows, so this is cover arithmetic, not ubiquity: any
- * two-target goal with the answer producer as one target reaches 0.50 against any answer-only path.
+ * same donor minutes later. The overlap was the answer channel (llm_completion_dispatch), not the
+ * goal's purpose. Recorded target-set shares show llm_completion_dispatch in only ~7% of rows, so
+ * this is cover arithmetic, not ubiquity: any two-target goal with the answer producer as one
+ * target reaches 0.50 against any answer-only path.
  *
  * Driven through POST /recommend with only the store stubbed (no helper seam). Must-fail: the
  * R2-shaped request does not return the llm donor. Controls: [data, llm] still matches a path covering
