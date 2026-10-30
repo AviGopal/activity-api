@@ -399,10 +399,18 @@ app.post('/templates', async (c) => {
     const activityVariantOf = validated.variant_of || validated.genealogy;
 
     // Validate required fields
+    //
+    // EVERY REFUSAL BELOW IS LOGGED. These guards answered 400 and wrote nothing, so a
+    // ribosome-extracted composition refused here left only an access-log `400 1ms`: the
+    // reason lived in the response body alone, and the caller recorded its write task as a
+    // success. The refusal line names the guard and the offending values (ids and shape
+    // names, never payload bodies), so a refused mint is diagnosable from the journal.
     if (!activityId) {
+      logger.warn('POST /v2/activities/templates refused', { reason: 'missing_id', name: activityName ?? null });
       return c.json({ error: 'Missing required field: id or variant_id' }, 400);
     }
     if (!activityName) {
+      logger.warn('POST /v2/activities/templates refused', { reason: 'missing_name', activity_id: activityId });
       return c.json({ error: 'Missing required field: name or variant_name' }, 400);
     }
 
@@ -435,6 +443,7 @@ app.post('/templates', async (c) => {
     if (_badShapeTask) {
       const offending = (((_badShapeTask as { outputShapes?: unknown[] }).outputShapes ?? []) as unknown[])
         .map(_shapeLike).filter((o) => o.startsWith('activity:'));
+      logger.warn('POST /v2/activities/templates refused', { reason: 'activity_id_as_output_shape', activity_id: activityId, offending });
       return c.json({
         error: 'Invalid outputShapes: an activity identifier is not a shape',
         detail:
@@ -473,6 +482,7 @@ app.post('/templates', async (c) => {
         .filter((i): i is string => typeof i === 'string')
         .filter((i) => _producedByOwnTasks.has(i));
       if (_selfSatisfied.length > 0) {
+        logger.warn('POST /v2/activities/templates refused', { reason: 'self_satisfied_input_shapes', activity_id: activityId, self_satisfied: _selfSatisfied });
         return c.json({
           error: 'Invalid input_shapes: the composition declares a precondition it produces itself',
           detail:
