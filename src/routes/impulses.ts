@@ -42,6 +42,7 @@ import activitiesRouter, { accountIdScopedWhere } from './activities';
 import executionTracesRouter from './execution-traces';
 import { runTemplateAuditReport, type TemplateAuditInput } from './template-audit';
 import { resolveGoalVerificationLabelWrite } from './goal-verification-label-write';
+import { resolveTraceEvidenceRefWrite } from './trace-evidence-ref-write';
 import { runExecutionTraceWithSignatures } from './execution-trace-with-signatures';
 import { runReplicationPull } from './replication-pull';
 import { runTraceAggregateReport } from './trace-aggregate-report';
@@ -2944,6 +2945,12 @@ router.post('/resolve', async (c) => {
       case 'goal_verification_label_write': {
         // The handler lives in ./goal-verification-label-write (the oracle corpus's one writer).
         const r = await resolveGoalVerificationLabelWrite(getJwtAuthFromContext(c), pointer as Record<string, unknown>, executeAsAuth);
+        return c.json(r.body, r.status);
+      }
+
+      case 'trace_evidence_ref_write': {
+        // Open/close a reference retention reads as protection, as the caller (handler: ./trace-evidence-ref-write).
+        const r = await resolveTraceEvidenceRefWrite(getJwtAuthFromContext(c), pointer as Record<string, unknown>, executeAsAuth);
         return c.json(r.body, r.status);
       }
 

@@ -28,7 +28,8 @@
  *     {execution_id, observation, instrument, horizon, code_version, at};
  *   - external references: table `trace_evidence_ref {execution_id, source, ref, open}`. The gap
  *     store and the attempt ledger live on development-vessel as files; this table is the in-store
- *     address retention can read at use time. Its writers are NOT exercised here;
+ *     address retention can read at use time. The gap and ledger writers are NOT exercised here; the
+ *     person_verdict writer (trace_evidence_ref_write, routes/trace-evidence-ref-write.ts) is, through the route;
  *   - the valve's "only gradable rows left over the cap" signal: getLastCeilingOutcome() reports
  *     stoppedBy 'protected_only' with `remaining` = the surplus it declined to delete (the gap seam
  *     today is a hardcoded network POST, which a test cannot observe).
@@ -117,6 +118,7 @@ function check(name: string, fn: () => Promise<void>): void {
 
 const mig = (f: string) => readFileSync(new URL(`../../sql/migrations/${f}`, import.meta.url), 'utf8');
 const COUNTER_MIGRATION = mig('213-shape-score-counter.surql');
+const REF_MIGRATION = mig('230-trace-evidence-ref-tenant-permissions.surql');
 const LABEL_MIGRATIONS = [
   mig('101-goal-verification-labels.surql'),
   mig('183-relax-goal-verification-labeler-assert.surql'),
@@ -127,6 +129,8 @@ type Mod = typeof import('./trace-retention');
 let M: Mod;
 let db: typeof import('../db/surreal')['surrealDB'];
 let clearTuning: () => void;
+/** POST /v2/impulses/resolve as an authenticated caller with the given scopes (the real impulses route; auth context set the way the auth middleware sets it). */
+let resolveAs: (scopes: string[], pointer: Record<string, unknown>, org?: string) => Promise<{ status: number; body: Record<string, unknown> }>;
 
 const DAY = 86_400_000;
 const HOT_MS = 2 * 3600_000;
@@ -271,6 +275,15 @@ describe('retention compacts graded/labelled evidence before any delete (real Su
       const TP = await import('../lib/tuning-params');
       const TC = await import('../lib/telemetry-class');
       clearTuning = () => { TP.__clearTuningParamCache(); TP.__clearTuningParamListCache(); TC.__clearTelemetryClassCache(); };
+      const { Hono } = await import('hono');
+      const impulses = (await import('../routes/impulses')).default;
+      resolveAs = async (scopes, pointer, org = ORG.replace(/^organizations:/, '')) => {
+        const app = new Hono();
+        app.use('*', async (c, next) => { c.set('jwtAuth' as never, { jwtToken: 't', orgId: org, keyId: 'key_testwrit', scopes, authType: 'apikey' } as never); await next(); });
+        app.route('/v2/impulses', impulses);
+        const res = await app.request('/v2/impulses/resolve', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pointer }) });
+        return { status: res.status, body: (await res.json().catch(() => ({}))) as Record<string, unknown> };
+      };
     } catch (e) {
       engineError = `engine unusable: ${e instanceof Error ? e.message : String(e)}`;
     }
@@ -292,6 +305,7 @@ describe('retention compacts graded/labelled evidence before any delete (real Su
     await q('DEFINE EVENT retention_order_audit ON TABLE execution WHEN $event = "DELETE" THEN { CREATE retention_audit SET eid = meta::id($before.id), had_obs = count((SELECT id FROM execution_observation WHERE execution_id = meta::id($before.id))) > 0, at = time::now() };');
     await q(COUNTER_MIGRATION);
     for (const m of LABEL_MIGRATIONS) await q(m);
+    await q(REF_MIGRATION); // the writer's table as deployed (tenant PERMISSIONS; root, as retention, is unaffected)
     await q('DEFINE TABLE substrate_tuning_param SCHEMALESS;');
     await setTuning('TRACE_RETENTION_DRAIN_BATCH', 40);
     await setTuning('TRACE_RETENTION_DRAIN_PAUSE_MS', 0);
@@ -454,6 +468,59 @@ describe('retention compacts graded/labelled evidence before any delete (real Su
     const obs = await q<Record<string, unknown>>('SELECT * FROM execution_observation WHERE execution_id IN $ids', { ids: r.protectedDeleted });
     expect(obs.length).toBe(r.removed);
     expect(obs.every((o) => o['instrument'] === 'reach_verdict' && o['observation'] === false)).toBe(true);
+  });
+
+  // ── A person-verdict deferral protects its execution through the WRITE path (trace_evidence_ref_write) ──
+  // A deferral on a template run (exec_*) waits on an engine-owned row that is ungraded until the person or the
+  // fallback decides; the valve pruned it first and /reach matched no row. The table had no writer: these drive
+  // the real impulses route, then the real valve. Must-fail at the parent: the shape is unknown there.
+
+  const PV = (execution_id: string, open: boolean) =>
+    ({ type: 'trace_evidence_ref_write', execution_id, source: 'person_verdict', ref: 'dispatch-under-test', open });
+
+  check('EVIDENCE-RETENTION PERSON-VERDICT: an ungraded exec_* row with an OPEN person_verdict ref written through trace_evidence_ref_write survives the valve', async () => {
+    const [deferred] = await seed('ungraded', 1, { prefix: 'exec_pv', ageDays: 5 }); // the oldest row in the store
+    await seed('ungraded', 60, { prefix: 'pvu', ageDays: 3 });
+    const w = await resolveAs(['read', 'write'], PV(deferred!, true));
+    expect(w.status).toBe(200);
+    const r = await measured(() => M.runCeilingDrainTick(cfgFor(51))); // surplus 10
+    expect(r.deleted).not.toContain(deferred!);
+    expect(await exists(deferred!)).toBe(true);
+    expect(await total()).toBe(51);
+  });
+
+  check('EVIDENCE-RETENTION PERSON-VERDICT CONTROL: after the ref is closed (open:false) the row is pruned like any ungraded row', async () => {
+    const [decided] = await seed('ungraded', 1, { prefix: 'exec_pc', ageDays: 5 }); // the oldest row in the store
+    await seed('ungraded', 60, { prefix: 'pcu', ageDays: 3 });
+    expect((await resolveAs(['read', 'write'], PV(decided!, true))).status).toBe(200);
+    expect((await resolveAs(['read', 'write'], PV(decided!, false))).status).toBe(200);
+    const refs = await q<{ open: boolean }>('SELECT open FROM trace_evidence_ref WHERE execution_id = $e', { e: decided });
+    expect(refs).toEqual([{ open: false }]); // the close landed on the row the open wrote
+    await M.runCeilingDrainTick(cfgFor(51));
+    expect(await exists(decided!)).toBe(false);
+    expect(await total()).toBe(51);
+  });
+
+  check('EVIDENCE-RETENTION PERSON-VERDICT CONTROL: a read-only key, a gap/attempt_ledger source, or a table-prefixed id writes nothing', async () => {
+    const [e] = await seed('ungraded', 1, { prefix: 'exec_pr', ageDays: 5 });
+    expect((await resolveAs(['read'], PV(e!, true))).status).toBe(403);
+    expect((await resolveAs(['read', 'write'], { ...PV(e!, true), source: 'gap' })).status).toBe(400);
+    expect((await resolveAs(['read', 'write'], { ...PV(e!, true), source: 'attempt_ledger' })).status).toBe(400);
+    expect((await resolveAs(['read', 'write'], PV(`execution:${e!}`, true))).status).toBe(400);
+    expect(await q('SELECT * FROM trace_evidence_ref')).toEqual([]);
+  });
+
+  check('EVIDENCE-RETENTION PERSON-VERDICT TENANCY: a caller of org A cannot open a ref on org B\'s execution (403, nothing written); its own org still can', async () => {
+    const [mine] = await seed('ungraded', 1, { prefix: 'exec_pa', ageDays: 5 }); // org o
+    await q('CREATE type::thing("execution", "exec_pb00000") CONTENT { activity_id: "act-other", org_id: "organizations:b", success: true, executed_at: time::now() - 5d }');
+    const cross = await resolveAs(['read', 'write'], PV('exec_pb00000', true)); // the caller is org o
+    expect(cross.status).toBe(403);
+    expect((await resolveAs(['read', 'write'], PV('exec_missing0', true))).status).toBe(403); // no such execution
+    expect(await q('SELECT * FROM trace_evidence_ref')).toEqual([]);
+    expect((await resolveAs(['read', 'write'], PV('exec_pb00000', true), 'b')).status).toBe(200); // org b may
+    expect((await resolveAs(['read', 'write'], PV(mine!, true))).status).toBe(200);
+    const rows = await q<{ execution_id: string; org_id: string }>('SELECT execution_id, org_id FROM trace_evidence_ref ORDER BY execution_id');
+    expect(rows).toEqual([{ execution_id: mine!, org_id: 'o' }, { execution_id: 'exec_pb00000', org_id: 'b' }]);
   });
 
   // ── CONTROLS (green at base, must stay green under the fix) ─────────────────────────────────────

@@ -410,6 +410,8 @@ export function loadConfig(): Config {
         'goalSeeking_write',
         'execution_write',
         'goal_verification_label_write',
+        // trace_evidence_ref_write: open/close a retention-protecting reference (routes/trace-evidence-ref-write.ts).
+        'trace_evidence_ref_write',
         // Admin/destructive shapes (admin scope required at route level)
         'activityTemplate_update',
         'activityTemplate_deprecate',
