@@ -53,6 +53,18 @@ export function goalPathUngradedSkipCount(): number { return goalPathUngradedSki
 /** How the walk denotes a satisfier pseudo-activity; the suffix IS the shape. */
 export const SATISFIER_PREFIX = 'satisfier:';
 
+// ANSWER PRODUCERS: the shapes an LLM answer is carried in. The walk's inferred targets add one to almost any goal
+// (the prose answer), so a borrowed path that overlaps a goal ONLY there shares the goal's answer channel, not its
+// purpose: targets [llm_completion_dispatch, human_surface:ui_view] reached cover 0.50 against a one-step llm
+// satisfier pathway and borrowed it, as did an unrelated goal minutes later. No helper in activity-api names these
+// shapes, so the set lives here, beside the one rule that reads it.
+export const ANSWER_PRODUCER_SHAPES: ReadonlySet<string> = new Set(['llm_completion_dispatch', 'llm_completion', 'llmCompletion', 'llmTextCompletion']);
+
+/** A shape-signature candidate qualifies only by covering a target that is NOT an answer producer. */
+export function coversNonAnswerTarget(have: readonly string[], targetSet: ReadonlySet<string>): boolean {
+  return have.some((s) => targetSet.has(s) && !ANSWER_PRODUCER_SHAPES.has(s));
+}
+
 export async function accumulateEndpointShapes(
   pathActivities: string[]
 ): Promise<string[]> {
@@ -1160,8 +1172,10 @@ app.post('/recommend', async (c) => {
         // A single incidental shape in common is not a nearby match. Require the
         // candidate to cover at least half of what the walk is trying to produce,
         // so first/last-mile adaptation has a real body to adapt rather than a
-        // coincidence to chase.
-        .filter((p) => p.__shape_cover >= 0.5)
+        // coincidence to chase. And an overlap ONLY on an answer producer (ANSWER_PRODUCER_SHAPES) never qualifies:
+        // it is the answer channel nearly every goal carries, not a body to adapt. That holds for a borrower whose
+        // only target IS the answer: a generic prose path is not a learned pathway for its goal.
+        .filter((p) => p.__shape_cover >= 0.5 && coversNonAnswerTarget(Array.isArray(p.endpoint_output_shapes) ? p.endpoint_output_shapes.map(String) : [], targetSet))
         .sort((a, b) => (b.__shape_cover - a.__shape_cover)
           || ((b.successful_executions ?? 0) - (a.successful_executions ?? 0))
           || ((b.total_executions ?? 0) - (a.total_executions ?? 0)));
