@@ -28,6 +28,7 @@ import {
 import { applyOutcomeToPosteriors } from '../lib/posterior-update';
 import { resolveTraceOrg, ORG_MISMATCH } from '../lib/trace-org';
 import { getJwtAuthFromContext } from '../middleware/jwtAuth';
+import { ubiquitousTargetShapes, shapeCover } from '../lib/ubiquitous-shapes';
 import type { SessionData } from '../models/schemas';
 
 const app = new Hono();
@@ -1145,12 +1146,14 @@ app.post('/recommend', async (c) => {
         goal_hash: goalHash,
       });
       const targetSet = new Set(targetShapes);
+      // A shape in most recent goals' target sets (measured; lib/ubiquitous-shapes.ts) carries no information
+      // about what THIS goal wants, so it never counts toward cover. Fail-open: no measurement, no exclusion.
+      const ubiquitous = await ubiquitousTargetShapes(targetShapes);
       const scored = ((shapeRows ?? []) as any[])
         .filter((p) => !isProvenFailing(p))
         .map((p) => {
           const have: string[] = Array.isArray(p.endpoint_output_shapes) ? p.endpoint_output_shapes.map(String) : [];
-          const covered = have.filter((s) => targetSet.has(s)).length;
-          p.__shape_cover = targetSet.size > 0 ? covered / targetSet.size : 0;
+          p.__shape_cover = shapeCover(have, targetSet, ubiquitous);
           p.__match_mode = 'shape_signature';
           return p;
         })
@@ -1170,6 +1173,7 @@ app.post('/recommend', async (c) => {
           target_shapes: targetShapes,
           candidates: shapeMatched,
           best_cover: scored[0].__shape_cover,
+          ubiquitous_excluded: [...ubiquitous],
         });
       }
     }
