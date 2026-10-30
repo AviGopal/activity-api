@@ -1685,6 +1685,15 @@ async function runTraceRetentionSweepInner(
         let removed = 0;
         const stratumStarted = Date.now();
         try {
+          // A PERSON'S VERDICT COUNTS WHATEVER THE ACTIVITY. The reservoir may let an evidence row's body go once it is
+          // compacted, but a row an OPEN person_verdict reference names is a deferral still waiting on a person (or
+          // the fallback): /reach needs the row itself, and an observation record cannot take the verdict. Those ids
+          // are left out of the reservoir's delete side; every other source keeps today's compact-then-delete. The
+          // list is the open deferrals only (small), read once per stratum.
+          const pvOpen = await withDeadline(surrealDB.query<unknown>(
+            `SELECT VALUE execution_id FROM trace_evidence_ref WHERE source = 'person_verdict' AND open != false TIMEOUT ${policy.stmtTimeoutS}s`,
+          ), deadlineFor(1, policy.stmtTimeoutS), 'person-verdict ref read');
+          const pv = Array.isArray(pvOpen) ? pvOpen.map(String) : [];
           for (let iter = 0; iter < maxIters && removed < target; iter++) {
             // BUDGETED: this loop had no time bound, and on the hub it was the whole sweep.
             if (Date.now() >= strataUntil) { strataStoppedBy = 'budget'; budgetHitAt ??= activityId; break; }
@@ -1694,9 +1703,9 @@ async function runTraceRetentionSweepInner(
             const ids = await withDeadline(surrealDB.query<unknown>(
               `SELECT VALUE id FROM ${TABLE}
                  WHERE activity_id = $aid AND success = $ok
-                   AND executed_at < type::datetime($cut) AND rand::float() >= $keepProb
+                   AND executed_at < type::datetime($cut) AND rand::float() >= $keepProb${pv.length > 0 ? ' AND meta::id(id) NOTINSIDE $pv' : ''}
                  LIMIT $batch TIMEOUT ${policy.stmtTimeoutS}s`,
-              { aid: activityId, ok: succeeded, cut: coldCutoffIso, keepProb, batch: thisBatch },
+              { aid: activityId, ok: succeeded, cut: coldCutoffIso, keepProb, batch: thisBatch, ...(pv.length > 0 ? { pv } : {}) },
             ), deadlineFor(1, policy.stmtTimeoutS), 'stratum select');
             if (!Array.isArray(ids) || ids.length === 0) break; // tail exhausted
             await deleteExecutionIds(ids, `DELETE $ids RETURN NONE TIMEOUT ${policy.stmtTimeoutS}s`, policy.stmtTimeoutS);

@@ -523,6 +523,32 @@ describe('retention compacts graded/labelled evidence before any delete (real Su
     expect(rows).toEqual([{ execution_id: mine!, org_id: 'o' }, { execution_id: 'exec_pb00000', org_id: 'b' }]);
   });
 
+  check('EVIDENCE-RETENTION PERSON-VERDICT STRATUM: the reservoir does not delete a row with an OPEN person_verdict ref; its other rows go as before', async () => {
+    const rows = await seed('ungraded', 40, { prefix: 'exec_ps', activity: 'pv-stratum-act', ageDays: 3 });
+    const kept = rows.slice(0, 5);
+    for (const e of kept) expect((await resolveAs(['read', 'write'], PV(e, true))).status).toBe(200);
+    const r = await measured(() => M.runTraceRetentionSweep(strataCfg(['pv-stratum-act'], 10)));
+    for (const e of kept) expect(r.deleted).not.toContain(e);
+    for (const e of kept) expect(await exists(e)).toBe(true);
+    expect(r.removed).toBeGreaterThan(0); // the unreferenced rows are still sampled and deleted
+  });
+
+  check('EVIDENCE-RETENTION PERSON-VERDICT STRATUM CONTROL: a CLOSED person_verdict ref, an open gap ref and no ref leave the reservoir as today', async () => {
+    const plain = await seed('ungraded', 30, { prefix: 'exec_pn', activity: 'pv-stratum-ctl', ageDays: 3 });
+    const closed = plain[0]!;
+    expect((await resolveAs(['read', 'write'], PV(closed, true))).status).toBe(200);
+    expect((await resolveAs(['read', 'write'], PV(closed, false))).status).toBe(200);
+    const [gapCited] = await seed('gap_ref', 1, { prefix: 'exec_pg', activity: 'pv-stratum-ctl', ageDays: 3 });
+    const s = await measured(() => M.runTraceRetentionSweep(strataCfg(['pv-stratum-ctl'], 0)));
+    // cap 0: every cold row of the stratum goes, the closed-ref row and the gap-cited row included; the gap row is
+    // compacted first (stratum behaviour for other sources is unchanged).
+    expect(s.removed).toBe(31);
+    expect(await countOf('pv-stratum-ctl')).toBe(0);
+    expect(s.deleted).toContain(closed);
+    expect(s.deleted).toContain(gapCited!);
+    expect(s.uncompacted).toEqual([]);
+  });
+
   // ── CONTROLS (green at base, must stay green under the fix) ─────────────────────────────────────
 
   check('EVIDENCE-RETENTION CONTROL: a telemetry-only store over the cap is trimmed exactly to the cap', async () => {
