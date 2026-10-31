@@ -58,7 +58,10 @@ const SOURCE = readFileSync(join(import.meta.dir, 'paradigm.ts'), 'utf8');
  * (`$org_id_prefix`), plus the pre-fix shape so a silent narrowing is still caught rather
  * than making the clause invisible to this test.
  */
-const POSTERIOR_LOOKUP_SITES = 2;
+// Was 2. The second site was getCanonicalPosteriors, the helper that overlaid these
+// posteriors on the v_activity_score view's rows; it was removed with the view branch, and
+// getActivityScores now reads variant_performance_metrics directly through the one site left.
+const POSTERIOR_LOOKUP_SITES = 1;
 
 function posteriorLookupClauses(): string[] {
   // `$org_id_prefix` is bound by these two sites and nowhere else, so it identifies them

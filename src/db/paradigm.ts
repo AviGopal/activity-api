@@ -35,79 +35,6 @@ export function isDualWriteEnabled(): boolean {
   return envValue === 'true' || envValue === '1';
 }
 
-/**
- * Check if reads should prefer new paradigm tables.
- * Controlled via PARADIGM_READ_ENABLED environment variable.
- * Default: true (try new tables first, fall back to legacy)
- */
-export function isParadigmReadEnabled(): boolean {
-  const envValue = process.env.PARADIGM_READ_ENABLED;
-  // Default to true unless explicitly disabled
-  return envValue !== 'false' && envValue !== '0';
-}
-
-/**
- * P5.2: Get percentage of traffic that should use new paradigm tables.
- * Controlled via PARADIGM_READ_PERCENTAGE environment variable.
- * Default: 100 (all traffic uses new tables when enabled)
- *
- * Use this for gradual rollout:
- * - 10: 10% of requests use new tables
- * - 50: 50% of requests use new tables
- * - 100: All requests use new tables
- */
-export function getParadigmReadPercentage(): number {
-  const envValue = process.env.PARADIGM_READ_PERCENTAGE;
-  if (!envValue) return 100;
-  const parsed = parseInt(envValue, 10);
-  if (isNaN(parsed) || parsed < 0) return 0;
-  if (parsed > 100) return 100;
-  return parsed;
-}
-
-/**
- * P5.1: Check if this specific request should use new paradigm tables.
- * Combines isParadigmReadEnabled() with percentage-based rollout.
- *
- * @returns true if this request should read from new tables
- */
-export function shouldUseParadigmRead(): boolean {
-  if (!isParadigmReadEnabled()) {
-    return false;
-  }
-  const percentage = getParadigmReadPercentage();
-  if (percentage >= 100) {
-    return true;
-  }
-  if (percentage <= 0) {
-    return false;
-  }
-  // Random selection based on percentage
-  return Math.random() * 100 < percentage;
-}
-
-/**
- * P5.1: Check if fallback to legacy tables should be skipped.
- * When PARADIGM_READ_NO_FALLBACK=true, errors from new tables are not caught.
- * Use this after gradual rollout is complete (100%) to ensure clean reads.
- */
-export function shouldSkipLegacyFallback(): boolean {
-  const envValue = process.env.PARADIGM_READ_NO_FALLBACK;
-  return envValue === 'true' || envValue === '1';
-}
-
-/**
- * Log dual-write configuration on startup
- */
-export function logDualWriteConfig(): void {
-  logger.info('[paradigm] Feature flags:', {
-    DUAL_WRITE_ENABLED: isDualWriteEnabled(),
-    PARADIGM_READ_ENABLED: isParadigmReadEnabled(),
-    PARADIGM_READ_PERCENTAGE: getParadigmReadPercentage(),
-    PARADIGM_READ_NO_FALLBACK: shouldSkipLegacyFallback(),
-  });
-}
-
 // =============================================================================
 // CANONICAL FIELD NAMES (aligned with 020-paradigm-core-tables.surql)
 // =============================================================================
@@ -506,87 +433,21 @@ export async function insertExecution(
 }
 
 /**
- * Get activity scores from v_activity_score view
- * Falls back to variant_performance_metrics on failure (unless no-fallback mode)
+ * Get activity scores from the canonical posterior store, variant_performance_metrics.
  *
- * P5.1/P5.2: Respects PARADIGM_READ_PERCENTAGE for gradual rollout
+ * `thompson_alpha/_beta` there are what applyOutcomeToPosteriors writes (by CAS) after
+ * classifyReach grades an execution, so they carry the honest-reach signal. This used to try
+ * the v_activity_score view first, behind the PARADIGM_READ_* env flags, and overlay these
+ * posteriors on the view's exit-status rows. The view is absent from the live database, and
+ * SurrealDB reports a missing table as an empty one, so every read already ended at this
+ * query; the view branch and its flags are removed. `jwtToken` is unused: tenancy is the
+ * WHERE clause below, as it already was on this path.
  *
  * Phase E: account_id-aware scoping. When `accountId` is non-null, posteriors
  * are read for that account first; legacy rows (`account_id IS NONE`) still
  * match via the org_id branch so callers without an accountId — and all
  * pre-Phase-B rows — keep returning data.
  */
-/**
- * Read the graded (alpha, beta) pairs from the canonical posterior store.
- *
- * `variant_performance_metrics.thompson_alpha/_beta` is what applyOutcomeToPosteriors
- * writes after classifyReach grades an execution, so it — and only it — carries the
- * honest-reach signal. Returns a map keyed by the same normalized activity_id the view
- * uses (the `activity:` wrapper stripped), so the two can be joined directly.
- *
- * Failure is NOT silent-degrade-to-status: an empty map means every caller falls back
- * to the uninformative prior, which is the honest reading of "we could not observe the
- * evidence". Degrading to exit status here would quietly reinstate the defect this
- * exists to fix.
- */
-async function getCanonicalPosteriors(
-  orgId: string,
-  activityIds: string[],
-  accountId: string | null,
-): Promise<Map<string, { alpha: number; beta: number }>> {
-  const out = new Map<string, { alpha: number; beta: number }>();
-  if (activityIds.length === 0) return out;
-  try {
-    const rows = await surrealDB.query<{
-      variant_id: string;
-      thompson_alpha: number | null;
-      thompson_beta: number | null;
-    }>(
-      `SELECT variant_id, thompson_alpha, thompson_beta FROM variant_performance_metrics
-       WHERE ((account_id = $account_id) OR (account_id IS NONE AND (org_id = $org_id OR org_id = $org_id_prefix)))
-         AND variant_id IN $activity_ids`,
-      {
-        // BOTH FORMS ARE REQUIRED — do not "simplify" this back to the bare one.
-        //
-        // Binding only the stripped form matched NOTHING. Measured on the live table:
-        //   org_id = 'substrate'                ->     0 rows
-        //   org_id = 'organizations:substrate'  -> 3,275 rows
-        // (distribution: organizations:substrate 3275, organizations:metabob 76,
-        //  public 17, metabob_internal 1, unknown 1)
-        //
-        // So this returned an empty map on EVERY call, and the doc comment on this
-        // function says what that means: every caller falls back to the uninformative
-        // prior. That is why every Thompson draw was Beta(1,1) plus heuristic boosts,
-        // and why beta sat pinned at 1.0 — no failure evidence could reach the draw.
-        //
-        // The strip was a back-compat shim for legacy plain-string rows. Those 19 rows
-        // are real, so this accepts EITHER form rather than swapping one for the other.
-        // The same both-forms pattern is already used elsewhere in this file (see the
-        // $org_id_bare / $org_id_prefixed clauses); these two queries were the ones left
-        // out of it. Pinned by src/db/paradigm.org-id-binding.test.ts.
-        org_id: orgId.startsWith('organizations:') ? orgId.replace('organizations:', '') : orgId,
-        org_id_prefix: orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`,
-        account_id: accountId,
-        // Stored ids are BARE (credit writes through normalizeActivityId); callers
-        // pass record strings (activity:<...>). Normalize here so the read matches.
-        activity_ids: activityIds.map(normalizeActivityId),
-      },
-    );
-    for (const r of rows ?? []) {
-      const id = String(r.variant_id).replace(/^activity:/, '').replace(/[⟨⟩`]/g, '');
-      out.set(id, {
-        alpha: typeof r.thompson_alpha === 'number' ? r.thompson_alpha : 1,
-        beta: typeof r.thompson_beta === 'number' ? r.thompson_beta : 1,
-      });
-    }
-  } catch (error) {
-    logger.warn('[paradigm] canonical posterior read failed; selection falls back to the prior, NOT to exit status', {
-      error: error instanceof Error ? error.message : String(error),
-    });
-  }
-  return out;
-}
-
 export async function getActivityScores(
   orgId: string,
   activityIds?: string[],
@@ -594,116 +455,7 @@ export async function getActivityScores(
   accountId: string | null = null
 ): Promise<QueryPathResult<ActivityScore>> {
   const startTime = Date.now();
-  const useParadigm = shouldUseParadigmRead();
-  const noFallback = shouldSkipLegacyFallback();
 
-  // P5.1: Try new v_activity_score view if paradigm read is enabled for this request
-  if (useParadigm) {
-    try {
-      // org_id format: Support both plain strings and record ID format
-      // execution table may store either "public" or "organizations:public"
-      const plainOrgId = orgId.replace(/^organizations:/, '');
-      // Phase E: account_id wins; legacy rows (account_id IS NONE) match via
-      // either org_id form. Both binds are always present so the SQL is stable.
-      let query = `SELECT * FROM v_activity_score WHERE ((account_id = $account_id) OR (account_id IS NONE AND (org_id = $org_id OR org_id = $plain_org_id)))`;
-      const params: Record<string, any> = {
-        org_id: orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`,
-        plain_org_id: plainOrgId,
-        account_id: accountId,
-      };
-
-      if (activityIds && activityIds.length > 0) {
-        // Normalize activity IDs: strip "activity:" prefix for matching
-        // execution table stores plain IDs like "fix.bug.comprehensive"
-        // but activity table uses record IDs like "activity:fix.bug.comprehensive"
-        const normalizedIds = activityIds.map(id => id.replace(/^activity:/, '').replace(/[⟨⟩`]/g, ''));
-        query += ` AND activity_id IN $activity_ids`;
-        params.activity_ids = normalizedIds;
-      }
-
-      const result = jwtToken
-        ? await queryWithAuth<ActivityScore>(jwtToken, query, params)
-        : await surrealDB.query<ActivityScore>(query, params);
-
-      if (result && result.length > 0) {
-        // THE POSTERIOR COMES FROM THE POSTERIOR STORE, NOT FROM EXIT STATUS.
-        //
-        // v_activity_score defines `alpha = count(success = true) + 1`. `success` is
-        // the template's exit status, which is the signal `reached` exists to replace:
-        // on a 24h exhaustive census of the hub (n=41,600) status was 92.4% green
-        // while honest reach was 1.67%. Selecting on it is selecting on ~90% noise.
-        //
-        // The honest posterior already exists. classifyReach grades every execution,
-        // applyOutcomeToPosteriors writes the (alpha, beta) deltas, and they land in
-        // variant_performance_metrics — which posterior-update.ts calls, in its own
-        // words, "the canonical posterior store". It was simply never read here: the
-        // view returns rows for every activity that has ever executed, so the
-        // `result.length > 0` branch always won and the canonical store was reached
-        // only when the view returned NOTHING. Populated, never consumed — the reach
-        // grading the whole learning loop is built on could not steer one selection.
-        //
-        // So overlay it. The view still supplies the descriptive columns it computes
-        // honestly (total_executions, successes/failures, durations, costs); only the
-        // two columns that STEER — alpha and beta — are taken from the graded store.
-        //
-        // An activity with no canonical row falls back to the uninformative prior
-        // (1, 1) rather than to its exit-status count. That is the deliberate part: an
-        // ungraded activity has no evidence, and Thompson must be told that rather
-        // than handed a green exit record. Expect a mass collapse toward (1,1) and
-        // near-uniform selection on first deploy. That is not the fleet forgetting —
-        // it is the fleet no longer claiming to know things it never measured, and the
-        // posterior rebuilds from graded outcomes at the rate reach verdicts land.
-        const graded = await getCanonicalPosteriors(
-          orgId,
-          result.map((r) => r.activity_id),
-          accountId,
-        );
-        const data = result.map((r) => {
-          const g = graded.get(r.activity_id);
-          return { ...r, alpha: g?.alpha ?? 1, beta: g?.beta ?? 1 };
-        });
-
-        logger.debug('[paradigm] Activity scores fetched from new view', {
-          count: data.length,
-          graded_posteriors: graded.size,
-          path: 'new',
-          latency_ms: Date.now() - startTime,
-        });
-
-        return {
-          data,
-          path: 'new',
-          latency_ms: Date.now() - startTime,
-        };
-      }
-
-      // P5.1: If no fallback mode and empty result, return empty (don't try legacy)
-      if (noFallback) {
-        logger.debug('[paradigm] Activity scores empty from new view (no fallback)', {
-          path: 'new',
-          latency_ms: Date.now() - startTime,
-        });
-        return {
-          data: [],
-          path: 'new',
-          latency_ms: Date.now() - startTime,
-        };
-      }
-    } catch (error) {
-      // P5.1: If no fallback mode, propagate error
-      if (noFallback) {
-        logger.error('[paradigm] v_activity_score query failed (no fallback)', {
-          error: error instanceof Error ? error.message : String(error),
-        });
-        throw error;
-      }
-      logger.warn('[paradigm] v_activity_score query failed, falling back', {
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
-
-  // Fall back to legacy variant_performance_metrics
   try {
     let query = `SELECT
       variant_id AS activity_id,
@@ -728,7 +480,10 @@ export async function getActivityScores(
       // legacy rows (account_id IS NONE) match via org_id. Both params bound.
       query += ` WHERE ((account_id = $account_id)`
         + ` OR (account_id IS NONE AND (org_id = $org_id OR org_id = $org_id_prefix)))`;
-      // BOTH FORMS — same defect and same fix as getCanonicalPosteriors above.
+      // BOTH FORMS ARE REQUIRED — do not "simplify" this back to the bare one. Measured on
+      // the live table: org_id = 'substrate' -> 0 rows, 'organizations:substrate' -> 3,275.
+      // The bare form stays for the 19 legacy plain-string rows. Pinned by
+      // src/db/paradigm.org-id-binding.test.ts.
       //
       // The TODO below expected a migration to record format, after which `orgId` could be
       // used directly. That migration HAPPENED: this table now holds 3,351 prefixed rows
@@ -747,13 +502,14 @@ export async function getActivityScores(
 
     if (activityIds && activityIds.length > 0) {
       query += ` AND variant_id IN $activity_ids`;
-      // Stored variant_id is BARE; callers pass record strings. Normalize (see getCanonicalPosteriors).
+      // Stored ids are BARE (credit writes through normalizeActivityId); callers pass record
+      // strings (activity:<...>). Normalize here so the read matches.
       params.activity_ids = activityIds.map(normalizeActivityId);
     }
 
     const result = await surrealDB.query<ActivityScore>(query, params);
 
-    logger.info('[paradigm] Activity scores fetched from legacy table', {
+    logger.info('[paradigm] Activity scores fetched from variant_performance_metrics', {
       count: result?.length || 0,
       path: 'legacy',
       latency_ms: Date.now() - startTime,
@@ -766,7 +522,7 @@ export async function getActivityScores(
     };
 
   } catch (error) {
-    logger.error('[paradigm] Both new and legacy activity score queries failed', {
+    logger.error('[paradigm] Activity score query failed', {
       error: error instanceof Error ? error.message : String(error),
     });
     return {
@@ -810,12 +566,9 @@ export async function queryActivitiesByShapes(
   jwtToken?: string | null
 ): Promise<QueryPathResult<ParadigmActivity>> {
   const startTime = Date.now();
-  const useParadigm = shouldUseParadigmRead();
-  const noFallback = shouldSkipLegacyFallback();
 
-  // P5.1: Try new activity table with shape matching if paradigm read is enabled
-  if (useParadigm) {
-    try {
+  // Try the activity table with shape matching; on empty or error, fall back to legacy below.
+  try {
     const whereClauses: string[] = [];
     // Admit a bounded superset, not the tight caller limit. The downstream
     // Thompson layer in /recommend re-ranks this pool by α/β draws, so the
@@ -894,31 +647,10 @@ export async function queryActivitiesByShapes(
         latency_ms: Date.now() - startTime,
       };
     }
-
-    // P5.1: If no fallback mode and empty result, return empty
-    if (noFallback) {
-      logger.debug('[paradigm] Activities empty from new table (no fallback)', {
-        path: 'new',
-        latency_ms: Date.now() - startTime,
-      });
-      return {
-        data: [],
-        path: 'new',
-        latency_ms: Date.now() - startTime,
-      };
-    }
-    } catch (error) {
-      // P5.1: If no fallback mode, propagate error
-      if (noFallback) {
-        logger.error('[paradigm] Shape-based query failed (no fallback)', {
-          error: error instanceof Error ? error.message : String(error),
-        });
-        throw error;
-      }
-      logger.warn('[paradigm] Shape-based query failed, falling back to legacy', {
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
+  } catch (error) {
+    logger.warn('[paradigm] Shape-based query failed, falling back to legacy', {
+      error: error instanceof Error ? error.message : String(error),
+    });
   }
 
   // Fall back to legacy activity_template table
@@ -1115,7 +847,7 @@ export async function getShapeConditionedScores(
 
   const params = {
     // Executions store org_id as written ('organizations:x' mostly, bare for a few legacy
-    // writers); bind both forms, as getCanonicalPosteriors does.
+    // writers); bind both forms, as getActivityScores does.
     org_ids: [orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`, orgId.replace(/^organizations:/, '')],
     activity_ids: activityIds.map(normalizeActivityId),
     signature: computeShapeSignature(inputShapes),
@@ -2122,80 +1854,37 @@ export async function getVariantScores(
     };
   }
 
-  const fullOrgId = orgId.startsWith('organizations:') ? orgId : `organizations:${orgId}`;
-
   try {
-    // Query from v_activity_score view (computed from execution table).
-    // Phase E: account_id wins; legacy rows (account_id IS NONE) match via
-    // org_id. Both binds always present.
+    // Read the canonical posterior store directly. This used to query the v_activity_score
+    // view first and fall back here only when it returned nothing; the view is absent from
+    // the live database (a missing table reads as empty), so every call already landed here.
+    // Phase E: dual-tenant scoping. account_id wins; legacy rows (account_id IS NONE) match
+    // via org_id.
     const query = `
       SELECT
-        activity_id,
-        alpha,
-        beta,
-        <float> successes / <float> total_executions AS success_rate,
+        variant_id AS activity_id,
+        thompson_alpha AS alpha,
+        thompson_beta AS beta,
+        success_rate,
         total_executions,
         avg_duration_ms,
         avg_cost_usd
-      FROM v_activity_score
-      WHERE activity_id IN $variant_ids
-        AND ((account_id = $account_id) OR (account_id IS NONE AND org_id = $org_id))
+      FROM variant_performance_metrics
+      WHERE variant_id IN $variant_ids
+        AND ${VPM_TENANT_SCOPE_SQL}
     `;
 
-    const params = {
+    // The stored org_id is prefixed on nearly every row and bare on a legacy few;
+    // VPM_TENANT_SCOPE_SQL strips the prefix on both sides, so either form matches.
+    const legacyOrgId = orgId.startsWith('organizations:')
+      ? orgId.replace('organizations:', '')
+      : orgId;
+
+    const result = await surrealDB.query<VariantScore>(query, {
       variant_ids: variantIds,
-      org_id: fullOrgId,
+      org_id: legacyOrgId,
       account_id: accountId,
-    };
-
-    let result = jwtToken
-      ? await queryWithAuth<VariantScore>(jwtToken, query, params)
-      : await surrealDB.query<VariantScore>(query, params);
-
-    // Same overlay as getActivityScores, for the same reason: the view's alpha/beta
-    // are exit-status counts, and variant selection must be steered by the graded
-    // posterior. success_rate and the descriptive columns stay as the view computes
-    // them. See the long note at the getActivityScores call site.
-    if (result && result.length > 0) {
-      const graded = await getCanonicalPosteriors(orgId, result.map((r) => r.activity_id), accountId);
-      result = result.map((r) => {
-        const g = graded.get(r.activity_id);
-        return { ...r, alpha: g?.alpha ?? 1, beta: g?.beta ?? 1 };
-      });
-    }
-
-    // If v_activity_score doesn't have data, fall back to variant_performance_metrics
-    if (!result || result.length === 0) {
-      logger.debug('[paradigm] getVariantScores: falling back to variant_performance_metrics');
-
-      // Phase E: dual-tenant scoping on the legacy fallback. account_id wins;
-      // legacy rows (account_id IS NONE) match via org_id.
-      const fallbackQuery = `
-        SELECT
-          variant_id AS activity_id,
-          thompson_alpha AS alpha,
-          thompson_beta AS beta,
-          success_rate,
-          total_executions,
-          avg_duration_ms,
-          avg_cost_usd
-        FROM variant_performance_metrics
-        WHERE variant_id IN $variant_ids
-          AND ${VPM_TENANT_SCOPE_SQL}
-      `;
-
-      // The stored org_id is prefixed on nearly every row and bare on a legacy few;
-      // VPM_TENANT_SCOPE_SQL strips the prefix on both sides, so either form matches.
-      const legacyOrgId = orgId.startsWith('organizations:')
-        ? orgId.replace('organizations:', '')
-        : orgId;
-
-      result = await surrealDB.query<VariantScore>(fallbackQuery, {
-        variant_ids: variantIds,
-        org_id: legacyOrgId,
-        account_id: accountId,
-      });
-    }
+    });
 
     // Ensure all values are numbers (handle NaN from division by zero)
     const scores = (result || []).map(s => ({

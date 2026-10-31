@@ -96,12 +96,7 @@ mock.module('../db/paradigm', () => ({
   // SYNC predicate returns a truthy Promise, which flips branches invisibly.
   computeShapeSignature: (s: string[]) => s,
   getActivityShapePatterns: async () => ({ data: [], path: 'legacy' as const }),
-  getParadigmReadPercentage: () => 0,
-  isParadigmReadEnabled: () => false,
-  logDualWriteConfig: () => undefined,
   queryActivitiesByEmbeddingDense: async () => ({ data: [], path: 'legacy' as const }),
-  shouldSkipLegacyFallback: () => false,
-  shouldUseParadigmRead: () => false,
   transformLegacyTemplate: (t: any) => t,
 }));
 

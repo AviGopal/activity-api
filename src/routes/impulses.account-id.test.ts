@@ -80,16 +80,11 @@ mock.module('../db/paradigm', () => ({
   // Filled from the real module's export list, MATCHING each signature.
   // A mock missing any export fails at import time (what made this suite inert);
   // and stubbing a SYNC predicate as `async () => null` returns a truthy Promise,
-  // which silently flips branches like shouldSkipLegacyFallback() and fabricates
+  // which silently flips a branch that tests it, and fabricates
   // failures that look like product defects.
   computeShapeSignature: (s: string[]) => s,
   getActivityShapePatterns: async () => ({ data: [], path: 'legacy' as const }),
-  getParadigmReadPercentage: () => 0,
-  isParadigmReadEnabled: () => false,
-  logDualWriteConfig: () => undefined,
   queryActivitiesByEmbeddingDense: async () => ({ data: [], path: 'legacy' as const }),
-  shouldSkipLegacyFallback: () => false,
-  shouldUseParadigmRead: () => false,
   transformLegacyTemplate: (t: any) => t,
 }));
 

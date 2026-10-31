@@ -148,24 +148,8 @@ Control paradigm schema adoption via environment variables:
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `DUAL_WRITE_ENABLED` | Write to both schemas | `true` |
-| `PARADIGM_READ_ENABLED` | Read from paradigm tables | `true` |
-| `PARADIGM_READ_PERCENTAGE` | Gradual rollout (0-100) | `100` |
-| `PARADIGM_READ_NO_FALLBACK` | Skip legacy fallback | `false` |
 
-**Example gradual rollout:**
-```bash
-# Week 1: 10% of reads from paradigm
-PARADIGM_READ_PERCENTAGE=10
-
-# Week 2: 50% of reads from paradigm
-PARADIGM_READ_PERCENTAGE=50
-
-# Week 3: 100% of reads from paradigm
-PARADIGM_READ_PERCENTAGE=100
-
-# Week 4: Disable fallback (fail fast on errors)
-PARADIGM_READ_NO_FALLBACK=true
-```
+Activity and variant scores (`getActivityScores`, `getVariantScores`) read `variant_performance_metrics`, the canonical posterior store, directly; there is no read-path flag.
 
 ### Backward Compatibility
 
@@ -207,15 +191,12 @@ SELECT * FROM activity_template_view WHERE variant_id = $id
 
 - [ ] Update execution trace writes to use paradigm field names
 - [ ] Replace `variant_id` with `activity_id` in queries
-- [ ] Use `v_activity_score` instead of `variant_performance_metrics`
-- [ ] Test with `PARADIGM_READ_PERCENTAGE=100`
-- [ ] Enable `PARADIGM_READ_NO_FALLBACK=true` before April 2027
+- [ ] Read posteriors from `variant_performance_metrics` (`thompson_alpha`/`thompson_beta`)
 
 **For Activity-API:**
 
 - [ ] Verify dual-write is working (`DUAL_WRITE_ENABLED=true`)
 - [ ] Monitor paradigm table query performance
-- [ ] Gradually increase `PARADIGM_READ_PERCENTAGE`
 - [ ] Remove legacy table queries by October 2026
 
 ### Performance Considerations
@@ -302,11 +283,7 @@ await insertExecution({
 
 #### Issue: Queries fail with paradigm schema
 
-**Solution:** Check feature flags and ensure dual-write is enabled:
-```bash
-DUAL_WRITE_ENABLED=true
-PARADIGM_READ_ENABLED=false  # Temporarily disable paradigm reads
-```
+**Solution:** Check the `[paradigm]` log lines; a failed shape query falls back to the legacy activity table on its own.
 
 #### Issue: Thompson Sampling scores differ
 
@@ -341,5 +318,4 @@ const result = await queryWithAuth(jwtToken, query, params);
 For migration support:
 - Review migration examples in `sql/migrations/`
 - Check dual-write logs in Activity-API: `[paradigm]` prefix
-- Test with `PARADIGM_READ_PERCENTAGE` gradual rollout
 - File issues in `metabob-devbob` repository

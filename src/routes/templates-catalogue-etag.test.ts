@@ -69,11 +69,6 @@ mock.module('../db/paradigm', () => ({
   buildVariantTree: async () => null,
   normalizeActivityId: (id: string) => id.replace(/^activity:/, '').replace(/[⟨⟩`]/g, ''),
   // The replacement outlives this file, so every real export stays (mock-module-completeness.test.ts).
-  isParadigmReadEnabled: () => false,
-  getParadigmReadPercentage: () => 0,
-  shouldUseParadigmRead: () => false,
-  shouldSkipLegacyFallback: () => false,
-  logDualWriteConfig: () => {},
   computeAdmissionLimit: (limit: number, cap = 1000) => Math.max(limit, cap),
   transformLegacyTemplate: (t: any) => t,
   computeShapeSignature: (shapes: string[]) => [...new Set(shapes)].sort(),

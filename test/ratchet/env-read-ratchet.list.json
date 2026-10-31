@@ -445,21 +445,6 @@
     "reason": "credential/secret: LLM provider key (read in src/selectActivityForGoal.ts)"
   },
   {
-    "name": "PARADIGM_READ_ENABLED",
-    "class": "behaviour",
-    "reason": "toggle: paradigm read path (read in src/db/paradigm.ts)"
-  },
-  {
-    "name": "PARADIGM_READ_NO_FALLBACK",
-    "class": "behaviour",
-    "reason": "toggle: paradigm read without fallback (read in src/db/paradigm.ts)"
-  },
-  {
-    "name": "PARADIGM_READ_PERCENTAGE",
-    "class": "behaviour",
-    "reason": "paradigm read rollout percentage (read in src/db/paradigm.ts)"
-  },
-  {
     "name": "POD_NAME",
     "class": "bootstrap",
     "reason": "identity/node name: pod name for vessel id (read in src/config.ts)"
