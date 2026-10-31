@@ -301,6 +301,29 @@ const ATTEMPTS_MAX = 10;
 const UNBOUND_TEMPLATE_VARIABLES_MAX = 50;
 const UNBOUND_TEMPLATE_VARIABLE_MAX_CHARS = 200;
 
+/**
+ * The execution_completed task census: how many of a stored trace's tasks completed and how many failed.
+ * A task's explicit status decides when it carries one ('completed' | 'success' vs 'failed' | 'failure'; any other
+ * status, e.g. 'pending' | 'in_progress', counts as NEITHER). A task with no status is judged by its `success`
+ * boolean: light-dispatch posts `success` and no status, and normalizePersistedTask stores what it was given, so a
+ * status-only count read completed=0 failed=0 on every such run and the ribosome (which extracts only when at least
+ * one task completed and none failed) extracted nothing. A task with neither counts as neither.
+ */
+export function countTaskCensus(tasks: unknown): { completed: number; failed: number } {
+  let completed = 0;
+  let failed = 0;
+  if (!Array.isArray(tasks)) return { completed, failed };
+  for (const t of tasks as Array<{ status?: unknown; success?: unknown } | null | undefined>) {
+    const status = typeof t?.status === 'string' ? t.status : undefined;
+    if (status !== undefined) {
+      if (status === 'completed' || status === 'success') completed++;
+      else if (status === 'failed' || status === 'failure') failed++;
+    } else if (t?.success === true) completed++;
+    else if (t?.success === false) failed++;
+  }
+  return { completed, failed };
+}
+
 export function normalizePersistedTask(task: any): {
   task_id: string;
   description?: string;
@@ -4282,6 +4305,7 @@ app.post('/', async (c) => {
       const storedReached = typeof judgeAtInsert === 'boolean'
         ? await storedReachForEvent(String(trace.execution_id), { withheld: betaWithheldAtInsert })
         : undefined;
+      const insertCensus = countTaskCensus(trace.tasks);
       broadcaster.emit({
         type: 'execution_completed',
         timestamp: new Date().toISOString(),
@@ -4303,21 +4327,17 @@ app.post('/', async (c) => {
           // abandoned mid-flight persists non-terminal tasks; subtracting only
           // failures would score those as successes and let an observer treat a
           // partial execution as a clean one.
-          // TWO VOCABULARIES. The TaskRecord type declares
-          // 'pending' | 'in_progress' | 'completed' | 'failed', but the write path
-          // at ~:415 persists `t.success === false ? 'failure' : 'success'` — so
-          // real rows carry 'success'/'failure' and the declared type is aspirational.
-          // Counting only the declared spelling returns 0 on every real trace, which
-          // reads identically to "nothing succeeded" and silently disables any
-          // consumer gating on it. Accept both spellings; anything else (pending /
+          // THREE VOCABULARIES. The TaskRecord type declares
+          // 'pending' | 'in_progress' | 'completed' | 'failed'; the digest write
+          // (insertTraceDigest) spells 'success'/'failure'; and the stored task
+          // itself often carries NO status, only a `success` boolean (light-dispatch).
+          // Counting a spelling the row lacks returns 0, which reads identically to
+          // "nothing succeeded" and silently disables any consumer gating on it.
+          // countTaskCensus accepts all three; anything else (pending /
           // in_progress) is deliberately counted as NEITHER, so a run abandoned
           // mid-flight cannot pass for a clean one.
-          completed_task_count: Array.isArray(trace.tasks)
-            ? trace.tasks.filter((t) => t?.status === 'completed' || (t as { status?: string })?.status === 'success').length
-            : 0,
-          failed_task_count: Array.isArray(trace.tasks)
-            ? trace.tasks.filter((t) => t?.status === 'failed' || (t as { status?: string })?.status === 'failure').length
-            : 0,
+          completed_task_count: insertCensus.completed,
+          failed_task_count: insertCensus.failed,
           duration_ms: trace.duration_ms || 0,
           cost: trace.cost_usd || 0,
           completed_at: new Date().toISOString(),
@@ -5632,7 +5652,8 @@ app.post('/reach', async (c) => {
     // The graded event, one shape for both emits below. `reached` is the column the mirror above just wrote, read back
     // (storedReachForEvent), never body.reached; org_id is the trace's own stored org, never the caller's.
     const emitGradedCompleted = (recalledForEvent: string[] | undefined) => {
-      const tasks = Array.isArray(preRow.tasks) ? (preRow.tasks as Array<{ status?: string }>) : [];
+      const tasks = Array.isArray(preRow.tasks) ? (preRow.tasks as Array<{ status?: string; success?: boolean }>) : [];
+      const census = countTaskCensus(tasks);
       const activityForEvent = preActivityId || '';
       void import('../websocket/broadcaster').then(async ({ broadcaster }) => {
         const verdictForEvent = await storedReachForEvent(String(execId), { withheld: betaWithheld });
@@ -5646,8 +5667,8 @@ app.post('/reach', async (c) => {
             variant_id: typeof preRow.variant_id === 'string' ? preRow.variant_id : activityForEvent,
             success: preRow.success === true,
             task_count: tasks.length,
-            completed_task_count: tasks.filter((t) => t?.status === 'completed' || t?.status === 'success').length,
-            failed_task_count: tasks.filter((t) => t?.status === 'failed' || t?.status === 'failure').length,
+            completed_task_count: census.completed,
+            failed_task_count: census.failed,
             duration_ms: typeof preRow.duration_ms === 'number' ? preRow.duration_ms : 0,
             cost: typeof preRow.cost_usd === 'number' ? preRow.cost_usd : 0,
             completed_at: new Date().toISOString(),
