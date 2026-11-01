@@ -43,6 +43,8 @@ export const FAILURE_CLASSES: ReadonlySet<string> = new Set([
   'structural:missing-input',
   // A template bound an input to a shape nothing produces.
   'input_binding',
+  // The caller sent a request the producer could not accept: a caller fault, not the peer's.
+  'malformed_request',
   // A safety cap refused to go deeper.
   'refused:chain-depth',
   // The resolver reported its own output as degraded.
@@ -71,6 +73,10 @@ const TYPED_VARIANTS: ReadonlySet<string> = new Set([
 
 /** Ordered rules: the first match wins. Order is load-bearing (see the notes). */
 const RULES: ReadonlyArray<readonly [RegExp, string]> = [
+  // A malformed request belongs to the CALLER, so name it before any error rule that could
+  // otherwise read carrier prose and blame the producer. Matches the proxy carrier
+  // (execution_error, failure_mode=malformed_request) and the bare dispatcher detail alike.
+  [/malformed[\s_-]*request/i, 'malformed_request'],
   // Before transport: a depth refusal can mention a dispatch that "would target" a peer.
   [/composition chain depth|chain depth \(\d+\)|max(?:imum)? (?:chain )?depth/i, 'refused:chain-depth'],
   // Before resolver_error: a structuredError whose cause is a failed fetch is transport.
