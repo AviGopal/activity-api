@@ -56,6 +56,21 @@ mock.module('../db/surreal', () => ({
   createAuthenticatedClient: async () => ({}),
 }));
 
+// Stub Redis so the 200 paths' template-cache invalidation does not retry against a
+// missing local Redis until the test times out (same stub as activities-mint-dedup.test.ts).
+const redisStub = {
+  del: async () => 0,
+  get: async () => null,
+  set: async () => 'OK',
+  sadd: async () => 0,
+  smembers: async () => [],
+  withLock: async (_lockKey: unknown, _cacheKey: unknown, fn: () => Promise<unknown>) => fn(),
+};
+mock.module('../db/redis', () => ({
+  RedisClient: { getInstance: () => redisStub },
+  redis: redisStub,
+}));
+
 // Import AFTER the module mock is registered.
 const impulsesRoutes = (await import('./impulses')).default;
 
@@ -334,6 +349,90 @@ describe('POST /v2/impulses/resolve → activityTemplate_update (404 vs 403)', (
     expect(status).toBe(200);
     expect(body.success).toBe(true);
     expect(body.metadata.shape).toBe('activityTemplate_update_result');
+    expect(queryLog.some((q) => q.sql.includes('UPDATE activity'))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// activityTemplate_update — the placeholder gate reads declarations from the
+// row the UPDATE merges into (`activity`), not only the legacy table.
+// ---------------------------------------------------------------------------
+
+describe('POST /v2/impulses/resolve → activityTemplate_update placeholder gate reads declared variables from `activity`', () => {
+  beforeEach(resetQueryLog);
+
+  const TEMPLATE_ID = 'development-vessel:own-check-baseline';
+  const row = { id: `activity:${TEMPLATE_ID}`, scope: 'org', org_id: 'org-test', name: 'own-check-baseline' };
+
+  // Route each query by what it reads: the gate's `activity` variables read, the legacy
+  // `activity_template` read, the existence SELECT, and the UPDATE.
+  function withRows(opts: { activityVars?: unknown[] | null; legacyVars?: unknown[] | null }) {
+    queryHandler = (sql: string) => {
+      if (sql.includes('SELECT variables FROM activity_template')) {
+        return opts.legacyVars ? [{ variables: opts.legacyVars }] : [];
+      }
+      if (sql.includes('SELECT variables FROM activity ')) {
+        return opts.activityVars === null ? [] : [{ ...row, variables: opts.activityVars }];
+      }
+      if (sql.includes('SELECT * FROM activity')) return [row];
+      if (sql.includes('UPDATE activity')) return [row];
+      return [];
+    };
+  }
+
+  const update = (tasks: unknown[]) =>
+    resolve(buildAppWithStubAuth({ orgId: 'org-test', isAdmin: false }), {
+      type: 'activityTemplate_update',
+      templateId: TEMPLATE_ID,
+      updates: { tasks },
+    });
+
+  const declared = [{ name: 'gap_id' }, { name: 'base_ref' }];
+
+  test('MUST-FAIL — placeholders declared on the `activity` row are accepted and the UPDATE runs', async () => {
+    withRows({ activityVars: declared, legacyVars: null });
+    const { status, body } = await update([
+      { id: 'classify', resolver: 'own_check_baseline_classify', config: { gap: '{{gap_id}}', base: '{{base_ref}}' } },
+    ]);
+    expect(status).toBe(200);
+    expect(body.success).toBe(true);
+    expect(queryLog.some((q) => q.sql.includes('UPDATE activity'))).toBe(true);
+  });
+
+  test('an undeclared placeholder on that same template is still refused', async () => {
+    withRows({ activityVars: declared, legacyVars: null });
+    const { status, body } = await update([
+      { id: 'classify', resolver: 'own_check_baseline_classify', config: { gap: '{{gap_id}}', x: '{{x}}' } },
+    ]);
+    expect(status).toBe(400);
+    expect(body.refused).toBe(true);
+    expect(body.error).toContain('{{x}}');
+    expect(body.error).not.toContain('{{gap_id}}');
+    expect(queryLog.some((q) => q.sql.includes('UPDATE activity'))).toBe(false);
+  });
+
+  test('a template with no variables in either table still has its placeholder refused', async () => {
+    withRows({ activityVars: undefined, legacyVars: null });
+    const { status, body } = await update([{ id: 'classify', config: { gap: '{{gap_id}}' } }]);
+    expect(status).toBe(400);
+    expect(body.refused).toBe(true);
+    expect(body.error).toContain('{{gap_id}}');
+    expect(queryLog.some((q) => q.sql.includes('UPDATE activity'))).toBe(false);
+  });
+
+  test('the legacy table is not consulted when the `activity` row exists', async () => {
+    withRows({ activityVars: undefined, legacyVars: declared });
+    const { status, body } = await update([{ id: 'classify', config: { gap: '{{gap_id}}' } }]);
+    expect(status).toBe(400);
+    expect(body.error).toContain('{{gap_id}}');
+    expect(queryLog.some((q) => q.sql.includes('FROM activity_template'))).toBe(false);
+  });
+
+  test('CONTROL — a task update with no placeholders is accepted as before', async () => {
+    withRows({ activityVars: undefined, legacyVars: null });
+    const { status, body } = await update([{ id: 'classify', resolver: 'own_check_baseline_classify' }]);
+    expect(status).toBe(200);
+    expect(body.success).toBe(true);
     expect(queryLog.some((q) => q.sql.includes('UPDATE activity'))).toBe(true);
   });
 });

@@ -3017,11 +3017,31 @@ router.post('/resolve', async (c) => {
         {
           const _tasks = (updatePointer.updates as Record<string, unknown>)['tasks'];
           if (Array.isArray(_tasks)) {
-            const stored = await surrealDB.query<Record<string, unknown>[]>(
-              'SELECT variables FROM activity_template WHERE variant_id = $vid LIMIT 1',
-              { vid: updatePointer.templateId },
-            ).catch(() => [] as Record<string, unknown>[][]);
-            const storedRow = (Array.isArray(stored?.[0]) ? stored[0]![0] : undefined) as { variables?: unknown } | undefined;
+            // The declarations live on the row this UPDATE merges into: the `activity` row,
+            // read by the same record id and tenant scope as the UPDATE below (its extra
+            // admin/evidence clause decides WRITE authority, which is checked after this gate).
+            // Seeds and minted templates are written to `activity`; the legacy SCHEMAFULL
+            // `activity_template` table is read only when no `activity` row exists. Reading
+            // only the legacy table refused every declared placeholder of an `activity`-only
+            // template as undeclared.
+            const _firstRow = (res: unknown): { variables?: unknown } | undefined => {
+              const r = Array.isArray(res) ? res[0] : undefined;
+              return (Array.isArray(r) ? r[0] : r) as { variables?: unknown } | undefined;
+            };
+            const _gateAuth = getJwtAuthFromContext(c)!;
+            const current = await executeAsAuth<Record<string, unknown>>(
+              _gateAuth,
+              `SELECT variables FROM activity WHERE record::id(id) = $id AND (${accountIdScopedWhere()} OR scope = 'global') LIMIT 1`,
+              { id: updatePointer.templateId, org_id: _gateAuth.orgId, account_id: _gateAuth.accountId ?? null },
+            ).catch(() => [] as Record<string, unknown>[]);
+            let storedRow = _firstRow(current);
+            if (!storedRow) {
+              const stored = await surrealDB.query<Record<string, unknown>[]>(
+                'SELECT variables FROM activity_template WHERE variant_id = $vid LIMIT 1',
+                { vid: updatePointer.templateId },
+              ).catch(() => [] as Record<string, unknown>[][]);
+              storedRow = _firstRow(stored);
+            }
             const declared = new Set<string>();
             const mergedVars = (updatePointer.updates as Record<string, unknown>)['variables'] ?? storedRow?.variables;
             if (Array.isArray(mergedVars)) {
