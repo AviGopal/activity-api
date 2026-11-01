@@ -396,7 +396,10 @@ export async function enrichTemplatesWithMetrics(
       const normalizedMetric = {
         id,
         total_executions: metric.total_executions,
-        successful_executions: metric.successful_executions || metric.successes,
+        // `??`, not `||`: a stored 0 is a measurement. `||` turned it into undefined, and
+        // light-dispatch's retire sweep reads undefined as "has succeeded" (fail-safe), so no
+        // never-succeeded arm could ever be retired. Only a missing counter falls back.
+        successful_executions: metric.successful_executions ?? metric.successes,
         failed_executions: metric.failed_executions || metric.failures,
         success_rate: metric.success_rate,
         avg_duration_ms: metric.avg_duration_ms,
