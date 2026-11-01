@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { createHash } from 'node:crypto';
 import { getActivitiesWithTieredFallback } from "./activities.get-activities-with-tiered-fallback";
 /**
  * Activity Template Routes
@@ -152,6 +153,23 @@ export function shapeSignature(arr: unknown): string {
 }
 
 /**
+ * Normalized EXECUTABLE BODY of a template's task list, for the mint-dedup novelty
+ * check. One entry per task, in order, uniform for every task:
+ *   resolver (or "") | sorted inputShapes | sorted outputShapes | sha256(trimmed prompt.template) (or "")
+ * Non-executable fields (ids, description, metadata) are excluded, so a
+ * description-only change is the same body. A missing or non-array task list is [].
+ */
+export function taskBodySignature(tasks: unknown): string {
+  const list = Array.isArray(tasks) ? tasks : [];
+  return JSON.stringify(list.map((t: any) => {
+    const tmpl = typeof t?.prompt?.template === 'string' ? t.prompt.template.trim() : '';
+    const promptHash = tmpl ? createHash('sha256').update(tmpl).digest('hex') : '';
+    const resolver = typeof t?.resolver === 'string' ? t.resolver : '';
+    return `${resolver}|${shapeSignature(t?.inputShapes)}|${shapeSignature(t?.outputShapes)}|${promptHash}`;
+  }));
+}
+
+/**
  * Pick the existing template an incoming mint should be UPSERTed onto, or undefined.
  *
  * This is the SAFETY BOUNDARY of mint dedup, extracted so it can be asserted
@@ -161,18 +179,23 @@ export function shapeSignature(arr: unknown): string {
  *   (b) its consumed/produced shape signature is IDENTICAL — two templates that
  *       share a name but differ in shapes are different capabilities and merging
  *       them would destroy a distinct posterior;
- *   (c) it is not the incoming row itself.
+ *   (c) it is not the incoming row itself;
+ *   (d) when `incomingBody` is given, its task list has the SAME normalized
+ *       executable body (`taskBodySignature`). A different body is NOVEL — a
+ *       variant — and lands as a sibling with its own posterior, whatever the
+ *       candidate's id or origin. The mint route always passes it.
  * Exact normalized-name matches are preferred over timestamp-suffixed siblings.
  */
 export function selectDedupTarget(
-  candidates: Array<{ id_str?: unknown; name?: unknown; input_shapes?: unknown; output_shapes?: unknown }> | null | undefined,
-  opts: { normalizedName: string; incomingSig: string; activityId: string },
+  candidates: Array<{ id_str?: unknown; name?: unknown; input_shapes?: unknown; output_shapes?: unknown; tasks?: unknown }> | null | undefined,
+  opts: { normalizedName: string; incomingSig: string; activityId: string; incomingBody?: string },
 ): { id_str?: unknown; name?: unknown } | undefined {
   const matches = (candidates || []).filter((cand) => {
     const candName = String(cand?.name ?? '');
     if (candName.replace(TS_SUFFIX_RE, '') !== opts.normalizedName) return false;
     const candId = String(cand?.id_str ?? '');
     if (!candId || candId === opts.activityId) return false;
+    if (opts.incomingBody !== undefined && taskBodySignature(cand?.tasks) !== opts.incomingBody) return false;
     return `${shapeSignature(cand?.input_shapes)}|${shapeSignature(cand?.output_shapes)}` === opts.incomingSig;
   });
   matches.sort((a, b) =>
@@ -824,8 +847,12 @@ app.post('/templates', async (c) => {
     // traffic across uninformed clones (52-62% of a week's mints in the audit).
     // When the incoming name/id carries a trailing timestamp suffix, look for an
     // existing template with the same NORMALIZED name AND the same consumed/produced
-    // shape signature; if found, UPSERT onto that record — its accumulated posterior
-    // is preserved (the metrics UPSERT below uses `??` defaults), body fields update.
+    // shape signature AND the same executable body (`taskBodySignature`: each task's
+    // resolver, shapes and prompt); if found, UPSERT onto that record — its accumulated
+    // posterior is preserved (the metrics UPSERT below uses `??` defaults). A different
+    // body is NOVEL (a variant) and inserts as a sibling under its own id, for every
+    // candidate alike: name plus shape signature alone once folded a variant with an
+    // added task over the row it varied.
     // ENTRY GATE. Only a timestamp-suffixed re-mint enters the dedup path; an
     // un-suffixed name deliberately issues NO candidate query, a contract pinned by
     // `activities-mint-dedup.test.ts` ("un-suffixed names never trigger the dedup
@@ -853,7 +880,7 @@ app.post('/templates', async (c) => {
           ? `(name = $norm_name OR string::starts_with(name, $norm_prefix)) AND org_id = $dedup_org`
           : `(name = $norm_name OR string::starts_with(name, $norm_prefix))`;
         const dedupQuery = `
-          SELECT meta::id(id) AS id_str, name, input_shapes, output_shapes FROM activity
+          SELECT meta::id(id) AS id_str, name, input_shapes, output_shapes, tasks FROM activity
           WHERE ${dedupWhere}
           LIMIT 50
         `;
@@ -866,12 +893,13 @@ app.post('/templates', async (c) => {
           ? await queryWithAuth<any>(jwtAuth.jwtToken, dedupQuery, dedupParams)
           : await surrealDB.query<any>(dedupQuery, dedupParams);
         // Prefer an exact normalized-name match; fall back to the first
-        // timestamp-suffixed sibling with the same shape signature. The predicate
+        // timestamp-suffixed sibling with the same shape signature and body. The predicate
         // lives in `selectDedupTarget` so the safety boundary is directly testable.
         const dedupTarget = selectDedupTarget(dedupCandidates as any, {
           normalizedName,
           incomingSig,
           activityId: String(activityId),
+          incomingBody: taskBodySignature(activityTasks),
         }) as any;
         if (dedupTarget) {
           logger.info('Template mint dedup: UPSERT onto existing capability (posterior preserved)', {
