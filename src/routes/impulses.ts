@@ -2985,13 +2985,32 @@ router.post('/resolve', async (c) => {
         // SAFE direction — it returns a producer to the candidate pool rather than removing one —
         // so it belongs with the ordinary write-scope updates rather than behind the Thompson
         // evidence gate that guards deprecation.
-        const allowedFields = new Set(['name', 'description', 'tags', 'tasks', 'input_shapes', 'optional_input_shapes', 'output_shapes', 'deprecated', 'retired']);
+        //
+        // `variables` is updatable because the placeholder gate below takes its declarations
+        // from it: a row whose stored declarations were lost (e.g. replaced by a mint UPSERT
+        // whose body carried none) could otherwise never declare a placeholder again, and every
+        // task update using one would be refused. It is shape-checked here; the write rules are
+        // the same as for every other field.
+        const allowedFields = new Set(['name', 'description', 'tags', 'tasks', 'variables', 'input_shapes', 'optional_input_shapes', 'output_shapes', 'deprecated', 'retired']);
         const rejected = Object.keys(updatePointer.updates).filter((k) => !allowedFields.has(k));
         if (rejected.length > 0) {
           return c.json({
             success: false,
             error: `Disallowed update fields: ${rejected.join(', ')}. Allowed: ${Array.from(allowedFields).join(', ')}`,
           } as ImpulseResolveResponse, 400);
+        }
+        if ('variables' in updatePointer.updates) {
+          const _vars = (updatePointer.updates as Record<string, unknown>)['variables'];
+          const _badVar = !Array.isArray(_vars)
+            ? 'variables must be an array of objects, each with a non-empty string name'
+            : (() => {
+                const i = _vars.findIndex((v) => !v || typeof v !== 'object' || Array.isArray(v)
+                  || typeof (v as { name?: unknown }).name !== 'string' || !(v as { name: string }).name);
+                return i < 0 ? null : `variables[${i}] must be an object with a non-empty string name`;
+              })();
+          if (_badVar) {
+            return c.json({ success: false, error: `Invalid update field: ${_badVar}` } as ImpulseResolveResponse, 400);
+          }
         }
 
         // A TEMPLATE IS THE ONLY CODE HERE THAT SHIPS WITH NO COMPILE STEP (2026-08-09).
@@ -3011,9 +3030,9 @@ router.post('/resolve', async (c) => {
         // cannot distinguish from a bad pathway). Same reasoning, one plane over: a template
         // stored broken is re-dispatched forever and every failure is charged to the drafter.
         //
-        // Checked against the MERGED view, not the update payload: `variables` is not an
-        // updatable field, so a placeholder's declaration lives only in the stored template and
-        // validating the payload alone would false-positive on every legitimate task update.
+        // Checked against the MERGED view, not the task payload alone: an update's `variables`
+        // when it carries them, otherwise the stored template's, so a task update that does not
+        // restate its declarations is not false-positived.
         {
           const _tasks = (updatePointer.updates as Record<string, unknown>)['tasks'];
           if (Array.isArray(_tasks)) {

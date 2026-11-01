@@ -436,3 +436,94 @@ describe('POST /v2/impulses/resolve → activityTemplate_update placeholder gate
     expect(queryLog.some((q) => q.sql.includes('UPDATE activity'))).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// activityTemplate_update — `variables` is updatable, so a row whose stored
+// declarations were lost (variables NULL) can declare its placeholders again.
+// ---------------------------------------------------------------------------
+
+describe('POST /v2/impulses/resolve → activityTemplate_update accepts a shape-checked `variables` update', () => {
+  beforeEach(resetQueryLog);
+
+  const TEMPLATE_ID = 'development-vessel:own-check-baseline';
+  // The live row after the fold: an `activity` row exists, its variables are NULL.
+  const row = { id: `activity:${TEMPLATE_ID}`, scope: 'org', org_id: 'org-test', name: 'own-check-baseline', variables: null };
+
+  function withNullVarsRow() {
+    queryHandler = (sql: string) => {
+      if (sql.includes('FROM activity_template')) return [];
+      if (sql.includes('SELECT variables FROM activity ')) return [row];
+      if (sql.includes('SELECT * FROM activity')) return [row];
+      if (sql.includes('UPDATE activity')) return [row];
+      return [];
+    };
+  }
+
+  const update = (updates: Record<string, unknown>) =>
+    resolve(buildAppWithStubAuth({ orgId: 'org-test', isAdmin: false }), {
+      type: 'activityTemplate_update',
+      templateId: TEMPLATE_ID,
+      updates,
+    });
+
+  const tasks = [{ id: 'classify', resolver: 'own_check_baseline_classify', config: { gap: '{{gap_id}}', base: '{{base_ref}}' } }];
+  const updateCall = () => queryLog.find((q) => q.sql.includes('UPDATE activity MERGE'));
+
+  test('MUST-FAIL — variables declared in the update cover its placeholders: accepted, and the UPDATE carries them', async () => {
+    withNullVarsRow();
+    const variables = [{ name: 'gap_id' }, { name: 'base_ref' }];
+    const { status, body } = await update({ variables, tasks });
+    expect(status).toBe(200);
+    expect(body.success).toBe(true);
+    expect(updateCall()?.params?.updates?.variables).toEqual(variables);
+  });
+
+  test('a placeholder the update does not declare is still refused, naming it', async () => {
+    withNullVarsRow();
+    const { status, body } = await update({ variables: [{ name: 'gap_id' }], tasks });
+    expect(status).toBe(400);
+    expect(body.refused).toBe(true);
+    expect(body.error).toContain('{{base_ref}}');
+    expect(body.error).not.toContain('{{gap_id}}');
+    expect(updateCall()).toBeUndefined();
+  });
+
+  for (const [label, variables] of [
+    ['a string', 'gap_id'],
+    ['an object', { name: 'gap_id' }],
+    ['an entry without a name', [{}]],
+    ['an empty name', [{ name: '' }]],
+    ['a non-string name', [{ name: 7 }]],
+    ['a non-object entry', ['gap_id']],
+  ] as Array<[string, unknown]>) {
+    test(`malformed variables (${label}) are refused 400 and nothing is written`, async () => {
+      withNullVarsRow();
+      const { status, body } = await update({ variables, tasks });
+      expect(status).toBe(400);
+      expect(body.success).toBe(false);
+      // the shape check names the problem (not the field-level refusal that preceded it)
+      expect(String(body.error)).toContain('Invalid update field: variables');
+      expect(updateCall()).toBeUndefined();
+    });
+  }
+
+  test('CONTROL — without a variables update, a NULL-variables row still has its placeholders refused', async () => {
+    withNullVarsRow();
+    const { status, body } = await update({ tasks });
+    expect(status).toBe(400);
+    expect(body.error).toContain('{{gap_id}}');
+    expect(updateCall()).toBeUndefined();
+  });
+
+  test('CONTROL — a global row still needs evidence for a variables update (no new write path)', async () => {
+    const globalRow = { ...row, scope: 'global', org_id: 'org-other' };
+    queryHandler = (sql: string) => {
+      if (sql.includes('SELECT variables FROM activity ') || sql.includes('SELECT * FROM activity')) return [globalRow];
+      return [];
+    };
+    const { status, body } = await update({ variables: [{ name: 'gap_id' }, { name: 'base_ref' }], tasks });
+    expect(status).toBe(422);
+    expect(body.error).toContain('insufficient_evidence');
+    expect(updateCall()).toBeUndefined();
+  });
+});
