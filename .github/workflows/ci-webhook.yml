@@ -170,11 +170,9 @@ jobs:
           EXECUTION_ID: ${{ github.event.inputs.execution_id }}
           # Set here, not at workflow level: integration tests run when ACTIVITY_API_URL is set, and a
           # workflow-wide default pointed the test step at the public hub.
-          # Default target for the CI-outcome webhook. `api.minibob.local` was a retired name that
-          # resolves nowhere, so once the workflow was parseable again the webhook still died with
-          # curl exit 5 (could not resolve host). Point the fallback at the public hub that actually
-          # serves /v2/activities/ci-result. Set the ACTIVITY_API_URL repo secret to override.
-          ACTIVITY_API_URL: ${{ secrets.ACTIVITY_API_URL || 'http://syzygy.host:18080' }}
+          # No default target: a public repo names no deployment. Without the ACTIVITY_API_URL and
+          # ACTIVITY_API_KEY repo secrets the step prints the payload and sends nothing.
+          ACTIVITY_API_URL: ${{ secrets.ACTIVITY_API_URL || '' }}
           ACTIVITY_API_KEY: ${{ secrets.ACTIVITY_API_KEY || '' }}
         run: |
           # Extract execution ID from commit message if not provided
@@ -254,7 +252,7 @@ jobs:
           )
 
           # Send webhook (with auth if available)
-          if [ -n "$ACTIVITY_API_KEY" ]; then
+          if [ -n "$ACTIVITY_API_URL" ] && [ -n "$ACTIVITY_API_KEY" ]; then
             curl -X POST "${ACTIVITY_API_URL}/v2/activities/ci-result" \
               -H "Content-Type: application/json" \
               -H "X-Internal-Api-Key: ${ACTIVITY_API_KEY}" \
@@ -264,7 +262,7 @@ jobs:
               --retry-delay 5 \
               || echo "WARNING: Webhook failed but continuing workflow"
           else
-            echo "ACTIVITY_API_KEY not set, skipping webhook"
+            echo "ACTIVITY_API_URL or ACTIVITY_API_KEY not set, skipping webhook"
             echo "Payload would have been:"
             echo "${PAYLOAD}" | jq .
           fi
