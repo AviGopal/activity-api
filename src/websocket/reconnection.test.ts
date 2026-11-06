@@ -220,10 +220,19 @@ describe('WebSocket Reconnection with Catchup', () => {
     broadcaster.removeClient(client2);
   });
 
-  test('catchup respects event type filtering (fine-grained only)', () => {
-    const seqBeforeCoarse = broadcaster.getCurrentSequence();
+  test('catchup respects event type filtering (buffered types only)', () => {
+    const seqBefore = broadcaster.getCurrentSequence();
 
-    // Emit a coarse-grained event (should not be buffered)
+    // Not buffered: metrics updates carry no sequence and are never replayed
+    broadcaster.emit({
+      type: 'template_updated',
+      data: {
+        variant_id: 'v-unbuffered',
+        metrics: { success_rate: 1, avg_duration_ms: 1, avg_cost_usd: 0, thompson_alpha: 1, thompson_beta: 1 },
+      },
+    } as WebSocketMessage);
+
+    // Buffered: execution lifecycle events feed the eventStream poll floor
     broadcaster.emit({
       type: 'execution_completed',
       data: {
@@ -236,7 +245,7 @@ describe('WebSocket Reconnection with Catchup', () => {
       },
     } as WebSocketMessage);
 
-    // Emit a fine-grained event (should be buffered)
+    // Buffered: fine-grained task event
     broadcaster.emit({
       type: 'task.started',
       data: {
@@ -249,14 +258,11 @@ describe('WebSocket Reconnection with Catchup', () => {
     } as WebSocketMessage);
 
     receivedMessages = [];
-    const sentCount = broadcaster.sendCatchup(mockClient, seqBeforeCoarse);
+    const sentCount = broadcaster.sendCatchup(mockClient, seqBefore);
 
-    // Should only send the fine-grained event
-    expect(sentCount).toBeGreaterThanOrEqual(1);
-
-    // Verify no coarse-grained events in catchup
-    const hasCoarseEvent = receivedMessages.some(msg => msg.type === 'execution_completed');
-    expect(hasCoarseEvent).toBe(false);
+    expect(sentCount).toBe(2);
+    expect(receivedMessages.map((m) => m.type)).toEqual(['execution_completed', 'task.started']);
+    expect(receivedMessages.some((m) => m.type === 'template_updated')).toBe(false);
   });
 });
 

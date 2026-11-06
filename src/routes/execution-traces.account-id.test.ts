@@ -3,13 +3,31 @@
  * OpenSpec change: activity-api-account-id-migration-2026-04-28.
  *
  * Locks in: writes set both account_id + org_id with account_id_version=1
- * (or null + version=1 when caller has no accountId); reads dual-bind both
- * params so legacy rows (account_id IS NONE) still match via the org_id
- * branch. Mirrors activities.account-id.test.ts mock pattern.
+ * (account_id left NONE when caller has no accountId); account-scoped reads
+ * coalesce so legacy rows (account_id NONE) still match within the org.
+ * Mirrors activities.account-id.test.ts mock pattern.
  */
 
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test';
 import { Hono } from 'hono';
+
+// mock.module is process-wide: capture the real modules and restore them in afterAll.
+const prevSurreal = { ...(await import('../db/surreal')) };
+const prevRedis = { ...(await import('../db/redis')) };
+const prevBroadcaster = { ...(await import('../websocket/broadcaster')) };
+const prevParadigm = { ...(await import('../db/paradigm')) };
+const prevVariantCreator = { ...(await import('../services/variant-creator')) };
+afterAll(() => {
+  mock.module('../db/surreal', () => prevSurreal);
+  mock.module('../db/redis', () => prevRedis);
+  mock.module('../websocket/broadcaster', () => prevBroadcaster);
+  mock.module('../db/paradigm', () => prevParadigm);
+  mock.module('../services/variant-creator', () => prevVariantCreator);
+});
+
+// `execution` (insertExecution) is the authoritative trace write; AET is the DUAL_WRITE shadow.
+const executionWrites: any[] = [];
+let dualWrite = false;
 
 const surrealQueries: { sql: string; params: any }[] = [];
 let queryReturnQueue: any[][] = [];
@@ -53,14 +71,14 @@ mock.module('../websocket/broadcaster', () => ({ broadcaster: { emit: () => {} }
 
 mock.module('../db/paradigm', () => ({
   insertActivity: async () => null,
-  insertExecution: async () => null,
+  insertExecution: async (e: any) => { executionWrites.push(e); return null; },
   getActivityScores: async () => ({ data: [], path: 'legacy' as const }),
   getShapeConditionedScores: async () => ({ data: [], path: 'legacy' as const }),
   queryActivitiesByShapes: async () => ({ data: [], path: 'legacy' as const }),
   queryActivitiesByFTS: async () => ({ data: [], path: 'legacy' as const }),
   queryActivitiesByDense: async () => ({ data: [], path: 'legacy' as const }),
   transformToLegacyTemplate: (t: any) => t,
-  isDualWriteEnabled: () => false,
+  isDualWriteEnabled: () => dualWrite,
   getVariantFamily: async () => ({ data: [], path: 'legacy' as const }),
   getVariantScores: async () => ({ data: [], path: 'legacy' as const }),
   buildVariantTree: async () => null,
@@ -110,16 +128,16 @@ const findInsertTrace = () =>
   surrealQueries.find((q) => /INSERT\s+INTO\s+activity_execution_traces\s*\{/i.test(q.sql));
 const findVariantMetricsUpsert = () =>
   surrealQueries.find((q) => /INSERT\s+INTO\s+variant_performance_metrics\b/i.test(q.sql));
+// The listing reads `execution` directly (the v_paradigm view froze).
 const findListTraces = () =>
-  surrealQueries.find(
-    (q) => /SELECT\s+\*\s+FROM\s+activity_execution_traces/i.test(q.sql) && /ORDER BY/.test(q.sql),
-  );
-const findCtxThompsonCreate = () =>
-  surrealQueries.find((q) => /context_thompson_scores/i.test(q.sql) && /CREATE/i.test(q.sql));
+  surrealQueries.find((q) => /FROM\s+execution\b/i.test(q.sql) && /ORDER BY/.test(q.sql));
+const findExecutionWrite = () => executionWrites[0];
 
 beforeEach(() => {
   surrealQueries.length = 0;
   queryReturnQueue = [];
+  executionWrites.length = 0;
+  dualWrite = false;
 });
 
 const baseTrace = (executionId: string, extra: Record<string, unknown> = {}) => ({
@@ -147,8 +165,8 @@ const authAcct = (accountId?: string) => ({
 // =============================================================================
 
 describe('Phase B2: POST /execution-traces dual-writes account_id', () => {
-  test('JWT carries accountId → INSERT and metrics UPSERT embed account_id + org_id', async () => {
-    queryReturnQueue.push([{ id: 'activity_execution_traces:1' }]);
+  test('JWT carries accountId → execution, AET shadow and metrics INSERT embed account_id + org_id', async () => {
+    dualWrite = true;
     const res = await appWithAuth(authAcct('acc-acme-001')).request(
       '/v2/activities/execution-traces',
       {
@@ -158,6 +176,12 @@ describe('Phase B2: POST /execution-traces dual-writes account_id', () => {
       },
     );
     expect(res.status).toBeLessThan(400);
+
+    const exec = findExecutionWrite();
+    expect(exec).toBeDefined();
+    expect(exec.org_id).toBe('org-acme');
+    expect(exec.account_id).toBe('acc-acme-001');
+    expect(exec.account_id_version).toBe(1);
 
     const insert = findInsertTrace()!;
     expect(insert).toBeDefined();
@@ -169,12 +193,12 @@ describe('Phase B2: POST /execution-traces dual-writes account_id', () => {
 
     const metrics = findVariantMetricsUpsert()!;
     expect(metrics).toBeDefined();
-    expect(metrics.sql).toContain('account_id: $account_id');
+    expect(metrics.sql).toMatch(/account_id:\s*IF \$account_id IS NULL THEN NONE ELSE \$account_id END/);
     expect(metrics.params.account_id).toBe('acc-acme-001');
   });
 
-  test('JWT has only orgId → INSERT writes account_id = null with version >= 1', async () => {
-    queryReturnQueue.push([{ id: 'activity_execution_traces:2' }]);
+  test('JWT has only orgId → account_id unset (NONE, never NULL) with version >= 1 on execution', async () => {
+    dualWrite = true;
     const res = await appWithAuth(authAcct(undefined)).request(
       '/v2/activities/execution-traces',
       {
@@ -184,15 +208,18 @@ describe('Phase B2: POST /execution-traces dual-writes account_id', () => {
       },
     );
     expect(res.status).toBeLessThan(400);
+    const exec = findExecutionWrite();
+    expect(exec.org_id).toBe('org-legacy');
+    expect(exec.account_id ?? null).toBeNull();
+    // Even legacy callers tag rows with version=1 so backfill can identify them.
+    expect(exec.account_id_version).toBeGreaterThanOrEqual(1);
+    // AET shadow omits the field: option<string> rejects NULL, an unbound field is NONE.
     const insert = findInsertTrace()!;
     expect(insert.params.org_id).toBe('org-legacy');
-    expect(insert.params.account_id).toBeNull();
-    // Even legacy callers tag rows with version=1 so backfill can identify them.
-    expect(insert.params.account_id_version).toBeGreaterThanOrEqual(1);
+    expect(insert.sql).not.toContain('account_id: $account_id');
   });
 
   test('body.account_id wins over JWT.accountId (mirrors body.org_id semantics)', async () => {
-    queryReturnQueue.push([{ id: 'activity_execution_traces:3' }]);
     const res = await appWithAuth(authAcct('acc-from-jwt')).request(
       '/v2/activities/execution-traces',
       {
@@ -202,9 +229,8 @@ describe('Phase B2: POST /execution-traces dual-writes account_id', () => {
       },
     );
     expect(res.status).toBeLessThan(400);
-    const insert = findInsertTrace()!;
     // Body-provided account_id takes precedence (matches existing org_id-from-body behaviour).
-    expect(insert.params.account_id).toBe('acc-from-body');
+    expect(findExecutionWrite().account_id).toBe('acc-from-body');
   });
 });
 
@@ -213,15 +239,13 @@ describe('Phase B2: POST /execution-traces dual-writes account_id', () => {
 // =============================================================================
 
 describe('Phase B2: reads + context-bucket writes dual-scope', () => {
-  test('GET / (session-fed) builds dual-tenant WHERE with account_id null fallback', async () => {
+  test('GET / (session-fed, no account) scopes by org equality alone', async () => {
     const res = await appWithSession('org-acme').request('/v2/activities/execution-traces');
     expect(res.status).toBe(200);
     const list = findListTraces()!;
     expect(list).toBeDefined();
-    expect(list.sql).toContain('account_id = $account_id');
-    expect(list.sql).toContain('account_id IS NONE');
     expect(list.sql).toContain('org_id = $org_id');
-    expect(list.params.account_id).toBeNull();
+    expect(list.sql).not.toContain('$account_id');
     expect(list.params.org_id).toBe('org-acme');
   });
 
@@ -237,15 +261,17 @@ describe('Phase B2: reads + context-bucket writes dual-scope', () => {
     expect(list.params.org_id).toBe('org-acme');
   });
 
-  test('legacy rows (account_id IS NONE) match via org_id branch — semantic check', async () => {
-    const res = await appWithSession('org-legacy-rows').request('/v2/activities/execution-traces');
+  test('legacy rows (account_id NONE) still match the account scope — semantic check', async () => {
+    const res = await appWithSession('org-legacy-rows', 'acc-x').request('/v2/activities/execution-traces');
     expect(res.status).toBe(200);
     const list = findListTraces()!;
-    expect(list.sql).toMatch(/account_id IS NONE\s+AND\s+org_id\s*=\s*\$org_id/);
+    // Coalesce, not an OR: a NONE account_id compares as the caller's own, within one org equality.
+    expect(list.sql).toContain('(account_id ?? $account_id) = $account_id');
+    expect(list.sql).toMatch(/org_id\s*=\s*\$org_id/);
+    expect(list.sql).not.toMatch(/account_id IS NONE\s+OR|OR\s+org_id\s*=\s*NULL/);
   });
 
-  test('context_thompson_scores CREATE branch dual-writes account_id + version', async () => {
-    queryReturnQueue.push([{ id: 'activity_execution_traces:ctx' }]);
+  test('8-hex context_bucket write is retired: no context_thompson_scores write keyed on it', async () => {
     const res = await appWithAuth(authAcct('acc-acme-001')).request(
       '/v2/activities/execution-traces',
       {
@@ -255,15 +281,9 @@ describe('Phase B2: reads + context-bucket writes dual-scope', () => {
       },
     );
     expect(res.status).toBeLessThan(400);
-    const ctx = findCtxThompsonCreate()!;
-    expect(ctx).toBeDefined();
-    // Read clause uses dual-tenant WHERE.
-    expect(ctx.sql).toContain('account_id = $account_id');
-    expect(ctx.sql).toContain('account_id IS NONE');
-    // CREATE branch writes account_id and account_id_version=1.
-    expect(ctx.sql).toContain('account_id: $account_id');
-    expect(ctx.sql).toContain('account_id_version: 1');
-    expect(ctx.params.account_id).toBe('acc-acme-001');
-    expect(ctx.params.org_id).toBe('org-acme');
+    const ctx = surrealQueries.filter(
+      (q) => /context_thompson_scores/i.test(q.sql) && JSON.stringify(q.params ?? {}).includes('a1b2c3d4'),
+    );
+    expect(ctx).toHaveLength(0);
   });
 });

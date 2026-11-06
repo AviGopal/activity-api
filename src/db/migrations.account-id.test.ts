@@ -7,8 +7,8 @@
  *   1. Both files exist on disk (matches the canonical migration directory).
  *   2. Migration 095 uses idempotent DEFINE FIELD OVERWRITE (matches 094 precedent).
  *   3. Migration 095 touches every table from the OpenSpec ~30-table list.
- *   4. Migration 096 defines a `v_<table>_by_account` view per migrated table.
- *   5. Migration 096 views are read-only (SELECT only; no INSERT/UPDATE).
+ *   4. Migration 096 (retired) REMOVEs the `v_<table>_by_account` view per table.
+ *   5. Migration 096 never re-defines or writes to those views.
  *
  * This is a static-text test — no SurrealDB connection required. The harness
  * is intentionally minimal so it runs in `bun test` without any infra setup,
@@ -133,34 +133,25 @@ describe('Phase A: migration 096 (back-compat alias views)', () => {
     expect(existsSync(M096)).toBe(true);
   });
 
-  test('defines a v_<table>_by_account view per migrated table', () => {
+  // 096 was retired (views had zero readers and churned on every write); it
+  // now REMOVEs each view so the reconcile re-apply cannot resurrect them.
+  test('removes the v_<table>_by_account view for every migrated table', () => {
     const sql = readFileSync(M096, 'utf-8');
     for (const table of EXPECTED_TABLES) {
-      expect(sql, `view v_${table}_by_account missing`).toContain(
-        `DEFINE TABLE OVERWRITE v_${table}_by_account AS`
+      expect(sql, `view v_${table}_by_account not removed`).toContain(
+        `REMOVE TABLE IF EXISTS v_${table}_by_account;`
       );
     }
   });
 
-  test('every view derives effective_account_id = account_id ?? org_id', () => {
+  test('never re-defines a by_account view (retirement stays durable)', () => {
     const sql = readFileSync(M096, 'utf-8');
-    // Every view must compute effective_account_id with the fallback expression.
-    // This is the defining contract of the back-compat layer (D7 in design.md).
-    const occurrences = (sql.match(
-      /\(account_id \?\? org_id\) AS effective_account_id/g
-    ) || []).length;
-    expect(occurrences).toBe(EXPECTED_TABLES.length);
+    expect(sql).not.toMatch(/DEFINE TABLE[^;]*v_\w+_by_account/);
+    expect(sql).not.toMatch(/AS effective_account_id/);
   });
 
-  test('views are read-only (SELECT-derived; no UPDATE/INSERT/DELETE on view definitions)', () => {
+  test('never writes to a by_account view', () => {
     const sql = readFileSync(M096, 'utf-8');
-    // Verify each view is defined via SELECT (not raw materialization).
-    const selectViewCount = (sql.match(/AS\s*\n\s*SELECT \*, \(account_id \?\? org_id\)/g) || [])
-      .length;
-    expect(selectViewCount).toBe(EXPECTED_TABLES.length);
-
-    // Sanity: the migration file itself does not include UPDATE/INSERT/DELETE
-    // statements on the views (read-only contract).
     expect(sql).not.toMatch(/UPDATE\s+v_\w+_by_account/);
     expect(sql).not.toMatch(/INSERT\s+INTO\s+v_\w+_by_account/);
     expect(sql).not.toMatch(/DELETE\s+FROM\s+v_\w+_by_account/);

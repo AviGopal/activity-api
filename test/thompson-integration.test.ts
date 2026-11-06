@@ -19,9 +19,8 @@ import { randomBytes } from 'crypto'
 const API_ENDPOINT = process.env.ACTIVITY_API_ENDPOINT || 'http://activity.metabob.local'
 const API_KEY = process.env.METABOB_API_KEY_TEST || process.env.METABOB_API_KEY_ORG_A
 
-if (!API_KEY) {
-  throw new Error('Missing API key: set METABOB_API_KEY_TEST or METABOB_API_KEY_ORG_A')
-}
+// Needs a live activity-api and its API key; without the key every case skips.
+const LIVE = !!API_KEY
 
 // Helper: Create test template
 async function createTestTemplate(name: string): Promise<{ id: string; template: ActivityTemplate }> {
@@ -127,7 +126,7 @@ async function getRecommendations(goal: string, count: number = 10): Promise<str
   return result.templates.map((t: any) => t.id)
 }
 
-describe('Thompson Sampling Integration', () => {
+describe.skipIf(!LIVE)('Thompson Sampling Integration', () => {
   let templateA: { id: string; template: ActivityTemplate }
   let templateB: { id: string; template: ActivityTemplate }
 
@@ -295,7 +294,7 @@ describe('Thompson Sampling Integration', () => {
   }, 60000)
 })
 
-describe('Thompson Sampling: Edge Cases', () => {
+describe.skipIf(!LIVE)('Thompson Sampling: Edge Cases', () => {
   test('Extreme positive feedback (α >> β)', async () => {
     const template = await createTestTemplate('Template Extreme Positive')
 

@@ -79,6 +79,7 @@ const redisMod = await import('../db/redis');
 const broadcasterMod = await import('../websocket/broadcaster');
 const paradigmMod = await import('../db/paradigm');
 const variantCreatorMod = await import('../services/variant-creator');
+const discoveryMod = await import('../services/discovery-client');
 
 const spies: Array<{ mockRestore(): void }> = [];
 /** Spy on `obj[key]` if it is a function there. In a full run an earlier file's mock.module may
@@ -128,6 +129,9 @@ stub(paradigmMod, 'updateShapeActivityScores', async (...args: unknown[]) => { s
 
 stub(variantCreatorMod, 'autoCreateVariantIfNeeded', async () => null);
 stub(variantCreatorMod, 'checkAndRetireTemplate', async () => false);
+
+// Prior seeding resolves concept-db via discovery; answer "none" so the credit path never waits on the network.
+stub(discoveryMod.discoveryClient, 'discoverVesselsForShape', async () => ({ found: false, vessels: [] }));
 
 afterAll(() => {
   for (const s of spies.splice(0)) s.mockRestore();

@@ -178,18 +178,49 @@ describe('resolveReconcileTraceStore', () => {
     expect(content.over_cap).toBe(true);
   });
 
+  // The swap runs only while DUAL_WRITE re-enables AET (2181e96); default is decommissioned.
   it('live run aborts before touching AET if the keep-set copy is empty', async () => {
-    const { ctx, calls } = makeCtx(async (sql) => {
-      if (sql.includes('SELECT count() AS c FROM activity_execution_traces_next')) return [{ c: 0 }];
-      if (sql.includes('INFO FOR TABLE')) return [{ fields: {}, indexes: {} }];
-      if (sql.includes('INFO FOR DB')) return [{ tables: {} }];
-      if (sql.includes('trace_store_counters')) return [{ row_count: 100, cap: 50000 }];
-      return [];
-    });
-    const result = await resolveReconcileTraceStore({ dry_run: false, lease_token: 'valid-token' }, 'test-actor', ctx as any);
-    expect(result.status).toBe(500);
-    // Must never have reached REMOVE TABLE activity_execution_traces (the
-    // destructive step) once the keep-set was found empty.
-    expect(calls.some((c) => /^REMOVE TABLE activity_execution_traces$/.test(c.sql.trim()))).toBe(false);
+    const prevDual = process.env.DUAL_WRITE_ENABLED;
+    process.env.DUAL_WRITE_ENABLED = 'true';
+    try {
+      const { ctx, calls } = makeCtx(async (sql) => {
+        if (sql.includes('SELECT count() AS c FROM activity_execution_traces_next')) return [{ c: 0 }];
+        if (sql.includes('INFO FOR TABLE')) return [{ fields: {}, indexes: {} }];
+        if (sql.includes('INFO FOR DB')) return [{ tables: {} }];
+        if (sql.includes('trace_store_counters')) return [{ row_count: 100, cap: 50000 }];
+        return [];
+      });
+      const result = await resolveReconcileTraceStore({ dry_run: false, lease_token: 'valid-token' }, 'test-actor', ctx as any);
+      expect(result.status).toBe(500);
+      expect(result.body.error).toMatch(/keep-set is empty/);
+      // Must never have reached REMOVE TABLE activity_execution_traces (the
+      // destructive step) once the keep-set was found empty.
+      expect(calls.some((c) => /^REMOVE TABLE activity_execution_traces$/.test(c.sql.trim()))).toBe(false);
+    } finally {
+      if (prevDual === undefined) delete process.env.DUAL_WRITE_ENABLED;
+      else process.env.DUAL_WRITE_ENABLED = prevDual;
+    }
+  });
+
+  it('live run with AET decommissioned skips the swap and touches no AET table', async () => {
+    const prevDual = process.env.DUAL_WRITE_ENABLED;
+    const prevRet = process.env.TRACE_RETENTION_ENABLED;
+    delete process.env.DUAL_WRITE_ENABLED;
+    delete process.env.TRACE_RETENTION_ENABLED;
+    try {
+      const { ctx, calls } = makeCtx(async (sql) => {
+        if (sql.includes('trace_store_counters')) return [{ row_count: 100, cap: 50000 }];
+        return [];
+      });
+      const result = await resolveReconcileTraceStore({ dry_run: false, lease_token: 'valid-token' }, 'test-actor', ctx as any);
+      expect(result.status).toBe(200);
+      const content = JSON.parse(result.body.content);
+      expect(content.aet_decommissioned).toBe(true);
+      expect(content.swap_skipped).toBe(true);
+      expect(calls.some((c) => /REMOVE TABLE|INSERT INTO activity_execution_traces/.test(c.sql))).toBe(false);
+    } finally {
+      if (prevDual !== undefined) process.env.DUAL_WRITE_ENABLED = prevDual;
+      if (prevRet !== undefined) process.env.TRACE_RETENTION_ENABLED = prevRet;
+    }
   });
 });

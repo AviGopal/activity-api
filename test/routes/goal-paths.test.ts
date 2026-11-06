@@ -20,7 +20,7 @@
  * route. Nothing here requires a live database.
  */
 
-import { describe, test, expect, beforeEach, mock } from 'bun:test';
+import { describe, test, expect, beforeEach, afterAll, mock } from 'bun:test';
 
 // ---------------------------------------------------------------------------
 // Stubbed SurrealDB module
@@ -40,7 +40,12 @@ interface QueryRecord {
 const queryLog: QueryRecord[] = [];
 let queryHandler: StubHandler = () => [];
 
+// mock.module is process-wide: keep the real exports underneath and restore them in afterAll.
+const prevSurreal = { ...(await import('../../src/db/surreal')) };
+afterAll(() => { mock.module('../../src/db/surreal', () => prevSurreal); });
+
 mock.module('../../src/db/surreal', () => ({
+  ...prevSurreal,
   surrealDB: {
     query: async (sql: string, params?: Record<string, any>) => {
       queryLog.push({ sql, params });

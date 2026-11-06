@@ -7,9 +7,9 @@
  *   1. Both files exist on disk.
  *   2. Migration 097 uses idempotent DEFINE FIELD OVERWRITE.
  *   3. Migration 097 touches the 7 tier-2 tables (and only those).
- *   4. Migration 098 defines a `v_<table>_by_account` view per tier-2 table.
- *   5. Migration 098 views are read-only and use the same effective_account_id
- *      fallback contract as migration 096.
+ *   4. Migration 098 retires (REMOVEs) the `v_<table>_by_account` view of
+ *      every tier-2 table; the views had no readers.
+ *   5. Migration 098 defines no view.
  *   6. The 4 phantom tables identified in the audit (activity_metrics,
  *      activity_templates, connection, org_members) are NOT referenced in
  *      either migration — guarding against accidentally adding fields to
@@ -140,29 +140,21 @@ describe('Phase A2: migration 098 (back-compat alias views, tier 2)', () => {
     expect(existsSync(M098)).toBe(true);
   });
 
-  test('defines a v_<table>_by_account view per tier-2 table', () => {
+  // 098's views were retired (0 readers, re-materialised on hot writes):
+  // each DEFINE became an idempotent REMOVE. Pin the retirement.
+  test('retires the v_<table>_by_account view of every tier-2 table', () => {
     const sql = readFileSync(M098, 'utf-8');
     for (const table of TIER2_TABLES) {
-      expect(sql, `view v_${table}_by_account missing`).toContain(
-        `DEFINE TABLE OVERWRITE v_${table}_by_account AS`
+      expect(sql, `REMOVE for v_${table}_by_account missing`).toContain(
+        `REMOVE TABLE IF EXISTS v_${table}_by_account;`
       );
     }
   });
 
-  test('every view derives effective_account_id = account_id ?? org_id', () => {
+  test('defines no account view (no DEFINE TABLE ... AS SELECT survives)', () => {
     const sql = readFileSync(M098, 'utf-8');
-    const occurrences = (sql.match(
-      /\(account_id \?\? org_id\) AS effective_account_id/g
-    ) || []).length;
-    expect(occurrences).toBe(TIER2_TABLES.length);
-  });
-
-  test('views are read-only (SELECT-derived; no UPDATE/INSERT/DELETE)', () => {
-    const sql = readFileSync(M098, 'utf-8');
-    const selectViewCount = (sql.match(/AS\s*\n\s*SELECT \*, \(account_id \?\? org_id\)/g) || [])
-      .length;
-    expect(selectViewCount).toBe(TIER2_TABLES.length);
-
+    expect(sql).not.toMatch(/^DEFINE TABLE\b/m);
+    expect(sql).not.toMatch(/AS\s*\n?\s*SELECT/);
     expect(sql).not.toMatch(/UPDATE\s+v_\w+_by_account/);
     expect(sql).not.toMatch(/INSERT\s+INTO\s+v_\w+_by_account/);
     expect(sql).not.toMatch(/DELETE\s+FROM\s+v_\w+_by_account/);
@@ -211,8 +203,8 @@ describe('Phase A2: cross-migration invariants', () => {
       expect(sql097, `097 missing field for ${table}`).toContain(
         `DEFINE FIELD OVERWRITE account_id ON TABLE ${table} `
       );
-      expect(sql098, `098 missing view for ${table}`).toContain(
-        `DEFINE TABLE OVERWRITE v_${table}_by_account AS`
+      expect(sql098, `098 missing view retirement for ${table}`).toContain(
+        `REMOVE TABLE IF EXISTS v_${table}_by_account;`
       );
     }
   });

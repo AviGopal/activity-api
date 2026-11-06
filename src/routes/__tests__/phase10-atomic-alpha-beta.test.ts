@@ -6,10 +6,10 @@
  * writes for the same row land concurrently. This test captures the SQL
  * statements produced by the route handlers and asserts:
  *
- *   - relevance-feedback emits a single bulk UPDATE per direction with
- *     the multiplier applied via SurrealDB's `math::ceil((alpha ?? 1) *
- *     $multiplier)` server-side expression. No SELECT-then-UPDATE loop
- *     remains, so concurrent writes accumulate cleanly.
+ *   - relevance-feedback emits a single bulk UPDATE per direction with a
+ *     capped additive increment computed server-side
+ *     (`math::min([1000000, (alpha ?? 1) + $increment])`). No SELECT-then-UPDATE
+ *     loop remains, so concurrent writes accumulate cleanly.
  *
  *   - goal-paths execution-record produces one UPDATE whose SET clauses
  *     all reference the row's pre-update state via `(field ?? 0) + $delta`
@@ -25,10 +25,22 @@
  * of the issued SQL.
  */
 
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test';
 import { Hono } from 'hono';
 
 const surrealQueries: { sql: string; params: any }[] = [];
+
+// mock.module is process-wide: capture the real modules and put them back in afterAll.
+const realModules: Array<[string, Record<string, unknown>]> = [
+  ['../../db/surreal', { ...(await import('../../db/surreal')) }],
+  ['../../db/redis', { ...(await import('../../db/redis')) }],
+  ['../../websocket/broadcaster', { ...(await import('../../websocket/broadcaster')) }],
+  ['../../db/paradigm', { ...(await import('../../db/paradigm')) }],
+  ['../../services/variant-creator', { ...(await import('../../services/variant-creator')) }],
+];
+afterAll(() => {
+  for (const [spec, real] of realModules) mock.module(spec, () => real);
+});
 
 mock.module('../../db/surreal', () => ({
   surrealDB: {
@@ -150,7 +162,7 @@ beforeEach(() => {
 });
 
 describe('Phase 10 P1 — atomic α/β increments', () => {
-  test('relevance-feedback positive emits one bulk UPDATE with math::ceil server-side multiply', async () => {
+  test('relevance-feedback positive emits one bulk UPDATE with a capped server-side additive increment', async () => {
     const app = appWithAuth(jwt);
     const res = await app.request('/v2/activities/feedback', {
       method: 'POST',
@@ -169,8 +181,9 @@ describe('Phase 10 P1 — atomic α/β increments', () => {
     // Exactly one bulk UPDATE — not one-per-shape from the loop pattern.
     expect(updates.length).toBe(1);
     const sql = updates[0].sql;
-    // Server-side math::ceil multiply expression on alpha.
-    expect(sql).toContain('alpha = math::ceil((alpha ?? 1) * $multiplier)');
+    // Server-side additive increment, capped (a Beta posterior adds observations;
+    // the old multiply saturated int64).
+    expect(sql).toContain('alpha = math::min([1000000, (alpha ?? 1) + $increment])');
     // No JS-projected $new_alpha parameter.
     expect(sql).not.toContain('$new_alpha');
     // WHERE filters on activity_id only — applies to all shapes for the
@@ -197,7 +210,7 @@ describe('Phase 10 P1 — atomic α/β increments', () => {
     );
     expect(updates.length).toBe(1);
     const sql = updates[0].sql;
-    expect(sql).toContain('beta = math::ceil((beta ?? 1) * $multiplier)');
+    expect(sql).toContain('beta = math::min([1000000, (beta ?? 1) + $increment])');
     expect(sql).not.toContain('$new_beta');
   });
 
@@ -241,13 +254,9 @@ describe('Phase 10 P1 — atomic α/β increments', () => {
     expect(sql).toContain(
       'failed_executions = (failed_executions ?? 0) + $failure_delta',
     );
-    // Posteriors derived from the same pre-update state.
-    expect(sql).toContain(
-      'thompson_alpha = (successful_executions ?? 0) + $success_delta + 1',
-    );
-    expect(sql).toContain(
-      'thompson_beta = (failed_executions ?? 0) + $failure_delta + 1',
-    );
+    // Posteriors are atomic deltas on the stored value (not re-derived from counts).
+    expect(sql).toContain('thompson_alpha = (thompson_alpha ?? 1) + $success_delta');
+    expect(sql).toContain('thompson_beta = (thompson_beta ?? 1) + $failure_delta');
     // Rolling means computed inline against pre-update mean and count.
     expect(sql).toContain('avg_duration_ms = (((avg_duration_ms ?? 0) * (total_executions ?? 0)) + $duration_ms) / ((total_executions ?? 0) + 1)');
     expect(sql).toContain('avg_cost_usd = (((avg_cost_usd ?? 0) * (total_executions ?? 0)) + $cost_usd) / ((total_executions ?? 0) + 1)');
@@ -262,14 +271,18 @@ describe('Phase 10 P1 — atomic α/β increments', () => {
     expect(updates[0].params).not.toHaveProperty('thompson_alpha');
   });
 
-  test('execution-traces UPDATE on activity_template α/β stays atomic (already-atomic site)', async () => {
-    // The activity_template UPDATE was already in atomic form pre-Phase-10
-    // (`thompson_alpha = (thompson_alpha ?? 1) + $alpha_delta`). Lock it
-    // in here so a future refactor doesn't accidentally regress to a
-    // fetch-modify-write.
+  test('execution-traces activity_template UPDATE writes counters only, never α/β (no fetch-modify-write site)', async () => {
+    // α/β on activity_template were retired (Phase 1): applyOutcomeToPosteriors is
+    // the sole posterior writer. Lock in that the counter UPDATE stays atomic and
+    // carries no posterior field a future refactor could fetch-modify-write.
     const fs = await import('node:fs/promises');
     const src = await fs.readFile('src/routes/execution-traces.ts', 'utf8');
-    expect(src).toContain('thompson_alpha = (thompson_alpha ?? 1) + $alpha_delta');
-    expect(src).toContain('thompson_beta = (thompson_beta ?? 1) + $beta_delta');
+    const m = /UPDATE activity_template\s+SET([\s\S]*?)WHERE/.exec(src);
+    expect(m).not.toBeNull();
+    const set = m![1];
+    expect(set).toContain('total_executions = (total_executions ?? 0) + 1');
+    expect(set).toContain('successful_executions = (successful_executions ?? 0) + $success_delta');
+    expect(set).toContain('failed_executions = (failed_executions ?? 0) + $failure_delta');
+    expect(set).not.toMatch(/thompson_(alpha|beta)/);
   });
 });

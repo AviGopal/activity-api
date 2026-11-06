@@ -7,12 +7,31 @@
  * Traces without resolver_tier default to stochastic treatment.
  */
 
-import { describe, test, expect } from 'bun:test';
+import { describe, test, expect, spyOn, beforeEach, afterEach } from 'bun:test';
 import {
   applyOutcomeToPosteriors,
   type DBQueryable,
   type TraceForPosterior,
 } from '../src/lib/posterior-update';
+import * as aggregator from '../src/lib/posterior-aggregator';
+
+// The leaf write is coalesced through the aggregator (1540053), not a direct
+// UPDATE. Capture leaf enqueues without queueing, so nothing flushes to a store.
+let leafEnqueues = 0;
+let enqueueSpy: ReturnType<typeof spyOn> | null = null;
+beforeEach(() => {
+  leafEnqueues = 0;
+  enqueueSpy = spyOn(aggregator, 'enqueueVariantDelta').mockImplementation(((
+    _v: string, _o: string, a: number, b: number, kind = 'leaf',
+  ) => {
+    if (kind === 'leaf' && (a !== 0 || b !== 0)) leafEnqueues++;
+    return true;
+  }) as typeof aggregator.enqueueVariantDelta);
+});
+afterEach(() => {
+  enqueueSpy?.mockRestore();
+  enqueueSpy = null;
+});
 
 function makeDb(): {
   db: DBQueryable;
@@ -37,14 +56,18 @@ function makeTrace(overrides: Partial<TraceForPosterior> = {}): TraceForPosterio
     success: true,
     failure_mode: null,
     org_id: ORG,
+    // The honest-reach gate (159bca7) skips an untagged success as ungraded;
+    // carry a reach verdict so the tier gate is what is under test.
+    tags: ['reached:true'],
     ...overrides,
   };
 }
 
+/** Leaf VPM writes: coalesced enqueues plus any synchronous fallback UPDATE. */
 function countVariantUpdates(
   calls: Array<{ sql: string; params: Record<string, unknown> }>,
 ): number {
-  return calls.filter(
+  return leafEnqueues + calls.filter(
     (c) =>
       c.sql.includes('variant_performance_metrics') &&
       c.sql.includes('UPDATE'),
@@ -67,8 +90,9 @@ describe('applyOutcomeToPosteriors — M4 tier-restricted bandit', () => {
     );
 
     expect(summary.skipped_reason).toBe('all_deterministic');
-    expect(summary.alpha_delta).toBe(1);
-    expect(summary.beta_delta).toBe(0);
+    // Graded-yield success (6793d04): alpha = y, beta = 1 - y, y in (0, 1].
+    expect(summary.alpha_delta).toBeGreaterThan(0);
+    expect(summary.alpha_delta + summary.beta_delta).toBeCloseTo(1);
     // No UPDATE against variant_performance_metrics on the leaf.
     expect(countVariantUpdates(calls)).toBe(0);
   });
@@ -90,12 +114,9 @@ describe('applyOutcomeToPosteriors — M4 tier-restricted bandit', () => {
     // Chain propagation runs as fire-and-forget; give it a tick to settle.
     await new Promise((resolve) => setTimeout(resolve, 10));
 
-    // The ancestor lookup SELECT is the canonical fingerprint of chain credit
-    // propagation having fired.
-    const selectCall = calls.find(
-      (c) =>
-        c.sql.includes('activity_execution_traces') && c.sql.includes('SELECT'),
-    );
+    // The ancestor lookup is the canonical fingerprint of chain credit
+    // propagation having fired (a point lookup on execution since 2f0451e).
+    const selectCall = calls.find((c) => /FROM execution WHERE id IN/.test(c.sql));
     expect(selectCall).toBeDefined();
   });
 

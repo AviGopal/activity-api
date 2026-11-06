@@ -2,32 +2,48 @@
  * Discovery Client Integration Tests
  */
 
-import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, mock } from 'bun:test';
 import { DiscoveryClient } from './discovery-client';
+import { config } from '../config';
+
+// Captured ONCE per file: a per-test capture would read back a leaked mock as "original".
+const originalFetch = globalThis.fetch;
+const originalDiscovery = { ...config.discovery };
 
 describe('DiscoveryClient', () => {
   let client: DiscoveryClient;
-  let originalFetch: typeof globalThis.fetch;
+
+  beforeAll(() => {
+    // isEnabled() reads config (frozen at boot), not process.env; backoff shortened so retries fit the test timeout.
+    config.discovery.retryBackoffMs = 1;
+  });
 
   beforeEach(() => {
     client = DiscoveryClient.getInstance();
-    originalFetch = globalThis.fetch;
+    config.discovery.enabled = true;
   });
 
-  afterEach(async () => {
-    await client.shutdown();
+  afterEach(() => {
+    // Reset the singleton without network: shutdown() would deregister through whatever fetch is installed.
+    client.stopHeartbeatManager();
+    (client as any).registered = false;
+    globalThis.fetch = originalFetch;
+  });
+
+  afterAll(() => {
+    Object.assign(config.discovery, originalDiscovery);
     globalThis.fetch = originalFetch;
   });
 
   describe('isEnabled', () => {
-    it('should return false when DISCOVERY_ENABLED=false', () => {
-      process.env.DISCOVERY_ENABLED = 'false';
+    it('should return false when discovery is disabled in config', () => {
+      config.discovery.enabled = false;
       const testClient = DiscoveryClient.getInstance();
       expect(testClient.isEnabled()).toBe(false);
     });
 
-    it('should return true when DISCOVERY_ENABLED=true', () => {
-      process.env.DISCOVERY_ENABLED = 'true';
+    it('should return true when discovery is enabled in config', () => {
+      config.discovery.enabled = true;
       const testClient = DiscoveryClient.getInstance();
       expect(testClient.isEnabled()).toBe(true);
     });
@@ -148,9 +164,14 @@ describe('DiscoveryClient', () => {
     });
 
     it('should handle heartbeat failure and mark as unregistered', async () => {
-      // Register first
+      // Register first; a failed heartbeat re-registers at once, and here that re-register fails too.
+      let registerCalls = 0;
       globalThis.fetch = mock(async (url) => {
         const urlStr = url.toString();
+
+        if (urlStr.endsWith('/register') && registerCalls++ > 0) {
+          return new Response('discovery restarting', { status: 503 });
+        }
 
         if (urlStr.endsWith('/register')) {
           return new Response(
@@ -179,7 +200,30 @@ describe('DiscoveryClient', () => {
       const success = await client.sendHeartbeat();
 
       expect(success).toBe(false);
+      expect(registerCalls).toBeGreaterThan(1);
       expect(client.isRegistered()).toBe(false);
+    });
+
+    it('should re-register immediately after a failed heartbeat', async () => {
+      let registerCalls = 0;
+      globalThis.fetch = mock(async (url) => {
+        const urlStr = url.toString();
+        if (urlStr.endsWith('/register')) {
+          registerCalls++;
+          return new Response(
+            JSON.stringify({ success: true, vesselId: 'activity-api-test', expiresAt: Date.now() + 300000 }),
+            { status: 201, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        return new Response(JSON.stringify({ error: 'Vessel not found' }), { status: 404 });
+      });
+
+      await client.register();
+      const success = await client.sendHeartbeat();
+
+      expect(success).toBe(false);
+      expect(registerCalls).toBe(2);
+      expect(client.isRegistered()).toBe(true);
     });
   });
 
@@ -227,7 +271,7 @@ describe('DiscoveryClient', () => {
     });
 
     it('should not start heartbeat manager when disabled', () => {
-      process.env.DISCOVERY_ENABLED = 'false';
+      config.discovery.enabled = false;
       const testClient = DiscoveryClient.getInstance();
 
       testClient.startHeartbeatManager();
@@ -252,7 +296,7 @@ describe('DiscoveryClient', () => {
     // so Wave 1D (minibob generic resolver) can dispatch against this vessel
     // without hardcoded knowledge. See super-repo CLAUDE.md auth section.
     it('should advertise resolve_endpoint, request_format, auth_scheme, timeout in registration payload', async () => {
-      process.env.DISCOVERY_ENABLED = 'true';
+      config.discovery.enabled = true;
       let capturedBody: any = null;
 
       globalThis.fetch = mock(async (_url: any, options: any) => {
@@ -280,7 +324,7 @@ describe('DiscoveryClient', () => {
     });
 
     it('should keep contract fields alongside pre-existing registration fields', async () => {
-      process.env.DISCOVERY_ENABLED = 'true';
+      config.discovery.enabled = true;
       let capturedBody: any = null;
 
       globalThis.fetch = mock(async (_url: any, options: any) => {

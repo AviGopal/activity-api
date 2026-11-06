@@ -6,10 +6,14 @@
  * return Beta(1, 1).
  */
 
-import { describe, expect, it, beforeEach, afterEach, mock } from 'bun:test';
+import { describe, expect, it, beforeEach, afterEach, afterAll, mock, spyOn } from 'bun:test';
 import { seedPriorFromConcepts } from '../src/lib/prior-seed';
+import { discoveryClient } from '../src/services/discovery-client';
 
 const originalFetch = globalThis.fetch;
+// Env this file sets; restored in afterAll so later files in the process see the original.
+const ENV_KEYS = ['CONCEPT_DB_URL', 'PRIOR_SEED_ENABLED', 'PRIOR_SEED_K', 'PRIOR_SEED_KAPPA', 'PRIOR_SEED_TIMEOUT_MS'];
+const originalEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
 
 function setEnv(overrides: Record<string, string | undefined>) {
   for (const [k, v] of Object.entries(overrides)) {
@@ -33,16 +37,27 @@ describe('seedPriorFromConcepts', () => {
     globalThis.fetch = originalFetch;
   });
 
+  afterAll(() => setEnv(originalEnv));
+
   it('falls back when disabled', async () => {
     setEnv({ PRIOR_SEED_ENABLED: 'false' });
     const r = await seedPriorFromConcepts('tpl', 'sig', 'org-1');
     expect(r).toEqual({ alpha0: 1, beta0: 1, source: 'fallback' });
   });
 
-  it('falls back when CONCEPT_DB_URL is unset', async () => {
+  it('falls back when CONCEPT_DB_URL is unset and discovery serves no concept vessel', async () => {
+    // With no override the endpoint resolves via discovery; stub it so no network is touched.
     setEnv({ CONCEPT_DB_URL: undefined });
-    const r = await seedPriorFromConcepts('tpl', 'sig', 'org-1');
-    expect(r.source).toBe('fallback');
+    const spy = spyOn(discoveryClient, 'discoverVesselsForShape').mockImplementation(
+      async () => ({ found: false, vessels: [] }) as never,
+    );
+    try {
+      const r = await seedPriorFromConcepts('tpl', 'sig', 'org-1');
+      expect(r.source).toBe('fallback');
+      expect(spy).toHaveBeenCalledWith('concept');
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('falls back on empty response', async () => {

@@ -25,7 +25,7 @@
  * covered here do not invoke those modules.
  */
 
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test';
 import { Hono } from 'hono';
 
 // =============================================================================
@@ -34,6 +34,16 @@ import { Hono } from 'hono';
 
 const surrealQueries: { sql: string; params: any }[] = [];
 let queryReturnQueue: any[][] = [];
+
+// mock.module is process-wide: capture the real modules and put them back in afterAll.
+const realModules: Array<[string, Record<string, unknown>]> = [
+  ['../db/surreal', { ...(await import('../db/surreal')) }],
+  ['../db/redis', { ...(await import('../db/redis')) }],
+  ['../utils/logger', { ...(await import('../utils/logger')) }],
+];
+afterAll(() => {
+  for (const [spec, real] of realModules) mock.module(spec, () => real);
+});
 
 mock.module('../db/surreal', () => ({
   surrealDB: {
@@ -118,8 +128,9 @@ function expectDualBound(q: { sql: string; params: any }, accountId: string | nu
 // Helper: assert a CREATE/UPDATE write carries account_id + version + org_id.
 function expectDualWritten(q: { sql: string; params: any }, accountId: string | null, orgId: string): void {
   // CREATE uses `account_id: $account_id` (CONTENT/SET map syntax).
-  // UPDATE uses `account_id = $account_id`. Match either.
-  expect(q.sql).toMatch(/account_id\s*[:=]\s*\$account_id/);
+  // UPDATE uses `account_id = $account_id`. Match either, bare or with the
+  // SQL-side null→NONE coercion (`IF $account_id IS NULL THEN NONE ELSE $account_id END`).
+  expect(q.sql).toMatch(/account_id\s*[:=]\s*(\$account_id|IF \$account_id IS NULL THEN NONE ELSE \$account_id END)/);
   expect(q.sql).toMatch(/account_id_version\s*[:=]\s*\$account_id_version/);
   expect(q.params.account_id).toBe(accountId as any);
   expect(q.params.account_id_version).toBe(1);
@@ -267,7 +278,8 @@ describe('Phase B-followup: routes/activities.ts — read+write', () => {
     expectDualBound(shapesRead, 'acc-acme-001', 'org-acme');
 
     const alphaUpdate = surrealQueries.find((q) =>
-      /UPDATE\s+impulse_shape_activity_score\b[\s\S]*?SET\s+alpha\s*=\s*\$new_alpha/i.test(q.sql),
+      // Phase 10 P1: one atomic server-side increment, no client-computed $new_alpha.
+      /UPDATE\s+impulse_shape_activity_score\b[\s\S]*?SET\s+alpha\s*=\s*math::min\(\[\d+,\s*\(alpha \?\? 1\) \+ \$increment/i.test(q.sql),
     )!;
     expect(alphaUpdate).toBeDefined();
     expect(alphaUpdate.sql).toContain('account_id = $account_id');

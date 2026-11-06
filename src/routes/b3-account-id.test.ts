@@ -3,7 +3,7 @@
  * OpenSpec change: activity-api-account-id-migration-2026-04-28.
  *
  * Locks in: writes set both account_id + org_id with account_id_version=1
- * (or null + version=1 when caller has no accountId); reads dual-bind both
+ * (account_id omitted, i.e. NONE, when caller has none); reads dual-bind both
  * params so legacy rows (account_id IS NONE) still match via the org_id
  * branch. Mirrors the activities.account-id and impulses.account-id mock
  * patterns — captures issued SurrealDB queries instead of round-tripping
@@ -26,8 +26,18 @@
  * to B3b).
  */
 
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test';
 import { Hono } from 'hono';
+
+// mock.module is process-wide: capture the real modules and restore them in afterAll.
+const prevSurreal = { ...(await import('../db/surreal')) };
+const prevVesselHealth = { ...(await import('../services/vessel-health')) };
+const prevHealthScoring = { ...(await import('../services/health-scoring')) };
+afterAll(() => {
+  mock.module('../db/surreal', () => prevSurreal);
+  mock.module('../services/vessel-health', () => prevVesselHealth);
+  mock.module('../services/health-scoring', () => prevHealthScoring);
+});
 
 // =============================================================================
 // SHARED MOCKS
@@ -299,8 +309,10 @@ describe('Phase B3: shapes.ts dual-writes account_id', () => {
       /CREATE\s+shape_definition/i.test(q.sql),
     )!;
     expect(create).toBeDefined();
-    expect(create.params.account_id).toBeNull();
-    expect(create.params.orgId).toBeNull();
+    // Public shapes omit org_id/account_id (unbound = NONE; NULL is rejected by option<string>).
+    expect('account_id' in create.params).toBe(false);
+    expect('org_id' in create.params).toBe(false);
+    expect(create.sql).not.toMatch(/account_id:\s*\$account_id|org_id:\s*\$org_id/);
     expect(create.params.account_id_version).toBe(1);
   });
 

@@ -6,7 +6,7 @@
  * and checks the UpdateSummary fields.
  */
 
-import { describe, test, expect, mock, afterAll } from 'bun:test';
+import { describe, test, expect, afterAll, beforeEach } from 'bun:test';
 import {
   applyOutcomeToPosteriors,
   propagateCreditAlongChain,
@@ -15,18 +15,75 @@ import {
   type ExecutionForChainCredit,
 } from '../src/lib/posterior-update';
 import { computeStateSpaceSignature } from '../src/utils/session-context';
-import { flushContextLane, __resetContextLaneForTests } from '../src/lib/context-posterior-lane';
-import { __resetPosteriorAggregatorForTests } from '../src/lib/posterior-aggregator';
+import { __resetContextLaneForTests } from '../src/lib/context-posterior-lane';
+import { __resetPosteriorAggregatorForTests, flushPosteriors } from '../src/lib/posterior-aggregator';
+import { surrealDB } from '../src/db/surreal';
 import { ctsWrites } from './support/cts-lane-writes';
 import type { FailureMode } from '../src/models/schemas';
 
 // With coalescing on, the chain-credit cases enqueue variant deltas (test-activity, A..E, org-test) that the flush
 // writes through the process's surrealDB, which no store answers here: they re-queued on every tick for the rest of
 // the process and were flushed into a later file's stubs and engine. They are this file's, so it discards them.
+beforeEach(() => {
+  __resetPosteriorAggregatorForTests();
+  __resetContextLaneForTests();
+  resolveCalls.length = 0;
+});
 afterAll(() => {
   __resetPosteriorAggregatorForTests();
   __resetContextLaneForTests();
+  globalThis.fetch = realFetch;
 });
+
+// No network here: the impulse-relevance penalty crosses as a shaped resolve (5543368), and prior seeding asks
+// discovery / concept-db. The sink answers `written` = ids sent; anything else finds nothing. Restored in afterAll.
+const realFetch = globalThis.fetch;
+const resolveCalls: Array<{ url: string; body: any }> = [];
+globalThis.fetch = (async (input: any, init?: any) => {
+  const url = String(input?.url ?? input);
+  if (url.endsWith('/v2/impulses/resolve')) {
+    const body = JSON.parse(String(init?.body ?? '{}'));
+    resolveCalls.push({ url, body });
+    const written = (body?.impulse?.pointer?.impulse_ids ?? []).length;
+    return new Response(JSON.stringify({ body: { written } }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (url.endsWith('/rpc')) return realFetch(input, init); // the SurrealDB client: refused as before
+  return new Response(JSON.stringify({ found: false, vessels: [], concepts: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+}) as typeof fetch;
+
+/** Penalty resolves the leaf sent (impulseRelevancePenalty_write pointers). */
+const penaltyPointers = () => resolveCalls.map((c) => c.body?.impulse?.pointer).filter((p) => p?.type === 'impulseRelevancePenalty_write');
+
+/**
+ * Settle the VPM writes into `calls` whichever mode the aggregator is in (it reads POSTERIOR_COALESCE once per
+ * process). Coalescing on: deltas are queued, so flush them with surrealDB recorded into `calls` (no row ⇒ prior
+ * (1,1); the UPDATE reports one row). Off: the writes already went to `db`. Context-lane writes flush into `db`.
+ */
+async function settle(db: DBQueryable, calls: Array<{ sql: string; params: Record<string, unknown> }>): Promise<void> {
+  const real = surrealDB.query;
+  (surrealDB as any).query = async (sql: string, params: Record<string, unknown> = {}) => {
+    calls.push({ sql, params });
+    return /^\s*UPDATE variant_performance_metrics/.test(sql) ? [{}] : [];
+  };
+  try { await flushPosteriors({ db: db as never }); } finally { (surrealDB as any).query = real; }
+}
+
+/**
+ * The VPM UPDATEs in `calls`, as deltas. The leaf and the coalesced flush write absolute `new_alpha`/`new_beta`
+ * over a missing row (prior 1,1), so delta = new − 1; the synchronous ancestor fallback sends the deltas itself.
+ */
+function vpmWrites(calls: Array<{ sql: string; params: Record<string, unknown> }>) {
+  return calls
+    .filter((c) => /^\s*UPDATE variant_performance_metrics/.test(c.sql))
+    .map((c) => ({
+      sql: c.sql,
+      params: {
+        activity_id: c.params.activity_id,
+        alpha_delta: c.params.alpha_delta ?? (c.params.new_alpha as number) - 1,
+        beta_delta: c.params.beta_delta ?? (c.params.new_beta as number) - 1,
+      },
+    }));
+}
 
 // ---------------------------------------------------------------------------
 // Mock DB factory
@@ -65,6 +122,7 @@ function makeDbWithTraces(ancestorRows: AncestorRow[]): { db: DBQueryable; calls
 // Helpers
 // ---------------------------------------------------------------------------
 
+// An untagged success is ungraded (cfb455e: success needs a verdict), so a success here carries reached:true.
 function makeTrace(overrides: Partial<TraceForPosterior> = {}): TraceForPosterior {
   return {
     activity_id: 'test-activity',
@@ -72,11 +130,14 @@ function makeTrace(overrides: Partial<TraceForPosterior> = {}): TraceForPosterio
     success: true,
     failure_mode: null,
     org_id: 'org-test',
+    ...(overrides.success === false ? {} : { tags: ['reached:true'] }),
     ...overrides,
   };
 }
 
 const ORG = 'org-test';
+// Graded yield (6793d04): a success earns full α only at ≥4 output impulses; with none it is α 0.75 / β 0.25.
+const PRODUCTIVE_TASK = { output_impulse_ids: ['o1', 'o2', 'o3', 'o4'] };
 
 // ---------------------------------------------------------------------------
 // Tests: delta rules
@@ -86,7 +147,7 @@ describe('applyOutcomeToPosteriors — delta rules', () => {
   test('success → alpha_delta=1, beta_delta=0', async () => {
     const { db, calls } = makeDb();
     const summary = await applyOutcomeToPosteriors(
-      makeTrace({ success: true, failure_mode: null }),
+      makeTrace({ success: true, failure_mode: null, tasks: [PRODUCTIVE_TASK] }),
       db,
       ORG,
     );
@@ -96,8 +157,8 @@ describe('applyOutcomeToPosteriors — delta rules', () => {
     expect(summary.failure_mode_type).toBeNull();
     expect(summary.warnings).toHaveLength(0);
     // DB write should have fired because alpha_delta !== 0
-    expect(calls.length).toBeGreaterThanOrEqual(1);
-    const writeCall = calls.find(c => c.sql.includes('variant_performance_metrics'));
+    await settle(db, calls);
+    const writeCall = vpmWrites(calls)[0];
     expect(writeCall).toBeDefined();
     expect(writeCall!.params.alpha_delta).toBe(1);
     expect(writeCall!.params.beta_delta).toBe(0);
@@ -183,7 +244,8 @@ describe('applyOutcomeToPosteriors — delta rules', () => {
     expect(summary.failure_mode_type).toBe('cascading');
     expect(summary.warnings).toHaveLength(0);
     // No DB write when both deltas are 0
-    const writeCall = calls.find(c => c.sql.includes('variant_performance_metrics'));
+    await settle(db, calls);
+    const writeCall = vpmWrites(calls)[0];
     expect(writeCall).toBeUndefined();
   });
 
@@ -205,7 +267,8 @@ describe('applyOutcomeToPosteriors — delta rules', () => {
     expect(summary.failure_mode_type).toBe('user_abort');
     expect(summary.warnings).toHaveLength(0);
     // No DB write when both deltas are 0
-    const writeCall = calls.find(c => c.sql.includes('variant_performance_metrics'));
+    await settle(db, calls);
+    const writeCall = vpmWrites(calls)[0];
     expect(writeCall).toBeUndefined();
   });
 
@@ -232,7 +295,8 @@ describe('applyOutcomeToPosteriors — delta rules', () => {
     expect(summary.beta_delta).toBe(1);
     expect(summary.failure_mode_type).toBe('prediction_disagreement');
     expect(summary.warnings).toHaveLength(0);
-    const writeCall = calls.find(c => c.sql.includes('variant_performance_metrics'));
+    await settle(db, calls);
+    const writeCall = vpmWrites(calls)[0];
     expect(writeCall).toBeDefined();
     expect(writeCall!.params.beta_delta).toBe(1);
   });
@@ -260,7 +324,8 @@ describe('applyOutcomeToPosteriors — delta rules', () => {
     expect(summary.beta_delta).toBe(0.5);
     expect(summary.failure_mode_type).toBe('prediction_disagreement');
     expect(summary.warnings).toHaveLength(0);
-    const writeCall = calls.find(c => c.sql.includes('variant_performance_metrics'));
+    await settle(db, calls);
+    const writeCall = vpmWrites(calls)[0];
     expect(writeCall).toBeDefined();
     expect(writeCall!.params.beta_delta).toBe(0.5);
   });
@@ -340,7 +405,8 @@ describe('applyOutcomeToPosteriors — activity_id resolution', () => {
       db,
       ORG,
     );
-    const writeCall = calls.find(c => c.sql.includes('variant_performance_metrics'));
+    await settle(db, calls);
+    const writeCall = vpmWrites(calls)[0];
     expect(writeCall!.params.activity_id).toBe('variant-id');
   });
 
@@ -351,7 +417,8 @@ describe('applyOutcomeToPosteriors — activity_id resolution', () => {
       db,
       ORG,
     );
-    const writeCall = calls.find(c => c.sql.includes('variant_performance_metrics'));
+    await settle(db, calls);
+    const writeCall = vpmWrites(calls)[0];
     expect(writeCall!.params.activity_id).toBe('v-id');
   });
 
@@ -361,9 +428,11 @@ describe('applyOutcomeToPosteriors — activity_id resolution', () => {
       activity_id: 'only-id',
       success: true,
       failure_mode: null,
+      tags: ['reached:true'],
     };
     await applyOutcomeToPosteriors(trace, db, ORG);
-    const writeCall = calls.find(c => c.sql.includes('variant_performance_metrics'));
+    await settle(db, calls);
+    const writeCall = vpmWrites(calls)[0];
     expect(writeCall!.params.activity_id).toBe('only-id');
   });
 });
@@ -395,8 +464,11 @@ describe('applyOutcomeToPosteriors — impulse_relevance writes', () => {
     );
 
     expect(summary.impulse_relevance_writes).toBe(3);
-    const relevanceCalls = calls.filter(c => c.sql.includes('impulse_relevance_metrics'));
-    expect(relevanceCalls).toHaveLength(3);
+    // One shaped penalty resolve carrying every input impulse id (5543368).
+    const pointers = penaltyPointers();
+    expect(pointers).toHaveLength(1);
+    expect(pointers[0].impulse_ids).toEqual(['imp-1', 'imp-2', 'imp-3']);
+    expect(pointers[0].org_id).toBe(ORG);
   });
 
   test('null failure_mode on failed trace also triggers impulse_relevance writes', async () => {
@@ -412,8 +484,9 @@ describe('applyOutcomeToPosteriors — impulse_relevance writes', () => {
     );
 
     expect(summary.impulse_relevance_writes).toBe(1);
-    const relevanceCalls = calls.filter(c => c.sql.includes('impulse_relevance_metrics'));
-    expect(relevanceCalls).toHaveLength(1);
+    const pointers = penaltyPointers();
+    expect(pointers).toHaveLength(1);
+    expect(pointers[0].impulse_ids).toEqual(['imp-a']);
   });
 
   test('success trace does not trigger impulse_relevance writes', async () => {
@@ -427,8 +500,7 @@ describe('applyOutcomeToPosteriors — impulse_relevance writes', () => {
       ORG,
     );
 
-    const relevanceCalls = calls.filter(c => c.sql.includes('impulse_relevance_metrics'));
-    expect(relevanceCalls).toHaveLength(0);
+    expect(penaltyPointers()).toHaveLength(0);
   });
 
   test('budget_exhausted trace does not trigger impulse_relevance writes', async () => {
@@ -450,8 +522,7 @@ describe('applyOutcomeToPosteriors — impulse_relevance writes', () => {
       ORG,
     );
 
-    const relevanceCalls = calls.filter(c => c.sql.includes('impulse_relevance_metrics'));
-    expect(relevanceCalls).toHaveLength(0);
+    expect(penaltyPointers()).toHaveLength(0);
   });
 });
 
@@ -488,9 +559,7 @@ function getGlobalCalls(
   calls: Array<{ sql: string; params: Record<string, unknown> }>,
   activityId: string,
 ) {
-  return calls.filter(
-    c => c.sql.includes('variant_performance_metrics') && c.params.activity_id === activityId,
-  );
+  return vpmWrites(calls).filter(c => c.params.activity_id === activityId);
 }
 
 describe('propagateCreditAlongChain — 18.4.5: success on 4-deep chain', () => {
@@ -512,6 +581,8 @@ describe('propagateCreditAlongChain — 18.4.5: success on 4-deep chain', () => 
     };
 
     await propagateCreditAlongChain(execution, db, ORG);
+
+    await settle(db, calls);
 
     // C is at depth 1 (closest ancestor) — reversed chain is [C, B, A]
     const cCalls = getGlobalCalls(calls, 'C');
@@ -543,7 +614,8 @@ describe('propagateCreditAlongChain — 18.4.5: success on 4-deep chain', () => 
       db,
       ORG,
     );
-    const globalWrites = calls.filter(c => c.sql.includes('variant_performance_metrics'));
+    await settle(db, calls);
+    const globalWrites = vpmWrites(calls);
     expect(globalWrites).toHaveLength(3);
   });
 
@@ -554,7 +626,8 @@ describe('propagateCreditAlongChain — 18.4.5: success on 4-deep chain', () => 
       db,
       ORG,
     );
-    const globalWrites = calls.filter(c => c.sql.includes('variant_performance_metrics'));
+    await settle(db, calls);
+    const globalWrites = vpmWrites(calls);
     expect(globalWrites).toHaveLength(4); // capped at CREDIT_PROPAGATION_MAX_DEPTH=4
   });
 });
@@ -577,6 +650,8 @@ describe('propagateCreditAlongChain — §7: horizontal-composition sibling aver
       ORG,
     );
 
+    await settle(db, calls);
+
     // C depth 1: λ^1 / 3 = 0.7/3; B depth 2: 0.49/3; A depth 3: 0.343/3
     expect(getGlobalCalls(calls, 'C')[0].params.alpha_delta).toBeCloseTo(0.7 / 3);
     expect(getGlobalCalls(calls, 'B')[0].params.alpha_delta).toBeCloseTo(0.49 / 3);
@@ -590,6 +665,7 @@ describe('propagateCreditAlongChain — §7: horizontal-composition sibling aver
       db,
       ORG,
     );
+    await settle(db, calls);
     expect(getGlobalCalls(calls, 'C')[0].params.alpha_delta).toBeCloseTo(0.7);
   });
 
@@ -606,6 +682,7 @@ describe('propagateCreditAlongChain — §7: horizontal-composition sibling aver
       db,
       ORG,
     );
+    await settle(db, calls);
     // verifier_negative → β to all ancestors, each halved by k=2
     expect(getGlobalCalls(calls, 'C')[0].params.beta_delta).toBeCloseTo(0.7 / 2);
     expect(getGlobalCalls(calls, 'A')[0].params.beta_delta).toBeCloseTo(0.343 / 2);
@@ -634,6 +711,8 @@ describe('propagateCreditAlongChain — 18.4.6: cascading failure on 4-deep chai
 
     await propagateCreditAlongChain(execution, db, ORG);
 
+    await settle(db, calls);
+
     // C is at depth 1 — gets β += λ^1 = 0.7
     const cCalls = getGlobalCalls(calls, 'C');
     expect(cCalls).toHaveLength(1);
@@ -661,6 +740,7 @@ describe('propagateCreditAlongChain — 18.4.6: cascading failure on 4-deep chai
       db,
       ORG,
     );
+    await settle(db, calls);
     const dCalls = getGlobalCalls(calls, 'D');
     expect(dCalls).toHaveLength(0);
   });
@@ -674,6 +754,7 @@ describe('propagateCreditAlongChain — edge cases', () => {
       db,
       ORG,
     );
+    await settle(db, calls);
     expect(calls).toHaveLength(0);
   });
 
@@ -686,8 +767,8 @@ describe('propagateCreditAlongChain — edge cases', () => {
       db,
       ORG,
     );
-    const ctsCalls = calls.filter(c => c.sql.includes('context_thompson_scores'));
-    expect(ctsCalls).toHaveLength(0);
+    await settle(db, calls);
+    expect(ctsWrites(calls)).toHaveLength(0);
   });
 
   test('non-cascading failure propagates decayed β to all ancestors', async () => {
@@ -703,6 +784,7 @@ describe('propagateCreditAlongChain — edge cases', () => {
       db,
       ORG,
     );
+    await settle(db, calls);
     // TD(λ=0.7) — B depth 1: β += λ^1 = 0.7; A depth 2: β += λ^2 = 0.49
     const bCalls = getGlobalCalls(calls, 'B');
     expect(bCalls[0].params.beta_delta).toBeCloseTo(0.7);
@@ -742,9 +824,11 @@ describe('propagateCreditAlongChain — §5: per-ancestor v1 signatures', () => 
       ORG,
     );
 
+    await settle(db, calls);
+
     // composition_chain reversed: C=depth-1, B=depth-2, A=depth-3. The cts writes go through the aggregator's cts lane
     // (CHANGE DB2): flush it into this db, then read each key's write.
-    await flushContextLane(db as never);
+    await settle(db, calls);
     const w = ctsWrites(calls);
     const cSigCall = w.find(x => x.activity_id === 'C') && { params: w.find(x => x.activity_id === 'C')! };
     const bSigCall = w.find(x => x.activity_id === 'B') && { params: w.find(x => x.activity_id === 'B')! };
@@ -786,7 +870,9 @@ describe('propagateCreditAlongChain — §5: per-ancestor v1 signatures', () => 
       ORG,
     );
 
-    await flushContextLane(db as never); // CHANGE DB2: cts writes go through the aggregator's cts lane
+    await settle(db, calls);
+
+    await settle(db, calls); // CHANGE DB2: cts writes go through the aggregator's cts lane
     const ctsCalls = ctsWrites(calls);
     expect(ctsCalls).toHaveLength(1);
     expect(ctsCalls[0].activity_id).toBe('C');
@@ -805,8 +891,11 @@ describe('applyOutcomeToPosteriors — composition_chain fire-and-forget wiring'
       db,
       ORG,
     );
-    // Wait a tick for the fire-and-forget promise to settle
-    await new Promise(r => setTimeout(r, 10));
+    // The propagation is fire-and-forget: settle until its write lands (bounded).
+    for (let i = 0; i < 100 && getGlobalCalls(calls, 'ancestor-B').length === 0; i++) {
+      await new Promise(r => setTimeout(r, 20));
+      await settle(db, calls);
+    }
     const ancestorBCalls = getGlobalCalls(calls, 'ancestor-B');
     expect(ancestorBCalls).toHaveLength(1);
     expect(ancestorBCalls[0].params.alpha_delta).toBeCloseTo(0.7);
@@ -816,8 +905,9 @@ describe('applyOutcomeToPosteriors — composition_chain fire-and-forget wiring'
     const { db, calls } = makeDb();
     await applyOutcomeToPosteriors(makeTrace({ success: true }), db, ORG);
     await new Promise(r => setTimeout(r, 10));
+    await settle(db, calls);
     // Only the single variant_performance_metrics write for the leaf itself
-    const allWrites = calls.filter(c => c.sql.includes('variant_performance_metrics'));
+    const allWrites = vpmWrites(calls);
     expect(allWrites).toHaveLength(1);
   });
 });
@@ -832,25 +922,26 @@ describe('applyOutcomeToPosteriors — v1 signature conditional writes', () => {
     const sig = computeStateSpaceSignature({ shapes: ['codeFile', 'gitDiff'], provenance: [], missing: [] });
 
     await applyOutcomeToPosteriors(
-      makeTrace({ success: true, signature: sig, signature_version: 1 }),
+      makeTrace({ success: true, signature: sig, signature_version: 1, tasks: [PRODUCTIVE_TASK] }),
       db,
       ORG,
     );
 
-    const sigWrites = calls.filter(c => c.sql.includes('context_thompson_scores'));
+    await settle(db, calls); // CHANGE DB2: cts writes go through the aggregator's cts lane
+    const sigWrites = ctsWrites(calls);
     expect(sigWrites).toHaveLength(1);
-    expect(sigWrites[0].params.sig).toBe(sig);
-    expect(sigWrites[0].params.sig_version).toBe(1);
-    expect(sigWrites[0].params.alpha_delta).toBe(1);
-    expect(sigWrites[0].params.beta_delta).toBe(0);
+    expect(sigWrites[0].sig).toBe(sig);
+    expect(sigWrites[0].sig_version).toBe(1);
+    expect(sigWrites[0].alpha_delta).toBe(1);
+    expect(sigWrites[0].beta_delta).toBe(0);
   });
 
   test('(b) signature-absent path: no context_thompson_scores write', async () => {
     const { db, calls } = makeDb();
     await applyOutcomeToPosteriors(makeTrace({ success: true }), db, ORG);
 
-    const sigWrites = calls.filter(c => c.sql.includes('context_thompson_scores'));
-    expect(sigWrites).toHaveLength(0);
+    await settle(db, calls);
+    expect(ctsWrites(calls)).toHaveLength(0);
   });
 
   test('(c) failure-mode rules apply per-bucket identically to global — verifier_negative → beta=1', async () => {
@@ -868,7 +959,7 @@ describe('applyOutcomeToPosteriors — v1 signature conditional writes', () => {
       ORG,
     );
 
-    await flushContextLane(db as never); // CHANGE DB2: cts writes go through the aggregator's cts lane
+    await settle(db, calls); // CHANGE DB2: cts writes go through the aggregator's cts lane
     const sigWrites = ctsWrites(calls);
     expect(sigWrites).toHaveLength(1);
     expect(sigWrites[0].alpha_delta).toBe(0);

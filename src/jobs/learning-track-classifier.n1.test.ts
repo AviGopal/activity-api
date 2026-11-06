@@ -8,7 +8,11 @@
  * ~2,000 `FROM activity WHERE id = $id` reads per 3 min on the hub (database session, 10-02).
  * The cycle query should carry the row fields and pass the row in.
  */
-import { describe, expect, mock, test, beforeEach } from 'bun:test';
+import { describe, expect, mock, test, beforeEach, afterAll } from 'bun:test';
+
+// mock.module is process-wide: restore the real module after this file.
+const prevSurreal = { ...(await import('../db/surreal')) };
+afterAll(() => { mock.module('../db/surreal', () => prevSurreal); });
 
 const calls: string[] = [];
 const DUE = ['t1', 't2', 't3', 't4', 't5'];

@@ -23,11 +23,21 @@
  * we can assert SQL text + params without round-tripping a live DB.
  */
 
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test';
 
 // =============================================================================
 // SHARED MOCKS — capture every SurrealDB query the services issue
 // =============================================================================
+
+// mock.module is process-wide: keep the real modules to restore in afterAll.
+const prevSurreal = { ...(await import('../db/surreal')) };
+const prevRedis = { ...(await import('../db/redis')) };
+const prevLogger = { ...(await import('../utils/logger')) };
+afterAll(() => {
+  mock.module('../db/surreal', () => prevSurreal);
+  mock.module('../db/redis', () => prevRedis);
+  mock.module('../utils/logger', () => prevLogger);
+});
 
 const surrealQueries: { sql: string; params: any }[] = [];
 let queryReturnQueue: any[][] = [];
@@ -284,9 +294,9 @@ describe('Phase B4a: variant-creator dual-binds reads + dual-writes activity var
 
     expect(result).not.toBeNull();
 
-    // Find the CREATE activity:⟨id⟩ statement.
+    // Find the CREATE statement (binds the record id via type::thing since f2857fc).
     const createStmt = surrealQueries.find((q) =>
-      /CREATE\s+activity:⟨\$variant_id⟩\s+SET/.test(q.sql),
+      /CREATE\s+type::thing\("activity",\s*\$variant_id\)\s+SET/.test(q.sql),
     )!;
     expect(createStmt).toBeDefined();
     expect(createStmt.sql).toContain('account_id = $account_id');
@@ -340,7 +350,7 @@ describe('Phase B4a: variant-creator dual-binds reads + dual-writes activity var
     );
 
     const createStmt = surrealQueries.find((q) =>
-      /CREATE\s+activity:⟨\$variant_id⟩\s+SET/.test(q.sql),
+      /CREATE\s+type::thing\("activity",\s*\$variant_id\)\s+SET/.test(q.sql),
     )!;
     expect(createStmt.params.account_id).toBeNull();
     expect(createStmt.params.account_id_version).toBe(1);

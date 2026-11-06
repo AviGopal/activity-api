@@ -19,8 +19,22 @@
  * mirrors the activities.account-id and b3-account-id mock patterns.
  */
 
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test';
 import { Hono } from 'hono';
+
+// mock.module is process-wide: capture the real modules and restore them in afterAll.
+const prevSurreal = { ...(await import('../db/surreal')) };
+const prevRedis = { ...(await import('../db/redis')) };
+const prevBroadcaster = { ...(await import('../websocket/broadcaster')) };
+const prevParadigm = { ...(await import('../db/paradigm')) };
+const prevVariantCreator = { ...(await import('../services/variant-creator')) };
+afterAll(() => {
+  mock.module('../db/surreal', () => prevSurreal);
+  mock.module('../db/redis', () => prevRedis);
+  mock.module('../websocket/broadcaster', () => prevBroadcaster);
+  mock.module('../db/paradigm', () => prevParadigm);
+  mock.module('../services/variant-creator', () => prevVariantCreator);
+});
 
 const surrealQueries: { sql: string; params: any }[] = [];
 let queryReturnQueue: any[][] = [];
@@ -64,6 +78,8 @@ mock.module('../websocket/broadcaster', () => ({
 }));
 
 mock.module('../db/paradigm', () => ({
+  // Real exports underneath so new paradigm exports never break this file's import.
+  ...prevParadigm,
   insertActivity: async () => null,
   insertExecution: async () => null,
   getActivityScores: async () => ({ data: [], path: 'legacy' as const }),
@@ -190,7 +206,8 @@ describe('Phase E: POST /v2/activities/impulse-relevance CREATE branch dual-writ
     const createQuery = findCreateQuery();
     expect(createQuery).not.toBeNull();
     expect(createQuery!.sql).toContain('org_id: $org_id');
-    expect(createQuery!.sql).toContain('account_id: $account_id');
+    // NULL is coerced to NONE in-query (option<string> rejects NULL).
+    expect(createQuery!.sql).toContain('account_id: IF $account_id IS NULL THEN NONE ELSE $account_id END');
     expect(createQuery!.sql).toContain('account_id_version: 1');
     expect(createQuery!.params.account_id).toBe('acc-acme-001');
     expect(createQuery!.params.org_id).toBe('org-acme');

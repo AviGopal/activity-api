@@ -35,7 +35,8 @@ describe('WebSocket Broadcaster', () => {
     expect(taskStartedMessage.sequence).toBe(newSequence);
   });
 
-  test('should not assign sequence numbers to coarse-grained events', () => {
+  // execution_started/_completed are sequenced since 5dec2e9 (eventStream needs them).
+  test('should assign sequence numbers to execution lifecycle events', () => {
     const executionCompletedMessage: WebSocketMessage = {
       type: 'execution_completed',
       timestamp: new Date().toISOString(),
@@ -49,11 +50,27 @@ describe('WebSocket Broadcaster', () => {
       },
     };
 
-    // Emit the message
     broadcaster.emit(executionCompletedMessage);
 
+    expect(executionCompletedMessage.sequence).toBe(broadcaster.getCurrentSequence());
+  });
+
+  test('should not assign sequence numbers to coarse-grained events', () => {
+    const templateUpdatedMessage: WebSocketMessage = {
+      type: 'template_updated',
+      timestamp: new Date().toISOString(),
+      data: {
+        variant_id: 'test-variant',
+        metrics: { success_rate: 1, avg_duration_ms: 1, avg_cost_usd: 0, thompson_alpha: 2, thompson_beta: 1 },
+      },
+    };
+    const before = broadcaster.getCurrentSequence();
+
+    broadcaster.emit(templateUpdatedMessage);
+
     // Coarse-grained events should not have sequence numbers
-    expect(executionCompletedMessage.sequence).toBeUndefined();
+    expect(templateUpdatedMessage.sequence).toBeUndefined();
+    expect(broadcaster.getCurrentSequence()).toBe(before);
   });
 
   test('should increment sequence for multiple fine-grained events', () => {

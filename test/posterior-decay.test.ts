@@ -11,7 +11,17 @@
  * (decay stored counts BEFORE adding the delta) and binds the half-life param.
  */
 
-import { describe, test, expect, mock } from 'bun:test';
+import { describe, test, expect, mock, afterAll } from 'bun:test';
+
+// mock.module is process-wide: capture the real modules and put them back in afterAll.
+const prevSurreal = { ...(await import('../src/db/surreal')) };
+const prevPriorSeed = { ...(await import('../src/lib/prior-seed')) };
+const prevEmbeddingCache = { ...(await import('../src/lib/embedding-lookup-cache')) };
+afterAll(() => {
+  mock.module('../src/db/surreal', () => prevSurreal);
+  mock.module('../src/lib/prior-seed', () => prevPriorSeed);
+  mock.module('../src/lib/embedding-lookup-cache', () => prevEmbeddingCache);
+});
 
 // Stub the surreal singleton BEFORE importing posterior-update so getTuningParam
 // (used by resolveThompsonDecayHalfLifeDays) never touches a real DB connection.
@@ -37,6 +47,7 @@ const {
   THOMPSON_DECAY_HALFLIFE_DAYS_DEFAULT,
   applyOutcomeToPosteriors,
 } = await import('../src/lib/posterior-update');
+const { flushPosteriors } = await import('../src/lib/posterior-aggregator');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -115,7 +126,7 @@ describe('decayedThompsonCounts', () => {
 });
 
 describe('context_thompson_scores write-site decay', () => {
-  test('UPDATE branch decays stored counts before adding the delta and binds half_life_secs', async () => {
+  test('context-lane UPSERT decays stored counts before adding the delta and binds the half-life', async () => {
     const calls: Array<{ sql: string; params: Record<string, unknown> }> = [];
     const db = {
       async query(sql: string, params: Record<string, unknown> = {}) {
@@ -128,6 +139,8 @@ describe('context_thompson_scores write-site decay', () => {
       {
         activity_id: 'decay-test-activity',
         success: true,
+        // Posteriors are reach-graded: success alone is ungraded and writes nothing.
+        tags: ['reached:true'],
         signature: 'a1b2c3d4e5f60718',
         signature_version: 1,
         tasks: [{ resolver_tier: 'llm' }],
@@ -136,18 +149,21 @@ describe('context_thompson_scores write-site decay', () => {
       'organizations:test',
     );
 
+    // CHANGE DB2: the delta goes through the context lane; drain it into this db.
+    await flushPosteriors({ db: db as any });
+
     const ctsCall = calls.find(
-      (c) => c.sql.includes('context_thompson_scores') && c.sql.includes('UPDATE'),
+      (c) => c.sql.includes('UPSERT context_thompson_scores') && c.params.k0_tpl === 'decay-test-activity',
     );
     expect(ctsCall).toBeDefined();
-    // Decay-then-add, both counts:
-    expect(ctsCall!.sql).toContain('alpha = 1 + (alpha - 1) * math::pow(0.5,');
-    expect(ctsCall!.sql).toContain('beta  = 1 + (beta - 1) * math::pow(0.5,');
-    expect(ctsCall!.sql).toContain('$half_life_secs');
+    // Decay-then-add, both counts (a new row starts from the seeded prior):
+    expect(ctsCall!.sql).toContain('alpha = IF alpha IS NONE THEN $k0_a0 ELSE 1 + (alpha - 1) * math::pow(0.5,');
+    expect(ctsCall!.sql).toContain('beta = IF beta IS NONE THEN $k0_b0 ELSE 1 + (beta - 1) * math::pow(0.5,');
+    expect(ctsCall!.sql).toContain('/ $k0_hl) END + $k0_da');
     // Negative-duration clamp (SurrealDB 2.3.3 errors on negative datetime diffs):
     expect(ctsCall!.sql).toContain('math::max([0,');
     // Half-life bound in seconds (default 3 days with no tuning row / stubbed DB):
-    expect(ctsCall!.params.half_life_secs).toBe(
+    expect(ctsCall!.params.k0_hl).toBe(
       THOMPSON_DECAY_HALFLIFE_DAYS_DEFAULT * 86400,
     );
   });
