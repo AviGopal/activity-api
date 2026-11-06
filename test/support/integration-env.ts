@@ -8,18 +8,21 @@
  * closed port (the pull-sync gate does) has no resource to integrate with, so its
  * integration files skip rather than fail.
  */
-async function answering(url: string | undefined): Promise<string | undefined> {
+async function answering(name: string): Promise<string | undefined> {
+  const url = process.env[name];
   if (!url) return undefined;
   try {
     await fetch(url.replace(/^ws/, 'http'), { signal: AbortSignal.timeout(1500) });
     return url;
   } catch {
+    // A wrong URL would otherwise read the same as no URL: say why the cases skip.
+    console.error(`integration-env: ${name} set but not answering; integration cases skip`);
     return undefined;
   }
 }
 
 const [surrealdb, activityApi, testApi] = await Promise.all(
-  [process.env.SURREALDB_URL, process.env.ACTIVITY_API_URL, process.env.TEST_API_URL].map(answering),
+  ['SURREALDB_URL', 'ACTIVITY_API_URL', 'TEST_API_URL'].map(answering),
 );
 
 export const integrationEnv = Object.freeze({
