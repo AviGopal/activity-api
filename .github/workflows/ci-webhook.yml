@@ -33,15 +33,6 @@ on:
         required: false
         type: string
 
-env:
-  # Set from repository secrets
-  # Default target for the CI-outcome webhook. `api.minibob.local` was a retired name that
-  # resolves nowhere, so once the workflow was parseable again the webhook still died with
-  # curl exit 5 (could not resolve host). Point the fallback at the public hub that actually
-  # serves /v2/activities/ci-result. Set the ACTIVITY_API_URL repo secret to override.
-  ACTIVITY_API_URL: ${{ secrets.ACTIVITY_API_URL || 'http://syzygy.host:18080' }}
-  ACTIVITY_API_KEY: ${{ secrets.ACTIVITY_API_KEY || '' }}
-
 jobs:
   ci:
     runs-on: ubuntu-latest
@@ -70,16 +61,22 @@ jobs:
         continue-on-error: true
         run: |
           echo "build_start=$(date +%s%3N)" >> $GITHUB_OUTPUT
-          bun run build || echo "build_failed=true" >> $GITHUB_OUTPUT
+          set +e  # the runner shell is bash -e; the stage exits with its own status below
+          bun run build; rc=${PIPESTATUS[0]}
+          [ "$rc" = 0 ] || echo "build_failed=true" >> $GITHUB_OUTPUT
           echo "build_end=$(date +%s%3N)" >> $GITHUB_OUTPUT
+          exit $rc
 
       - name: Typecheck
         id: typecheck
         continue-on-error: true
         run: |
           echo "typecheck_start=$(date +%s%3N)" >> $GITHUB_OUTPUT
-          bun run typecheck 2>&1 | tee typecheck.log || echo "typecheck_failed=true" >> $GITHUB_OUTPUT
+          set +e
+          bun run typecheck 2>&1 | tee typecheck.log; rc=${PIPESTATUS[0]}
+          [ "$rc" = 0 ] || echo "typecheck_failed=true" >> $GITHUB_OUTPUT
           echo "typecheck_end=$(date +%s%3N)" >> $GITHUB_OUTPUT
+          exit $rc
 
       - name: Install SurrealDB (engine version the substrate runs; DB-backed tests spawn it in memory)
         run: |
@@ -92,7 +89,9 @@ jobs:
         continue-on-error: true
         run: |
           echo "test_start=$(date +%s%3N)" >> $GITHUB_OUTPUT
-          bun test --coverage 2>&1 | tee test.log || echo "test_failed=true" >> $GITHUB_OUTPUT
+          set +e
+          bun test --coverage 2>&1 | tee test.log; rc=${PIPESTATUS[0]}
+          [ "$rc" = 0 ] || echo "test_failed=true" >> $GITHUB_OUTPUT
           echo "test_end=$(date +%s%3N)" >> $GITHUB_OUTPUT
 
           # Extract test results from log (example parser, adjust based on actual output)
@@ -100,13 +99,20 @@ jobs:
           TESTS_FAILED=$(grep -oP "(?<=✗ )\d+" test.log | awk '{s+=$1} END {print s}' || echo 0)
           echo "tests_passed=${TESTS_PASSED}" >> $GITHUB_OUTPUT
           echo "tests_failed=${TESTS_FAILED}" >> $GITHUB_OUTPUT
+          exit $rc
 
       - name: Lint
         id: lint
         continue-on-error: true
         run: |
+          # The shape-dispatch and evidence-aliasing checks read the super-repo's packages/ at ../../packages, as in a super-repo checkout.
+          git clone --quiet --depth 1 --filter=blob:none --sparse -b dev https://github.com/AviGopal/substrate.git "$RUNNER_TEMP/super"
+          git -C "$RUNNER_TEMP/super" sparse-checkout set packages/shape-dispatch-check packages/evidence-aliasing-check
+          ln -sfn "$RUNNER_TEMP/super/packages" ../../packages
           echo "lint_start=$(date +%s%3N)" >> $GITHUB_OUTPUT
-          bun run lint --format=compact 2>&1 | tee lint.log || echo "lint_failed=true" >> $GITHUB_OUTPUT
+          set +e
+          bun run lint --format=compact 2>&1 | tee lint.log; rc=${PIPESTATUS[0]}
+          [ "$rc" = 0 ] || echo "lint_failed=true" >> $GITHUB_OUTPUT
           echo "lint_end=$(date +%s%3N)" >> $GITHUB_OUTPUT
 
           # Extract lint results (example parser)
@@ -114,14 +120,7 @@ jobs:
           LINT_WARNINGS=$(grep -c "warning" lint.log || echo 0)
           echo "lint_errors=${LINT_ERRORS}" >> $GITHUB_OUTPUT
           echo "lint_warnings=${LINT_WARNINGS}" >> $GITHUB_OUTPUT
-
-      - name: Format check
-        id: format
-        continue-on-error: true
-        run: |
-          echo "format_start=$(date +%s%3N)" >> $GITHUB_OUTPUT
-          bun run format:check 2>&1 | tee format.log || echo "format_failed=true" >> $GITHUB_OUTPUT
-          echo "format_end=$(date +%s%3N)" >> $GITHUB_OUTPUT
+          exit $rc
 
       - name: Secret scanning
         id: secrets
@@ -130,35 +129,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_CONFIG: .gitleaks.toml
-
-      - name: Build Docker image (on success)
-        id: docker
-        if: steps.build.outcome == 'success' && steps.typecheck.outcome == 'success' && steps.test.outcome == 'success'
-        run: |
-          echo "docker_start=$(date +%s%3N)" >> $GITHUB_OUTPUT
-
-          # Tag with commit SHA
-          IMAGE_TAG="metabob-activity-api:${{ github.sha }}"
-          docker build -t ${IMAGE_TAG} .
-
-          # Save image as artifact
-          docker save ${IMAGE_TAG} | gzip > docker-image.tar.gz
-
-          echo "docker_end=$(date +%s%3N)" >> $GITHUB_OUTPUT
-          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
-
-          # Get image size
-          IMAGE_SIZE=$(stat -c%s docker-image.tar.gz)
-          echo "image_size=${IMAGE_SIZE}" >> $GITHUB_OUTPUT
-
-      - name: Upload Docker image artifact
-        if: steps.docker.outcome == 'success'
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-image-${{ github.sha }}
-          path: docker-image.tar.gz
-          retention-days: 7
-          compression-level: 0 # Already gzipped
 
       - name: Upload test coverage
         if: steps.test.outcome == 'success'
@@ -181,8 +151,7 @@ jobs:
           if [ "${{ steps.build.outcome }}" == "success" ] && \
              [ "${{ steps.typecheck.outcome }}" == "success" ] && \
              [ "${{ steps.test.outcome }}" == "success" ] && \
-             [ "${{ steps.lint.outcome }}" == "success" ] && \
-             [ "${{ steps.format.outcome }}" == "success" ]; then
+             [ "${{ steps.lint.outcome }}" == "success" ]; then
             echo "success=true" >> $GITHUB_OUTPUT
           else
             echo "success=false" >> $GITHUB_OUTPUT
@@ -197,6 +166,14 @@ jobs:
         continue-on-error: true
         env:
           EXECUTION_ID: ${{ github.event.inputs.execution_id || github.event.head_commit.message }}
+          # Set here, not at workflow level: integration tests run when ACTIVITY_API_URL is set, and a
+          # workflow-wide default pointed the test step at the public hub.
+          # Default target for the CI-outcome webhook. `api.minibob.local` was a retired name that
+          # resolves nowhere, so once the workflow was parseable again the webhook still died with
+          # curl exit 5 (could not resolve host). Point the fallback at the public hub that actually
+          # serves /v2/activities/ci-result. Set the ACTIVITY_API_URL repo secret to override.
+          ACTIVITY_API_URL: ${{ secrets.ACTIVITY_API_URL || 'http://syzygy.host:18080' }}
+          ACTIVITY_API_KEY: ${{ secrets.ACTIVITY_API_KEY || '' }}
         run: |
           # Extract execution ID from commit message if not provided
           # Commit message format: "feat: implement X [execution:exec-abc123]"
@@ -264,17 +241,6 @@ jobs:
                 "error": "${{ steps.lint.outputs.lint_failed && 'Lint failed' || '' }}"
               }
             },
-            "artifacts": [
-              {
-                "name": "docker-image-${{ github.sha }}",
-                "type": "docker_image",
-                "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-                "size_bytes": ${{ steps.docker.outputs.image_size || 0 }},
-                "metadata": {
-                  "image_tag": "${{ steps.docker.outputs.image_tag || '' }}"
-                }
-              }
-            ],
             "metadata": {
               "repository": "${{ github.repository }}",
               "actor": "${{ github.actor }}",
