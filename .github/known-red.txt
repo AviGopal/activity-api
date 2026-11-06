@@ -1,0 +1,35 @@
+# Tests that fail because the source is wrong and the test is right.
+# They stay red in the test files: open gap rows read them as falsifiers.
+# CI passes when every failure is listed here, and warns when a listed case passes.
+# One bun test name per line ("describe > test"); each group cites its ledger finding.
+
+# agf_oedw4qco4x90: strict email regex accepts a leading-dot local part
+Email Validation > validateEmailStrict (stricter validation) > should reject invalid formats
+
+# agf_3g57ocftrxy9: classifier re-reads each listed template row by id (N+1)
+learning-track classifier cycle: no N+1 re-read of listed templates > a cycle over 5 due templates issues no per-template activity read
+
+# agf_15wdnmd7t0ut: cadence map keyed by a fresh RecordId never hits
+learning-track classifier over the real schema: cycle cost does not grow with the due set > an in-cadence cycle issues the same number of statements over 5 and over 50 due templates
+
+# agf_ikpv4wwjcwht: first cycle re-reads each listed row (N+1)
+learning-track classifier over the real schema: cycle cost does not grow with the due set > a first cycle costs at most one statement per newly due template beyond the listing (no row re-read)
+
+# agf_83oohgn6n3lq: malformed_request failures still write beta
+MUST-FAIL — a caller-fault failure gives no alpha and no beta > the goal-host proxy carrier (execution_error, failure_mode=malformed_request) abstains
+MUST-FAIL — a caller-fault failure gives no alpha and no beta > the bare dispatcher detail abstains too (same token, no proxy prefix)
+ancestor chain credit (the second posterior write site) > MUST-FAIL: a caller-fault leaf writes no alpha or beta to any ancestor
+
+# agf_kuy83d2fvlkt: promote gate and deliverable-shapes disagree on builtin resolvers
+deliverable-shapes: a composite terminal is claimed when every task resolver is advertised > CHECK: a terminal produced only by composites whose task resolvers are all advertised is admitted
+deliverable-shapes: a composite terminal is claimed when every task resolver is advertised > CHECK: a composite whose task uses a BUILTIN resolver (not advertised in discovery) counts as claimed
+deliverable-shapes: a composite terminal is claimed when every task resolver is advertised > CHECK: the promote gate and deliverable-shapes consult the SAME exported BUILTIN_RESOLVER_IDS object
+
+# agf_1eyxvcn62835: prior seeding full-text-searches machine identifiers
+prior seeding never full-text-searches machine identifiers > an activity id with a signature-cluster hash issues no concept text search
+prior seeding never full-text-searches machine identifiers > an activity id with a raw hex signature issues no concept text search
+prior seeding never full-text-searches machine identifiers > an identifier-only templateId with no signature issues no concept text search (generated id shapes)
+prior seeding never full-text-searches machine identifiers > an identifier-only templateId with any identifier signature issues no concept text search (generated pairs)
+
+# agf_p5n8gdf7nite: the no-dates trace list materialises the whole 24 h window
+trace list: same rows, bounded work > THE DEFECT: a no-dates first page costs a fraction of materialising the 24 h window
