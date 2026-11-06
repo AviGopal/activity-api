@@ -13,7 +13,7 @@
  * anything that has not earned it. Queries are captured rather than round-tripped.
  */
 
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test';
 
 // config.ts evaluates `export const config = loadConfig()` at import time and THROWS without
 // SURREALDB_NAMESPACE. Setting the env with ??= is NOT enough in a full-suite run: a sibling
@@ -28,6 +28,7 @@ const surrealQueries: { sql: string; params: any }[] = [];
 let metricsRow: Record<string, unknown> | null = null;
 let updateReturns: unknown[] = [{ id: 'x' }];
 
+const realSurreal = { ...(await import('../db/surreal')) };
 mock.module('../db/surreal', () => ({
   surrealDB: {
     query: async (sql: string, params: any) => {
@@ -48,6 +49,12 @@ mock.module('../db/surreal', () => ({
 // 37fed291 on exactly that. So only getTuningParam is overridden; every other export is the REAL
 // function, copied off the namespace BEFORE the mock patches it (the namespace object is live).
 const realTuningParams = { ...(await import('../lib/tuning-params')) };
+// The getTuningParam override (always the default) must not outlive this file either:
+// accelerator-flag-tick reads SF_BLEND_VERDICT through it.
+afterAll(() => {
+  mock.module('../lib/tuning-params', () => realTuningParams);
+  mock.module('../db/surreal', () => realSurreal);
+});
 
 mock.module('../lib/tuning-params', () => ({
   getTuningParam: async (_n: string, _e: string | undefined, d: number) => d,

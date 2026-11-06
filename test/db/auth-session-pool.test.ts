@@ -6,8 +6,13 @@
  * wait queue, drain semantics, monotonic counters) is verifiable from
  * the public surface alone, so we don't need to stub the wire protocol.
  */
-import { describe, expect, mock, beforeEach, afterEach, test } from 'bun:test';
+import { describe, expect, mock, beforeEach, afterEach, afterAll, test } from 'bun:test';
 import * as jose from 'jose';
+
+// mock.module is process-wide: restore the real package after this file, or a later real-engine
+// file's `new Surreal()` gets the stub and every query returns no rows.
+const realSurrealdb = { ...(await import('surrealdb')) };
+afterAll(() => { mock.module('surrealdb', () => realSurrealdb); });
 
 const SECRET = new TextEncoder().encode('a'.repeat(64));
 

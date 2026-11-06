@@ -135,6 +135,11 @@ export async function startRealSurreal(): Promise<RealSurreal> {
       return res;
     },
     async connectModuleClient() {
+      // Restore the env on stop: a later file that reads SURREALDB_URL would otherwise get this
+      // stopped engine's ws:// URL (health.test's child then never answers /health).
+      const envKeys = ['SURREALDB_URL', 'SURREALDB_NAMESPACE', 'SURREALDB_DATABASE', 'SURREALDB_USERNAME', 'SURREALDB_PASSWORD'] as const;
+      const savedEnv = envKeys.map((k) => [k, process.env[k]] as const);
+      restores.push(() => { for (const [k, v] of savedEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
       process.env.SURREALDB_URL = rpcUrl;
       process.env.SURREALDB_NAMESPACE = NS;
       process.env.SURREALDB_DATABASE = DB;

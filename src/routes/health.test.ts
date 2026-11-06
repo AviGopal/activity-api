@@ -11,6 +11,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
 import { join } from 'node:path';
 import type { Subprocess } from 'bun';
+import { integrationEnv } from '../../test/support/integration-env';
 
 const CLOSED = 'http://127.0.0.1:9';
 const children: Subprocess[] = [];
@@ -33,7 +34,8 @@ async function bootAndProbe(discoveryEnabled: boolean): Promise<{ status: number
       DISCOVERY_ENABLED: String(discoveryEnabled),
       DISCOVERY_VESSEL_ENDPOINT: CLOSED,
       REDIS_URL: process.env.REDIS_URL ?? 'redis://127.0.0.1:9',
-      SURREALDB_URL: process.env.SURREALDB_URL ?? CLOSED,
+      // The env as the run started, not as an earlier file left it.
+      SURREALDB_URL: integrationEnv.surrealdb ?? CLOSED,
     },
     stdout: 'ignore',
     stderr: 'ignore',

@@ -42,7 +42,9 @@ function emitAndCapture(message: WebSocketMessage): Record<string, unknown> {
   const internal = broadcaster as unknown as { clients: Set<unknown> };
   internal.clients.add(fake as unknown);
   try {
-    broadcaster.emit(message);
+    // A copy: emit() stamps a sequence onto the object and keeps it in the catchup history,
+    // so re-emitting a shared fixture would rewrite an earlier history entry's sequence.
+    broadcaster.emit({ ...message });
     expect(fake.sent.length).toBeGreaterThan(0);
     return JSON.parse(fake.sent[fake.sent.length - 1]!).data as Record<string, unknown>;
   } finally {
