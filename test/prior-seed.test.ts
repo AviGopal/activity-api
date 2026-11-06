@@ -51,11 +51,16 @@ describe('seedPriorFromConcepts', () => {
     const spy = spyOn(discoveryClient, 'discoverVesselsForShape').mockImplementation(
       async () => ({ found: false, vessels: [] }) as never,
     );
+    // The resolved endpoint is cached for 60 s per process; an earlier file may have
+    // warmed it, so step past the TTL to make this call reach discovery.
+    const realNow = Date.now();
+    const clock = spyOn(Date, 'now').mockReturnValue(realNow + 120_000);
     try {
       const r = await seedPriorFromConcepts('tpl', 'sig', 'org-1');
       expect(r.source).toBe('fallback');
       expect(spy).toHaveBeenCalledWith('concept');
     } finally {
+      clock.mockRestore();
       spy.mockRestore();
     }
   });
