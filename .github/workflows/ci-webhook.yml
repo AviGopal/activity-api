@@ -167,7 +167,7 @@ jobs:
         # unresolvable, curl exit 5 failed the whole job even though `|| echo` was present.)
         continue-on-error: true
         env:
-          EXECUTION_ID: ${{ github.event.inputs.execution_id || github.event.head_commit.message }}
+          EXECUTION_ID: ${{ github.event.inputs.execution_id }}
           # Set here, not at workflow level: integration tests run when ACTIVITY_API_URL is set, and a
           # workflow-wide default pointed the test step at the public hub.
           # Default target for the CI-outcome webhook. `api.minibob.local` was a retired name that
