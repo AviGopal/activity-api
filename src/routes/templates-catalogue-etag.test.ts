@@ -14,11 +14,23 @@
  *   [CONTROL]   no If-None-Match, or a stale one, gets the full body; the FTS path carries no ETag.
  */
 
-import { beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterAll, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { Hono } from 'hono';
 
 const surrealQueries: { sql: string; params: any }[] = [];
 let rows: any[] = [];
+
+// mock.module is process-wide: capture the real modules and put them back in afterAll.
+const realModules: Array<[string, Record<string, unknown>]> = [
+  ['../db/surreal', { ...(await import('../db/surreal')) }],
+  ['../db/redis', { ...(await import('../db/redis')) }],
+  ['../websocket/broadcaster', { ...(await import('../websocket/broadcaster')) }],
+  ['../db/paradigm', { ...(await import('../db/paradigm')) }],
+  ['../services/variant-creator', { ...(await import('../services/variant-creator')) }],
+];
+afterAll(() => {
+  for (const [spec, real] of realModules) mock.module(spec, () => real);
+});
 
 mock.module('../db/surreal', () => ({
   surrealDB: {

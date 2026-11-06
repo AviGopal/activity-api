@@ -13,17 +13,21 @@
  * The control keeps a query that carries words reaching concept-db as before.
  */
 
-import { describe, expect, it, beforeEach, afterEach, mock } from 'bun:test';
+import { describe, expect, it, beforeEach, afterEach, afterAll, mock } from 'bun:test';
 import { seedPriorFromConcepts } from '../src/lib/prior-seed';
 
 const originalFetch = globalThis.fetch;
 
+// Env this file sets; restored in afterAll so later files in the process see the original.
+const ENV_KEYS = ['CONCEPT_DB_URL', 'PRIOR_SEED_ENABLED', 'EMBEDDING_PRIOR_ENABLED', 'PRIOR_SEED_K', 'PRIOR_SEED_KAPPA', 'PRIOR_SEED_TIMEOUT_MS'];
+const originalEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
 function setEnv(overrides: Record<string, string | undefined>) {
   for (const [k, v] of Object.entries(overrides)) {
     if (v === undefined) delete (process.env as Record<string, string | undefined>)[k];
     else process.env[k] = v;
   }
 }
+afterAll(() => setEnv(originalEnv));
 
 /** Installs a fetch mock that records every /concepts/search?query= request. */
 function recordSearches(): string[] {

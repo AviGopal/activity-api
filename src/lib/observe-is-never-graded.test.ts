@@ -14,51 +14,72 @@
  *   CONTROL:   the same rows without the observe tag grade exactly as before (reached ⇒ α, not-reached ⇒ β, and an
  *              ungraded goal-host run whose task threw still takes β through the ungraded-failure arm).
  */
-process.env.SURREALDB_NAMESPACE = 'activity-system';
-process.env.SURREALDB_DATABASE = 'learning_loop';
-process.env.POSTERIOR_COALESCE = '0';
-process.env.SURREALDB_URL = 'http://127.0.0.1:9';
-process.env.RELEVANCE_SINK_ENDPOINT = 'http://127.0.0.1:9';
-process.env.PRIOR_SEED_ENABLED = 'false';
-
 import { describe, expect, test } from 'bun:test';
+import { relative as pathRelative, join as pathJoin } from 'node:path';
 import { classifyReach, isObserveTrace, observeSkipCount } from './reach-classify';
 
-const { applyOutcomeToPosteriors } = await import('./posterior-update');
-const sent: string[] = [];
-const db = { query: async (sql: string) => { sent.push(sql); return []; }, queryAll: async (sql: string) => { sent.push(sql); return []; } } as never;
-const run = async (tags: string[], extra: Record<string, unknown> = {}) => {
-  sent.length = 0;
-  const s = await applyOutcomeToPosteriors({ activity_id: 'observe-gate-arm', execution_id: `e-${tags.join('|')}`, success: true, failure_mode: null, tags, ...extra } as never, db, 'org-1');
-  return { a: s.alpha_delta, b: s.beta_delta, skipped: s.skipped_reason ?? null, statements: sent.length };
-};
+// Child bun, as in grading-counters.test.ts: POSTERIOR_COALESCE=0 is read when posterior-aggregator loads, and the
+// module is shared by the whole run, so setting it here turned coalescing off for every later file.
+const ISOLATED_ENV = 'ACTIVITY_API_ISOLATED_TEST';
+const ISOLATED = process.env[ISOLATED_ENV] === import.meta.path;
+if (!ISOLATED) {
+  test('runs isolated in its own bun process (4 cases)', () => {
+    const root = pathJoin(import.meta.dir, '..', '..');
+    const r = Bun.spawnSync(['bun', 'test', './' + pathRelative(root, import.meta.path)], {
+      cwd: root,
+      env: { HOME: process.env.HOME ?? '', PATH: process.env.PATH ?? '', TMPDIR: process.env.TMPDIR ?? '', [ISOLATED_ENV]: import.meta.path },
+      stdout: 'pipe', stderr: 'pipe', timeout: 240_000,
+    });
+    const out = (r.stdout.toString() + '\n' + r.stderr.toString()).replace(/\x1b\[[0-9;]*m/g, '');
+    const count = (k: string) => Number(out.match(new RegExp(`^\\s*(\\d+) ${k}\\s*$`, 'm'))?.[1] ?? -1);
+    expect({ exit: r.exitCode, pass: count('pass'), fail: count('fail') }, out.slice(-4000)).toEqual({ exit: 0, pass: 4, fail: 0 });
+  }, 250_000);
+}
 
-describe('MUST-FAIL — the one gate answers ungraded for an observe row', () => {
-  test('classifyReach: learning_mode:observe or reach_observe:true wins over reached:true / reached:false', () => {
-    expect(classifyReach({ success: true, tags: ['reached:true', 'learning_mode:observe'] })).toBe('ungraded');
-    expect(classifyReach({ success: false, tags: ['reached:false', 'learning_mode:observe'] })).toBe('ungraded');
-    expect(classifyReach({ success: true, tags: ['reached:true', 'reach_observe:true'] })).toBe('ungraded');
-    expect(classifyReach({ success: false, tags: ['reach_observe:true'] })).toBe('ungraded');
-    expect(isObserveTrace({ tags: ['learning_mode:learn'] })).toBe(false);
-  });
-  test('applyOutcomeToPosteriors: an observe row moves nothing and sends nothing, and the skip is counted', async () => {
-    const before = observeSkipCount();
-    expect(await run(['reached:true', 'learning_mode:observe', 'correlation:obs-c1'])).toEqual({ a: 0, b: 0, skipped: 'observe', statements: 0 });
-    expect(await run(['dispatcher_used:goal-host', 'reach_observe:true'], { success: false, failure_count: 1, task_count: 1 })).toEqual({ a: 0, b: 0, skipped: 'observe', statements: 0 });
-    expect(observeSkipCount()).toBe(before + 2);
-  });
-});
+if (ISOLATED) {
+  process.env.SURREALDB_NAMESPACE = 'activity-system';
+  process.env.SURREALDB_DATABASE = 'learning_loop';
+  process.env.POSTERIOR_COALESCE = '0';
+  process.env.SURREALDB_URL = 'http://127.0.0.1:9';
+  process.env.RELEVANCE_SINK_ENDPOINT = 'http://127.0.0.1:9';
+  process.env.PRIOR_SEED_ENABLED = 'false';
 
-describe('CONTROL — rows without the observe tag grade as before', () => {
-  test('classifyReach unchanged', () => {
-    expect(classifyReach({ success: true, tags: ['reached:true', 'learning_mode:learn'] })).toBe('reached');
-    expect(classifyReach({ success: true, tags: ['reached:false'] })).toBe('not-reached');
+  const { applyOutcomeToPosteriors } = await import('./posterior-update');
+  const sent: string[] = [];
+  const db = { query: async (sql: string) => { sent.push(sql); return []; }, queryAll: async (sql: string) => { sent.push(sql); return []; } } as never;
+  const run = async (tags: string[], extra: Record<string, unknown> = {}) => {
+    sent.length = 0;
+    const s = await applyOutcomeToPosteriors({ activity_id: 'observe-gate-arm', execution_id: `e-${tags.join('|')}`, success: true, failure_mode: null, tags, ...extra } as never, db, 'org-1');
+    return { a: s.alpha_delta, b: s.beta_delta, skipped: s.skipped_reason ?? null, statements: sent.length };
+  };
+
+  describe('MUST-FAIL — the one gate answers ungraded for an observe row', () => {
+    test('classifyReach: learning_mode:observe or reach_observe:true wins over reached:true / reached:false', () => {
+      expect(classifyReach({ success: true, tags: ['reached:true', 'learning_mode:observe'] })).toBe('ungraded');
+      expect(classifyReach({ success: false, tags: ['reached:false', 'learning_mode:observe'] })).toBe('ungraded');
+      expect(classifyReach({ success: true, tags: ['reached:true', 'reach_observe:true'] })).toBe('ungraded');
+      expect(classifyReach({ success: false, tags: ['reach_observe:true'] })).toBe('ungraded');
+      expect(isObserveTrace({ tags: ['learning_mode:learn'] })).toBe(false);
+    });
+    test('applyOutcomeToPosteriors: an observe row moves nothing and sends nothing, and the skip is counted', async () => {
+      const before = observeSkipCount();
+      expect(await run(['reached:true', 'learning_mode:observe', 'correlation:obs-c1'])).toEqual({ a: 0, b: 0, skipped: 'observe', statements: 0 });
+      expect(await run(['dispatcher_used:goal-host', 'reach_observe:true'], { success: false, failure_count: 1, task_count: 1 })).toEqual({ a: 0, b: 0, skipped: 'observe', statements: 0 });
+      expect(observeSkipCount()).toBe(before + 2);
+    });
   });
-  test('applyOutcomeToPosteriors: reached ⇒ α; not-reached ⇒ β; an ungraded goal-host run whose task threw ⇒ β', async () => {
-    const r = await run(['reached:true', 'learning_mode:learn']);
-    expect(r.a).toBeGreaterThan(0);
-    expect(r.skipped).toBeNull();
-    expect((await run(['reached:false'], { success: false })).b).toBeGreaterThan(0);
-    expect((await run(['dispatcher_used:goal-host'], { success: false, failure_count: 1, task_count: 1 })).b).toBeGreaterThan(0);
+
+  describe('CONTROL — rows without the observe tag grade as before', () => {
+    test('classifyReach unchanged', () => {
+      expect(classifyReach({ success: true, tags: ['reached:true', 'learning_mode:learn'] })).toBe('reached');
+      expect(classifyReach({ success: true, tags: ['reached:false'] })).toBe('not-reached');
+    });
+    test('applyOutcomeToPosteriors: reached ⇒ α; not-reached ⇒ β; an ungraded goal-host run whose task threw ⇒ β', async () => {
+      const r = await run(['reached:true', 'learning_mode:learn']);
+      expect(r.a).toBeGreaterThan(0);
+      expect(r.skipped).toBeNull();
+      expect((await run(['reached:false'], { success: false })).b).toBeGreaterThan(0);
+      expect((await run(['dispatcher_used:goal-host'], { success: false, failure_count: 1, task_count: 1 })).b).toBeGreaterThan(0);
+    });
   });
-});
+}

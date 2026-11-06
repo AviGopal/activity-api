@@ -9,12 +9,24 @@
  * captures issued SurrealDB queries instead of round-tripping a live DB.
  */
 
-import { describe, test, expect, mock } from 'bun:test';
+import { afterAll, describe, test, expect, mock } from 'bun:test';
 import { Hono } from 'hono';
 
 // Capture every SurrealDB query the handler issues so the assertions can
 // inspect both the SQL text and the parameter binds.
 const surrealQueries: { sql: string; params: any }[] = [];
+
+// mock.module is process-wide: capture the real modules and put them back in afterAll.
+const realModules: Array<[string, Record<string, unknown>]> = [
+  ['../db/surreal', { ...(await import('../db/surreal')) }],
+  ['../db/redis', { ...(await import('../db/redis')) }],
+  ['../websocket/broadcaster', { ...(await import('../websocket/broadcaster')) }],
+  ['../db/paradigm', { ...(await import('../db/paradigm')) }],
+  ['../services/variant-creator', { ...(await import('../services/variant-creator')) }],
+];
+afterAll(() => {
+  for (const [spec, real] of realModules) mock.module(spec, () => real);
+});
 
 mock.module('../db/surreal', () => ({
   surrealDB: {

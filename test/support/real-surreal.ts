@@ -174,9 +174,10 @@ export async function startRealSurreal(): Promise<RealSurreal> {
       // next start miss its 8 s health window ("surreal did not answer /health within 8 s"): a beforeAll failure with no
       // test name, i.e. an unnamed load failure, plus named failures in every real-engine file after it.
       if (proc) {
+        // 3 s, not 5: callers stop from an afterAll whose default timeout is 5 s, so a 5 s grace failed the hook.
         proc.kill();
-        const exited = await Promise.race([proc.exited.then(() => true), Bun.sleep(5_000).then(() => false)]);
-        if (!exited) { console.warn(`[real-surreal] engine on ${url} ignored SIGTERM for 5 s; sent SIGKILL`); proc.kill(9); await proc.exited; }
+        const exited = await Promise.race([proc.exited.then(() => true), Bun.sleep(3_000).then(() => false)]);
+        if (!exited) { console.warn(`[real-surreal] engine on ${url} ignored SIGTERM for 3 s; sent SIGKILL`); proc.kill(9); await proc.exited; }
       }
       clearTimeout(hardStop);
     },

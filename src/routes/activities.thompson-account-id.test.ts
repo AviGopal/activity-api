@@ -15,10 +15,22 @@
  * mirrors the activities.account-id mock pattern.
  */
 
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { afterAll, describe, test, expect, mock, beforeEach } from 'bun:test';
 import { Hono } from 'hono';
 
 const surrealQueries: { sql: string; params: any }[] = [];
+
+// mock.module is process-wide: capture the real modules and put them back in afterAll.
+const realModules: Array<[string, Record<string, unknown>]> = [
+  ['../db/surreal', { ...(await import('../db/surreal')) }],
+  ['../db/redis', { ...(await import('../db/redis')) }],
+  ['../websocket/broadcaster', { ...(await import('../websocket/broadcaster')) }],
+  ['../db/paradigm', { ...(await import('../db/paradigm')) }],
+  ['../services/variant-creator', { ...(await import('../services/variant-creator')) }],
+];
+afterAll(() => {
+  for (const [spec, real] of realModules) mock.module(spec, () => real);
+});
 
 mock.module('../db/surreal', () => ({
   surrealDB: {
