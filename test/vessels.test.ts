@@ -6,6 +6,7 @@
  */
 
 import { test, expect, describe, beforeAll } from 'bun:test';
+import { integrationEnv } from './support/integration-env';
 
 // Configuration
 const ACTIVITY_API_URL = process.env.ACTIVITY_API_URL || 'http://activity.metabob.local';
@@ -107,7 +108,8 @@ async function getVesselHealth(vesselId: string, jwt?: string): Promise<Response
   return fetch(`${ACTIVITY_API_URL}/v2/vessels/${vesselId}/health`, { headers });
 }
 
-describe('SPEC-004: Vessel Registry Protocol', () => {
+// Runs against a live activity-api (ACTIVITY_API_URL); skipped otherwise.
+describe.skipIf(!integrationEnv.activityApi)('SPEC-004: Vessel Registry Protocol', () => {
 
   describe('Test 1: Vessel Registration', () => {
 

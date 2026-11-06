@@ -1,0 +1,3 @@
+[test]
+# Snapshot the integration-gate env before any test file mutates process.env.
+preload = ["./test/support/integration-env.ts"]

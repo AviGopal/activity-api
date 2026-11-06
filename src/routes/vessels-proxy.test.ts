@@ -3,6 +3,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
+import { integrationEnv } from '../../test/support/integration-env';
 import { Hono } from 'hono';
 import vesselsRoutes from './vessels';
 
@@ -50,7 +51,8 @@ describe('Vessel Proxy Mode', () => {
       expect(res.headers.get('X-API-Replacement')).toBe('discovery-vessel');
     });
 
-    it('should include deprecation notice in response body', async () => {
+    // Writes the vessel row: needs a live SurrealDB (SURREALDB_URL).
+    it.skipIf(!integrationEnv.surrealdb)('should include deprecation notice in response body', async () => {
       // Mock SurrealDB and discovery-vessel
       globalThis.fetch = mock(async () => {
         return new Response(
@@ -123,7 +125,8 @@ describe('Vessel Proxy Mode', () => {
       // In production, we'd use a message queue or event system for reliable testing
     });
 
-    it('should not fail if discovery-vessel is down (graceful degradation)', async () => {
+    // Writes the vessel row: needs a live SurrealDB (SURREALDB_URL).
+    it.skipIf(!integrationEnv.surrealdb)('should not fail if discovery-vessel is down (graceful degradation)', async () => {
       // Mock discovery-vessel failure
       globalThis.fetch = mock(async (url) => {
         const urlStr = url.toString();

@@ -4,8 +4,10 @@
  */
 
 import { describe, test, expect } from 'bun:test';
+import { integrationEnv } from '../../test/support/integration-env';
 
-describe('POST /v2/activities/validate-composition', () => {
+// Runs against a live activity-api (TEST_API_URL); skipped otherwise.
+describe.skipIf(!integrationEnv.testApi)('POST /v2/activities/validate-composition', () => {
   const baseUrl = process.env.TEST_API_URL || 'http://localhost:8080';
 
   test('should validate a valid composition with no errors', async () => {

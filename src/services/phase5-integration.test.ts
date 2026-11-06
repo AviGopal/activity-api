@@ -10,12 +10,14 @@
  */
 
 import { describe, test, expect, beforeEach, afterAll } from 'bun:test';
+import { integrationEnv } from '../../test/support/integration-env';
 import { CircuitBreakerService } from './circuit-breaker';
 import { HealthScoringService } from './health-scoring';
 import { RoutingTraceService } from './routing-trace';
 import { surrealDB } from '../db/surreal';
 
-describe('Phase 5 Integration Tests', () => {
+// Needs a live SurrealDB (SURREALDB_URL); skipped otherwise.
+describe.skipIf(!integrationEnv.surrealdb)('Phase 5 Integration Tests', () => {
   const testOrgId = 'organizations:test-integration';
   const testVesselId = 'test-vessel-integration';
   const testShape = 'test_impulse_shape';

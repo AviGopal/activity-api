@@ -3,11 +3,13 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { integrationEnv } from '../../test/support/integration-env';
 import { Hono } from 'hono';
 import { surrealDB } from '../db/surreal';
 import activitiesRoutes from './activities';
 
-describe('POST /v2/activities/discover-by-shapes', () => {
+// Needs a live SurrealDB (SURREALDB_URL); skipped otherwise.
+describe.skipIf(!integrationEnv.surrealdb)('POST /v2/activities/discover-by-shapes', () => {
   let app: Hono;
 
   beforeEach(async () => {

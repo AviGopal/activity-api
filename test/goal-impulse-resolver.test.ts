@@ -5,6 +5,7 @@
  */
 
 import { describe, test, expect, beforeAll } from 'bun:test';
+import { integrationEnv } from './support/integration-env';
 import { Hono } from 'hono';
 import impulsesRouter from '../src/routes/impulses';
 import { surrealDB } from '../src/db/surreal';
@@ -14,9 +15,10 @@ const app = new Hono();
 app.route('/v2/impulses', impulsesRouter);
 
 // Test JWT token (for auth context)
-const TEST_JWT_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJvcmdJZCI6Im1ldGFib2JfaW50ZXJuYWwiLCJwcm9qZWN0SWQiOiJ0ZXN0LXByb2plY3QiLCJpbnN0YW5jZUlkIjoidGVzdC1taW5pYm9iIiwiaWF0IjoxNzAwMDAwMDAwfQ.test';
+const TEST_JWT_TOKEN = integrationEnv.jwt ?? '';
 
-describe('Goal Impulse Resolver', () => {
+// Needs a live SurrealDB (SURREALDB_URL) and a JWT identity-vessel signs (TEST_JWT_TOKEN); skipped otherwise.
+describe.skipIf(!integrationEnv.surrealdb || !integrationEnv.jwt)('Goal Impulse Resolver', () => {
   beforeAll(async () => {
     // Ensure database is connected
     try {

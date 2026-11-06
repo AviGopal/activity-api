@@ -3,6 +3,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { integrationEnv } from '../../test/support/integration-env';
 import { surrealDB } from '../db/surreal';
 import {
   shouldCreateVariant,
@@ -14,7 +15,8 @@ import {
 const TEST_ORG_ID = 'test-org-variant-creator';
 const TEST_TEMPLATE_ID = 'test.template.failing';
 
-describe('Variant Creator Service', () => {
+// Needs a live SurrealDB (SURREALDB_URL); skipped otherwise.
+describe.skipIf(!integrationEnv.surrealdb)('Variant Creator Service', () => {
   beforeAll(async () => {
     // Create test template
     await surrealDB.query(`

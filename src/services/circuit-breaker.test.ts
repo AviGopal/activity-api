@@ -3,12 +3,14 @@
  */
 
 import { describe, test, expect, beforeEach } from 'bun:test';
+import { integrationEnv } from '../../test/support/integration-env';
 import { CircuitBreakerService, type CircuitState } from './circuit-breaker';
 
 // Note: These tests require a running SurrealDB instance
 // Run with: SURREALDB_URL=... bun test circuit-breaker.test.ts
 
-describe('CircuitBreakerService', () => {
+// Needs a live SurrealDB (SURREALDB_URL); skipped otherwise.
+describe.skipIf(!integrationEnv.surrealdb)('CircuitBreakerService', () => {
   const testVesselId = 'test-vessel-circuit-breaker';
   const testOrgId = 'organizations:test-org';
 

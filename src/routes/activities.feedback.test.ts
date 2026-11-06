@@ -6,6 +6,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { integrationEnv } from '../../test/support/integration-env';
 import { Hono } from 'hono';
 import activitiesRouter from './activities';
 import { surrealDB } from '../db/surreal';
@@ -44,6 +45,7 @@ function createTestContext(orgId: string) {
 
 // Setup test data
 beforeAll(async () => {
+  if (!integrationEnv.surrealdb) return;
   // Create test activity
   await surrealDB.query(
     `UPSERT activity:\`${TEST_ACTIVITY_ID}\` CONTENT {
@@ -103,6 +105,7 @@ beforeAll(async () => {
 
 // Cleanup test data
 afterAll(async () => {
+  if (!integrationEnv.surrealdb) return;
   await surrealDB.query(
     `DELETE FROM activity WHERE id = $id`,
     { id: TEST_ACTIVITY_ID }
@@ -118,7 +121,8 @@ afterAll(async () => {
   );
 });
 
-describe('POST /v2/activities/feedback', () => {
+// Needs a live SurrealDB (SURREALDB_URL); skipped otherwise.
+describe.skipIf(!integrationEnv.surrealdb)('POST /v2/activities/feedback', () => {
   test('positive feedback with intensity 0 (1.5x multiplier)', async () => {
     const response = await app.request('/v2/activities/feedback', {
       method: 'POST',

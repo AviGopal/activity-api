@@ -6,6 +6,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { integrationEnv } from '../support/integration-env';
 
 const API_URL = process.env.ACTIVITY_API_URL || 'http://activity.metabob.local';
 const TEST_ORG_ID = 'metabob_internal';
@@ -46,7 +47,8 @@ async function apiRequest(
   });
 }
 
-describe('Connection Slots Integration Tests', () => {
+// Runs against a live activity-api (ACTIVITY_API_URL); skipped otherwise.
+describe.skipIf(!integrationEnv.activityApi)('Connection Slots Integration Tests', () => {
   beforeAll(async () => {
     // Connection slots use API key authentication
     // The API key is set in TEST_API_KEY environment variable or defaults to 'test-api-key-123'
@@ -205,7 +207,7 @@ describe('Connection Slots Integration Tests', () => {
   });
 });
 
-describe('Tiered Resolver Integration Tests', () => {
+describe.skipIf(!integrationEnv.activityApi)('Tiered Resolver Integration Tests', () => {
   beforeAll(async () => {
     // Use API key authentication for resolver tests
     // JWT token will be used if we have one from connection acquisition
@@ -307,7 +309,7 @@ describe('Tiered Resolver Integration Tests', () => {
   });
 });
 
-describe('Health and Connectivity', () => {
+describe.skipIf(!integrationEnv.activityApi)('Health and Connectivity', () => {
   test('should have healthy API', async () => {
     const response = await fetch(`${API_URL}/health`);
     expect(response.status).toBe(200);

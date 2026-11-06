@@ -3,12 +3,14 @@
  */
 
 import { describe, test, expect, beforeEach } from 'bun:test';
+import { integrationEnv } from '../../test/support/integration-env';
 import { HealthScoringService } from './health-scoring';
 
 // Note: These tests require a running SurrealDB instance
 // Run with: SURREALDB_URL=... bun test health-scoring.test.ts
 
-describe('HealthScoringService', () => {
+// Needs a live SurrealDB (SURREALDB_URL); skipped otherwise.
+describe.skipIf(!integrationEnv.surrealdb)('HealthScoringService', () => {
   const testVesselId = 'test-vessel-health';
   const testOrgId = 'organizations:test-org';
 

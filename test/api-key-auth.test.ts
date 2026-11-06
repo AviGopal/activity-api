@@ -15,6 +15,7 @@
  */
 
 import { test, expect, describe, beforeAll } from 'bun:test'
+import { integrationEnv } from './support/integration-env';
 
 // Test configuration
 const ACTIVITY_API_URL = process.env.ACTIVITY_API_URL || 'http://activity.metabob.local'
@@ -36,7 +37,8 @@ interface TemplateCreateRequest {
   }>
 }
 
-describe('Activity API: API Key Authentication Middleware', () => {
+// Runs against a live activity-api (ACTIVITY_API_URL); skipped otherwise.
+describe.skipIf(!integrationEnv.activityApi)('Activity API: API Key Authentication Middleware', () => {
 
   describe('1. API Key Header Extraction', () => {
 

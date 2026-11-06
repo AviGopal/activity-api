@@ -6,8 +6,10 @@
  */
 
 import { describe, test, expect } from 'bun:test';
+import { integrationEnv } from '../../test/support/integration-env';
 
-describe('POST /v2/impulses/resolve - Phase 5 (Proxy Removal)', () => {
+// Runs against a live activity-api (ACTIVITY_API_URL); skipped otherwise.
+describe.skipIf(!integrationEnv.activityApi)('POST /v2/impulses/resolve - Phase 5 (Proxy Removal)', () => {
   const ACTIVITY_API_URL = process.env.ACTIVITY_API_URL || 'http://localhost:8080';
 
   /**
@@ -118,7 +120,7 @@ describe('POST /v2/impulses/resolve - Phase 5 (Proxy Removal)', () => {
  * This test ensures the deprecated proxyToAnalysisApi function is not being called.
  * We can't directly test this without instrumentation, but we verify the behavior.
  */
-describe('Integration: No Analysis API proxy calls', () => {
+describe.skipIf(!integrationEnv.activityApi)('Integration: No Analysis API proxy calls', () => {
   test('Analysis API shapes fail immediately without network call', async () => {
     const startTime = Date.now();
 
