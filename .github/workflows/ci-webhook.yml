@@ -118,8 +118,8 @@ jobs:
           echo "lint_end=$(date +%s%3N)" >> $GITHUB_OUTPUT
 
           # Extract lint results (example parser)
-          LINT_ERRORS=$(grep -c "error" lint.log || echo 0)
-          LINT_WARNINGS=$(grep -c "warning" lint.log || echo 0)
+          LINT_ERRORS=$(grep -c "error" lint.log)
+          LINT_WARNINGS=$(grep -c "warning" lint.log)
           echo "lint_errors=${LINT_ERRORS}" >> $GITHUB_OUTPUT
           echo "lint_warnings=${LINT_WARNINGS}" >> $GITHUB_OUTPUT
           exit $rc
