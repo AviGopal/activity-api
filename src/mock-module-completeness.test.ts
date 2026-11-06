@@ -71,6 +71,13 @@ function mockFactories(testFile: string): Array<{ spec: string; keys: string[]; 
   const re = /mock\.module\(\s*['"]([^'"]+)['"]\s*,/g;
   for (const m of src.matchAll(re)) {
     const start = m.index! + m[0].length;
+    // `() => prevX` restoring a snapshot of the real module (`{ ...(await import(spec)) }`)
+    // is complete by construction; without this the walk below reads the next `{` in the file.
+    const ret = /^\s*\(\s*\)\s*=>\s*([A-Za-z_$][\w$]*)\s*\)/.exec(src.slice(start));
+    if (ret) {
+      const esc = m[1]!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (new RegExp(`\\{\\s*\\.\\.\\.\\(await import\\(['"]${esc}['"]\\)\\)\\s*\\}`).test(src)) continue;
+    }
     // Walk to the end of the factory's returned object literal.
     const open = src.indexOf("{", start);
     if (open === -1) continue;
